@@ -17,7 +17,7 @@ lint:
 check: build
 	./target/release/hisn check
 
-# Leak suite L1-L11. Needs unprivileged user namespaces: run on a real host,
+# Leak suite (L1-L14; L15-L20 arrive with `exec`). Needs unprivileged user namespaces: run on a real host,
 # not inside a seccomp-restricted container. Never reports a pass it did not run.
 leaktest: build
 	$(CARGO) build --release --example leakprobe

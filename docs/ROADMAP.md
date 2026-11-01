@@ -4,15 +4,14 @@
 
 Policy → rootfs/mounts → init (pivot_root, caps, NNP) → seccomp → Landlock →
 env scrub → supervisor + unix control socket → grant/revoke → CLI → pty
-passthrough. Linux x86_64 + aarch64. Acceptance: leak tests L1–L11 on a real
+passthrough. Linux x86_64 + aarch64. Acceptance: leak tests L1–L14 on a real
 host (`make leaktest`).
 
-Known v0 limits are tracked in `docs/OPEN-POINTS.md` (e.g. `/etc` is a live
-bind, single-id uid map, no egress filtering, no cgroups).
+Known v0 limits are tracked in `docs/OPEN-POINTS.md` (e.g. single-id uid map,
+no egress filtering, no cgroups).
 
 ## v0.x candidates
 
-* allowlist-style `/etc` (only named files) instead of live bind + masks;
 * 65536-id mapping via `newuidmap` using a launcher stage (DESIGN D4);
 * `/dev/shm`, `/dev/pts` options;
 * shared-subtree grant fallback (DESIGN §10) if `move_mount` into U is not

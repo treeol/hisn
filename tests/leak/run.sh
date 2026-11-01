@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hisn leak suite (L1-L14). Usage: tests/leak/run.sh PATH/TO/hisn
+# hisn leak suite (L1-L14b). Usage: tests/leak/run.sh PATH/TO/hisn
 #
 # Each test runs a probe (examples/leakprobe) INSIDE a real `hisn run` session
 # and asserts from the host. Needs unprivileged user namespaces on the host.
@@ -385,6 +385,21 @@ if command -v unshare >/dev/null && unshare -Urm true 2>/dev/null; then
   out=$(XDG_RUNTIME_DIR="$X14" unshare -Urm bash -c "mount --bind '$X14/hisn' '$C14/runtime-alias' && '$HISN' run --policy '$WORK/L14.toml' --session-id alias14 -- /bin/true" 2>&1)
   rc=$?
   if [ $rc -eq 125 ] && printf '%s' "$out" | grep -q "aliases the hisn runtime directory"; then pass "L14 runtime-dir bind alias under cwd is rejected (R1b)"; else fail "L14 R1b" "rc=$rc out=[$(printf %s "$out" | head -c 300)]"; fi
+  # L14b: the same alias as a *grant source* of a running session (grant-time R1b).
+  A14=$(new_cwd alias14b)
+  X14B="$WORK/xdg14b"
+  mkdir -p "$X14B/hisn" "$WORK/alias14b-mnt"
+  chmod 700 "$X14B" "$X14B/hisn"
+  write_policy "$WORK/L14b.toml" "$A14"
+  out=$(unshare -Urm bash "$HERE/l14b.sh" "$HISN" "$WORK/L14b.toml" "$X14B" "$WORK/alias14b-mnt" "$WORK/L14b.log" 2>&1)
+  rc=$?
+  if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q 'E_PATH_FORBIDDEN' && printf '%s' "$out" | grep -q 'aliases the runtime directory'; then
+    pass "L14b runtime-dir bind alias offered as a grant source is refused"
+  elif [ $rc -eq 90 ] || [ $rc -eq 91 ]; then
+    skip "L14b grant-time R1b" "fixture could not be built (rc=$rc: 90 = bind failed, 91 = session did not start inside the nested userns); session log: $(head -c 300 "$WORK/L14b.log" 2>/dev/null)"
+  else
+    fail "L14b grant-time R1b" "rc=$rc out=[$(printf %s "$out" | head -c 400)]"
+  fi
   weak "L14 R5" "the control-socket pid-namespace check (R5) is covered by unit tests only; no end-to-end test can place the socket inside the sandbox without a test hook"
 else
   skip "L14 alias fixture" "'unshare -Urm' unavailable, cannot build the bind-alias fixture"

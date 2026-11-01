@@ -1,12 +1,13 @@
 # hisn — design
 
-Status: v0 design, pre-implementation. Binding input: `docs/BRIEF.md`
+Status: v0 implemented (code and design reconciled in §12). Binding input: `docs/BRIEF.md`
 (the DO NOT ALTER block there always wins). This document expands the brief's
 architecture and records every place where working it through forced a
 refinement (§12 "Deviations from the brief"). Items marked **[HOST-VERIFY]**
 cannot be exercised in the Wakil build sandbox (user namespaces and the mount
 API are blocked there, see `hisn check` output in the README/close-out) and
-must be confirmed by `make leaktest` on a real host.
+must be confirmed by `make leaktest` on a real host. `docs/VERIFICATION.txt`
+records which commit each result was obtained on.
 
 ## 1. Goals and non-goals
 
@@ -482,6 +483,18 @@ Properties:
 | D11 | mkdir -p mountpoint by path | component walk with `openat2(NO_SYMLINKS)` + `move_mount` to a dirfd | no path TOCTOU in the helper |
 
 ## 13. Module map
+
+`alias` (R1b, §9) is a **reject-only gate**, not part of path resolution or of
+the mount plan. It parses a `/proc/self/mountinfo` text (pure, unit-tested) and
+answers one question: is a tree that is about to be exposed (recursively or not)
+the same filesystem object as, an ancestor of, or a descendant of the hisn
+runtime directory, reached through a bind alias that the lexical rules R1-R4
+cannot see? It has two callers, both in `supervisor`: `mountinfo_check` at
+session start (cwd, `mounts.*`, toolchain trees) and `do_grant` (the grant
+source). It never changes what `mounts::plan` derives and never influences how
+`grant::open_source` resolves a path; a positive result only makes the session
+start or the grant fail (`E_PATH_FORBIDDEN`). Because it does gate grants, both
+uses have a leak test: L14 (start) and L14b (grant).
 
 `policy` (schema, load, validate, resolve) → `check` → `mounts` (pure plan) →
 `rootfs` (executes plan) → `init` (§3) → `seccomp` → `landlock` → `env` →

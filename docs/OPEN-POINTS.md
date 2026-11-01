@@ -166,3 +166,16 @@ spawn gate is held until `C` is reaped on failure.
   five cap sets zero, NNP, seccomp 2 in the exec'd process), not the window.
   A hostile-probe test that races `/proc/<pid>/{mem,fd,status}` of new
   processes during a burst of execs is a v0.3 candidate.
+
+* **P20 — `exec` `K`-line delivery observed lost twice (unreproduced).** In
+  two `tools/verification.sh` runs, `exec::tests::monitor_forwards_signals_to_
+  the_process_group` failed after exactly the child's `sleep` timeout: the
+  `K <sig>` line the test wrote to the status socket never reached
+  `signal_group`, so the child died naturally. 25 isolated runs of the same
+  test and 5 sequential full-suite runs were green; the two failures happened
+  only while the script ran other work around the suite. If the loss is real
+  in `monitor`'s read loop (not a test artifact), a lost `K` line means a
+  cancelled exec is never killed. **[HOST-VERIFY]**: L16/L19 on a real host
+  (signal delivery to a running exec, 50+10 execs) plus a targeted burst test
+  would settle it. The test now waits for the child to be signalable before
+  writing (`8287313`), which removes the spawn/exec race as a cause.

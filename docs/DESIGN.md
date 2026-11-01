@@ -569,15 +569,25 @@ then only sleeps and reaps until `SIGTERM/SIGINT/SIGHUP`, then exits 0.
   `setns(user)` **first**: S is the owner-ancestor of the sandbox userns U, so
   `C` has all capabilities in U on joining — and only there. Then
   `setns(mnt)`, `ipc`, `uts`, `[net]`, and `pid` last (the pid-ns switch affects
-  only children). `chdir("/")`, `fork` → `D`, `waitpid(D)`, exit. `C` never uses
+  only children). `C` sets `PR_SET_DUMPABLE=0` **before and after** `setns(user)`
+  (joining a userns replaces the credentials, which may reset dumpability) and
+  closes every fd except the passed stdio fds and the status socket **before**
+  the fork, so `D` never inherits the namespace fds or `E`'s channel.
+  `chdir("/")`, `fork` → `D`, `waitpid(D)`, exit. `C` never uses
   `/proc/self` (after `setns(mnt)` `/proc` is the sandbox's, in which `C`, being
   outside the pid ns, has no `self`).
 * `D` is inside the pid ns but its parent (`C`) is outside: ns-pid parent `0`.
+  It sets `PDEATHSIG=SIGKILL` (relative to `C`), so killing `C` kills a stuck `D`.
   It is the only process that ever holds capabilities inside the sandbox, and
   only until §14.4 step 5. It does the confinement, then forks `W` and exits.
 * `W` (monitor) waits until `getppid()==1` — i.e. until the kernel has
   reparented it to the sandbox init, so the chain `init → W` exists — and only
-  then forks `P`. `W` relays status and signals (§14.8) and is reaped by init.
+  then forks `P`. The wait is **bounded (5 s)**; on timeout, or if `getppid()` is
+  ever neither `D`'s pid nor `1`, `W` reports `E …` and exits without forking `P`
+  (fail closed). Why `1` is the right adopter: `D`'s only ancestors are outside
+  the namespace, so within it there is no subreaper between `D` and init, and
+  orphans of `D` go to the namespace's init. `PDEATHSIG` is cleared across
+  `fork`, so `W` does not inherit `D`'s and survives `D`'s exit. `W` relays status and signals (§14.8) and is reaped by init.
 * `P` is the program: `setsid` (+ controlling tty if `tty`), `dup2` of the
   passed stdio, `PDEATHSIG=SIGKILL` (so it dies with `W`), `execve`.
 
@@ -650,8 +660,14 @@ implementation to drift):
    `/proc/<D>/mem`; non-dumpable plus "target has caps the tracer lacks" closes
    it (seccomp already denies `ptrace`/`process_vm_*`). `W` inherits it and stays
    non-dumpable; `P` becomes dumpable on `execve` as any process does.
-2. `close_all_except` {stdio fds, status socket}; fds 0-2 are reopened on the
-   sandbox's `/dev/null` so no host stdio stays in `D`/`W`.
+2. `close_all_except` {the three passed stdio fds *kept at their high numbers*,
+   status socket}; `D`'s own fds 0-2 are pointed at the sandbox's `/dev/null`
+   (so nothing it prints or reads touches the client). The passed fds stay
+   untouched until `P` `dup2`s them onto 0-2 (§14.8); `W` keeps them only to
+   hand to `P`. Descriptor inventory by stage — `E`: ns fds, supervisor channel;
+   `C`: passed fds + status socket (ns fds closed before the fork); `D`/`W`:
+   passed fds + status socket; `P`: 0-2 + nothing else (status socket and the
+   high copies are closed before `execve`).
 3. `setsid`; `set_rlimits(policy)` (`nofile`, `nproc`, `core=0`).
 4. `chdir("/")`, then `landlock::apply(plan, require_scope)` — the **same
    plan** as init (`landlock::plan(policy, initial_rw)`, copied into `E`).
@@ -688,7 +704,13 @@ environment never changes after start (host env is read once, as for `run`).
 ### 14.6 Ordering, hard revoke, session end
 
 * **Spawn gate (D22).** A `RwLock`: each exec holds it *shared* from "send to
-  `E`" until `P <pid>` (or failure) is received — by then `W` is in init's tree.
+  `E`" until `P <pid>` is received — `W` sends it only after it observed
+  `getppid()==1`, so by then `W` is in init's tree. On **failure, timeout or
+  client disconnect** before that point the gate is *not* released until `E` has
+  reported that `C` was reaped (on timeout `E` first sends `SIGKILL` to `C`,
+  which kills `D` through its `PDEATHSIG`; a `W` that already exists dies when
+  the supervisor closes the status socket). Only then can hard revoke sweep, so
+  a half-started exec is either in init's tree and killable, or gone.
   Hard revoke (§10) takes it *exclusive* before its kill sweep, so the sweep can
   never run while an exec is half-started (a `D` not yet under init would be
   missed). Grants/soft revokes use `op_lock` as before; they do not wait for
@@ -773,6 +795,16 @@ pty behaviour. See `docs/VERIFICATION.txt` for which commit each result is
 for.
 
 ### 14.12 Known limits of this design
+
+* **Landlock write roots are resolved by pathname in `D`** (the plan holds
+  paths; `PathFd::new` runs after `setns(mnt)`). A sandbox process that
+  renames a non-mountpoint ancestor under a writable tmpfs (`/tmp`, `/run`)
+  and recreates a directory at the old path could make `D` anchor a write rule
+  on the *new* directory. That can only weaken what the exec'd process may write
+  (it can write under `/tmp`/`/run` anyway); it cannot add rights outside the
+  write set. Closing it needs inode-anchored rules captured at session start
+  (open the roots once in the supervisor before the pivot and pass the fds) —
+  open point P18.
 
 * **Sibling Landlock domains.** Each exec gets its *own* Landlock domain
   (`landlock::apply` in `D`), a sibling of init's domain and of every other

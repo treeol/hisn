@@ -39,6 +39,25 @@ disposition (no third round is allowed, so everything is closed here or listed):
 | 7 | initial rw grants rejected by `grantable_rw` although in the write set; absent Landlock roots skipped silently | NON-BLOCKING | initial rw grants now count as grantable; skipping an absent root remains (nothing to anchor) — P13 |
 | 8 | holder enumeration not fail-closed | NON-BLOCKING | fixed: unreadable same-uid process ⇒ enumeration error; unparsable fdinfo / failed map lookup ⇒ `unknown` holder |
 
+## Review log — v0.2 exec design
+
+**Round 1 (design review of DESIGN §14)** — a *weak* round, recorded as such.
+One reviewer answered (`openai/gpt-6-astra`); the other
+(`anthropic/claude-fable-5.1`) was cut off at `max_tokens` and returned nothing.
+The answering reviewer stated that its copy of `docs/DESIGN.md` **ended at §13**
+(the file on disk had §14, 789 lines), so it reviewed the D21-D24 summaries and
+the brief, not the mechanism in §14. It reported **no BLOCKING finding** and
+explicitly did not approve §14. Its non-blocking points are P17-P19 below plus
+requirements on the host tests (fd inventory per stage, gate lifetime on
+failure, a `getppid()==1` proof, env rejection / confinement-equality /
+grants-visible tests). Only two review rounds are allowed per task, so §14 was
+**not** re-reviewed at design time; the implementation review (round 2) is the
+second and last look. Three refinements to §14 were made by the author while
+triaging (not by the panel): `C` sets non-dumpable before and after
+`setns(user)` and closes the ns fds before forking `D`; `D` keeps the client's
+stdio fds at high numbers until `P`; the `getppid()==1` wait is bounded and the
+spawn gate is held until `C` is reaped on failure.
+
 ## Open
 
 * **P1 — grant mechanism verified on one host only.** Cross-userns
@@ -128,3 +147,22 @@ disposition (no third round is allowed, so everything is closed here or listed):
   `cfg(test)`/feature-gated build of the supervisor, so the leak suite would no
   longer test the shipped binary; (b) does not exist, because R1b exists to
   prevent it. Revisit if R1b is ever relaxed.
+* **P17 — exec'd processes are sibling Landlock domains.** Each exec applies
+  its own ruleset (DESIGN §14.12), so with ABI >= 6 scoping an exec'd program
+  cannot signal, or connect abstract unix sockets of, the main command or
+  another exec's processes (`EPERM`). Stricter than needed but a behaviour
+  change tool authors may trip over; the supervisor-side `signal` op is not
+  affected. Alternatives (one shared domain) would need init to fork the
+  program, which §14.10 rejects.
+* **P18 — Landlock write roots in exec are re-resolved by pathname** (§14.12).
+  Can only weaken, never widen; fix = inode-anchored root fds captured at
+  start.
+* **P19 — exec confinement window is argued, not shown.** `D` holds
+  capabilities in the sandbox userns from `setns(user)` until `drop_all_caps`.
+  The design closes the known routes (non-dumpable before and after the userns
+  join, no inherited ns fds, seccomp denies `ptrace`/`process_vm_*`/
+  `pidfd_getfd`, `/proc/<D>/*` unreadable when non-dumpable) but the *absence*
+  of a route is only demonstrable on a host: L17/L15 check the end state (all
+  five cap sets zero, NNP, seccomp 2 in the exec'd process), not the window.
+  A hostile-probe test that races `/proc/<pid>/{mem,fd,status}` of new
+  processes during a burst of execs is a v0.3 candidate.

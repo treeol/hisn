@@ -419,6 +419,205 @@ pub fn recv_with_fd(sock: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<Ow
     }
 }
 
+/// Most descriptors one control message may carry (3 stdio + 1 status, with
+/// head-room). A message with more is truncated by the kernel and rejected.
+pub const MAX_PASSED_FDS: usize = 4;
+
+/// Send `data` plus any number of fds in a single `sendmsg`.
+pub fn send_with_fds(sock: RawFd, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    let mut iov = libc::iovec {
+        iov_base: data.as_ptr() as *mut _,
+        iov_len: data.len(),
+    };
+    let payload = std::mem::size_of_val(fds) as c_uint;
+    // SAFETY: cmsg buffer sized with CMSG_SPACE and aligned via u64 storage.
+    unsafe {
+        let space = libc::CMSG_SPACE(payload) as usize;
+        let mut buf = vec![0u64; space.div_ceil(8)];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        if !fds.is_empty() {
+            msg.msg_control = buf.as_mut_ptr().cast();
+            msg.msg_controllen = space as _;
+            let c = libc::CMSG_FIRSTHDR(&msg);
+            (*c).cmsg_level = libc::SOL_SOCKET;
+            (*c).cmsg_type = libc::SCM_RIGHTS;
+            (*c).cmsg_len = libc::CMSG_LEN(payload) as _;
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr().cast::<u8>(),
+                libc::CMSG_DATA(c),
+                payload as usize,
+            );
+        }
+        let n = libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL);
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (n as usize) < data.len() {
+            return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
+        }
+    }
+    Ok(())
+}
+
+/// What one `recvmsg` produced.
+pub struct Received {
+    pub len: usize,
+    pub fds: Vec<OwnedFd>,
+    /// The kernel dropped data or descriptors (`MSG_TRUNC`/`MSG_CTRUNC`):
+    /// the message must be rejected, never half-used.
+    pub truncated: bool,
+}
+
+/// Receive bytes plus up to [`MAX_PASSED_FDS`] fds (all `CLOEXEC`). Every
+/// descriptor that arrived is wrapped, so none can leak even when rejected.
+pub fn recv_with_fds(sock: RawFd, buf: &mut [u8]) -> io::Result<Received> {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: as in `send_with_fds`; received fds are wrapped immediately.
+    unsafe {
+        let space =
+            libc::CMSG_SPACE((MAX_PASSED_FDS * std::mem::size_of::<c_int>()) as c_uint) as usize;
+        let mut cbuf = vec![0u64; space.div_ceil(8)];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr().cast();
+        msg.msg_controllen = space as _;
+        let n = libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC);
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut fds = Vec::new();
+        let mut c = libc::CMSG_FIRSTHDR(&msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                let bytes = (*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let count = bytes / std::mem::size_of::<c_int>();
+                for i in 0..count {
+                    let mut raw: RawFd = -1;
+                    std::ptr::copy_nonoverlapping(
+                        libc::CMSG_DATA(c)
+                            .cast_const()
+                            .add(i * std::mem::size_of::<c_int>()),
+                        (&mut raw as *mut RawFd).cast::<u8>(),
+                        std::mem::size_of::<c_int>(),
+                    );
+                    if raw >= 0 {
+                        fds.push(OwnedFd::from_raw_fd(raw));
+                    }
+                }
+            }
+            c = libc::CMSG_NXTHDR(&msg, c);
+        }
+        Ok(Received {
+            len: n as usize,
+            fds,
+            truncated: msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0,
+        })
+    }
+}
+
+/// Connected `AF_UNIX`/`SOCK_SEQPACKET` pair: one `send` is one message, so a
+/// request and its descriptors can never be split or merged.
+pub fn socketpair_seqpacket() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: valid 2-element out array.
+    cvt_int(unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    })?;
+    // SAFETY: fresh descriptors from socketpair.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// Point fd 0, 1 and 2 at `/dev/null` (of the caller's current mount ns).
+pub fn stdio_to_dev_null() -> io::Result<()> {
+    // SAFETY: open + dup2 onto the three standard descriptors.
+    unsafe {
+        let n = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for fd in 0..3 {
+            if n != fd && libc::dup2(n, fd) < 0 {
+                let e = io::Error::last_os_error();
+                libc::close(n);
+                return Err(e);
+            }
+        }
+        if n > 2 {
+            libc::close(n);
+        }
+    }
+    Ok(())
+}
+
+/// `waitpid(pid, WNOHANG)`: `Ok(Some(status))` once it exited, `Ok(None)` if
+/// still running.
+pub fn try_wait(pid: i32) -> io::Result<Option<i32>> {
+    let mut st = 0;
+    // SAFETY: waitpid with a valid out pointer.
+    let r = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
+    match r {
+        0 => Ok(None),
+        r if r == pid => Ok(Some(st)),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// `pidfd_open(2)`; becomes readable when the process exits.
+pub fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
+    // SAFETY: plain syscall with integer arguments.
+    let r = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    cvt(r).map(owned)
+}
+
+/// Poll `fds` for up to `timeout_ms` (-1 = forever). Retries on `EINTR`.
+pub fn poll(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize> {
+    loop {
+        // SAFETY: `fds` is a valid slice.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        match cvt_int(r) {
+            Ok(n) => return Ok(n as usize),
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Write all of `data` to a stream socket without raising `SIGPIPE`.
+pub fn send_all(sock: RawFd, data: &[u8]) -> io::Result<()> {
+    let mut off = 0;
+    while off < data.len() {
+        // SAFETY: valid buffer slice.
+        let n = unsafe {
+            libc::send(
+                sock,
+                data[off..].as_ptr().cast(),
+                data.len() - off,
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+        off += n as usize;
+    }
+    Ok(())
+}
+
 pub fn socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as c_int; 2];
     // SAFETY: valid 2-element out array.
@@ -576,6 +775,59 @@ mod tests {
         drop(a);
         let (n, _) = recv_with_fd(b.as_raw_fd(), &mut buf).unwrap();
         assert_eq!(n, 0, "EOF after peer closes");
+    }
+
+    #[test]
+    fn several_fds_travel_in_one_message_and_extras_are_flagged() {
+        use std::io::{Read, Seek, SeekFrom};
+        let (a, b) = socketpair_seqpacket().unwrap();
+        let mut files: Vec<std::fs::File> = (0..3)
+            .map(|i| {
+                let mut f = tempfile::tempfile().unwrap();
+                write!(f, "file{i}").unwrap();
+                f
+            })
+            .collect();
+        let raw: Vec<RawFd> = files.iter().map(AsRawFd::as_raw_fd).collect();
+        send_with_fds(a.as_raw_fd(), b"{\"x\":1}", &raw).unwrap();
+        let mut buf = [0u8; 64];
+        let r = recv_with_fds(b.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(&buf[..r.len], b"{\"x\":1}");
+        assert!(!r.truncated);
+        assert_eq!(r.fds.len(), 3);
+        for (i, fd) in r.fds.into_iter().enumerate() {
+            let mut g = std::fs::File::from(fd);
+            g.seek(SeekFrom::Start(0)).unwrap();
+            let mut s = String::new();
+            g.read_to_string(&mut s).unwrap();
+            assert_eq!(s, format!("file{i}"), "order is preserved");
+        }
+        // Data without fds, then more fds than we accept: flagged, never lost.
+        send_with_fds(a.as_raw_fd(), b"plain", &[]).unwrap();
+        let r = recv_with_fds(b.as_raw_fd(), &mut buf).unwrap();
+        assert!(r.fds.is_empty() && !r.truncated && r.len == 5);
+        files.extend((0..3).map(|_| tempfile::tempfile().unwrap()));
+        let raw: Vec<RawFd> = files.iter().map(AsRawFd::as_raw_fd).collect();
+        assert_eq!(raw.len(), 6);
+        send_with_fds(a.as_raw_fd(), b"many", &raw).unwrap();
+        let r = recv_with_fds(b.as_raw_fd(), &mut buf).unwrap();
+        assert!(
+            r.truncated,
+            "6 fds exceed MAX_PASSED_FDS and must be flagged"
+        );
+        assert!(r.fds.len() <= MAX_PASSED_FDS);
+    }
+
+    #[test]
+    fn seqpacket_keeps_message_boundaries() {
+        let (a, b) = socketpair_seqpacket().unwrap();
+        send_all(a.as_raw_fd(), b"one").unwrap();
+        send_all(a.as_raw_fd(), b"two").unwrap();
+        let mut buf = [0u8; 64];
+        assert_eq!(recv_with_fds(b.as_raw_fd(), &mut buf).unwrap().len, 3);
+        assert_eq!(&buf[..3], b"one");
+        assert_eq!(recv_with_fds(b.as_raw_fd(), &mut buf).unwrap().len, 3);
+        assert_eq!(&buf[..3], b"two");
     }
 
     #[test]

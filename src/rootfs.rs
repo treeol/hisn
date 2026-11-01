@@ -190,6 +190,30 @@ fn bind_onto(
         flags |= sys::AT_RECURSIVE;
     }
     let tree = sys::open_tree(libc::AT_FDCWD, &sys::cstr(src)?, flags)?;
+    attach_tree(&tree, target, recursive, readonly, extra)
+}
+
+/// Re-bind the object `fd` refers to onto itself with `readonly` set. The
+/// source is the fd (`AT_EMPTY_PATH`), never a path: a `/proc/self/fd/N`
+/// path is a magic symlink and `AT_SYMLINK_NOFOLLOW` would clone the link
+/// itself, which cannot be moved onto a directory (EINVAL).
+fn bind_self_ro(fd: &OwnedFd, recursive: bool) -> io::Result<()> {
+    let mut flags = sys::OPEN_TREE_CLONE | sys::OPEN_TREE_CLOEXEC | sys::AT_EMPTY_PATH;
+    if recursive {
+        flags |= sys::AT_RECURSIVE;
+    }
+    let tree = sys::open_tree(fd.as_raw_fd(), c"", flags)?;
+    attach_tree(&tree, fd, recursive, true, 0)
+}
+
+/// Apply attributes to the detached `tree` and move it onto `target`.
+fn attach_tree(
+    tree: &OwnedFd,
+    target: &OwnedFd,
+    recursive: bool,
+    readonly: bool,
+    extra: u64,
+) -> io::Result<()> {
     let set = if readonly { sys::MOUNT_ATTR_RDONLY } else { 0 } | extra;
     if set != 0 {
         let attr = MountAttr {
@@ -272,10 +296,9 @@ fn harden_proc(root: RawFd) -> Result<()> {
                     .with_context(|| format!("opening /proc/{name} to remount it read-only"));
             }
         };
-        // Bind the entry onto itself read-only. The *source* is addressed via
-        // the (safe) fd, so no path is re-resolved.
-        let src = proc_fd_path(&t);
-        bind_onto(&src, &t, true, true, 0)
+        // Bind the entry onto itself read-only. The *source* is the (safe)
+        // fd itself, so no path is re-resolved.
+        bind_self_ro(&t, true)
             .with_context(|| format!("remounting /proc/{name} read-only"))?;
     }
     Ok(())

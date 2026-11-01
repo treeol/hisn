@@ -126,10 +126,15 @@ pub enum MountKind {
     MaskFile,
     /// Directory covered by an empty read-only tmpfs.
     MaskDir,
-    /// File with generated content, bound read-only over the target.
+    /// Regular file with generated content, written into the (later sealed)
+    /// parent tmpfs. Not a mount.
     Generated {
         content: String,
     },
+    /// Plain directory created in the root tmpfs; not a mount. Gives Landlock
+    /// and the grant helper an existing path for grant targets and
+    /// `grantable_rw` prefixes.
+    EmptyDir,
     /// New procfs for the sandbox pid namespace.
     Proc,
     /// New devpts instance.
@@ -215,9 +220,19 @@ fn under_etc(p: &Path) -> Option<&Path> {
 /// Ordering: parents before children (by path depth, stable), later
 /// declaration wins on an equal target. This keeps `/tmp` tmpfs before a cwd
 /// below it, and masks after the trees they cover.
-pub fn plan(policy: &ResolvedPolicy, facts: &HostFacts) -> Result<Vec<MountOp>, PlanError> {
+pub fn plan(
+    policy: &ResolvedPolicy,
+    facts: &HostFacts,
+    grant_dirs: &[PathBuf],
+) -> Result<Vec<MountOp>, PlanError> {
     let host_net = policy.network == crate::policy::Network::Host;
     let mut ops: Vec<MountOp> = Vec::new();
+
+    // 0. Mountpoint directories for grants (declared first so any real mount
+    //    on the same target wins in `order_and_dedupe`).
+    for d in grant_dirs.iter().chain(&policy.grantable_rw) {
+        ops.push(op(d, None, MountKind::EmptyDir));
+    }
 
     // 1. Toolchain: ro, recursive; symlinked entries (e.g. /bin -> usr/bin)
     //    are recreated as symlinks, never followed.
@@ -241,7 +256,7 @@ pub fn plan(policy: &ResolvedPolicy, facts: &HostFacts) -> Result<Vec<MountOp>, 
         MountKind::Tmpfs {
             size: ETC_SIZE,
             mode: 0o755,
-            readonly: false,
+            readonly: true,
         },
     ));
     for (name, kind) in &facts.etc {
@@ -361,7 +376,7 @@ pub fn plan(policy: &ResolvedPolicy, facts: &HostFacts) -> Result<Vec<MountOp>, 
     //    anyway, and a mask would just invent a mount point).
     let tree_roots: Vec<PathBuf> = ops
         .iter()
-        .filter(|o| !matches!(o.kind, MountKind::Symlink { .. }))
+        .filter(|o| is_mount(&o.kind))
         .map(|o| o.target.clone())
         .collect();
     for m in &policy.mask {
@@ -386,7 +401,7 @@ pub fn plan(policy: &ResolvedPolicy, facts: &HostFacts) -> Result<Vec<MountOp>, 
         MountKind::Tmpfs {
             size: DEV_SIZE,
             mode: 0o755,
-            readonly: false,
+            readonly: true,
         },
     ));
     for n in DEV_NODES {
@@ -429,13 +444,22 @@ fn order_and_dedupe(ops: Vec<MountOp>) -> Vec<MountOp> {
     indexed.into_iter().map(|(_, o)| o).collect()
 }
 
-/// Mount targets the sandbox must show in its mount table (symlinks excluded).
-/// Generated files are bound mounts and count. Used by L8 / `hisn inspect`.
+/// Mount targets the sandbox must show in its mount table (symlinks, generated
+/// files and plain directories excluded). Used by L8 / `hisn inspect`.
 pub fn expected_targets(plan: &[MountOp]) -> BTreeSet<PathBuf> {
     plan.iter()
-        .filter(|o| !matches!(o.kind, MountKind::Symlink { .. }))
+        .filter(|o| is_mount(&o.kind))
         .map(|o| o.target.clone())
         .collect()
+}
+
+/// Does executing this op create a mount (as opposed to a symlink, a plain
+/// file, or a directory)?
+pub fn is_mount(k: &MountKind) -> bool {
+    !matches!(
+        k,
+        MountKind::Symlink { .. } | MountKind::Generated { .. } | MountKind::EmptyDir
+    )
 }
 
 /// Directories that must exist (as plain tmpfs directories) before `op` can be
@@ -547,7 +571,7 @@ mod tests {
 
     #[test]
     fn etc_is_an_allowlist_without_secrets() {
-        let ops = plan(&pol("/work/p"), &facts()).unwrap();
+        let ops = plan(&pol("/work/p"), &facts(), &[]).unwrap();
         let t = targets(&ops);
         for secret in [
             "/etc/shadow",
@@ -597,7 +621,7 @@ mod tests {
         p.network = Network::Host;
         let mut f = facts();
         f.resolv_conf = Some("nameserver 1.1.1.1\n".into());
-        let ops = plan(&p, &f).unwrap();
+        let ops = plan(&p, &f, &[]).unwrap();
         assert_eq!(
             find(&ops, "/etc/resolv.conf").unwrap().kind,
             MountKind::Generated {
@@ -608,7 +632,7 @@ mod tests {
 
     #[test]
     fn toolchain_is_ro_and_symlinks_are_recreated() {
-        let ops = plan(&pol("/work/p"), &facts()).unwrap();
+        let ops = plan(&pol("/work/p"), &facts(), &[]).unwrap();
         assert_eq!(
             find(&ops, "/usr").unwrap().kind,
             MountKind::BindRo { recursive: true }
@@ -634,7 +658,7 @@ mod tests {
 
     #[test]
     fn cwd_is_rw_recursive_at_identical_path_and_parents_come_first() {
-        let ops = plan(&pol("/tmp/proj"), &facts()).unwrap();
+        let ops = plan(&pol("/tmp/proj"), &facts(), &[]).unwrap();
         let cwd = find(&ops, "/tmp/proj").unwrap();
         assert_eq!(cwd.kind, MountKind::BindRw { recursive: true });
         assert_eq!(cwd.source.as_deref(), Some(Path::new("/tmp/proj")));
@@ -650,7 +674,7 @@ mod tests {
 
     #[test]
     fn cwd_equal_to_tmp_replaces_the_private_tmp() {
-        let ops = plan(&pol("/tmp"), &facts()).unwrap();
+        let ops = plan(&pol("/tmp"), &facts(), &[]).unwrap();
         let tmp: Vec<_> = ops
             .iter()
             .filter(|o| o.target == Path::new("/tmp"))
@@ -661,14 +685,14 @@ mod tests {
 
     #[test]
     fn home_modes() {
-        let ops = plan(&pol("/work/p"), &facts()).unwrap();
+        let ops = plan(&pol("/work/p"), &facts(), &[]).unwrap();
         assert!(matches!(
             find(&ops, SANDBOX_HOME).unwrap().kind,
             MountKind::Tmpfs { mode: 0o700, .. }
         ));
         let mut p = pol("/work/p");
         p.home = Home::Path("/cache/home".into());
-        let ops = plan(&p, &facts()).unwrap();
+        let ops = plan(&p, &facts(), &[]).unwrap();
         let h = find(&ops, SANDBOX_HOME).unwrap();
         assert_eq!(h.kind, MountKind::BindRw { recursive: false });
         assert_eq!(h.source.as_deref(), Some(Path::new("/cache/home")));
@@ -679,7 +703,7 @@ mod tests {
         let mut p = pol("/work/p");
         p.ro = vec!["/opt/toolchains".into()];
         p.rw = vec!["/data/out".into()];
-        let ops = plan(&p, &facts()).unwrap();
+        let ops = plan(&p, &facts(), &[]).unwrap();
         assert_eq!(
             find(&ops, "/opt/toolchains").unwrap().kind,
             MountKind::BindRo { recursive: true }
@@ -701,7 +725,7 @@ mod tests {
         let mut f = facts();
         f.masks.insert("/work/p/.secrets".into(), EntryKind::Dir);
         f.masks.insert("/work/p/.env".into(), EntryKind::File);
-        let ops = plan(&p, &f).unwrap();
+        let ops = plan(&p, &f, &[]).unwrap();
         assert_eq!(
             find(&ops, "/work/p/.secrets").unwrap().kind,
             MountKind::MaskDir
@@ -725,7 +749,7 @@ mod tests {
         let mut f = facts();
         f.masks.insert("/srv/thing".into(), EntryKind::File);
         assert_eq!(
-            plan(&p, &f).unwrap_err(),
+            plan(&p, &f, &[]).unwrap_err(),
             PlanError::MaskOutsideTree {
                 path: "/srv/thing".into()
             }
@@ -743,7 +767,7 @@ mod tests {
         ] {
             let mut p = pol("/work/p");
             p.ro = vec![path.into()];
-            let e = plan(&p, &facts()).unwrap_err();
+            let e = plan(&p, &facts(), &[]).unwrap_err();
             if is_masked {
                 assert!(
                     matches!(e, PlanError::MaskedEtcOverlap { .. }),
@@ -755,19 +779,19 @@ mod tests {
         }
         // cwd and rw too
         let p = pol("/etc/ssh");
-        assert!(plan(&p, &facts()).is_err());
+        assert!(plan(&p, &facts(), &[]).is_err());
         let mut p = pol("/work/p");
         p.rw = vec!["/etc".into()];
-        assert!(plan(&p, &facts()).is_err());
+        assert!(plan(&p, &facts(), &[]).is_err());
         // an unmasked etc subpath is fine
         let mut p = pol("/work/p");
         p.ro = vec!["/etc/ssl/certs".into()];
-        assert!(plan(&p, &facts()).is_ok());
+        assert!(plan(&p, &facts(), &[]).is_ok());
     }
 
     #[test]
     fn proc_dev_are_fixed_and_complete() {
-        let ops = plan(&pol("/work/p"), &facts()).unwrap();
+        let ops = plan(&pol("/work/p"), &facts(), &[]).unwrap();
         assert_eq!(find(&ops, "/proc").unwrap().kind, MountKind::Proc);
         let dev: Vec<_> = ops
             .iter()
@@ -790,7 +814,7 @@ mod tests {
 
     #[test]
     fn expected_targets_excludes_symlinks_and_is_exact() {
-        let ops = plan(&pol("/work/p"), &facts()).unwrap();
+        let ops = plan(&pol("/work/p"), &facts(), &[]).unwrap();
         let exp = expected_targets(&ops);
         assert!(exp.contains(Path::new("/usr")));
         assert!(exp.contains(Path::new("/etc/hosts")));
@@ -798,19 +822,52 @@ mod tests {
         assert!(!exp.contains(Path::new("/bin")), "symlink");
         assert!(!exp.contains(Path::new("/etc/os-release")), "symlink");
         assert!(!exp.contains(Path::new("/dev/stdin")), "symlink");
+        assert!(!exp.contains(Path::new("/etc/passwd")), "generated file");
+        assert_eq!(exp.len(), ops.iter().filter(|o| is_mount(&o.kind)).count());
+    }
+
+    #[test]
+    fn grant_dirs_are_plain_directories_and_lose_to_real_mounts() {
+        let mut p = pol("/work/p");
+        p.grantable_rw = vec!["/data/shared".into(), "/work/p".into()];
+        let ops = plan(&p, &facts(), &["/g/in".into()]).unwrap();
+        for d in ["/data/shared", "/g/in"] {
+            assert_eq!(find(&ops, d).unwrap().kind, MountKind::EmptyDir, "{d}");
+            assert!(!expected_targets(&ops).contains(Path::new(d)));
+        }
+        // a prefix equal to the cwd stays the real bind
         assert_eq!(
-            exp.len(),
-            ops.iter()
-                .filter(|o| !matches!(o.kind, MountKind::Symlink { .. }))
-                .count()
+            find(&ops, "/work/p").unwrap().kind,
+            MountKind::BindRw { recursive: true }
         );
+    }
+
+    #[test]
+    fn etc_and_dev_tmpfs_are_sealed_read_only() {
+        let ops = plan(&pol("/work/p"), &facts(), &[]).unwrap();
+        for t in ["/etc", "/dev"] {
+            assert!(
+                matches!(
+                    find(&ops, t).unwrap().kind,
+                    MountKind::Tmpfs { readonly: true, .. }
+                ),
+                "{t}"
+            );
+        }
+        assert!(matches!(
+            find(&ops, "/tmp").unwrap().kind,
+            MountKind::Tmpfs {
+                readonly: false,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn plan_is_deterministic() {
         assert_eq!(
-            plan(&pol("/work/p"), &facts()),
-            plan(&pol("/work/p"), &facts())
+            plan(&pol("/work/p"), &facts(), &[]),
+            plan(&pol("/work/p"), &facts(), &[])
         );
     }
 

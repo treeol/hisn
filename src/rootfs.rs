@@ -298,8 +298,7 @@ fn harden_proc(root: RawFd) -> Result<()> {
         };
         // Bind the entry onto itself read-only. The *source* is the (safe)
         // fd itself, so no path is re-resolved.
-        bind_self_ro(&t, true)
-            .with_context(|| format!("remounting /proc/{name} read-only"))?;
+        bind_self_ro(&t, true).with_context(|| format!("remounting /proc/{name} read-only"))?;
     }
     Ok(())
 }

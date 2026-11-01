@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "hisn-policy/v1",
+  "description": "The policy as written in `hisn.toml`.",
+  "type": "object",
+  "properties": {
+    "env": {
+      "$ref": "#/$defs/EnvPolicy",
+      "default": {
+        "pass": [],
+        "set": {}
+      }
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits",
+      "default": {
+        "nofile": 65536,
+        "nproc": 4096
+      }
+    },
+    "mounts": {
+      "$ref": "#/$defs/Mounts",
+      "default": {
+        "grantable_rw": [],
+        "mask": [],
+        "ro": [],
+        "rw": []
+      }
+    },
+    "seccomp": {
+      "$ref": "#/$defs/SeccompPolicy",
+      "default": {
+        "extra_deny": []
+      }
+    },
+    "session": {
+      "$ref": "#/$defs/Session",
+      "default": {
+        "cwd": ".",
+        "home": "tmpfs",
+        "hostname": "hisn",
+        "network": "none"
+      }
+    },
+    "version": {
+      "description": "Must be exactly `hisn-policy/v1`.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version"
+  ],
+  "$defs": {
+    "EnvPolicy": {
+      "type": "object",
+      "properties": {
+        "pass": {
+          "description": "Variable names copied from the host environment if set.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "set": {
+          "description": "Literal variables; wins over `pass`.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false
+    },
+    "Limits": {
+      "type": "object",
+      "properties": {
+        "nofile": {
+          "description": "RLIMIT_NOFILE (>= 1).",
+          "type": "integer",
+          "format": "uint64",
+          "default": 65536,
+          "minimum": 0
+        },
+        "nproc": {
+          "description": "RLIMIT_NPROC (>= 1).",
+          "type": "integer",
+          "format": "uint64",
+          "default": 4096,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Mounts": {
+      "type": "object",
+      "properties": {
+        "grantable_rw": {
+          "description": "Prefixes under which dynamic rw grants are allowed (Landlock write set).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "mask": {
+          "description": "Extra paths masked inside allowed trees.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "ro": {
+          "description": "Extra read-only binds (absolute paths, recursive).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "rw": {
+          "description": "Extra read-write binds (absolute paths).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Network": {
+      "type": "string",
+      "enum": [
+        "none",
+        "host"
+      ]
+    },
+    "SeccompPolicy": {
+      "type": "object",
+      "properties": {
+        "extra_deny": {
+          "description": "Syscall names added to the built-in denylist.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Session": {
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "description": "Working directory, mounted rw at the identical path. Relative paths\nresolve against the policy file's directory.",
+          "type": "string",
+          "default": "."
+        },
+        "home": {
+          "description": "`\"tmpfs\"` or an absolute host path (persistent, rw).",
+          "type": "string",
+          "default": "tmpfs"
+        },
+        "hostname": {
+          "description": "RFC 1123 label, at most 63 characters.",
+          "type": "string",
+          "default": "hisn"
+        },
+        "network": {
+          "$ref": "#/$defs/Network",
+          "default": "none"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

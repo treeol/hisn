@@ -1,0 +1,25 @@
+# Example hisn policy (hisn-policy/v1). See docs/POLICY-SPEC.md.
+version = "hisn-policy/v1"
+
+[session]
+cwd = "."            # mounted rw at the identical path
+home = "tmpfs"       # or an absolute host path for warm caches
+network = "none"     # "none" | "host"
+hostname = "hisn"
+
+[mounts]
+ro = []              # e.g. ["/opt/toolchains"]
+rw = []
+mask = []            # paths hidden inside allowed trees, e.g. [".secrets"] (absolute)
+grantable_rw = []    # prefixes where `hisn grant --rw` is allowed
+
+[env]
+pass = ["GOFLAGS", "RUSTFLAGS"]
+set  = { CI = "1" }
+
+[seccomp]
+extra_deny = []
+
+[limits]
+nofile = 65536
+nproc  = 4096

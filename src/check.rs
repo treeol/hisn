@@ -331,30 +331,181 @@ fn check_seccomp() -> Item {
     }
 }
 
-/// Probe a mount-API syscall with deliberately invalid arguments: ENOSYS
-/// means missing, EPERM means blocked by an outer filter, anything else
-/// means the kernel implements it.
-fn probe_syscall(name: &'static str, nr: libc::c_long, args: [libc::c_long; 5]) -> Item {
-    // SAFETY: arguments are invalid by construction (bad fd / null) so the
-    // call can only fail; it cannot mutate state.
-    let r = unsafe { libc::syscall(nr, args[0], args[1], args[2], args[3], args[4]) };
-    if r >= 0 {
-        return item(name, true, Status::Ok, "available");
+/// How a mount-API probe ended, from inside a fresh user+mount namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// The call ran far enough to be rejected for its (deliberately invalid)
+    /// arguments: the kernel implements it and nothing filters it.
+    Available(i32),
+    Missing,
+    /// `EPERM` *inside a user namespace we own* — an outer seccomp/LSM policy.
+    Filtered,
+}
+
+/// Classify the errno of a deliberately-invalid call made with
+/// `CAP_SYS_ADMIN` over our own mount namespace.
+///
+/// Why inside a namespace: `move_mount(2)` checks `may_mount()` before it
+/// looks at any argument, so outside a user namespace an unprivileged process
+/// gets `EPERM` regardless of seccomp. Probing there reported a false
+/// "blocked by an outer seccomp filter" on a healthy host.
+pub fn classify_probe(errno: i32) -> ProbeOutcome {
+    match errno {
+        libc::ENOSYS => ProbeOutcome::Missing,
+        libc::EPERM => ProbeOutcome::Filtered,
+        e => ProbeOutcome::Available(e),
     }
-    match errno() {
-        libc::ENOSYS => item(name, true, Status::Fail, "missing (ENOSYS)"),
-        libc::EPERM => item(
-            name,
-            true,
-            Status::Fail,
-            "blocked by an outer seccomp filter (EPERM)",
-        ),
-        e => item(
-            name,
-            true,
-            Status::Ok,
-            format!("available (probe errno {e})"),
-        ),
+}
+
+const PROBE_COUNT: usize = 3;
+const MOUNT_PROBES: [&str; PROBE_COUNT] = ["open_tree", "move_mount", "mount_setattr"];
+
+/// Run the three probes in a forked child that first enters a new user+mount
+/// namespace with the caller's uid/gid mapped (exactly what `hisn run` does).
+/// Returns the errno of each probe, or `(stage, errno)` if the namespace could
+/// not be set up (then nothing was probed).
+fn probe_mount_api() -> Result<[i32; PROBE_COUNT], (&'static str, i32)> {
+    let uid_map = format!("{0} {0} 1", rustix::process::getuid().as_raw());
+    let gid_map = format!("{0} {0} 1", rustix::process::getgid().as_raw());
+    let mut fds = [0i32; 2];
+    // SAFETY: valid 2-element array for pipe2.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(("pipe", errno()));
+    }
+    // SAFETY: the child below calls only raw syscalls on data prepared before
+    // the fork (no allocation), then `_exit`s.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(("fork", errno()));
+    }
+    if pid == 0 {
+        // Wire format: PROBE_COUNT x i32 errnos, or a single i32 stage code
+        // (negative) followed by the errno.
+        let fail = |stage: i32, e: i32| -> ! {
+            let buf = [stage, e];
+            // SAFETY: valid fd and buffer; `_exit` never returns.
+            unsafe {
+                libc::write(fds[1], buf.as_ptr().cast(), std::mem::size_of_val(&buf));
+                libc::_exit(1)
+            }
+        };
+        let put = |path: &std::ffi::CStr, body: &str| -> i32 {
+            // SAFETY: plain open/write/close on a /proc file.
+            unsafe {
+                let fd = libc::open(path.as_ptr(), libc::O_WRONLY);
+                if fd < 0 {
+                    return errno();
+                }
+                let n = libc::write(fd, body.as_ptr().cast(), body.len());
+                let e = if n < 0 { errno() } else { 0 };
+                libc::close(fd);
+                e
+            }
+        };
+        // SAFETY: plain syscalls with valid arguments.
+        unsafe {
+            if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
+                fail(-1, errno());
+            }
+        }
+        for (stage, path, body) in [
+            (-2, c"/proc/self/setgroups", "deny"),
+            (-3, c"/proc/self/uid_map", uid_map.as_str()),
+            (-4, c"/proc/self/gid_map", gid_map.as_str()),
+        ] {
+            let e = put(path, body);
+            if e != 0 {
+                fail(stage, e);
+            }
+        }
+        let nul = std::ptr::null::<u8>() as libc::c_long;
+        let calls: [(libc::c_long, [libc::c_long; 5]); PROBE_COUNT] = [
+            (SYS_OPEN_TREE, [-1, nul, 0, 0, 0]),
+            (SYS_MOVE_MOUNT, [-1, nul, -1, nul, 0]),
+            (SYS_MOUNT_SETATTR, [-1, nul, 0, nul, 0]),
+        ];
+        let mut out = [0i32; PROBE_COUNT];
+        for (i, (nr, a)) in calls.iter().enumerate() {
+            // SAFETY: arguments are invalid by construction (bad fd / null),
+            // so the call can only fail; it cannot mutate state.
+            let r = unsafe { libc::syscall(*nr, a[0], a[1], a[2], a[3], a[4]) };
+            out[i] = if r >= 0 { 0 } else { errno() };
+        }
+        // SAFETY: valid fd and buffer.
+        unsafe {
+            libc::write(fds[1], out.as_ptr().cast(), std::mem::size_of_val(&out));
+            libc::_exit(0)
+        }
+    }
+    // SAFETY: closing our copy of the write end; reading from the read end.
+    unsafe { libc::close(fds[1]) };
+    let mut buf = [0i32; PROBE_COUNT];
+    // SAFETY: buf is valid for its size.
+    let n = unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), std::mem::size_of_val(&buf)) };
+    // SAFETY: valid fd / pid.
+    unsafe {
+        libc::close(fds[0]);
+        let mut status = 0;
+        libc::waitpid(pid, &mut status, 0);
+    }
+    parse_probe_reply(&buf, n)
+}
+
+/// Interpret the child's reply (`n` bytes read into `buf`).
+fn parse_probe_reply(
+    buf: &[i32; PROBE_COUNT],
+    n: isize,
+) -> Result<[i32; PROBE_COUNT], (&'static str, i32)> {
+    let full = (PROBE_COUNT * std::mem::size_of::<i32>()) as isize;
+    if n == full && buf[0] >= 0 {
+        return Ok(*buf);
+    }
+    if n >= 2 * std::mem::size_of::<i32>() as isize || buf[0] < 0 {
+        let stage = match buf[0] {
+            -1 => "unshare(NEWUSER|NEWNS)",
+            -2 => "setgroups",
+            -3 => "uid_map",
+            -4 => "gid_map",
+            _ => "probe",
+        };
+        return Err((stage, buf[1]));
+    }
+    Err(("probe child died", 0))
+}
+
+fn check_mount_api() -> Vec<Item> {
+    match probe_mount_api() {
+        Ok(errnos) => MOUNT_PROBES
+            .iter()
+            .zip(errnos)
+            .map(|(name, e)| match classify_probe(e) {
+                ProbeOutcome::Available(0) => item(name, true, Status::Ok, "available"),
+                ProbeOutcome::Available(e) => item(
+                    name,
+                    true,
+                    Status::Ok,
+                    format!("available (probe errno {e})"),
+                ),
+                ProbeOutcome::Missing => item(name, true, Status::Fail, "missing (ENOSYS)"),
+                ProbeOutcome::Filtered => item(
+                    name,
+                    true,
+                    Status::Fail,
+                    "blocked by an outer seccomp/LSM policy (EPERM inside our own user namespace)",
+                ),
+            })
+            .collect(),
+        Err((stage, e)) => MOUNT_PROBES
+            .iter()
+            .map(|name| {
+                item(
+                    name,
+                    true,
+                    Status::Fail,
+                    format!("not probed: {stage} failed: {}", errno_name(e)),
+                )
+            })
+            .collect(),
     }
 }
 
@@ -418,22 +569,7 @@ pub fn run_checks() -> Report {
     items.extend(check_userns());
     items.push(check_landlock());
     items.push(check_seccomp());
-    let nul = std::ptr::null::<u8>() as libc::c_long;
-    items.push(probe_syscall(
-        "open_tree",
-        SYS_OPEN_TREE,
-        [-1, nul, 0, 0, 0],
-    ));
-    items.push(probe_syscall(
-        "move_mount",
-        SYS_MOVE_MOUNT,
-        [-1, nul, -1, nul, 0],
-    ));
-    items.push(probe_syscall(
-        "mount_setattr",
-        SYS_MOUNT_SETATTR,
-        [-1, nul, 0, nul, 0],
-    ));
+    items.extend(check_mount_api());
     items.push(check_subids());
     items.extend(check_misc());
     Report { arch, items }
@@ -442,6 +578,56 @@ pub fn run_checks() -> Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_classification() {
+        assert_eq!(classify_probe(libc::ENOSYS), ProbeOutcome::Missing);
+        assert_eq!(classify_probe(libc::EPERM), ProbeOutcome::Filtered);
+        // the errnos a healthy kernel returns for the deliberately bad calls
+        for e in [libc::EBADF, libc::EFAULT, libc::EINVAL, libc::ENOENT] {
+            assert_eq!(classify_probe(e), ProbeOutcome::Available(e));
+        }
+    }
+
+    #[test]
+    fn probe_reply_parsing() {
+        assert_eq!(parse_probe_reply(&[9, 9, 22], 12), Ok([9, 9, 22]));
+        assert_eq!(
+            parse_probe_reply(&[0, libc::EBADF, 22], 12),
+            Ok([0, libc::EBADF, 22])
+        );
+        assert_eq!(
+            parse_probe_reply(&[-1, libc::EPERM, 0], 8),
+            Err(("unshare(NEWUSER|NEWNS)", libc::EPERM))
+        );
+        assert_eq!(
+            parse_probe_reply(&[-3, libc::EACCES, 0], 8),
+            Err(("uid_map", libc::EACCES))
+        );
+        assert_eq!(
+            parse_probe_reply(&[0, 0, 0], 0),
+            Err(("probe child died", 0))
+        );
+    }
+
+    #[test]
+    fn mount_probes_never_report_a_false_filter_without_a_namespace() {
+        // Whatever this machine allows, an un-probed or failed namespace setup
+        // must be reported as "not probed", never as an outer seccomp filter
+        // blamed on the syscall itself.
+        for it in check_mount_api() {
+            if it.status == Status::Fail {
+                assert!(
+                    it.detail.starts_with("not probed")
+                        || it.detail.contains("inside our own user namespace")
+                        || it.detail.contains("ENOSYS"),
+                    "{}: {}",
+                    it.name,
+                    it.detail
+                );
+            }
+        }
+    }
 
     #[test]
     fn kernel_parse() {

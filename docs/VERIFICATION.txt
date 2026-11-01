@@ -1,20 +1,20 @@
-# Verification record (generated 2026-11-01T04:13:47Z, host: Wakil build sandbox, uid 1000)
+# Verification record (generated 2026-11-01T04:20:44Z, host: Wakil build sandbox, uid 1000)
 
 ## cargo fmt --check
 clean
 
 ## cargo clippy --all-targets -- -D warnings (x86_64)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
-
-## cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
 
+## cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+
 ## cargo test
-test result: ok. 121 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 124 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
 
 ## unit tests per module
       8 alias
-      3 check
+      6 check
       3 cli
       9 control
       8 env
@@ -37,9 +37,9 @@ hisn host check (x86_64)
   [FAIL] user namespaces        unshare(NEWUSER): Operation not permitted (os error 1) (errno 1)
   [ok  ] landlock               ABI v10
   [ok  ] seccomp                filter mode, KILL_PROCESS available (current process mode=2)
-  [FAIL] open_tree              blocked by an outer seccomp filter (EPERM)
-  [FAIL] move_mount             blocked by an outer seccomp filter (EPERM)
-  [FAIL] mount_setattr          blocked by an outer seccomp filter (EPERM)
+  [FAIL] open_tree              not probed: unshare(NEWUSER|NEWNS) failed: Operation not permitted (os error 1) (errno 1)
+  [FAIL] move_mount             not probed: unshare(NEWUSER|NEWNS) failed: Operation not permitted (os error 1) (errno 1)
+  [FAIL] mount_setattr          not probed: unshare(NEWUSER|NEWNS) failed: Operation not permitted (os error 1) (errno 1)
   [warn] subuid ranges          no >=65536 range in /etc/subuid; single-id mapping only (optional)
   [ok  ] lsm list               unreadable (optional)
   [ok  ] cgroup v2              mounted (used for limits in v1) (optional)

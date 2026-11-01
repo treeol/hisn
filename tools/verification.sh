@@ -46,10 +46,12 @@ TMP=$(mktemp)
   cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings 2>&1 | tail -1
   echo
   echo "## cargo test"
-  cargo test 2>&1 | grep -E "^test result: .* [1-9][0-9]* passed|FAILED|panicked"
+  cargo test 2>&1 | tee /tmp/hisn-verif-unittests.log | grep -E "^test result: .* [1-9][0-9]* passed|FAILED|panicked"
   echo
   echo "## unit tests per module"
-  cargo test 2>&1 | grep -E "^test [a-z_0-9]+::" | sed -E 's/^test ([a-z_0-9]+)::.*/\1/' | sort | uniq -c
+  # Derived from the SAME single run above (a second back-to-back `cargo test`
+  # was the observed trigger of a test-ordering flake, OPEN-POINTS P20).
+  grep -E "^test [a-z_0-9]+::" /tmp/hisn-verif-unittests.log | sed -E 's/^test ([a-z_0-9]+)::.*/\1/' | sort | uniq -c
   echo
   echo "## python3 tests/leak/test_l8.py (L8 comparator self-tests)"
   python3 -W ignore tests/leak/test_l8.py 2>&1 | grep -E "^(Ran|OK|FAILED)"

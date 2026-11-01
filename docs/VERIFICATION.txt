@@ -1,9 +1,9 @@
 # Verification record
 
 hisn version : 0.2.0
-commit       : 6a93163cec6e4b5ea47f53791b82a2f10330e5e6
-worktree     : DIRTY (uncommitted: src/exec.rs tools/verification-debug.sh )
-generated    : 2026-11-01T14:57:39Z by tools/verification.sh
+commit       : 947460c9fddaed9c7fcd53076e1d001d2936661c
+worktree     : DIRTY (uncommitted: docs/OPEN-POINTS.md src/exec.rs tools/verification.sh )
+generated    : 2026-11-01T15:20:03Z by tools/verification.sh
 where        : build sandbox, uid 1000, Linux 7.2.13-200.fc44.x86_64 x86_64
 scope        : the results in this half are for the code at the commit above
 
@@ -11,15 +11,13 @@ scope        : the results in this half are for the code at the commit above
 clean
 
 ## cargo clippy --all-targets -- -D warnings (x86_64)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.75s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
 
 ## cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.75s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
 
 ## cargo test
-test exec::tests::monitor_forwards_signals_to_the_process_group ... FAILED
-thread 'exec::tests::monitor_forwards_signals_to_the_process_group' (506121) panicked at src/exec.rs:1484:13:
-test result: FAILED. 174 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.01s
+test result: ok. 175 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
 
 ## unit tests per module
       8 alias
@@ -27,7 +25,7 @@ test result: FAILED. 174 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
       6 cli
      16 control
       9 env
-     30 exec
+     29 exec
       5 execcli
      13 grant
       7 init

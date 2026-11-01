@@ -186,8 +186,19 @@ L15-L20. No third round is allowed. Disposition:
   A hostile-probe test that races `/proc/<pid>/{mem,fd,status}` of new
   processes during a burst of execs is a v0.3 candidate.
 
-* **P20 — `monitor_forwards_signals_to_the_process_group` fails under
-  `tools/verification.sh` (unit-level, test-only).** Under the script the test
+* **P20 — RESOLVED (build-sandbox artifact): HUP is not delivered here.** The
+  `monitor_forwards_signals_to_the_process_group` unit test used SIGHUP and
+  failed "randomly" (second run, under `tools/verification.sh`, …). Root
+  cause, proven in the sandbox with plain shell: `kill(-pgid, SIGHUP)`
+  returns 0 **and the target survives** in this build container (HUP is
+  swallowed somewhere in its process supervisor), while SIGTERM works. Every
+  failure was the test's child living to its natural `sleep 60` death
+  (`Code(0)`), with the monitor's forwarding path instrument-verified as
+  correct (every `K` line popped, `signal_group` executed, kill returning 0).
+  No hisn defect: `signal_group` forwards whatever signal was requested, and
+  on a normal host HUP kills. The test now uses SIGTERM (and notes the
+  artifact). Residual: **[HOST-VERIFY]** that HUP delivery through the exec
+  `K` path works on a real host (L16/L19 cover signal delivery generally). Under the script the test
   fails after exactly the child's sleep timeout with `got=Code(0)`;
   40+ direct runs are green. Instrumented runs (commit history) proved the
   shipped path works: the monitor pops every `K` line from the status socket

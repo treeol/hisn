@@ -47,9 +47,11 @@ Escalation (user approves a write mid-session) is a dynamic grant:
 `hisn grant --session ID PATH --rw` (requires `PATH` under a configured
 `mounts.grantable_rw`). Wakil must treat `E_NOT_GRANTABLE` as "restart the
 session with a wider policy", never as a reason to retry differently.
-Revocation on consent withdrawal: `hisn revoke --session ID PATH
-[kill_holders]` and read `holders` — if non-empty and the guarantee matters,
-end the session.
+Revocation on consent withdrawal: `hisn revoke --session ID PATH --hard` —
+kills every sandbox process except init and returns `guarantee:"hard"`. A plain
+(soft) revoke only guarantees the path no longer resolves; already-open or
+queued file descriptors may survive it. Wakil must use `--hard` whenever the
+revocation is a security decision.
 
 ## 3. `.secrets/` as an rw grant
 

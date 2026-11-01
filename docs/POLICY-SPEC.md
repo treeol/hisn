@@ -62,8 +62,8 @@ function of it plus a snapshot of which default toolchain paths exist.
 
 ## 3. Defaults that are not configurable in v0
 
-Toolchain ro binds (`/usr /bin /sbin /lib /lib32 /lib64 /etc /opt /nix`, only
-existing), default `/etc` masks (DESIGN §4.2), tmpfs sizes, `/dev` node list,
+Toolchain ro binds (`/usr /bin /sbin /lib /lib32 /lib64 /opt /nix`, only
+existing), the allowlist `/etc` view and its default masks (DESIGN §4.2), tmpfs sizes, `/dev` node list,
 the seccomp base denylist, capability set (empty), `no_new_privs`, and the
 env allowlist base (`PATH HOME TERM LANG LC_* TZ`). The brief's DO NOT ALTER
 invariants forbid weakening them from policy; `seccomp.extra_deny` can only
@@ -81,7 +81,12 @@ Applied to the canonical (symlink-free) form of every path in `cwd`,
 * **R3** may not overlap a mask or a non-grant static mount except as a nested
   child of an rw/ro static mount;
 * **R4** grant sources are resolved with no symlink and no magic-link
-  traversal.
+  traversal;
+* **R1b** a recursive bind tree may not contain a mount aliasing the runtime
+  root (mountinfo scan at start; DESIGN §9);
+* **R5** (not a path rule) the control socket rejects any peer inside the
+  sandbox pid namespace, so even a nameable `control.sock` is unusable from
+  inside (DESIGN §9).
 
 Violations are errors (`E_PATH_FORBIDDEN`), never silently adjusted.
 
@@ -93,8 +98,9 @@ Violations are errors (`E_PATH_FORBIDDEN`), never silently adjusted.
   parts.
 * **mask**: file → reads as empty (`/dev/null` bind); directory → empty,
   read-only tmpfs. Masking is by bind-over, so it works for any depth but is
-  **not** retroactive for files created later in a *live* bind of the host
-  (DESIGN §4.2).
+  **not** retroactive for files created later inside a recursively bound
+  tree. The built-in `/etc` view is an allowlist of top-level entries present
+  at start, so later `/etc` files never appear (DESIGN §4.2).
 * **home**: `"tmpfs"` → memory-backed, gone at exit. A path → persistent rw
   bind at the sandbox `$HOME` (`/run/hisn/home`); the caller accepts that the
   sandbox can write there.
@@ -121,7 +127,7 @@ response line per request, in order. Max line 64 KiB.
 | request | fields | success response |
 |---------|--------|------------------|
 | `grant` | `path` (abs), `mode` (`"ro"`\|`"rw"`, default `"ro"`), `recursive` (bool, default false) | `{"ok":true,"mount_id":N,"path":P,"mode":M}` |
-| `revoke` | `path`, `kill_holders` (bool, default false) | `{"ok":true,"holders":[]}` or `{"ok":false,"error":"E_HELD","holders":[{"pid":N,"kind":"cwd\|fd\|map"}]}` (mount **is** detached either way; `ok:false` means open handles remain) |
+| `revoke` | `path`, `hard` (bool, default false), `kill_holders` (bool, default false; soft only) | `{"ok":true,"guarantee":"lookup\|hard","holders":[…]}`. The mount is detached in every case. `guarantee:"lookup"` = the path no longer resolves, but already-open or **queued (`SCM_RIGHTS`) descriptors cannot be ruled out** — `holders` lists what the scan found (kinds `cwd fd map unknown`). `guarantee:"hard"` = all sandbox processes except init were killed after the detach, so no usable reference remains inside the sandbox. `E_INTERNAL` if a hard revoke could not complete (the session is then killed). |
 | `list` | — | `{"ok":true,"grants":[{"path","mode","recursive","mount_id","ts"}]}` |
 | `inspect` | — | `{"ok":true,"mountinfo":"<text of /proc/<init>/mountinfo>","policy":"<resolved toml>"}` |
 | `kill` | `signal` (name or number; default `TERM`) | `{"ok":true}` |

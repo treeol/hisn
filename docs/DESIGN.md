@@ -135,7 +135,8 @@ and unit-tested; `hisn inspect` output must equal it exactly (L8). Order:
 
 | # | target | source | flags |
 |---|--------|--------|-------|
-| 1 | `/usr /bin /sbin /lib /lib32 /lib64 /etc /opt /nix` (only those existing on host) | same host path | recursive bind, **recursive ro** |
+| 1 | `/usr /bin /sbin /lib /lib32 /lib64 /opt /nix` (only those existing on host) | same host path | recursive bind, **recursive ro** |
+| 1b | `/etc` — **not** a bind of the host `/etc`: a tmpfs holding one bind (or recreated symlink) per *top-level entry that exists at session start and is not masked* (§4.2) | `/etc/<entry>` | recursive bind, recursive ro |
 | 2 | policy `mounts.ro[]` | same path | recursive bind, recursive ro |
 | 3 | `/tmp` | tmpfs `size=1g,mode=1777` | nosuid,nodev |
 | 4 | `/run` | tmpfs `size=64m,mode=0755` | nosuid,nodev |
@@ -158,17 +159,31 @@ cwd is `/home/u/proj`). That is an unavoidable consequence of path parity.
 L1 therefore asserts "ENOENT unless the path is an ancestor of cwd or of a
 grant" and the leak tests run with cwd under host `/tmp`.
 
-### 4.2 Masks
+### 4.2 Masks and the `/etc` view (round-1 BLOCKING fix, D12)
 
-`/etc/ssh /etc/shadow /etc/gshadow /etc/sudoers /etc/sudoers.d /etc/krb5*
-/etc/*.key /etc/*.pem` (outside `/etc/ssl`) plus `/etc/ssl/private`,
-`/etc/shadow-`, `/etc/gshadow-`, plus policy `mounts.mask`. Globs are expanded
-once against the host `/etc` at session start. Files → bind of the sandbox's
-`/dev/null` (reads as empty), directories → empty ro tmpfs. A mask over a
-path that does not exist at start is skipped (it then genuinely does not
-exist). **Known weakness:** `/etc` is a *live* bind, so a secret file created
-on the host *after* start is visible; allowlist-style `/etc` is the v0.2
-fix (OPEN-POINTS).
+`/etc` is an **allowlist built at start, not a live bind**: the sandbox `/etc`
+is a small tmpfs; for every *top-level* entry of the host `/etc` that exists at
+session start and is not masked, the plan adds a ro bind of that entry (symlinks
+are recreated as symlinks with the same target text; dangling or escaping
+targets simply do not resolve in the sandbox). A secret file created in the
+host `/etc` *after* start therefore does not exist in the sandbox (deny by
+non-existence, invariant 1), and a masked name is omitted entirely (ENOENT,
+which L1 accepts for masks).
+
+Default masks, expanded once against the host `/etc` top level:
+`ssh shadow shadow- gshadow gshadow- sudoers sudoers.d krb5* *.key *.pem`
+(top-level only), plus `ssl/private` (a *nested* mask, so `ssl` is bound
+recursively and `ssl/private` is covered by an empty ro tmpfs). Policy
+`mounts.mask` entries inside other allowed trees (cwd, `mounts.*`) are applied
+as: file → bind of the sandbox `/dev/null`; directory → empty ro tmpfs.
+`/etc/passwd`, `/etc/group` are generated stubs (§3 step 7), never bound from
+the host.
+
+Residual (OPEN-POINTS P8): *nested* files created later inside a bound `/etc`
+directory (e.g. `/etc/foo.d/x.key`) are visible, since only the top-level
+secret globs of the brief are masked; the same applies to later files inside
+any recursively bound tree (cwd, `mounts.*`) — those trees are the user's
+explicit grant.
 
 ### 4.3 /proc, /dev, /sys
 
@@ -307,6 +322,24 @@ paths):
   | RESOLVE_NO_MAGICLINKS)`: a symlink the agent plants inside a granted rw
   directory can never redirect a later host-side grant to another host path.
 
+* **R5 (path-independent, primary defence; round-1 BLOCKING fix, D13)** — the
+  control socket **refuses any peer inside the sandbox's pid namespace**.
+  On `accept` the supervisor obtains the peer identity with `SO_PEERPIDFD`
+  (kernel ≥ 6.5) or `SO_PEERCRED` pid, opens `/proc/<pid>/ns/pid`, and compares
+  its inode with that of `/proc/<init>/ns/pid` (held open since start). Equal,
+  unreadable, or process-already-gone ⇒ close the connection (fail closed). The
+  check is repeated for every request line. This holds even if a bind alias,
+  an inherited fd, or any other mount-topology accident makes `control.sock`
+  *nameable* from inside, because a sandbox process always carries the
+  sandbox pidns. (A sandbox process cannot hide in another pidns: seccomp
+  denies `unshare`/`setns`/`clone(CLONE_NEWPID)` and it has no caps.)
+* **R1b (defence in depth)** — at start, for every recursively bound tree,
+  the supervisor scans the host `/proc/self/mountinfo` and rejects the session
+  if any mount inside that tree has the same `major:minor` and a root that is
+  the runtime root or lies within it, or if the tree is itself on the runtime
+  filesystem object (`st_dev`+`st_ino` ancestry check). A non-recursive bind
+  cannot import such a submount. Unreadable mountinfo ⇒ reject.
+
 Requests are newline-delimited JSON (see POLICY-SPEC §7). Unknown ops, bad
 JSON, or lines > 64 KiB close the connection. Every request is appended to
 `grants.jsonl` *before* it is executed and the result after.
@@ -361,14 +394,27 @@ Properties:
   Renamed ancestors, planted symlinks, or a shadowing mount cannot make
   revoke miss. After detach, new lookups of that path yield ENOENT (or the
   underlying empty mountpoint dir).
-* **Revoke and already-open handles.** A lazy unmount cannot invalidate fds,
-  cwd, or mmaps that point into the old mount. After detaching, the supervisor
-  scans the sandbox's processes (`/proc/<pid>/{cwd,root,fd/*,maps}` via the
-  mount id from `fdinfo`) and returns `{"holders":[{pid,kind}]}`. With
-  `"kill_holders":true` it `SIGKILL`s them and re-scans; the response is
-  `ok:true, holders:[]` only after a clean scan. Residual: fds in flight inside
-  a unix-socket queue are not scannable — callers needing a hard guarantee
-  must end the session. Documented in POLICY-SPEC §7.
+* **Revoke guarantees are explicit (round-1 BLOCKING fix, D14).** Detaching
+  the mount removes the path for *new lookups* only; it cannot invalidate fds,
+  cwd, mmaps — or **descriptors queued in a unix socket via `SCM_RIGHTS`**,
+  which no scan can see. So there are two revoke strengths and the response
+  states which one was achieved:
+  * **soft** (default): detach, then scan the sandbox processes'
+    `/proc/<pid>/{cwd,root,fd/*,maps}` (mount id from `fdinfo`) and report
+    `holders`. Response is `guarantee:"lookup"` — *never* more, whatever the
+    scan found; unreadable/unidentifiable entries are listed as holders of kind
+    `"unknown"`. `kill_holders:true` kills the listed holders but keeps the
+    `"lookup"` guarantee (it cannot reach queued descriptors).
+  * **hard** (`"hard":true`): detach, then `SIGKILL` **every process in the
+    sandbox pid namespace except init** (enumerated from the pidns's
+    `/proc`, repeated until empty, bounded by a timeout), and only then report
+    `guarantee:"hard"`. Killing all processes closes every socket that could
+    hold a queued descriptor, so no usable reference to the revoked object
+    remains inside the sandbox (init is capless, holds no grant fds, and never
+    `recvmsg`s on sandbox-reachable sockets). Sockets whose other end is
+    *outside* the sandbox are not a sandbox-side reference. Timeout ⇒
+    `E_INTERNAL` and the session is killed. Callers that need "no access after
+    revoke" use hard; callers that only need "the path is gone" use soft.
 * **Session end.** On init's exit the supervisor first closes its
   `/proc/<init>/ns/*` fds and stored mount fds, then removes the session dir.
   Mounts live only in M (and the anon trees, which die with the fds);
@@ -409,6 +455,9 @@ Properties:
 | D8 | `network="host"` | requires Landlock scope (ABI ≥6) or explicit flag | abstract unix sockets are otherwise an escape (D-Bus/X11) |
 | D9 | seccomp list in invariant 2 | list + `process_vm_*`, `pidfd_getfd`, `open_by_handle_at`, clone/clone3 handling, x32 deny, `TIOCSTI` | each is a known bypass of the listed set |
 | D10 | pty "inside the sandbox via /dev/ptmx" | same; master passed to supervisor via SCM_RIGHTS | master must be held outside the command's reach |
+| D12 | `/etc` ro bind with masks | `/etc` = tmpfs of per-entry binds (allowlist at start) | round-1 BLOCKING: live bind exposes later-created secrets |
+| D13 | (not specified) | R5 peer-pidns check on the control socket + R1b mount-alias scan | round-1 BLOCKING: path rules alone miss bind aliases |
+| D14 | revoke = umount | soft/hard revoke with explicit `guarantee` | round-1 BLOCKING: queued `SCM_RIGHTS` fds survive lazy detach |
 | D11 | mkdir -p mountpoint by path | component walk with `openat2(NO_SYMLINKS)` + `move_mount` to a dirfd | no path TOCTOU in the helper |
 
 ## 13. Module map

@@ -410,7 +410,11 @@ fi
 # a detached one so the tests do not end it.
 CX=$(new_cwd exec)
 write_policy "$WORK/X.toml" "$CX"
-if "$HISN" run --policy "$WORK/X.toml" --session-id xdet-$$ --detach </dev/null >"$WORK/xdet.out" 2>"$WORK/xdet.err" & DET_PID=$!; then
+# The host secrets are in its environment on purpose: the exec'd programs must
+# not see them (L15), while env.pass (HISN_LEAK_PASSED) must reach them.
+if HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
+  HISN_LEAK_PASSED=visible-ok \
+  "$HISN" run --policy "$WORK/X.toml" --session-id xdet-$$ --detach </dev/null >"$WORK/xdet.out" 2>"$WORK/xdet.err" & DET_PID=$!; then
   SESSIONS+=("$DET_PID")
   ok_ready=0
   for i in $(seq 1 150); do
@@ -419,7 +423,7 @@ if "$HISN" run --policy "$WORK/X.toml" --session-id xdet-$$ --detach </dev/null 
     sleep 0.1
   done
   if [ "$ok_ready" = 1 ]; then
-    ex() { timeout 30 "$HISN" exec --session xdet-$$ "$@" ; }
+    ex() { timeout 30 "$HISN" exec --session xdet-$$ "$@" </dev/null; }
     exq() { # exq ARGS... : one probe command through exec; prints its output
       local out
       out=$(timeout 30 "$HISN" exec --session xdet-$$ -- "$CX/leakprobe" "$@" </dev/null 2>&1)
@@ -452,8 +456,18 @@ if "$HISN" run --policy "$WORK/X.toml" --session-id xdet-$$ --detach </dev/null 
     eq "L15 exec /sys absent" "$(exq stat /sys)" ENOENT
 
     # ---- L17: ancestry and lifecycle
-    ppid_line=$(exq ppid)
-    has "L17 exec'd process descends from sandbox init (PPid 1)" "$ppid_line" "ppid=1"
+    # DESIGN §14.3 (D21): the program is a grandchild of init: init -> W -> P.
+    chain=$(exq ppid-chain)
+    case $chain in
+      "OK chain="*)
+        IFS=, read -r -a ch <<<"${chain#OK chain=}"
+        if [ "${#ch[@]}" -eq 3 ] && [ "${ch[2]}" = 1 ]; then
+          pass "L17 exec'd process chain is P -> W -> init (${ch[0]} -> ${ch[1]} -> 1)"
+        else
+          fail "L17 PPid chain" "want 3 pids ending in 1 (P,W,init), got [$chain]"
+        fi ;;
+      *) fail "L17 PPid chain" "got [$chain]" ;;
+    esac
     pidsv=$(exq pids)
     has "L17 exec'd process is in the sandbox pid ns (init=1 visible)" ",${pidsv#OK }," ",1,"
     n=$(printf '%s' "${pidsv#OK }" | tr ',' '\n' | grep -c .)
@@ -494,12 +508,21 @@ if "$HISN" run --policy "$WORK/X.toml" --session-id xdet-$$ --detach </dev/null 
       ro-secret-content) fail "L16 mid-exec revoke" "the running exec re-read the revoked grant" ;;
       *) pass "L16 mid-exec revoke: the running exec cannot re-read the grant (rc=${rcc:-gone})" ;;
     esac
-    eq "L16 revoked path -> ENOENT for a later exec" "$(exq stat "$WORK/g_rw/execmid")" ENOENT
+    eq "L16 revoked path -> ENOENT for a later exec" "$(exq stat "$WORK/g_ro")" ENOENT
+    # the grant that was NOT revoked is still there for a later exec
+    eq "L16 an unrevoked grant stays visible to a later exec" "$(exq write "$WORK/g_rw/execmid/g")" OK
+    hisn_json "$WORK/xrv2.json" revoke --session xdet-$$ "$WORK/g_rw/execmid"
+    $PY json-ok "$WORK/xrv2.json" && eq "L16 second revoke -> ENOENT for a later exec" "$(exq stat "$WORK/g_rw/execmid")" ENOENT || fail "L16 second revoke" "$(cat "$WORK/xrv2.json")"
     wait "$SLEEPER" >/dev/null 2>&1
 
     # ---- L19: 50 sequential + 10 concurrent execs, no fd/zombie leak
-    SUP=$(pgrep -f "hisn run --policy.*xdet-$\$" | head -1)
-    [ -n "$SUP" ] && fds_before=$(ls /proc/$SUP/fd 2>/dev/null | wc -l) || fds_before=0
+    # The supervisor reports its own descriptor count through `inspect`
+    # (/proc/<supervisor>/fd is not readable from here).
+    supfds() {
+      hisn_json "$WORK/xi.json" inspect --session xdet-$$ --json
+      $PY json-get "$WORK/xi.json" supervisor_fds
+    }
+    fds_before=$(supfds)
     okseq=0
     for i in $(seq 1 50); do ex -- /bin/true >/dev/null 2>&1 && okseq=$((okseq+1)); done
     eq "L19 50 sequential execs all succeed" "$okseq" 50
@@ -507,23 +530,26 @@ if "$HISN" run --policy "$WORK/X.toml" --session-id xdet-$$ --detach </dev/null 
     for i in $(seq 1 10); do ex -- sh -c 'sleep 0.4' >/dev/null 2>&1 & pids="$pids $!"; done
     for p in $pids; do wait "$p" && okconc=$((okconc+1)); done
     eq "L19 10 concurrent execs all succeed" "$okconc" 10
-    sleep 0.5
-    if [ "$fds_before" -gt 0 ]; then
-      fds_after=$(ls "/proc/$SUP/fd" 2>/dev/null | wc -l)
-      [ "$fds_after" -le $((fds_before + 2)) ] && pass "L19 supervisor fd count back to baseline ($fds_before -> $fds_after)" || weak "L19 supervisor fds" "$fds_before -> $fds_after (leaked or held descriptors)"
-    else
-      weak "L19 supervisor fd baseline" "could not read /proc/$SUP/fd"
-    fi
+    sleep 1
+    fds_after=$(supfds)
+    case "$fds_before$fds_after" in
+      *[!0-9]* | "") weak "L19 supervisor fd baseline" "inspect did not report supervisor_fds (before=[$fds_before] after=[$fds_after])" ;;
+      *) if [ "$fds_after" -le $((fds_before + 2)) ]; then
+           pass "L19 supervisor fd count back to baseline ($fds_before -> $fds_after after 60 execs)"
+         else
+           fail "L19 supervisor fds" "$fds_before -> $fds_after: descriptors leaked by exec"
+         fi ;;
+    esac
+    z=$(exq zombies)
+    eq "L19 no zombie in the sandbox after 60 execs" "${z%% pids=*}" "OK n=0"
+    [ "${z%% pids=*}" = "OK n=0" ] || echo "      zombies: $z"
 
     # ---- L20: --tty exec gets a working pty (isatty, resize propagates)
-    if command -v script >/dev/null; then
-      # `script` starts a new shell, so its $$ differs from ours: pass the
-      # session id through the environment, expanded by THIS shell.
-      XDET_ID=xdet-$$ out=$(timeout 20 script -qec "stty rows 24 cols 80; $HISN exec --session \"\$XDET_ID\" --tty -- $CX/leakprobe tty" /dev/null </dev/null 2>&1)
-      has "L20 --tty exec: probe sees a tty (isatty=1)" "$out" "isatty=1"
-      has "L20 --tty exec: pty has a winsize" "$out" "24x80"
+    out=$(python3 "$HERE/pty_drive.py" "$HISN" xdet-$$ "$CX/leakprobe" 2>&1); rc=$?
+    if [ $rc -eq 0 ]; then
+      pass "L20 --tty exec: isatty=1, initial size 80x24, resize to 100x30 reached the program ($out)"
     else
-      weak "L20 --tty exec" "'script' is unavailable to drive a pty"
+      fail "L20 --tty exec" "rc=$rc $out"
     fi
     # without --tty and a terminal on stdin, hisn must refuse
     if [ -t 0 ]; then

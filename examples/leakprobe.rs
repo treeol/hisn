@@ -372,6 +372,94 @@ fn cmd_ppid() -> String {
     )
 }
 
+/// Parent chain of this process up to pid 1, read from the sandbox's own
+/// /proc (`init -> W -> P` for an exec'd program, DESIGN §14.3).
+fn cmd_ppid_chain() -> String {
+    let mut chain = vec![std::process::id() as i64];
+    for _ in 0..64 {
+        let cur = *chain.last().expect("non-empty");
+        if cur <= 1 {
+            break;
+        }
+        let st = fs::read_to_string(format!("/proc/{cur}/status")).unwrap_or_default();
+        let pp = st
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<i64>().ok());
+        match pp {
+            Some(p) => chain.push(p),
+            None => return format!("UNREADABLE at {cur}"),
+        }
+    }
+    format!(
+        "OK chain={}",
+        chain
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+/// Zombie processes visible in this pid namespace (state `Z`).
+fn cmd_zombies() -> String {
+    let mut z = Vec::new();
+    for e in fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i64>().ok()) else {
+            continue;
+        };
+        let st = fs::read_to_string(e.path().join("status")).unwrap_or_default();
+        if st
+            .lines()
+            .any(|l| l.starts_with("State:") && l.contains('Z'))
+        {
+            z.push(pid.to_string());
+        }
+    }
+    format!("OK n={} pids={}", z.len(), z.join(","))
+}
+
+static WINCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_winch(_: libc::c_int) {
+    WINCH.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn winsize_str() -> String {
+    // SAFETY: ioctl with a zeroed winsize on fd 0.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) == 0 {
+            format!("{}x{}", ws.ws_col, ws.ws_row)
+        } else {
+            "none".into()
+        }
+    }
+}
+
+/// Print isatty + size, wait (up to 8 s) for SIGWINCH, print the new size.
+/// One line each, flushed, so the host-side driver can react between them.
+fn cmd_tty_resize() -> String {
+    // SAFETY: installing a handler that only stores to an atomic.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_winch as extern "C" fn(libc::c_int) as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());
+    }
+    // SAFETY: isatty only inspects the descriptor.
+    let is = unsafe { libc::isatty(0) == 1 };
+    println!("FIRST isatty={} size={}", is as u8, winsize_str());
+    let _ = std::io::stdout().flush();
+    for _ in 0..160 {
+        if WINCH.load(std::sync::atomic::Ordering::SeqCst) {
+            return format!("RESIZED size={}", winsize_str());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    "NO_WINCH".into()
+}
+
 fn cmd_tty() -> String {
     // SAFETY: isatty and ioctl with a zeroed winsize on fd 0.
     unsafe {
@@ -406,6 +494,9 @@ fn dispatch(a: &[String]) -> String {
     let arg = |i: usize| a.get(i).map(String::as_str).unwrap_or("");
     match arg(0) {
         "ppid" => cmd_ppid(),
+        "ppid-chain" => cmd_ppid_chain(),
+        "zombies" => cmd_zombies(),
+        "tty-resize" => cmd_tty_resize(),
         "tty" => cmd_tty(),
         "fds" => cmd_fds(),
         "stat" => cmd_stat(arg(1)),

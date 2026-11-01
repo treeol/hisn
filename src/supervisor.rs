@@ -515,7 +515,14 @@ impl Shared {
 
     fn inspect(&self) -> Value {
         match fs::read_to_string(format!("/proc/{}/mountinfo", self.init_pid)) {
-            Ok(mi) => ok(json!({ "mountinfo": mi, "policy": self.resolved_toml })),
+            Ok(mi) => ok(json!({
+                "mountinfo": mi,
+                "policy": self.resolved_toml,
+                // The supervisor's own descriptor count: the leak suite (L19)
+                // cannot read /proc/<supervisor>/fd (non-dumpable after the
+                // userns change), so the supervisor reports it itself.
+                "supervisor_fds": open_fd_count().ok(),
+            })),
             Err(e) => err(
                 control::E_INTERNAL,
                 format!("cannot read sandbox mountinfo: {e}"),
@@ -727,6 +734,12 @@ fn static_rules(plan: &[mounts::MountOp], policy: &ResolvedPolicy, roots: &[Path
         .map(|o| o.target.clone())
         .collect();
     rules
+}
+
+/// Number of descriptors this process has open (includes the one used to
+/// count them, which is constant between calls).
+pub fn open_fd_count() -> io::Result<usize> {
+    Ok(fs::read_dir("/proc/self/fd")?.count())
 }
 
 /// Exit code of `hisn run`.
@@ -1302,6 +1315,31 @@ mod tests {
                 ours: 1000
             })
         );
+    }
+
+    #[test]
+    fn open_fd_count_tracks_descriptors() {
+        // Forked child: the harness runs tests as threads of one process, so
+        // other tests open and close descriptors while this one counts.
+        // SAFETY: the child only opens/closes files, counts and `_exit`s.
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                let before = open_fd_count().unwrap_or(usize::MAX);
+                let f = fs::File::open("/dev/null").unwrap();
+                let during = open_fd_count().unwrap_or(0);
+                drop(f);
+                let after = open_fd_count().unwrap_or(usize::MAX);
+                libc::_exit(if during == before + 1 && after == before {
+                    0
+                } else {
+                    1
+                });
+            }
+            let mut st = 0;
+            libc::waitpid(pid, &mut st, 0);
+            assert_eq!(crate::init::decode_status(st), 0);
+        }
     }
 
     #[test]

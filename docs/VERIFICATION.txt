@@ -80,6 +80,35 @@ Landlock write-set, rlimits, fd passing, openat2 symlink refusal.
 Hand-maintained. One entry per run on a real host, newest first. The commit is
 the one the host *reported or checked out*; if it was inferred, the entry says so.
 
+
+### Fedora, kernel 7.2.13-200.fc44, x86_64, same host — v0.2.0 exec, **two partial runs, not green**
+Both pastes came from the user; neither is a full-suite record (the first
+shows the whole run, the second only its tail, so it has no L1-L14 lines).
+* Run A (commit: v0.2.0 before 97951cc, *inferred - confirm*): 123 passed, 39
+  failed, 1 skipped, 3 weak. L1-L14 and L14b all PASS (L14b passes on a real
+  host for the first time). Every exec-based test failed with
+  `E_EXEC: root: Bad file descriptor`: a real bug (the sandbox-root fd was
+  missing from the exec helper's keep-set), fixed in 97951cc.
+* Run B (after 97951cc, *inferred - confirm*, tail only): 158 passed, 4 failed,
+  1 skipped, 3 weak. Exec confinement checks pass through `hisn exec`
+  (L15: ENOENT paths, EPERM syscalls, EROFS, /dev, /sys, symlink escape, env
+  scrubbing, write in cwd), L16 grants before/during exec, L17 pid-ns view and
+  session-end death, L18 env rejection. The 4 failures were **test bugs**, not
+  product bugs: L15 `env passed var` (the detached session was started without
+  the host env that the test then expected to be passed), L17 `ppid=1`
+  (the program is a grandchild of init: observed `pid=88 ppid=87`, which is
+  the P -> W -> init chain of DESIGN §14.3 / D21), L16 `revoked path` (stat of
+  a path that was never revoked), L19 `50 sequential` (the loop inherited the
+  caller's terminal, which `hisn exec` refuses by design; the concurrent
+  variant, run in background jobs, passed).
+* Fixed in the tests since (**unrun on any host**): L15 starts the detached
+  session with the host env; L17 asserts the 3-pid chain `P -> W -> 1`;
+  L16 checks the revoked path and an unrevoked one; L19 reads the
+  supervisor's descriptor count from `inspect` and counts zombies; L20 is
+  driven by `tests/leak/pty_drive.py` (python `pty`, resize 80x24 -> 100x30)
+  instead of `script`. L19's fd baseline and L20 were WEAK/unrun before.
+* Host commands for the next run: `make lint && make test && make leaktest`.
+
 ### Fedora, kernel 7.2.13-200.fc44, x86_64, Landlock ABI 10, unprivileged user
 * `hisn check`: "this host can run hisn" (user namespaces, landlock v10, seccomp,
   open_tree / move_mount / mount_setattr, subuid range, cgroup v2 all ok).
@@ -91,4 +120,4 @@ the one the host *reported or checked out*; if it was inferred, the entry says s
 * NOT run on that host: `make lint && make test` after the last fixes (the
   earlier failures were a missing rustfmt component, then a one-line rustfmt
   diff, fixed in edd896d and 74bb7dc); aarch64; any other kernel/distro.
-* L14b (grant-time R1b) and L15-L20 did not exist yet: **not run anywhere**.
+* L14b (grant-time R1b) and L15-L20 did not exist yet (see the newer entry above).

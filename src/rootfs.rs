@@ -66,8 +66,17 @@ fn open_dir_path(p: &Path) -> io::Result<OwnedFd> {
 /// Walk `rel` (no `..`, no leading slash) from `root`, creating directories
 /// as needed. Returns an `O_PATH` fd of the final directory.
 pub fn ensure_dir(root: RawFd, rel: &Path) -> io::Result<OwnedFd> {
+    ensure_dir_tracked(root, rel).map(|(fd, _)| fd)
+}
+
+/// Like [`ensure_dir`], also returning the directories this call *created*
+/// (relative to `root`, shallowest first) so a revoke can remove exactly
+/// those and leave the path as ENOENT again.
+pub fn ensure_dir_tracked(root: RawFd, rel: &Path) -> io::Result<(OwnedFd, Vec<PathBuf>)> {
     // SAFETY: dup of a valid fd to get an owned handle we can replace.
     let mut cur = unsafe { OwnedFd::from_raw_fd(libc::dup(root)) };
+    let mut created = Vec::new();
+    let mut walked = PathBuf::new();
     for comp in rel.components() {
         let Component::Normal(name) = comp else {
             if matches!(comp, Component::RootDir | Component::CurDir) {
@@ -76,6 +85,7 @@ pub fn ensure_dir(root: RawFd, rel: &Path) -> io::Result<OwnedFd> {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         };
         let c = sys::cstr(Path::new(name))?;
+        walked.push(name);
         let next = match sys::openat2(cur.as_raw_fd(), &c, O_PATH_DIR, 0, RESOLVE_SAFE) {
             Ok(fd) => fd,
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
@@ -83,11 +93,47 @@ pub fn ensure_dir(root: RawFd, rel: &Path) -> io::Result<OwnedFd> {
                 if unsafe { libc::mkdirat(cur.as_raw_fd(), c.as_ptr(), 0o755) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
+                created.push(walked.clone());
                 sys::openat2(cur.as_raw_fd(), &c, O_PATH_DIR, 0, RESOLVE_SAFE)?
             }
             Err(e) => return Err(e),
         };
         cur = next;
+    }
+    Ok((cur, created))
+}
+
+/// Remove `rels` (as returned by [`ensure_dir_tracked`]) deepest first.
+/// Best effort: a directory that is no longer empty or is a mountpoint stays.
+pub fn remove_created(root: RawFd, rels: &[PathBuf]) {
+    for rel in rels.iter().rev() {
+        let Some(name) = rel.file_name() else {
+            continue;
+        };
+        let Ok(parent) = ensure_existing_dir(root, rel.parent().unwrap_or(Path::new(""))) else {
+            continue;
+        };
+        if let Ok(c) = sys::cstr(Path::new(name)) {
+            // SAFETY: valid dirfd + C string; AT_REMOVEDIR removes an empty dir only.
+            unsafe { libc::unlinkat(parent.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) };
+        }
+    }
+}
+
+/// Open an existing directory beneath `root` (never creating anything).
+fn ensure_existing_dir(root: RawFd, rel: &Path) -> io::Result<OwnedFd> {
+    // SAFETY: dup of a valid fd.
+    let mut cur = unsafe { OwnedFd::from_raw_fd(libc::dup(root)) };
+    for comp in rel.components() {
+        if let Component::Normal(name) = comp {
+            cur = sys::openat2(
+                cur.as_raw_fd(),
+                &sys::cstr(Path::new(name))?,
+                O_PATH_DIR,
+                0,
+                RESOLVE_SAFE,
+            )?;
+        }
     }
     Ok(cur)
 }
@@ -388,6 +434,30 @@ mod tests {
         );
         // `..` is rejected outright
         assert!(ensure_dir(rfd, Path::new("a/../../x")).is_err());
+    }
+
+    #[test]
+    fn tracked_creation_and_removal_restores_enoent() {
+        let d = tempfile::tempdir().unwrap();
+        let root = fs::File::open(d.path()).unwrap();
+        let rfd = root.as_fd().as_raw_fd();
+        ensure_dir(rfd, Path::new("pre")).unwrap();
+        let (_fd, created) = ensure_dir_tracked(rfd, Path::new("pre/a/b")).unwrap();
+        assert_eq!(
+            created,
+            vec![PathBuf::from("pre/a"), PathBuf::from("pre/a/b")]
+        );
+        // second call creates nothing
+        let (_fd, again) = ensure_dir_tracked(rfd, Path::new("pre/a/b")).unwrap();
+        assert!(again.is_empty());
+        remove_created(rfd, &created);
+        assert!(!d.path().join("pre/a").exists(), "created dirs are gone");
+        assert!(d.path().join("pre").is_dir(), "pre-existing dirs stay");
+        // a created dir that gained content is left alone
+        let (_fd, created) = ensure_dir_tracked(rfd, Path::new("x/y")).unwrap();
+        fs::write(d.path().join("x/y/keep"), b"1").unwrap();
+        remove_created(rfd, &created);
+        assert!(d.path().join("x/y/keep").exists());
     }
 
     #[test]

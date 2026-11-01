@@ -236,7 +236,7 @@ impl Shared {
             self.helper
                 .lock()
                 .expect("helper")
-                .revoke(&held.mount_root)
+                .revoke(&p, &held.mount_root)
                 .map_err(|e| (control::E_INTERNAL.into(), format!("detach: {e}")))?;
             self.table.lock().expect("table").remove(&p);
             drop(held); // releases our reference to the (now detached) mount
@@ -584,7 +584,15 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
     mountinfo_check(&policy, &prep.roots)?;
 
     let facts = HostFacts::probe(&policy, uid, gid, &username);
-    let grant_dirs: Vec<PathBuf> = prep.grants.iter().map(|(p, _)| PathBuf::from(p)).collect();
+    // Only rw initial grants need a pre-created directory (Landlock anchors a
+    // write rule on an existing inode). ro grants are created by the helper and
+    // removed again on revoke, so a revoked ro path is ENOENT again.
+    let grant_dirs: Vec<PathBuf> = prep
+        .grants
+        .iter()
+        .filter(|(_, m)| *m == Mode::Rw)
+        .map(|(p, _)| PathBuf::from(p))
+        .collect();
     let plan = mounts::plan(&policy, &facts, &grant_dirs).context("mount plan")?;
 
     let id = match &args.session_id {
@@ -759,6 +767,8 @@ fn run_session(
     // ---- 7. relay + wait
     let code = relay_and_wait(pid, master, tty);
 
+    // Let in-flight responses (e.g. a hard revoke that ended the session) go out.
+    control::drain(std::time::Duration::from_secs(2));
     // Cleanup order (DESIGN §10): close ns / mount fds first, then the dir.
     drop(shared);
     Ok(code)

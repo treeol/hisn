@@ -292,17 +292,22 @@ pub fn prepare_tree(src: &OwnedFd, mode: Mode, recursive: bool) -> io::Result<Ow
 #[derive(Debug, PartialEq, Eq)]
 pub enum HelperCmd {
     Grant(PathBuf),
-    Revoke,
+    /// Detach the passed mount-root fd; then remove the directories the
+    /// grant of this path created.
+    Revoke(PathBuf),
 }
 
 pub fn parse_helper_cmd(line: &str) -> Option<HelperCmd> {
     let line = line.trim_end_matches('\n');
-    if line == "revoke" {
-        return Some(HelperCmd::Revoke);
+    let (verb, p) = line.split_once(' ')?;
+    if !(p.starts_with('/') && !p.contains('\0') && !has_dot_segments(p)) {
+        return None;
     }
-    let p = line.strip_prefix("grant ")?;
-    (p.starts_with('/') && !p.contains('\0') && !has_dot_segments(p))
-        .then(|| HelperCmd::Grant(PathBuf::from(p)))
+    match verb {
+        "grant" => Some(HelperCmd::Grant(PathBuf::from(p))),
+        "revoke" => Some(HelperCmd::Revoke(PathBuf::from(p))),
+        _ => None,
+    }
 }
 
 /// Persistent helper (DESIGN §10, D17). Forked by the supervisor once, after
@@ -347,6 +352,8 @@ fn helper_loop(sock: &OwnedFd, mntns: &OwnedFd) -> io::Result<()> {
         0,
     )?;
     let mut buf = vec![0u8; 8192];
+    // Directories each live grant created, for removal on revoke.
+    let mut created: std::collections::BTreeMap<PathBuf, Vec<PathBuf>> = Default::default();
     loop {
         let (n, fd) = sys::recv_with_fd(sock.as_raw_fd(), &mut buf)?;
         if n == 0 {
@@ -354,8 +361,18 @@ fn helper_loop(sock: &OwnedFd, mntns: &OwnedFd) -> io::Result<()> {
         }
         let line = String::from_utf8_lossy(&buf[..n]).into_owned();
         let result = match (parse_helper_cmd(&line), fd) {
-            (Some(HelperCmd::Grant(target)), Some(tree)) => do_grant(&root, &target, &tree),
-            (Some(HelperCmd::Revoke), Some(mnt)) => do_revoke(&mnt).map(|()| (0, None)),
+            (Some(HelperCmd::Grant(target)), Some(tree)) => {
+                do_grant(&root, &target, &tree).map(|(id, attached, made)| {
+                    created.insert(target, made);
+                    (id, attached)
+                })
+            }
+            (Some(HelperCmd::Revoke(target)), Some(mnt)) => do_revoke(&mnt).map(|()| {
+                if let Some(made) = created.remove(&target) {
+                    crate::rootfs::remove_created(root.as_raw_fd(), &made);
+                }
+                (0, None)
+            }),
             _ => Err(io::Error::from_raw_os_error(libc::EINVAL)),
         };
         match result {
@@ -372,16 +389,22 @@ fn helper_loop(sock: &OwnedFd, mntns: &OwnedFd) -> io::Result<()> {
     }
 }
 
-fn do_grant(root: &OwnedFd, target: &Path, tree: &OwnedFd) -> io::Result<(u64, Option<OwnedFd>)> {
+type Granted = (u64, Option<OwnedFd>, Vec<PathBuf>);
+
+fn do_grant(root: &OwnedFd, target: &Path, tree: &OwnedFd) -> io::Result<Granted> {
     let rel = sys::rel_to_root(target);
-    let dir = crate::rootfs::ensure_dir(root.as_raw_fd(), rel)?;
-    sys::move_mount(
+    let (dir, made) = crate::rootfs::ensure_dir_tracked(root.as_raw_fd(), rel)?;
+    let attach = sys::move_mount(
         tree.as_raw_fd(),
         c"",
         dir.as_raw_fd(),
         c"",
         sys::MOVE_MOUNT_F_EMPTY_PATH | sys::MOVE_MOUNT_T_EMPTY_PATH,
-    )?;
+    );
+    if let Err(e) = attach {
+        crate::rootfs::remove_created(root.as_raw_fd(), &made); // leave no trace on failure
+        return Err(e);
+    }
     // Reopen the *attached* mount root (not the covered mountpoint fd).
     let attached = sys::openat2(
         root.as_raw_fd(),
@@ -391,7 +414,7 @@ fn do_grant(root: &OwnedFd, target: &Path, tree: &OwnedFd) -> io::Result<(u64, O
         sys::RESOLVE_BENEATH | sys::RESOLVE_NO_SYMLINKS | sys::RESOLVE_NO_MAGICLINKS,
     )?;
     let id = sys::mnt_id(attached.as_raw_fd(), c"", libc::AT_EMPTY_PATH)?;
-    Ok((id, Some(attached)))
+    Ok((id, Some(attached), made))
 }
 
 /// Detach by fd, never by path: renames, planted symlinks or a shadowing mount
@@ -439,8 +462,11 @@ impl HelperClient {
         ))
     }
 
-    pub fn revoke(&self, mount_root: &OwnedFd) -> io::Result<()> {
-        let (reply, _) = self.call("revoke", mount_root.as_raw_fd())?;
+    pub fn revoke(&self, target: &Path, mount_root: &OwnedFd) -> io::Result<()> {
+        let (reply, _) = self.call(
+            &format!("revoke {}", target.display()),
+            mount_root.as_raw_fd(),
+        )?;
         parse_helper_reply(&reply).map(drop)
     }
 }
@@ -670,7 +696,12 @@ mod tests {
 
     #[test]
     fn helper_command_parsing() {
-        assert_eq!(parse_helper_cmd("revoke\n"), Some(HelperCmd::Revoke));
+        assert_eq!(
+            parse_helper_cmd("revoke /a\n"),
+            Some(HelperCmd::Revoke("/a".into()))
+        );
+        assert_eq!(parse_helper_cmd("revoke"), None);
+        assert_eq!(parse_helper_cmd("revoke /a/../b"), None);
         assert_eq!(
             parse_helper_cmd("grant /a/b\n"),
             Some(HelperCmd::Grant("/a/b".into()))

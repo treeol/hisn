@@ -8,7 +8,9 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -168,6 +170,39 @@ pub fn read_line_limited<R: BufRead>(r: &mut R) -> io::Result<Option<String>> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "request is not UTF-8"))
 }
 
+/// Requests currently being handled or answered.
+static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct Inflight;
+
+impl Inflight {
+    fn enter() -> Self {
+        INFLIGHT.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Wait until every in-flight request has been answered (or `timeout`).
+/// The supervisor calls this before exiting so that e.g. the response to a
+/// hard revoke — which kills the command and thereby ends the session — is
+/// delivered first. Returns `true` if drained.
+pub fn drain(timeout: Duration) -> bool {
+    let end = Instant::now() + timeout;
+    while INFLIGHT.load(Ordering::SeqCst) > 0 {
+        if Instant::now() > end {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
 fn serve_conn(h: &dyn Handler, stream: UnixStream) {
     if h.authorize(&stream).is_err() {
         return;
@@ -185,6 +220,7 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
         if h.authorize(&stream).is_err() {
             return;
         }
+        let _inflight = Inflight::enter();
         let resp = match parse_request(&line) {
             Ok(req) => h.handle(req, &stream),
             // Unknown op / bad JSON closes the connection (POLICY-SPEC §7).
@@ -391,6 +427,40 @@ mod tests {
             other => panic!("expected a closed connection, got {other:?}"),
         }
         assert!(h.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn drain_waits_for_a_slow_response_to_be_written() {
+        struct Slow;
+        impl Handler for Slow {
+            fn authorize(&self, _: &UnixStream) -> Result<(), String> {
+                Ok(())
+            }
+            fn handle(&self, _: Request, _: &UnixStream) -> Value {
+                thread::sleep(Duration::from_millis(150));
+                ok(json!({"late": true}))
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("s.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let h: Arc<dyn Handler> = Arc::new(Slow);
+        thread::spawn(move || serve(l, h));
+        let client = {
+            let sock = sock.clone();
+            thread::spawn(move || request(&sock, &json!({"op":"list"})).unwrap())
+        };
+        thread::sleep(Duration::from_millis(50)); // request is now in flight
+        assert!(drain(Duration::from_secs(3)), "drained");
+        assert_eq!(
+            client.join().unwrap()["late"],
+            true,
+            "response delivered before drain returned"
+        );
+        assert!(
+            drain(Duration::from_millis(10)),
+            "idle server drains immediately"
+        );
     }
 
     #[test]

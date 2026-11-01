@@ -1,3 +1,4 @@
+SHELL := /bin/bash
 .PHONY: build test check lint leaktest leaktest-log
 
 CARGO ?= cargo
@@ -24,6 +25,18 @@ leaktest: build
 	$(CARGO) build --release --example leakprobe
 	bash tests/leak/run.sh ./target/release/hisn
 
-# Leak suite with a timestamped log tee'd to docs/leaktest-host-YYYY-MM-DD.log.
-leaktest-log: leaktest
-	$(MAKE) leaktest 2>&1 | tee docs/leaktest-host-$$(date +%F).log
+# Leak suite with a log at docs/leaktest-host-YYYY-MM-DD.log. The first lines
+# are a header (commit, tree state, date, hostname, kernel, hisn version); the
+# suite output follows. Exit status is the suite's (pipefail), not tee's.
+leaktest-log: build
+	@set -o pipefail; \
+	f=docs/leaktest-host-$$(date +%F).log; \
+	{ echo "# hisn leaktest host log"; \
+	  echo "commit:  $$(git rev-parse HEAD)"; \
+	  echo "tree:    $$(if [ -n "$$(git status --porcelain --untracked-files=no)" ]; then echo dirty; else echo clean; fi)"; \
+	  echo "date:    $$(date -u +%FT%TZ)"; \
+	  echo "host:    $$(hostname)"; \
+	  echo "kernel:  $$(uname -r)"; \
+	  echo "hisn:    $$(./target/release/hisn --version)"; \
+	  echo "---"; } > "$$f"; \
+	$(MAKE) leaktest 2>&1 | tee -a "$$f"

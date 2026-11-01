@@ -4,6 +4,19 @@ Non-blocking findings and known limits. Blocking findings from review rounds
 are folded into DESIGN.md (see its §12 deviations table); they are not repeated
 here except where residual risk remains.
 
+## §14 external review pending (outside Wakil, 2026-11-01)
+
+No valid review of DESIGN §14 exists. Every attempted round (design round 1,
+implementation round 2, P17 round 2) is void: the answering reviewer's copy
+ended before §14 and the other reviewer returned nothing. No round was
+counted as spent, and **no further round is started inside this task**. The
+review is to be done outside Wakil, on the full `docs/DESIGN.md` §14 plus the
+P17 change (DESIGN §14.12, `[landlock] scoped`). Question for the reviewers:
+*which step lets an exec'd process end up less confined than the original
+command, outlive the session, or reach anything on the host?* Only BLOCKING
+findings (demonstrable escape, leak, or grant persistence) change code; the
+rest goes here.
+
 ## Review log
 
 **Round 1 (design review)** — panel: one model answered
@@ -41,6 +54,8 @@ disposition (no third round is allowed, so everything is closed here or listed):
 
 ## Review log — v0.2 exec design
 
+> **Status: VOID — reviewer did not receive §14.** Per the task's DO NOT ALTER #3 this is not a spent review round (round 1). The findings below are kept as non-blocking notes only.
+
 **Round 1 (design review of DESIGN §14)** — a *weak* round, recorded as such.
 One reviewer answered (`openai/gpt-6-astra`); the other
 (`anthropic/claude-fable-5.1`) was cut off at `max_tokens` and returned nothing.
@@ -59,6 +74,8 @@ stdio fds at high numbers until `P`; the `getppid()==1` wait is bounded and the
 spawn gate is held until `C` is reaped on failure.
 
 ## Review log — v0.2 implementation (round 2)
+
+> **Status: VOID — reviewer did not receive §14.** Per the task's DO NOT ALTER #3 this is not a spent review round (round 2, first attempt). The findings below are kept as non-blocking notes only.
 
 **Round 2 (implementation + tests)** — one reviewer answered
 (`openai/gpt-6-astra`), the second (`anthropic/claude-fable-5.1`) was again
@@ -246,6 +263,8 @@ L15-L20. No third round is allowed. Disposition:
 
 ## Review log — v0.2.0 P17 implementation (round 2)
 
+> **Status: VOID — reviewer did not receive §14.** Per the task's DO NOT ALTER #3 this is not a spent review round (round 2, second attempt). The findings below are kept as non-blocking notes only.
+
 **Round 2 (P17 implementation review)** — a *weak* round, recorded as such.
 One reviewer answered (`openai/gpt-6-astra`); the second
 (`anthropic/claude-fable-5.1`) was again cut off at `max_tokens`. The
@@ -256,7 +275,7 @@ could not review the confinement sequence in §14.4 or the actual
 explicitly did not approve §14. Its non-blocking findings are below; only
 finding #4 led to a code change (tightening `apply`'s `require_scope` check
 to test *abstract* scope specifically, not just any scope). No third round
-is allowed.
+was allowed in that task.
 
 | # | finding | triage | resolution |
 |---|---------|--------|-----------|

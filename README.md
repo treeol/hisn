@@ -10,15 +10,15 @@ host path** (rw), a read-only toolchain, private tmpfs `$HOME`/`/tmp`/`/run`,
 and paths the host side explicitly **grants** for the life of the session.
 Everything else does not exist (ENOENT), not "permission denied".
 
-> **Status: v0.2.0.** Unit tests and clippy pass in the build sandbox. The full
-> leak suite (L1-L20, including `exec`) was run on one real host (Fedora, kernel
-> 7.2, x86_64, Landlock ABI 10): **167 passed, 0 failed, 1 skipped, 1 weak**.
-> The skip is L12 (needs write access to `/etc`) and the weak one is R5
-> end-to-end (unit-tested only, OPEN-POINTS P16) — both inferred from earlier
-> runs, since only the summary line was reported. L21-L23 (P17: cross-exec
-> signal/scope tests) are new and await the host run. Not run: aarch64, other
-> kernels or distros, and `make lint && make test` on that host after the last
-> changes. See [docs/VERIFICATION.txt](docs/VERIFICATION.txt).
+> **Status: v0.2.0 (not yet tagged).** Unit tests and clippy pass in the build
+> sandbox. The leak suite (L1-L23, including `exec` and the P17 scoping tests)
+> last ran green on one real host (Fedora, kernel 7.2, x86_64, Landlock ABI
+> 10): **173 passed, 0 failed, 1 skipped, 1 weak** (user-reported summary line;
+> not yet recorded as a log in the repo). The skip is L12 (needs write access
+> to `/etc`) and the weak one is R5 end-to-end (unit-tested only, OPEN-POINTS
+> P16) — both inferred from earlier runs. The §14 (`exec`) design has had no
+> valid external review (OPEN-POINTS). Not run: aarch64, other kernels or
+> distros. See [docs/VERIFICATION.txt](docs/VERIFICATION.txt).
 
 ## Install
 
@@ -102,7 +102,8 @@ make leaktest-log               # same, but also tee'd to docs/leaktest-host-YYY
 `make leaktest` prints one line per check (`L<n>[<sub>] PASS|FAIL|SKIP|WEAK —
 <reason for SKIP/WEAK>`) and a final `RESULT:` summary line; exit is non-zero
 on any `FAIL`. `make leaktest-log` is the same command tee'd to a dated log
-file under `docs/` — append the log file to the host-run table in
+file under `docs/`, prefixed with a header (commit, tree state, date,
+hostname, kernel, `hisn --version`) — record that log in the host-run table in
 `docs/VERIFICATION.txt`.
 
 On 0.2.0 run `make lint && make test && make leaktest` in one go; the suite

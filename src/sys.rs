@@ -260,7 +260,7 @@ pub fn dev_ino(dirfd: RawFd, path: &CStr, flags: c_int) -> io::Result<(u64, u64)
         return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
     }
     let dev = libc::makedev(st.stx_dev_major, st.stx_dev_minor);
-    Ok((u64::from(dev), st.stx_ino))
+    Ok((dev, st.stx_ino))
 }
 
 pub fn set_dumpable(on: bool) -> io::Result<()> {

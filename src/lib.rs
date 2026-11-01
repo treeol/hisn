@@ -6,6 +6,7 @@ pub mod cli;
 pub mod control;
 pub mod env;
 pub mod grant;
+pub mod init;
 pub mod landlock;
 pub mod mounts;
 pub mod policy;

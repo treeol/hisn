@@ -1,0 +1,177 @@
+name: CI
+
+on:
+  # Branches only: a tag push is qualified by release.yml, which calls this
+  # workflow (workflow_call) so the leak suite runs on the tagged commit before
+  # anything is built or published.
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (stable + rustfmt + clippy + aarch64 target)
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy \
+            --target aarch64-unknown-linux-gnu
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy (x86_64-unknown-linux-gnu)
+        run: cargo clippy --locked --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+
+      # Cross-check only: nothing is linked or run for aarch64.
+      - name: cargo clippy (aarch64-unknown-linux-gnu)
+        run: cargo clippy --locked --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: L8 comparator self-tests
+        run: python3 tests/leak/test_l8.py
+
+      # Metadata check only; nothing is published.
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --locked
+
+  # The leak suite is the acceptance criterion. It runs rootless: the only
+  # privileged command in this workflow is the sysctl below.
+  leaktest:
+    name: leaktest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      # 24.04 blocks unprivileged user namespaces through AppArmor by default.
+      # The key does not exist on 22.04, so it is only set where it exists.
+      # This is the single use of sudo in this workflow.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Host facts
+        run: |
+          rustc --version
+          cargo --version
+          uname -r
+          cat /sys/kernel/security/lsm || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          python3 --version
+
+      # `hisn check` exits 2 if a required capability is missing; the job then
+      # fails and the leak suite is not attempted.
+      - name: hisn check
+        run: make check
+
+      # Logs committed to the repo are history, not evidence of this run: remove
+      # them from the CI workspace so that exactly one log exists afterwards.
+      - name: make leaktest-log
+        id: leaktest
+        run: |
+          rm -f docs/leaktest-host-*.log
+          make leaktest-log
+
+      - name: Upload leaktest log
+        if: ${{ !cancelled() && steps.leaktest.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: leaktest-log-${{ matrix.os }}
+          path: docs/leaktest-host-*.log
+          if-no-files-found: error
+
+      # A green job must mean the suite ran. `make leaktest` already exits
+      # non-zero on any FAIL and on "NOT RUN" (exit 77); this step additionally
+      # refuses a log that is missing, internally inconsistent, hollow, or
+      # lacking a PASS for any of L1-L22. SKIP/WEAK lines are listed but do not
+      # fail the job.
+      - name: Verify the suite actually ran
+        if: ${{ !cancelled() && steps.leaktest.outcome != 'skipped' }}
+        run: |
+          shopt -s nullglob
+          logs=(docs/leaktest-host-*.log)
+          if [ "${#logs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one leaktest log, found ${#logs[@]}"; exit 1
+          fi
+          log=${logs[0]}
+          if grep -q 'NOT RUN' "$log"; then
+            echo "::error::the leak suite reported NOT RUN"; exit 1
+          fi
+          if [ "$(grep -c '^RESULT: ' "$log")" -ne 1 ]; then
+            echo "::error::expected exactly one RESULT line in $log"; exit 1
+          fi
+          line=$(grep '^RESULT: ' "$log")
+          re='^RESULT: ([0-9]+) passed, ([0-9]+) failed, ([0-9]+) skipped, ([0-9]+) weak$'
+          if ! [[ $line =~ $re ]]; then
+            echo "::error::unparseable RESULT line: $line"; exit 1
+          fi
+          passed=${BASH_REMATCH[1]} failed=${BASH_REMATCH[2]}
+          skipped=${BASH_REMATCH[3]} weak=${BASH_REMATCH[4]}
+          # The summary must agree with the per-check lines.
+          npass=$(grep -c '^PASS  ' "$log" || true)
+          nfail=$(grep -c '^FAIL  ' "$log" || true)
+          nskip=$(grep -c '^SKIP  ' "$log" || true)
+          nweak=$(grep -c '^WEAK  ' "$log" || true)
+          if [ "$npass" != "$passed" ] || [ "$nfail" != "$failed" ] \
+             || [ "$nskip" != "$skipped" ] || [ "$nweak" != "$weak" ]; then
+            echo "::error::RESULT line ($line) disagrees with the per-check lines ($npass/$nfail/$nskip/$nweak)"; exit 1
+          fi
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::$failed leak checks failed"; grep '^FAIL  ' "$log" || true; exit 1
+          fi
+          # The host run that qualified 0.2.0 had 175 passes; allow for SKIPs on
+          # kernels without Landlock ABI 6, but not for a hollow run.
+          if [ "$passed" -lt 150 ]; then
+            echo "::error::only $passed checks passed; expected at least 150"; exit 1
+          fi
+          # Every test group L1-L22 must have at least one PASS. L23/L24 may
+          # SKIP on Landlock ABI < 6.
+          missing=""
+          for n in $(seq 1 22); do
+            grep -Eq "^PASS  L${n} " "$log" || missing="$missing L$n"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::no PASS line for:$missing"; exit 1
+          fi
+          {
+            echo "### leaktest ${{ matrix.os }}"
+            echo
+            echo "$line"
+            echo
+            echo '```'
+            grep -E '^(SKIP|WEAK)  ' "$log" || echo "(no SKIP or WEAK lines)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Expected skips: L12 (needs write access to /etc) and L23/L24 on
+          # Landlock ABI < 6. Anything else is annotated so it is not missed.
+          grep -E '^SKIP  ' "$log" | grep -Ev '^SKIP  (L12 |L2[34] .*ABI < 6)' \
+            | while IFS= read -r l; do echo "::warning::unexpected SKIP: $l"; done || true

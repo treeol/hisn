@@ -1,0 +1,136 @@
+name: Release
+
+# Runs on a tag push. The tag is created by the maintainer, never by CI.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Build decision: glibc (…-unknown-linux-gnu) binaries on NATIVE runners, not
+# musl and not a cross toolchain. At 0.2.0 the musl targets do not compile
+# (src/init.rs passes u64 ioctl request constants where musl's libc::ioctl takes
+# c_int; OPEN-POINTS P22), and the release must not move the host-verified code.
+# Building natively on the oldest available runner keeps the glibc floor low
+# (ubuntu-22.04: glibc 2.35) and avoids cross/zig entirely.
+jobs:
+  # Qualification gate: the full CI workflow (fmt, clippy x2, tests, and the
+  # leak suite with its log verification on Ubuntu 22.04 and 24.04) runs on the
+  # tagged commit. build and release depend on it, so a red or skipped suite
+  # cannot publish. The leak suite is x86_64 only; the aarch64 binary is built
+  # and `--version`-checked but not leak-tested (said so in the release notes).
+  qualify:
+    name: qualify
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: qualify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            asset: hisn-x86_64-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            asset: hisn-aarch64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match the crate version
+        shell: bash
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$crate" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"; exit 1
+          fi
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage the binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/hisn dist/${{ matrix.asset }}
+          chmod +x dist/${{ matrix.asset }}
+
+      # Both runners are native, so the aarch64 binary is run too.
+      - name: hisn --version
+        run: |
+          ./dist/${{ matrix.asset }} --version
+          ./dist/${{ matrix.asset }} --version | grep -q "^hisn ${GITHUB_REF_NAME#v}$"
+          ldd ./dist/${{ matrix.asset }} || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: hisn-*
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          ls -l
+          test "$(ls | wc -l)" -eq 2
+          test -f hisn-x86_64-linux-gnu -a -f hisn-aarch64-linux-gnu
+          chmod +x hisn-*
+          sha256sum hisn-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          ver=${GITHUB_REF_NAME#v}
+          awk -v v="$ver" '
+            /^## \[/ { if (found) exit; if (index($0, "[" v "]") == 4) { found = 1; next } }
+            /^\[[^]]+\]: / { if (found) exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no non-empty section for $ver"; exit 1
+          fi
+          {
+            echo
+            echo "The leak suite (L1-L24) passed on Ubuntu 22.04 and 24.04 x86_64 CI runners for this exact commit before these binaries were built; the aarch64 binary is built and started (`--version`) but has not been leak-tested. Binaries are dynamically linked against glibc and built natively on Ubuntu 22.04 (glibc 2.35 or newer required). Verify with \`sha256sum -c SHA256SUMS\`. See README, \"Verifying a build\"."
+          } >> notes.md
+          cat notes.md
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "hisn ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md \
+            --verify-tag \
+            dist/hisn-x86_64-linux-gnu dist/hisn-aarch64-linux-gnu dist/SHA256SUMS

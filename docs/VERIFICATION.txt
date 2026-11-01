@@ -1,0 +1,58 @@
+# Verification record (generated 2026-11-01T04:05:56Z, host: Wakil build sandbox, uid 1000)
+
+## cargo fmt --check
+clean
+
+## cargo clippy --all-targets -- -D warnings (x86_64)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+
+## cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+
+## cargo test
+test result: ok. 120 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+## unit tests per module
+      8 alias
+      3 check
+      3 cli
+      9 control
+      8 env
+     13 grant
+      7 init
+      4 landlock
+     18 mounts
+     11 policy
+      4 rootfs
+     12 seccomp
+      8 session
+      1 sig
+      7 supervisor
+      4 sys
+
+## hisn check (this sandbox)
+hisn host check (x86_64)
+  [ok  ] kernel                 7.2.13-200.fc44.x86_64 (>= 5.12)
+  [ok  ] userns sysctls         max_user_namespaces=239426 (optional)
+  [FAIL] user namespaces        unshare(NEWUSER): Operation not permitted (os error 1) (errno 1)
+  [ok  ] landlock               ABI v10
+  [ok  ] seccomp                filter mode, KILL_PROCESS available (current process mode=2)
+  [FAIL] open_tree              blocked by an outer seccomp filter (EPERM)
+  [FAIL] move_mount             blocked by an outer seccomp filter (EPERM)
+  [FAIL] mount_setattr          blocked by an outer seccomp filter (EPERM)
+  [warn] subuid ranges          no >=65536 range in /etc/subuid; single-id mapping only (optional)
+  [ok  ] lsm list               unreadable (optional)
+  [ok  ] cgroup v2              mounted (used for limits in v1) (optional)
+result: this host CANNOT run hisn sessions (required item failed)
+exit=2
+
+## tests/leak/run.sh (this sandbox)
+leaktest NOT RUN: 'hisn check' reports this host cannot run sessions:
+    hisn host check (x86_64)
+      [ok  ] kernel                 7.2.13-200.fc44.x86_64 (>= 5.12)
+...
+exit=77  (77 = suite NOT RUN; no leak test has been executed anywhere yet)
+
+## NOT verified here
+rootfs::execute, init (pivot_root, caps, post-setup verification), grant helper (move_mount/umount), supervisor lifecycle, pty relay, R5 end-to-end, and every leak test L1-L14.
+Kernel-enforced here (real syscalls, no userns needed): seccomp filter stack (EPERM on ptrace), Landlock write-set, rlimits, fd passing, openat2 symlink refusal.

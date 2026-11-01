@@ -33,7 +33,7 @@ policy and issues grants. The **sandboxed command** is hostile.
      │  (single-id map uid→uid). Mounts made in S never reach the host.
      └─ supervisor  (this process, lives in S)
          ├─ control thread  (started AFTER all clone/unshare work)
-         ├─ helper  (re-exec of `hisn __helper`, short-lived, per grant/revoke)
+         ├─ helper  (forked once after READY, before any thread; joins only the sandbox mntns)
          └─ sandbox init = PID 1 of new pidns
               clone(NEWUSER|NEWNS|NEWPID|NEWIPC|NEWUTS[|NEWNET])  → userns U ⊂ S
               └─ command (child of init, new session, no caps, NNP, seccomp)
@@ -53,10 +53,10 @@ S and U are both single-id maps (`uid→uid`, `gid→gid`, `setgroups=deny`).
 Files owned by other host users appear as `nobody`. The 65536-id range via
 `newuidmap` is detected by `hisn check` but **not used in v0** (§12, D4).
 
-The supervisor must be single-threaded for `unshare(CLONE_NEWUSER)` and for
-`setns(userns)`; therefore all namespace work happens before the control
-thread starts, and grant helpers are fresh re-execs (never `fork()` from the
-threaded supervisor).
+The supervisor must be single-threaded for `unshare(CLONE_NEWUSER)`; all
+namespace work therefore happens before the control thread starts, and the one
+grant helper is forked at that point (never `fork()` from the threaded
+supervisor afterwards).
 
 ## 3. Sandbox init (PID 1) — build order
 
@@ -353,7 +353,7 @@ sequenceDiagram
     autonumber
     participant W as caller
     participant S as supervisor (userns S)
-    participant H as helper (re-exec, single-threaded)
+    participant H as helper (forked once at start, single-threaded, in userns S)
     participant M as sandbox mntns (userns U)
 
     W->>S: {"op":"grant","path":"/abs/x","mode":"ro"} on control.sock
@@ -361,7 +361,7 @@ sequenceDiagram
     S->>S: src = openat2(path, O_PATH, NO_SYMLINKS)
     S->>S: tree = open_tree(src, "", EMPTY_PATH|CLONE|CLOEXEC [|RECURSIVE])  (anon mntns owned by S)
     S->>S: ro? mount_setattr(tree, RDONLY, AT_RECURSIVE) on the detached tree
-    S->>H: spawn `hisn __helper grant` with fds: mntns, tree, reply socket
+    S->>H: send `grant /abs/x` + tree fd over the helper socketpair (helper forked once, before any thread)
     H->>M: setns(mntns M)  (stays in userns S: S is U's owner-ancestor ⇒ caps over M and over the tree)
     H->>M: walk components of /abs/x with openat2(NO_SYMLINKS), mkdirat as needed
     H->>M: move_mount(tree, "", dirfd, "", F_EMPTY_PATH|T_EMPTY_PATH)
@@ -459,6 +459,8 @@ Properties:
 | D14 | revoke = umount | soft/hard revoke with explicit `guarantee` | round-1 BLOCKING: queued `SCM_RIGHTS` fds survive lazy detach |
 | D15 | helper does `setns(userns)` then `setns(mntns)` | helper stays in S and joins **only the mount ns** | joining U would drop the helper's authority over the detached tree (owned by S); S is U's owner-ancestor and already has full caps over M |
 | D16 | supervisor writes init's uid/gid maps | init writes its own single-id maps (`setgroups=deny` first) | an unprivileged process may map its own euid in a userns it created; avoids a supervisor↔init race and needs no helper |
+| D17 | helper "single-threaded fresh re-exec" per operation | one persistent helper, `fork`ed after READY and before the control thread; talks over a socketpair | an `execve` drops the capabilities S grants, so a re-exec'd helper could not mount; a fork keeps them |
+| D18 | (unspecified) | revoke removes the directories the grant created; `ro` initial grants get no pre-created dir | so a revoked path is ENOENT again, not an empty directory (L6); rw prefixes stay as empty dirs (Landlock needs an inode) |
 | D11 | mkdir -p mountpoint by path | component walk with `openat2(NO_SYMLINKS)` + `move_mount` to a dirfd | no path TOCTOU in the helper |
 
 ## 13. Module map

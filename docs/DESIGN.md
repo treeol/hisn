@@ -1,6 +1,6 @@
 # hisn — design
 
-Status: v0 implemented (code and design reconciled in §12). Binding input: `docs/BRIEF.md`
+Status: v0 implemented (code and design reconciled in §12); §14 (exec, v0.2) is the design for the next step and is implemented after review. Binding input: `docs/BRIEF.md`
 (the DO NOT ALTER block there always wins). This document expands the brief's
 architecture and records every place where working it through forced a
 refinement (§12 "Deviations from the brief"). Items marked **[HOST-VERIFY]**
@@ -481,6 +481,10 @@ Properties:
 | D19 | revoke handle = reopened mount root | revoke handle = the `open_tree` fd itself | round-2 finding: reopening the target by pathname after `move_mount` can be redirected by a sandbox that renames an ancestor, so revoke would hit the wrong mount |
 | D20 | (unspecified) | `landlock::apply` counts scoping as applied only if the kernel's *effective ABI* >= 6 | round-2 finding: best-effort mode drops unsupported scopes silently; "requested" is not "applied" |
 | D11 | mkdir -p mountpoint by path | component walk with `openat2(NO_SYMLINKS)` + `move_mount` to a dirfd | no path TOCTOU in the helper |
+| D21 | v0.2 exec: "exec'd processes are children of sandbox PID 1 (fork from a helper that has setns'd into the pid ns)" | the helper's child forks a second time inside the pid ns; the program is a **grandchild** of PID 1 (init → monitor `W` → program `P`) | a single fork from outside the pid ns yields a process whose parent is *outside* the namespace (PPid 0 inside, never adopted by init): it would not descend from init in the supervisor's `/proc` view, so R5 (§9) would fail open and hard revoke (§10) would miss it. Intent of the invariant (descendant of PID 1, reaped inside, dies with the session) is kept; the literal "direct child" is not achievable. See §14.3 |
+| D22 | (unspecified) | grants/revokes and exec spawns are ordered by a spawn gate (`RwLock`): spawns share it, a hard revoke takes it exclusively | a hard revoke must not sweep while an exec is half-started (§14.6) |
+| D23 | (unspecified) | exec uses a **second** persistent helper `E` (userns S, joins nothing itself); the grant helper is unchanged | the grant helper must stay in S + sandbox mntns only (D15); exec needs a per-exec child that joins userns U |
+| D24 | (unspecified) | **all** `/proc/<init>/ns/*` fds the exec helper needs are opened before `GO`, like the mount-ns fd already is | no later `/proc/<init>` access is needed; whether the supervisor *could* open them after init became non-dumpable (§6) is not relied on and not verified |
 
 ## 13. Module map
 
@@ -502,3 +506,284 @@ uses have a leak test: L14 (start) and L14b (grant).
 pty relay (in `supervisor`). Pure functions (policy, env scrub, mount plan,
 seccomp rule set, rule R1–R4 checks) carry the unit tests; everything
 namespace-dependent is covered by `tests/leak` on a host.
+
+## 14. `exec` into a running session (v0.2)
+
+Wakil issues many tool calls per session. Each must run in the **same
+namespaces, with the same confinement, seeing the same grants** as the
+original command. This section is the design for that; deviations from the v0.2
+brief are D21-D24 in §12. Everything here is **[HOST-VERIFY]**: it needs user
+namespaces, which the build sandbox blocks. §14.11 lists what is unit-tested
+here and what only a host can show.
+
+### 14.1 Contract
+
+Control-socket op (POLICY-SPEC §7 has the table):
+
+```
+{"op":"exec","argv":["sh","-c","…"],"cwd":"/abs"|null,"env":{"K":"V"},"tty":false}
+```
+
+The request line carries `SCM_RIGHTS` fds in the **same `sendmsg`**: three
+(stdin, stdout, stderr) when `tty=false`, exactly one (the slave side of a pty
+the *client* allocated) when `tty=true`. Responses, one JSON line each:
+
+1. `{"ok":true,"pid":N}` once the program has been `execve`d (`N` is its pid
+   **inside the sandbox pid namespace**; it is only a handle for `signal`), or
+   `{"ok":false,"error":E,"message":…}` (`E_BAD_REQUEST` for validation incl.
+   rejected env keys, `E_EXEC` if confinement or `execve` failed, `E_INTERNAL`);
+2. on exit: `{"exit":{"code":N}}` or `{"exit":{"signal":"TERM"}}`, or
+   `{"exit":{"lost":true}}` (extension, §14.9: the monitor died, so the status
+   is unknown; the program is still inside the session).
+
+`{"op":"signal","pid":N,"signal":"TERM"}` (second connection) forwards a signal
+to the program's process group, only for a pid that is a live exec of this
+session (`E_NOT_FOUND` otherwise). Closing the exec connection counts as
+cancellation: `TERM`, then `KILL` after 5 s.
+
+CLI: `hisn exec --session ID [--cwd DIR] [--env K=V]... [--tty] -- CMD…`
+passes stdio through, exits with the program's code (`128+sig` if signalled;
+`125` hisn error, `126`/`127` as for `run`) and prints nothing of its own.
+`hisn run --detach` starts a session with **no command**: init finishes setup,
+then only sleeps and reaps until `SIGTERM/SIGINT/SIGHUP`, then exits 0.
+
+### 14.2 Processes
+
+```
+ supervisor (userns S)            ──forks once, before any thread──▶  E  exec helper (userns S)
+ E ── per exec ──▶ C  (still outside the sandbox; setns user,mnt,ipc,uts,[net],pid)
+                   └─ fork ─▶ D  (inside the pid ns, confines itself)
+                              └─ fork ─▶ W  monitor ──▶ P  the program
+ D exits; W is reparented to sandbox init.
+```
+
+* `E` is forked next to the grant helper, while the supervisor is
+  single-threaded. It holds the namespace fds (`/proc/<init>/ns/{user,mnt,ipc,
+  uts,pid[,net]}`, opened before `GO`, D24), the resolved policy, the Landlock
+  plan, the compiled seccomp programs and the session's base environment (all
+  copied by `fork`). It never joins a namespace itself (D23): it stays in S like
+  the grant helper, so the grant helper's invariants (D15) are untouched. It
+  has `PDEATHSIG=SIGKILL`, `SIGCHLD=SIG_IGN` and talks to the supervisor over a
+  `SOCK_SEQPACKET` socketpair, so one message is one request (JSON spec + fds).
+* `C` is forked by `E` per exec. It sets `PDEATHSIG=SIGKILL`, then
+  `setns(user)` **first**: S is the owner-ancestor of the sandbox userns U, so
+  `C` has all capabilities in U on joining — and only there. Then
+  `setns(mnt)`, `ipc`, `uts`, `[net]`, and `pid` last (the pid-ns switch affects
+  only children). `chdir("/")`, `fork` → `D`, `waitpid(D)`, exit. `C` never uses
+  `/proc/self` (after `setns(mnt)` `/proc` is the sandbox's, in which `C`, being
+  outside the pid ns, has no `self`).
+* `D` is inside the pid ns but its parent (`C`) is outside: ns-pid parent `0`.
+  It is the only process that ever holds capabilities inside the sandbox, and
+  only until §14.4 step 5. It does the confinement, then forks `W` and exits.
+* `W` (monitor) waits until `getppid()==1` — i.e. until the kernel has
+  reparented it to the sandbox init, so the chain `init → W` exists — and only
+  then forks `P`. `W` relays status and signals (§14.8) and is reaped by init.
+* `P` is the program: `setsid` (+ controlling tty if `tty`), `dup2` of the
+  passed stdio, `PDEATHSIG=SIGKILL` (so it dies with `W`), `execve`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as client (hisn exec / Wakil)
+    participant S as supervisor (control thread)
+    participant E as exec helper E (userns S)
+    participant C as C (setns → U)
+    participant D as D (inside pid ns)
+    participant I as sandbox init (PID 1)
+    participant W as W monitor
+    participant P as P program
+
+    K->>S: exec request line + stdio fds (one sendmsg)
+    S->>S: authorize (R5), validate argv/cwd/env, audit "request"
+    S->>S: take spawn gate (shared); socketpair "status"
+    S->>E: spec + stdio fds + status end (SEQPACKET)
+    E->>C: fork
+    C->>C: setns user, mnt, ipc, uts, [net], pid; chdir /
+    C->>D: fork (D lands in the sandbox pid ns, ns-ppid 0)
+    D->>D: dumpable=0, rlimits, Landlock, NNP, drop all caps, seccomp, verify (fail closed)
+    D->>W: fork; D exits
+    I-->>W: W reparented to init (getppid()==1)
+    W->>P: fork; P: setsid, stdio, execve
+    W-->>S: status: "P <ns pid>"
+    S->>S: register pid, release spawn gate, audit "ok"
+    S-->>K: {"ok":true,"pid":N}
+    P-->>W: exit
+    W-->>S: status: "X exit 0"
+    S-->>K: {"exit":{"code":0}}
+    W-->>I: W exits; init reaps it
+```
+
+### 14.3 Why two forks (D21)
+
+The brief wants exec'd processes to be children of sandbox PID 1, "fork from a
+helper that has setns'd into the pid ns". A process forked that way is created
+inside the namespace but its **parent is outside it**: its in-namespace `PPid`
+is 0, and when the parent exits the kernel picks a new reaper from the *dying
+parent's* pid namespace (a subreaper or the host init), **not** the sandbox
+init. Consequences, none acceptable:
+
+* in the supervisor's `/proc` the process would not descend from init, so the
+  R5 ancestry test (§9) would conclude "not in the sandbox" — **R5 would fail
+  open** for it — and hard revoke's sweep (§10, `descendants_of(init)`) would
+  miss it;
+* nothing inside the sandbox would reap it (zombie, or an orphan that outlives
+  init's reaping duty; it still dies with the pid ns).
+
+The second fork fixes all three: `D` exits, `W` is reparented *within* the pid
+ns to init (it is `D`'s child inside the ns), so `init → W → P` is a real tree
+in both views. `W` is also the only way to obtain `P`'s exit status: the
+supervisor is not `P`'s parent, `waitid(P_PIDFD)` needs a child, and
+`PIDFD_GET_INFO` exit info needs kernel ≥ 6.15. `P` is therefore a
+*grandchild* of PID 1 (and a child if `W` dies), not the literal child the
+brief names. The intent — descendant of PID 1, reaped inside, never outliving
+the session — holds; the literal wording cannot. **Reported to the user.**
+
+### 14.4 Confinement re-applied on every exec (DO NOT ALTER #1)
+
+`setns` does not carry the sandbox's seccomp filter, Landlock domain,
+`no_new_privs` or dropped capabilities. `D` re-applies, in this order, **reusing
+the exact functions and inputs `init` uses** (so there is no second
+implementation to drift):
+
+1. `prctl(PR_SET_DUMPABLE, 0)` — the very first action. While `D` holds
+   capabilities a same-uid sandbox process could otherwise `ptrace`/read
+   `/proc/<D>/mem`; non-dumpable plus "target has caps the tracer lacks" closes
+   it (seccomp already denies `ptrace`/`process_vm_*`). `W` inherits it and stays
+   non-dumpable; `P` becomes dumpable on `execve` as any process does.
+2. `close_all_except` {stdio fds, status socket}; fds 0-2 are reopened on the
+   sandbox's `/dev/null` so no host stdio stays in `D`/`W`.
+3. `setsid`; `set_rlimits(policy)` (`nofile`, `nproc`, `core=0`).
+4. `chdir("/")`, then `landlock::apply(plan, require_scope)` — the **same
+   plan** as init (`landlock::plan(policy, initial_rw)`, copied into `E`).
+5. `PR_SET_NO_NEW_PRIVS`; `drop_all_caps()` (securebits, ambient, bounding,
+   inheritable/permitted/effective); `seccomp::install(progs)` — the same
+   compiled programs; `verify_hardening()` re-reads `/proc/self/status` and
+   requires all five cap sets zero, `NoNewPrivs 1`, `Seccomp 2`.
+6. only now `chdir(cwd)` and the environment is built (§14.5).
+
+Any failure writes `E <message>` on the status socket and `_exit(125)`: the
+request fails closed with `E_EXEC` and nothing is started. `fork` of `W` happens
+only after step 5, so no process in the sandbox ever has capabilities or lacks
+seccomp, and `W`/`P` inherit all four layers.
+
+### 14.5 Request validation and environment (DO NOT ALTER #1, env)
+
+Validated by the supervisor before anything is sent (pure, unit-tested):
+`argv` 1-4096 entries, none containing NUL, total request ≤ 48 KiB; `cwd` null
+(→ the policy `cwd`) or absolute without NUL or `..` segments; `tty` matches
+the number of fds; unknown JSON keys are errors (as for every op).
+
+Final environment = the session's base environment (what init gave the main
+command: allowlist + `env.pass` + `env.set` + computed `HOME`/cache vars) with
+the request's `env` applied on top. A request key is **accepted only if it is
+in `env.pass`** and is not a computed name (`HOME`, `XDG_*`, `CARGO_HOME`,
+`GOMODCACHE`, `GOCACHE`, `npm_config_cache`, `PIP_CACHE_DIR`). Any other key
+rejects the **whole request** (`E_BAD_REQUEST`, message lists the keys, never
+the values); nothing is dropped silently. Names must be non-empty, without `=`
+or NUL; values without NUL; ≤ 256 variables. *Decision:* `TERM`/`LANG`/`TZ`/`LC_*`
+are not exempt — they are already in the base environment from session start;
+a policy that wants per-exec values adds them to `env.pass`. The base
+environment never changes after start (host env is read once, as for `run`).
+
+### 14.6 Ordering, hard revoke, session end
+
+* **Spawn gate (D22).** A `RwLock`: each exec holds it *shared* from "send to
+  `E`" until `P <pid>` (or failure) is received — by then `W` is in init's tree.
+  Hard revoke (§10) takes it *exclusive* before its kill sweep, so the sweep can
+  never run while an exec is half-started (a `D` not yet under init would be
+  missed). Grants/soft revokes use `op_lock` as before; they do not wait for
+  spawns, which is what "grant during a running exec is visible to it" needs:
+  the grant mount lives in the shared mount namespace.
+* **Grants (DO NOT ALTER #3).** `P` is in the sandbox mount namespace, so a
+  grant made before or after it started is visible, and a revoke detaches the
+  mount for it too (`ENOENT` for new lookups; soft-revoke guarantees unchanged).
+* **R5 (§9).** `W`, `P` descend from init, so the control socket still refuses
+  them. `D` is briefly outside the tree (parent `C`), but `D` holds no path to
+  the socket (never mounted) and runs no sandbox-controlled code.
+* **Session end (DO NOT ALTER #2).** Init exiting destroys the pid ns and kills
+  every process in it: `D`, `W`, `P`. A `D` forked while init is already dying is
+  killed by the teardown; a *new* `fork` into a dead pid ns fails (`ENOMEM`),
+  so no exec can start after the session ended. `C`/`E` die with the supervisor
+  (`PDEATHSIG`); `C` also exits when `D` is gone.
+
+### 14.7 Control-socket changes
+
+The server reads request lines with `recvmsg` (`MSG_CMSG_CLOEXEC`, room for ≤ 4
+fds; `MSG_CTRUNC` ⇒ bad request, fds closed). Rules: fds are accepted **only**
+on the first request line of a connection and **only** for `exec`; anywhere
+else they are closed and the request is `E_BAD_REQUEST`; the count must be
+exactly 3 / 1. Clients send the request line and its fds in one `sendmsg` and
+nothing after the newline until the response. R5 still runs per request line.
+The exec handler may write several lines (response, then exit), so the
+connection thread is occupied for the exec's duration; `signal` therefore uses
+a second connection. The accept loop now starts **after** `START` is sent (the
+socket is bound earlier, so early clients wait in the listen backlog): no exec
+can reach a session that is not fully set up.
+
+### 14.8 Stdio, signals, tty
+
+* Pipes/files (`tty=false`): the client's three fds are `dup2`ed onto `P`'s
+  0-2. The supervisor closes its copies once handed to `E`.
+* `tty=true`: **the user's terminal is never passed to the sandbox.** The
+  client allocates a *fresh host pty*, passes the slave, and relays master ↔
+  its own stdin/stdout (raw mode on a real tty, restored on every exit path);
+  `SIGWINCH` → `TIOCSWINSZ` on the master, which the kernel propagates to the
+  foreground group of the slave. `P` makes the slave its controlling tty
+  (`TIOCSCTTY`) after `setsid`. The CLI refuses (exit 125 with a hint) when any
+  of fd 0-2 is a terminal and `--tty` was not given, instead of handing the
+  host tty over (`TIOCSTI`-class attacks stay impossible, §11).
+* Status/signals use the per-exec **status socketpair** (`W` ↔ supervisor):
+  `W → S: P <pid>`, `X exit <code>` | `X sig <n>`; `S → W: K <n>` (1 ≤ n ≤ 64,
+  delivered with `kill(-P, n)`). EOF from the supervisor side means "cancel":
+  `W` kills `P`'s group with `SIGKILL`.
+
+### 14.9 Failure modes
+
+* `W` killed by `P` (same uid, same Landlock domain): `P` dies with it through
+  `PDEATHSIG` unless the program cleared it; either way the status socket closes
+  and the client gets `{"exit":{"lost":true}}`. The program cannot leave the
+  session: it is in init's tree and dies with the session or a hard revoke.
+* `E` dies: the supervisor sees EOF on its socket; further execs fail with
+  `E_INTERNAL`; the main command and grants are unaffected.
+* Spawn handshake exceeds 10 s: the supervisor closes the status socket (`W`
+  kills `P`), replies `E_INTERNAL`, audits it.
+* Each exec is audited (`exec` request/result, argv[0] only, never env values).
+
+### 14.10 Rejected alternatives
+
+* **Ask init to fork the program.** Gives literal "child of PID 1" and
+  trivial status, but needs a sandbox-reachable command channel into a process
+  that must stay minimal, capless and non-dumpable (§6), and the brief
+  mandates helper + `setns` + re-application. Rejected.
+* **Single fork from the helper.** §14.3: R5 fails open, revoke misses it.
+* **Exec a `nsenter`-style binary.** `execve` drops the capabilities `setns`
+  needs (D17) and adds a binary on the trust path.
+* **Re-parent with `PR_SET_CHILD_SUBREAPER`.** Would make the *supervisor* the
+  reaper, i.e. outside the sandbox tree.
+
+### 14.11 What is tested where
+
+Unit tests (here): request parsing/validation, env rejection, status-line
+format/parse, fd-receiving control server with a fake handler, the monitor
+loop with a real child process over a socketpair (signal forwarding, exit code
+vs signal reporting), multi-fd `SCM_RIGHTS`, CLI parsing. **Host only
+(`make leaktest`, L15-L20):** the `setns` chain, `D`'s confinement, the
+`init → W → P` ancestry, grants seen by exec'd processes, fd/zombie hygiene,
+pty behaviour. See `docs/VERIFICATION.txt` for which commit each result is
+for.
+
+### 14.12 Known limits of this design
+
+* **Sibling Landlock domains.** Each exec gets its *own* Landlock domain
+  (`landlock::apply` in `D`), a sibling of init's domain and of every other
+  exec's. With ABI >= 6 the ruleset scopes `Signal` and `AbstractUnixSocket`
+  (§7): a scoped process cannot signal, or connect an abstract unix socket to, a
+  process in a *different* (non-descendant) domain. So an exec'd program cannot
+  signal the main command or another exec's processes, nor reach their abstract
+  sockets. This is stricter, not looser, but it changes behaviour (`kill`
+  between tool calls fails with `EPERM` on such kernels); the supervisor-side
+  `signal` op is unaffected. Open point P17.
+* `P` shares the pid namespace, mount namespace and (for `network="host"`) the
+  network with the main command; exec does not add isolation between tool calls.
+* The ns-pid returned in `{"ok":true,"pid":N}` is only meaningful for the
+  `signal` op of this session.

@@ -473,6 +473,8 @@ if "$HISN" run --policy "$WORK/X.toml" --session-id xdet-$$ --detach </dev/null 
     $PY json-ok "$WORK/xg.json" && pass "L16 grant before exec accepted" || fail "L16 grant" "$(cat "$WORK/xg.json")"
     eq "L16 grant made before exec is visible in it" "$(exq cat "$WORK/g_ro/hello")" "OK ro-secret-content"
     # a long-running exec, then a grant while it runs: it must see it
+    # (grant sources must exist on the host, so create the target first)
+    mkdir -p "$WORK/g_rw/execmid"
     ex --cwd "$CX" -- sh -c 'sleep 5' >/dev/null 2>&1 &
     SLEEPER=$!
     sleep 0.4

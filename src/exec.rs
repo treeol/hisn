@@ -685,6 +685,7 @@ impl NsFds {
             self.ipc.as_raw_fd(),
             self.uts.as_raw_fd(),
             self.pid.as_raw_fd(),
+            self.root.as_raw_fd(),
         ];
         v.extend(self.net.as_ref().map(AsRawFd::as_raw_fd));
         v

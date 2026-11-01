@@ -10,14 +10,15 @@ host path** (rw), a read-only toolchain, private tmpfs `$HOME`/`/tmp`/`/run`,
 and paths the host side explicitly **grants** for the life of the session.
 Everything else does not exist (ENOENT), not "permission denied".
 
-> **Status: v0.1.0 (code at `225ef70`, plus later test/doc commits).** Unit tests
-> and clippy pass in the build sandbox. The leak suite (L1-L14) was run on one
-> real host (Fedora, kernel 7.2, x86_64, Landlock ABI 10): 111 passed, 0 failed,
-> 1 skipped (L12 needs write access to `/etc`), 1 weak (R5 end-to-end is covered
-> by unit tests only, see OPEN-POINTS P16). The newer L14b check has not been run
-> yet, and nothing has been run on aarch64 or on other kernels/distros.
-> [docs/VERIFICATION.txt](docs/VERIFICATION.txt) states which commit every result
-> was obtained on. See [Verifying](#verifying).
+> **Status: v0.2.0.** Unit tests and clippy pass in the build sandbox. The leak
+> suite (L1-L14) was run on one real host (Fedora, kernel 7.2, x86_64, Landlock
+> ABI 10): 111 passed, 0 failed, 1 skipped (L12 needs write access to `/etc`),
+> 1 weak (R5 end-to-end is covered by unit tests only, see OPEN-POINTS P16) —
+> but on **0.1.0**, before exec existed. **Nothing has been run on 0.2.0 yet**:
+> L14b and the exec suite (L15-L20) have not been executed anywhere, and exec's
+> helper chain (`setns`, confinement re-application) is design- and
+> unit-tested only. Run `make leaktest` on a host with unprivileged user
+> namespaces. See [docs/VERIFICATION.txt](docs/VERIFICATION.txt).
 
 ## Install
 
@@ -97,8 +98,11 @@ git clone <repo> && cd hisn
 make leaktest                   # builds release + examples/leakprobe, runs tests/leak/run.sh
 ```
 
-`tools/verification.sh` regenerates the build-sandbox half of
-`docs/VERIFICATION.txt`, stamped with the commit it ran on.
+On 0.2.0 run `make lint && make test && make leaktest` in one go; the suite now
+covers L1-L14 plus the exec suite L15-L20 (the L1-L14 results above were
+obtained on 0.1.0). Append host runs under the `## Host runs` heading of
+`docs/VERIFICATION.txt`; `tools/verification.sh` regenerates the build-sandbox
+half, stamped with the commit it ran on.
 
 Output is one `PASS`/`FAIL`/`SKIP`/`WEAK` line per check. `WEAK` means a check
 passed without the fixture that would make it meaningful (e.g. no `~/.ssh` on

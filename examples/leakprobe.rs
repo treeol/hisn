@@ -396,7 +396,10 @@ fn cmd_fds() -> String {
         })
         .unwrap_or_default();
     v.sort_unstable();
-    format!("OK {}", v.iter().map(i32::to_string).collect::<Vec<_>>().join(","))
+    format!(
+        "OK {}",
+        v.iter().map(i32::to_string).collect::<Vec<_>>().join(",")
+    )
 }
 
 fn dispatch(a: &[String]) -> String {

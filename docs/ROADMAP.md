@@ -10,6 +10,13 @@ host (`make leaktest`).
 Known v0 limits are tracked in `docs/OPEN-POINTS.md` (e.g. single-id uid map,
 no egress filtering, no cgroups).
 
+## v0.2 (done, this repo)
+
+`exec` into a running session: control ops `exec` + `signal`, the helper
+chain C→D→W→P with confinement re-applied on every exec (DESIGN §14), and
+`hisn run --detach` for a session that is only exec'd into. Leak tests
+L15-L20.
+
 ## v0.x candidates
 
 * 65536-id mapping via `newuidmap` using a launcher stage (DESIGN D4);
@@ -20,11 +27,13 @@ no egress filtering, no cgroups).
 ## v1
 
 1. **E2B-shaped HTTP API** over a unix socket (`hisn serve --socket PATH`):
-   sandboxes = sessions; create/kill/list; `commands.run` (exec with streamed
-   stdout/stderr/exit), `files.read|write|list`, `filesystem` watch is out of
+   sandboxes = sessions; create/kill/list; `commands.run` **wraps the v0.2
+   `exec` control op** (same confinement, same helper chain — it must not
+   reimplement exec), `files.read|write|list`, `filesystem` watch is out of
    scope. The v0 JSON control socket stays the internal transport.
 2. **MCP server** (`hisn mcp`, stdio): tools `exec`, `read_file`, `write_file`,
-   `grant`, `revoke` (+ `list_grants`). `read_file`/`write_file` operate
+   `grant`, `revoke` (+ `list_grants`). `exec` **wraps the v0.2 control op**;
+   `read_file`/`write_file` operate through the sandbox's view only. `read_file`/`write_file` operate
    through the sandbox's view only (path must be visible in the session), so
    an MCP client cannot use them to bypass grants.
 3. **Egress proxy with allowlist:** `network = "proxy"`; the sandbox gets a net

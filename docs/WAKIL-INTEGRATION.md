@@ -21,12 +21,18 @@ err := cmd.Run()                // *exec.ExitError.ExitCode() == command's code
 * `hisn run` does not print on stdout; stdout is the command's.
   Exit codes: command's code, `128+sig`; `125` hisn error (policy/host),
   `126` cannot exec, `127` not found.
-* A long-lived "sandbox" (Wakil's per-session container today) is one
-  `hisn run … -- sleep infinity`-style session started at agent start; each
-  tool call is then a further process in it. v0 has no `exec-in-session` verb;
-  the v1 HTTP/MCP `commands.run` provides it. Until then Wakil starts one
-  `hisn run` per tool call with the same persistent `home` path (warm caches)
-  and `--session-id <agent>-<n>`.
+* **v0.2: one session, many tool calls.** Wakil starts ONE long-lived session
+  at agent start — `hisn run --session-id <agent> --detach` — and runs every
+  tool call with `hisn exec --session <agent> [--cwd DIR] [--env K=V]... -- CMD…`
+  in it: the same namespaces, the same confinement, the same grants. `exec`
+  passes stdio through, propagates the exit code (`128+sig` if signalled,
+  `125` hisn error, `126`/`127` as for `run`) and prints nothing of its own.
+  Grants made mid-session (`hisn grant`) are visible to later and running
+  execs. `hisn exec --tty` runs a tool on a fresh pty (Wakil passes pipes
+  instead). Terminate a running tool with `hisn exec`'s own
+  `{"op":"signal","pid":N}` on a second connection, or end the whole session
+  with `hisn kill`. Pre-v0.2 (one `hisn run` per tool call, warm `home`)
+  still works and remains the fallback when `hisn --version` < 0.2.
 * Cancellation: `ctx` cancel → SIGTERM to `hisn`, which forwards to the
   command's process group; after a grace period `hisn kill --session ID
   --signal KILL`.

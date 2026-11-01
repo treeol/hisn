@@ -306,20 +306,27 @@ pub fn parse_helper_cmd(line: &str) -> Option<HelperCmd> {
 }
 
 /// Fixed fd layout of the helper process (set up by the supervisor).
-pub const HELPER_FD_USERNS: RawFd = 3;
-pub const HELPER_FD_MNTNS: RawFd = 4;
+pub const HELPER_FD_MNTNS: RawFd = 3;
 /// Detached tree (grant) or mount-root fd (revoke).
-pub const HELPER_FD_OBJECT: RawFd = 5;
-/// Socket to report the result: one byte status line + optional fd.
-pub const HELPER_FD_REPLY: RawFd = 6;
+pub const HELPER_FD_OBJECT: RawFd = 4;
+/// Socket to report the result: `ok <mount-id>` + optional fd.
+pub const HELPER_FD_REPLY: RawFd = 5;
 
 /// Entry point of `hisn __helper <cmd...>`. Single-threaded by construction
-/// (a fresh exec). Joins the sandbox namespaces and performs one operation.
+/// (a fresh exec).
+///
+/// The helper stays in the supervisor's user namespace S and joins **only the
+/// sandbox mount namespace**: S is the owner-ancestor of the sandbox userns,
+/// so it holds `CAP_SYS_ADMIN` over the sandbox mntns *and* over the
+/// anonymous tree it created with `open_tree`. Joining the sandbox userns
+/// would drop its authority over that tree (DESIGN §10, D1).
+///
+/// After `setns` the helper's `/proc` is the *sandbox's* procfs, where
+/// `/proc/self` does not resolve (the helper is outside that pid namespace),
+/// so no `/proc/self/...` path may be used here.
 pub fn helper_main(cmd: HelperCmd) -> io::Result<()> {
-    sys::setns(HELPER_FD_USERNS, libc::CLONE_NEWUSER)?;
     sys::setns(HELPER_FD_MNTNS, libc::CLONE_NEWNS)?;
-    // After setns(NEWNS) the root/cwd are those of the sandbox mntns, but do
-    // not rely on that: work only through an explicit root dirfd.
+    // Work only through an explicit root dirfd of the sandbox mntns.
     std::env::set_current_dir("/")?;
     let root = sys::openat2(
         libc::AT_FDCWD,
@@ -355,10 +362,14 @@ pub fn helper_main(cmd: HelperCmd) -> io::Result<()> {
             )
         }
         HelperCmd::Revoke => {
-            // Detach by fd: no path is resolved, so renames, planted symlinks
-            // or shadowing mounts cannot make revoke miss (DESIGN D5).
-            let p = PathBuf::from(format!("/proc/self/fd/{HELPER_FD_OBJECT}"));
-            sys::umount2(&p, libc::MNT_DETACH)?;
+            // Detach by fd, never by path: renames, planted symlinks or a
+            // shadowing mount cannot make revoke miss (DESIGN D5). `fchdir`
+            // onto the mount root, then unmount ".".
+            // SAFETY: plain fchdir on a descriptor passed by the supervisor.
+            if unsafe { libc::fchdir(HELPER_FD_OBJECT) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            sys::umount2(Path::new("."), libc::MNT_DETACH)?;
             sys::send_with_fd(HELPER_FD_REPLY, b"ok 0", None)
         }
     }

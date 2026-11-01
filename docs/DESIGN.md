@@ -63,7 +63,7 @@ threaded supervisor).
 All steps run in U with full caps *inside U only*. Any failure aborts the
 session before the command runs (fail closed).
 
-1. Write `setgroups=deny`, `uid_map`, `gid_map` (own single id).
+1. Write `setgroups=deny`, `uid_map`, `gid_map` (own single id); then wait for the supervisor's `GO` (it has opened `/proc/<init>/ns/*` by then).
 2. `prctl(PR_SET_PDEATHSIG, SIGKILL)` — init dies if the supervisor dies, so
    no sandbox outlives its supervisor (invariant 3). Mark init
    `PR_SET_DUMPABLE=0` (see §6).
@@ -359,11 +359,10 @@ sequenceDiagram
     W->>S: {"op":"grant","path":"/abs/x","mode":"ro"} on control.sock
     S->>S: rules R1–R4, grantable check, audit "request"
     S->>S: src = openat2(path, O_PATH, NO_SYMLINKS)
-    S->>S: tree = open_tree(src, "", EMPTY_PATH|CLONE|CLOEXEC [|RECURSIVE])
+    S->>S: tree = open_tree(src, "", EMPTY_PATH|CLONE|CLOEXEC [|RECURSIVE])  (anon mntns owned by S)
     S->>S: ro? mount_setattr(tree, RDONLY, AT_RECURSIVE) on the detached tree
-    S->>H: spawn `hisn __helper grant` with fds: userns, mntns, tree
-    H->>H: setns(userns U)  (owner ⇒ full caps in U)
-    H->>M: setns(mntns M)
+    S->>H: spawn `hisn __helper grant` with fds: mntns, tree, reply socket
+    H->>M: setns(mntns M)  (stays in userns S: S is U's owner-ancestor ⇒ caps over M and over the tree)
     H->>M: walk components of /abs/x with openat2(NO_SYMLINKS), mkdirat as needed
     H->>M: move_mount(tree, "", dirfd, "", F_EMPTY_PATH|T_EMPTY_PATH)
     H->>M: mnt = open(dirfd-of-target, O_PATH)  (the mount root)
@@ -458,6 +457,8 @@ Properties:
 | D12 | `/etc` ro bind with masks | `/etc` = tmpfs of per-entry binds (allowlist at start) | round-1 BLOCKING: live bind exposes later-created secrets |
 | D13 | (not specified) | R5 peer-pidns check on the control socket + R1b mount-alias scan | round-1 BLOCKING: path rules alone miss bind aliases |
 | D14 | revoke = umount | soft/hard revoke with explicit `guarantee` | round-1 BLOCKING: queued `SCM_RIGHTS` fds survive lazy detach |
+| D15 | helper does `setns(userns)` then `setns(mntns)` | helper stays in S and joins **only the mount ns** | joining U would drop the helper's authority over the detached tree (owned by S); S is U's owner-ancestor and already has full caps over M |
+| D16 | supervisor writes init's uid/gid maps | init writes its own single-id maps (`setgroups=deny` first) | an unprivileged process may map its own euid in a userns it created; avoids a supervisor↔init race and needs no helper |
 | D11 | mkdir -p mountpoint by path | component walk with `openat2(NO_SYMLINKS)` + `move_mount` to a dirfd | no path TOCTOU in the helper |
 
 ## 13. Module map

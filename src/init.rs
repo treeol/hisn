@@ -57,6 +57,9 @@ pub struct InitConfig {
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub use_pty: bool,
+    /// Caller's uid/gid in the supervisor's namespace; mapped 1:1 (single id).
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// Entry point in the cloned child. Never returns.
@@ -77,7 +80,10 @@ pub fn init_main(cfg: InitConfig, chan: OwnedFd) -> ! {
 }
 
 fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
-    // 1. Wait for the supervisor to finish writing our uid/gid maps.
+    // 0. Single-id maps, written by ourselves: allowed for an unprivileged
+    //    process mapping its own euid, with setgroups denied first.
+    write_id_maps(cfg.uid, cfg.gid).context("writing uid/gid maps")?;
+    // 1. Wait for the supervisor to have opened our namespace fds.
     let mut b = [0u8; 1];
     let (n, _) = sys::recv_with_fd(chan.as_raw_fd(), &mut b).context("waiting for supervisor")?;
     if n != 1 || b[0] != MSG_GO {
@@ -291,6 +297,12 @@ pub fn resolve_program(
         .filter(|d| d.starts_with('/'))
         .map(|d| Path::new(d).join(argv0))
         .find(|p| is_exec(p))
+}
+
+fn write_id_maps(uid: u32, gid: u32) -> io::Result<()> {
+    std::fs::write("/proc/self/setgroups", "deny")?;
+    std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
+    std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))
 }
 
 fn set_rlimits(p: &ResolvedPolicy) -> io::Result<()> {

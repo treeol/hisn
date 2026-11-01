@@ -1,9 +1,9 @@
 # Verification record
 
-hisn version : 0.1.0
-commit       : 864e22d1fa86a1943e492f81a1a014dd0d4e6102
+hisn version : 0.2.0
+commit       : f70d2c6102db665ec5bfe8fca0e6b587bfc55f37
 worktree     : clean (docs/VERIFICATION.txt itself excluded)
-generated    : 2026-11-01T12:34:19Z by tools/verification.sh
+generated    : 2026-11-01T13:34:41Z by tools/verification.sh
 where        : build sandbox, uid 1000, Linux 7.2.13-200.fc44.x86_64 x86_64
 scope        : the results in this half are for the code at the commit above
 
@@ -11,20 +11,24 @@ scope        : the results in this half are for the code at the commit above
 clean
 
 ## cargo clippy --all-targets -- -D warnings (x86_64)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
 
 ## cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
 
 ## cargo test
-test result: ok. 129 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test exec::tests::monitor_forwards_signals_to_the_process_group ... FAILED
+thread 'exec::tests::monitor_forwards_signals_to_the_process_group' (122227) panicked at src/exec.rs:1346:9:
+test result: FAILED. 172 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.01s
 
 ## unit tests per module
       8 alias
       6 check
-      3 cli
-     10 control
-      8 env
+      6 cli
+     16 control
+      9 env
+     27 exec
+      5 execcli
      13 grant
       7 init
       4 landlock
@@ -35,14 +39,14 @@ test result: ok. 129 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fi
       8 session
       1 sig
       8 supervisor
-      7 sys
+      9 sys
 
 ## python3 tests/leak/test_l8.py (L8 comparator self-tests)
 Ran 12 tests in 0.004s
 OK
 
 ## hisn --version
-hisn 0.1.0
+hisn 0.2.0
 
 ## hisn check (this sandbox)
 hisn host check (x86_64)

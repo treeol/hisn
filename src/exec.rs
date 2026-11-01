@@ -1333,14 +1333,27 @@ mod tests {
     #[test]
     fn monitor_forwards_signals_to_the_process_group() {
         let (a, b) = sys::socketpair().unwrap();
-        let (p, _) = spawn_group("sleep 30");
+        // The child must exist before we signal it: spawn+exec can be slow
+        // under load, and a signal to a not-yet-exec'd pid is racy.
+        let wait_up = |p: i32| {
+            for _ in 0..300 {
+                if sys::kill(p, 0).is_ok() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        };
+        let (p, _) = spawn_group("sleep 60");
+        assert!(wait_up(p));
         sys::send_all(b.as_raw_fd(), format_kill(libc::SIGTERM).as_bytes()).unwrap();
         assert_eq!(
             monitor(p, a.as_raw_fd()).unwrap(),
             Exit::Signal(libc::SIGTERM)
         );
         // Out-of-range requests are ignored, a valid one still works.
-        let (p, _) = spawn_group("sleep 30");
+        let (p, _) = spawn_group("sleep 60");
+        assert!(wait_up(p));
         sys::send_all(b.as_raw_fd(), b"K 0\nK 999\nbogus\n").unwrap();
         sys::send_all(b.as_raw_fd(), format_kill(libc::SIGHUP).as_bytes()).unwrap();
         assert_eq!(

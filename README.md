@@ -95,11 +95,18 @@ refuse to run, exit 77, and report nothing otherwise):
 ```sh
 git clone <repo> && cd hisn
 make leaktest                   # builds release + examples/leakprobe, runs tests/leak/run.sh
+make leaktest-log               # same, but also tee'd to docs/leaktest-host-YYYY-MM-DD.log
 ```
 
-On 0.2.0 run `make lint && make test && make leaktest` in one go; the suite now
-covers L1-L14 plus the exec suite L15-L20 (the L1-L14 results above were
-obtained on 0.1.0). Append host runs under the `## Host runs` heading of
+`make leaktest` prints one line per check (`L<n>[<sub>] PASS|FAIL|SKIP|WEAK —
+<reason for SKIP/WEAK>`) and a final `RESULT:` summary line; exit is non-zero
+on any `FAIL`. `make leaktest-log` is the same command tee'd to a dated log
+file under `docs/` — append the log file to the host-run table in
+`docs/VERIFICATION.txt`.
+
+On 0.2.0 run `make lint && make test && make leaktest` in one go; the suite
+covers L1-L23 (L1-L14 plus the exec suite L15-L20 and the Landlock-scope suite
+L21-L23). Append host runs under the `## Host runs` heading of
 `docs/VERIFICATION.txt`; `tools/verification.sh` regenerates the build-sandbox
 half, stamped with the commit it ran on.
 

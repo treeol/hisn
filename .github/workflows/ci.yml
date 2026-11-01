@@ -97,6 +97,8 @@ jobs:
       # them from the CI workspace so that exactly one log exists afterwards.
       - name: make leaktest-log
         id: leaktest
+        # A hang must fail fast and still leave a partial log to upload.
+        timeout-minutes: 15
         run: |
           rm -f docs/leaktest-host-*.log
           make leaktest-log

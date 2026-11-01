@@ -614,7 +614,7 @@ mod tests {
                     extra_deny: vec![],
                     landlock_scoped: vec![],
                     nofile: 321,
-                    nproc: 100_000,
+                    nproc: 2048, // lowering is always allowed; a larger value fails with EPERM under a low hard limit (CI)
                 };
                 let ok = set_rlimits(&p).is_ok() && {
                     let mut l: libc::rlimit = std::mem::zeroed();

@@ -31,6 +31,8 @@ pub enum Command {
     Ls(LsArgs),
     /// Dump the mount table and resolved policy of a session.
     Inspect(InspectArgs),
+    /// Run a command inside a running session (same namespaces and confinement).
+    Exec(ExecArgs),
     /// Signal the sandbox of a session.
     Kill(KillArgs),
     /// Report host capabilities required by hisn.
@@ -68,9 +70,53 @@ pub struct RunArgs {
     /// Initial grant, `PATH[:ro|rw]` (default ro). Repeatable.
     #[arg(long = "grant", value_name = "PATH[:ro|rw]")]
     pub grants: Vec<String>,
+    /// Start the session without a command: PID 1 only reaps, and the
+    /// session lives until `hisn kill` / SIGTERM. Use `hisn exec` to run things in it.
+    #[arg(long)]
+    pub detach: bool,
+    /// Command and arguments (required unless `--detach`).
+    #[arg(last = true, value_name = "CMD")]
+    pub command: Vec<String>,
+}
+
+impl RunArgs {
+    /// `--detach` and a command are mutually exclusive; one of them is required.
+    pub fn check_command(&self) -> Result<(), String> {
+        match (self.detach, self.command.is_empty()) {
+            (true, false) => Err("--detach starts a session without a command; \
+                                  run commands in it with `hisn exec`"
+                .into()),
+            (false, true) => Err("a command is required (or use --detach)".into()),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ExecArgs {
+    #[arg(long)]
+    pub session: String,
+    /// Working directory inside the sandbox (default: the session's cwd).
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// `K=V`, repeatable. Only keys the policy lists in `env.pass` are accepted;
+    /// anything else rejects the request.
+    #[arg(long = "env", value_name = "K=V")]
+    pub env: Vec<String>,
+    /// Run on a pty (allocated here, never the caller's own terminal).
+    #[arg(long)]
+    pub tty: bool,
     /// Command and arguments.
     #[arg(last = true, required = true, value_name = "CMD")]
     pub command: Vec<String>,
+}
+
+/// Parse `K=V` (the value may contain `=`; the name must be non-empty).
+pub fn parse_env_spec(spec: &str) -> Result<(String, String), String> {
+    match spec.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.to_owned(), v.to_owned())),
+        _ => Err(format!("expected K=V, got {spec:?}")),
+    }
 }
 
 #[derive(Debug, Args)]
@@ -203,10 +249,76 @@ mod tests {
         assert_eq!(r.grants, ["/x:rw", "/y"]);
         assert_eq!(r.network, Some(NetworkArg::Host));
         assert!(
-            Cli::try_parse_from(["hisn", "run"]).is_err(),
-            "command is required"
+            Cli::try_parse_from(["hisn", "run"]).is_ok_and(|c| match c.command {
+                Command::Run(r) => r.check_command().is_err(),
+                _ => false,
+            }),
+            "a command (or --detach) is required"
         );
         assert!(Cli::try_parse_from(["hisn", "run", "--network", "bridge", "--", "ls"]).is_err());
+    }
+
+    #[test]
+    fn detach_and_command_are_mutually_exclusive() {
+        let run = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
+            Command::Run(r) => r,
+            _ => panic!("not run"),
+        };
+        assert!(run(&["hisn", "run", "--detach"]).check_command().is_ok());
+        assert!(run(&["hisn", "run", "--", "ls"]).check_command().is_ok());
+        assert!(
+            run(&["hisn", "run", "--detach", "--", "ls"])
+                .check_command()
+                .is_err()
+        );
+        assert!(run(&["hisn", "run"]).check_command().is_err());
+    }
+
+    #[test]
+    fn exec_command_parses() {
+        let c = Cli::try_parse_from([
+            "hisn",
+            "exec",
+            "--session",
+            "s1",
+            "--cwd",
+            "/w",
+            "--env",
+            "A=1",
+            "--env",
+            "B=x=y",
+            "--tty",
+            "--",
+            "sh",
+            "-c",
+            "true",
+        ])
+        .unwrap();
+        let Command::Exec(e) = c.command else {
+            panic!("not exec")
+        };
+        assert_eq!(e.session, "s1");
+        assert_eq!(e.cwd.as_deref(), Some(std::path::Path::new("/w")));
+        assert_eq!(e.env, ["A=1", "B=x=y"]);
+        assert!(e.tty);
+        assert_eq!(e.command, ["sh", "-c", "true"]);
+        assert!(
+            Cli::try_parse_from(["hisn", "exec", "--session", "s"]).is_err(),
+            "command required"
+        );
+        assert!(
+            Cli::try_parse_from(["hisn", "exec", "--", "ls"]).is_err(),
+            "session required"
+        );
+    }
+
+    #[test]
+    fn env_specs() {
+        assert_eq!(parse_env_spec("A=1").unwrap(), ("A".into(), "1".into()));
+        assert_eq!(parse_env_spec("A=").unwrap(), ("A".into(), "".into()));
+        assert_eq!(parse_env_spec("A=b=c").unwrap(), ("A".into(), "b=c".into()));
+        assert!(parse_env_spec("=x").is_err());
+        assert!(parse_env_spec("nothing").is_err());
     }
 
     #[test]

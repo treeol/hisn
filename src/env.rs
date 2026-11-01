@@ -36,6 +36,13 @@ pub struct ScrubbedEnv {
     pub secretish_passed: Vec<String>,
 }
 
+/// Names the session computes itself (`HOME` and the cache variables): they
+/// can neither be passed through nor overridden, by `env.pass` or by an
+/// `exec` request (DESIGN §14.5).
+pub fn is_computed(name: &str) -> bool {
+    name == "HOME" || CACHE_VARS.iter().any(|(n, _)| *n == name)
+}
+
 pub fn looks_secret(name: &str) -> bool {
     let up = name.to_ascii_uppercase();
     SECRETISH.iter().any(|s| up.contains(s))
@@ -227,6 +234,17 @@ mod tests {
         assert_eq!(e.vars["GOFLAGS"], "-x");
         assert_eq!(e.vars["CI"], "1");
         assert_eq!(e.vars["CARGO_HOME"], format!("{SANDBOX_HOME}/.cargo"));
+    }
+
+    #[test]
+    fn computed_names_are_exactly_home_and_the_cache_vars() {
+        assert!(
+            is_computed("HOME") && is_computed("CARGO_HOME") && is_computed("npm_config_cache")
+        );
+        assert!(!is_computed("PATH") && !is_computed("GOFLAGS") && !is_computed("home"));
+        for (n, _) in CACHE_VARS {
+            assert!(is_computed(n), "{n}");
+        }
     }
 
     #[test]

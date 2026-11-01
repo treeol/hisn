@@ -234,6 +234,17 @@ pub fn dup_inheritable(fd: RawFd, min: RawFd) -> io::Result<OwnedFd> {
     Ok(owned(r as c_long))
 }
 
+/// Duplicate `fd` to a close-on-exec descriptor numbered >= `min`.
+pub fn dup_cloexec_min(fd: RawFd, min: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: fcntl F_DUPFD_CLOEXEC on a caller-owned fd.
+    let r = cvt_int(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, min) })?;
+    Ok(owned(r as c_long))
+}
+
+pub fn set_dumpable(on: bool) -> io::Result<()> {
+    prctl(4 /* PR_SET_DUMPABLE */, u64::from(on), 0, 0, 0).map(drop)
+}
+
 /// Mount id of the mount `fd` (or path) lives on, via `statx(STATX_MNT_ID)`.
 pub fn mnt_id(dirfd: RawFd, path: &CStr, flags: c_int) -> io::Result<u64> {
     // SAFETY: zeroed statx is a valid out-buffer.

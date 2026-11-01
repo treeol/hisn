@@ -5,7 +5,9 @@
 //! the operations themselves are supplied through [`Handler`], which keeps
 //! this module testable without namespaces.
 
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,6 +33,8 @@ pub const E_EXISTS: &str = "E_EXISTS";
 pub const E_NOT_GRANTED: &str = "E_NOT_GRANTED";
 pub const E_HELD: &str = "E_HELD";
 pub const E_INTERNAL: &str = "E_INTERNAL";
+/// The program could not be started (confinement failed, not found, not executable).
+pub const E_EXEC: &str = "E_EXEC";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -78,6 +82,23 @@ pub enum Request {
         #[serde(default = "term")]
         signal: String,
     },
+    /// Run a program inside the running session (DESIGN §14). The request
+    /// travels with its stdio descriptors (`SCM_RIGHTS`).
+    Exec {
+        argv: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        #[serde(default)]
+        tty: bool,
+    },
+    /// Signal a live exec'd program (by its in-sandbox pid, as returned by `exec`).
+    Signal {
+        pid: i32,
+        #[serde(default = "term")]
+        signal: String,
+    },
 }
 
 impl Request {
@@ -88,6 +109,8 @@ impl Request {
             Request::List {} => "list",
             Request::Inspect {} => "inspect",
             Request::Kill { .. } => "kill",
+            Request::Exec { .. } => "exec",
+            Request::Signal { .. } => "signal",
         }
     }
 
@@ -115,26 +138,60 @@ pub fn err(code: &str, message: impl Into<String>) -> Value {
     json!({ "ok": false, "error": code, "message": message.into() })
 }
 
-/// Signal name or number → signal number. `None` for unknown input.
+/// One table for both directions, so a name the supervisor prints is always a
+/// name the client (and `signal`) accepts.
+const SIGNALS: [(&str, i32); 30] = [
+    ("HUP", libc::SIGHUP),
+    ("INT", libc::SIGINT),
+    ("QUIT", libc::SIGQUIT),
+    ("ILL", libc::SIGILL),
+    ("TRAP", libc::SIGTRAP),
+    ("ABRT", libc::SIGABRT),
+    ("BUS", libc::SIGBUS),
+    ("FPE", libc::SIGFPE),
+    ("KILL", libc::SIGKILL),
+    ("USR1", libc::SIGUSR1),
+    ("SEGV", libc::SIGSEGV),
+    ("USR2", libc::SIGUSR2),
+    ("PIPE", libc::SIGPIPE),
+    ("ALRM", libc::SIGALRM),
+    ("TERM", libc::SIGTERM),
+    ("CHLD", libc::SIGCHLD),
+    ("CONT", libc::SIGCONT),
+    ("STOP", libc::SIGSTOP),
+    ("TSTP", libc::SIGTSTP),
+    ("TTIN", libc::SIGTTIN),
+    ("TTOU", libc::SIGTTOU),
+    ("URG", libc::SIGURG),
+    ("XCPU", libc::SIGXCPU),
+    ("XFSZ", libc::SIGXFSZ),
+    ("VTALRM", libc::SIGVTALRM),
+    ("PROF", libc::SIGPROF),
+    ("WINCH", libc::SIGWINCH),
+    ("IO", libc::SIGIO),
+    ("PWR", libc::SIGPWR),
+    ("SYS", libc::SIGSYS),
+];
+
+/// Signal name (with or without `SIG`, any case) or number → signal number.
+/// `None` for unknown input.
 pub fn parse_signal(s: &str) -> Option<i32> {
     if let Ok(n) = s.parse::<i32>() {
         return (1..=64).contains(&n).then_some(n);
     }
     let upper = s.to_ascii_uppercase();
     let name = upper.strip_prefix("SIG").unwrap_or(&upper);
-    Some(match name {
-        "HUP" => libc::SIGHUP,
-        "INT" => libc::SIGINT,
-        "QUIT" => libc::SIGQUIT,
-        "KILL" => libc::SIGKILL,
-        "USR1" => libc::SIGUSR1,
-        "USR2" => libc::SIGUSR2,
-        "TERM" => libc::SIGTERM,
-        "CONT" => libc::SIGCONT,
-        "STOP" => libc::SIGSTOP,
-        "WINCH" => libc::SIGWINCH,
-        _ => return None,
-    })
+    SIGNALS.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+}
+
+/// Signal number → the name clients print and send back (`TERM`, not
+/// `SIGTERM`); numbers without a name (real-time signals) stay numeric, which
+/// [`parse_signal`] accepts again.
+pub fn signal_name(n: i32) -> String {
+    SIGNALS
+        .iter()
+        .find(|(_, v)| *v == n)
+        .map_or_else(|| n.to_string(), |(name, _)| (*name).to_owned())
 }
 
 /// Operations behind the socket. Implemented by the supervisor.
@@ -142,7 +199,88 @@ pub trait Handler: Send + Sync + 'static {
     /// Decide whether this peer may talk to the socket (R5). Called on accept
     /// and again before every request. `Err` closes the connection.
     fn authorize(&self, peer: &UnixStream) -> Result<(), String>;
-    fn handle(&self, req: Request, peer: &UnixStream) -> Value;
+    /// Handle one request and return its (final) response line. `fds` are the
+    /// descriptors that arrived with the request: the server only lets them
+    /// through on the *first* request line of a connection and only for
+    /// `exec`, so every other handler can assume `fds` is empty. A handler may
+    /// write intermediate response lines to `conn` before returning the final
+    /// one (`exec`: `{"ok":true,"pid":N}`, later `{"exit":…}`).
+    fn handle(&self, req: Request, fds: Vec<OwnedFd>, conn: &UnixStream) -> Value;
+}
+
+/// One request line plus the descriptors that arrived with it.
+pub struct ReadLine {
+    pub line: String,
+    pub fds: Vec<OwnedFd>,
+}
+
+/// Line reader over a unix stream socket that also receives `SCM_RIGHTS`.
+///
+/// Every descriptor that arrives is owned from the moment of `recvmsg`, so a
+/// rejected request can never leak one. Descriptors received while a line is
+/// still incomplete are attached to that line when it completes. Truncated
+/// ancillary data is an error (a half-delivered descriptor set must never be
+/// used).
+pub struct FdLineReader {
+    fd: RawFd,
+    buf: Vec<u8>,
+    fds: Vec<OwnedFd>,
+}
+
+impl FdLineReader {
+    pub fn new(fd: RawFd) -> Self {
+        Self {
+            fd,
+            buf: Vec::new(),
+            fds: Vec::new(),
+        }
+    }
+
+    /// Bytes already read past the last returned line.
+    pub fn leftover(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// `Ok(None)` = clean EOF; `Err(InvalidData)` = oversized, non-UTF-8 or
+    /// truncated input.
+    pub fn next_line(&mut self) -> io::Result<Option<ReadLine>> {
+        loop {
+            if let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+                if pos > MAX_LINE {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+                }
+                let rest = self.buf.split_off(pos + 1);
+                let mut line = std::mem::replace(&mut self.buf, rest);
+                line.pop();
+                let line = String::from_utf8(line)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "line is not UTF-8"))?;
+                return Ok(Some(ReadLine {
+                    line,
+                    fds: std::mem::take(&mut self.fds),
+                }));
+            }
+            if self.buf.len() > MAX_LINE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+            }
+            let mut chunk = [0u8; 8192];
+            let r = match crate::sys::recv_with_fds(self.fd, &mut chunk) {
+                Ok(r) => r,
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => return Err(e),
+            };
+            self.fds.extend(r.fds);
+            if r.truncated {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ancillary data truncated",
+                ));
+            }
+            if r.len == 0 {
+                return Ok(None);
+            }
+            self.buf.extend_from_slice(&chunk[..r.len]);
+        }
+    }
 }
 
 /// Read one `\n`-terminated line of at most [`MAX_LINE`] bytes.
@@ -209,22 +347,40 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
     if h.authorize(&stream).is_err() {
         return;
     }
-    let Ok(read_half) = stream.try_clone() else {
-        return;
-    };
-    let mut reader = BufReader::new(read_half);
+    let mut reader = FdLineReader::new(stream.as_raw_fd());
     let mut out = &stream;
+    let mut lines = 0usize;
     loop {
-        let line = match read_line_limited(&mut reader) {
+        let ReadLine { line, fds } = match reader.next_line() {
             Ok(Some(l)) => l,
-            _ => return, // EOF, oversized, or malformed framing: close
+            _ => return, // EOF, oversized, truncated or malformed framing: close
         };
+        lines += 1;
         if h.authorize(&stream).is_err() {
             return;
         }
         let _inflight = Inflight::enter();
         let resp = match parse_request(&line) {
-            Ok(req) => h.handle(req, &stream),
+            Ok(req) => {
+                let is_exec = matches!(req, Request::Exec { .. });
+                // Descriptors are valid only with the first line of a
+                // connection and only for `exec`; `exec` itself must be the
+                // first line and must not be pipelined with further input.
+                let misuse = (!fds.is_empty() && !(is_exec && lines == 1))
+                    || (is_exec && (lines != 1 || reader.leftover() > 0));
+                if misuse {
+                    let _ = writeln!(
+                        out,
+                        "{}",
+                        err(
+                            E_BAD_REQUEST,
+                            "descriptors are only accepted with a first, unpipelined `exec` request"
+                        )
+                    );
+                    return; // `fds` dropped: every received descriptor is closed
+                }
+                h.handle(req, fds, &stream)
+            }
             // Unknown op / bad JSON closes the connection (POLICY-SPEC §7).
             Err(m) => {
                 let _ = writeln!(out, "{}", err(E_BAD_REQUEST, m));
@@ -308,6 +464,11 @@ mod tests {
             "",
             "not json",
             r#"{"op":"exec","cmd":"id"}"#,
+            r#"{"op":"exec"}"#,
+            r#"{"op":"exec","argv":"id"}"#,
+            r#"{"op":"exec","argv":["id"],"tty":"yes"}"#,
+            r#"{"op":"signal"}"#,
+            r#"{"op":"signal","pid":"1"}"#,
             r#"{"op":"grant"}"#,
             r#"{"op":"grant","path":"/a","mode":"rwx"}"#,
             r#"{"op":"list","extra":1}"#,
@@ -326,6 +487,15 @@ mod tests {
         assert_eq!(parse_signal("0"), None);
         assert_eq!(parse_signal("65"), None);
         assert_eq!(parse_signal("BOGUS"), None);
+    }
+
+    #[test]
+    fn signal_names_round_trip_through_parse_signal() {
+        for n in 1..=64 {
+            assert_eq!(parse_signal(&signal_name(n)), Some(n), "signal {n}");
+        }
+        assert_eq!(signal_name(libc::SIGTERM), "TERM");
+        assert_eq!(signal_name(40), "40");
     }
 
     #[test]
@@ -389,7 +559,7 @@ mod tests {
                 Err("denied".into())
             }
         }
-        fn handle(&self, req: Request, _: &UnixStream) -> Value {
+        fn handle(&self, req: Request, _: Vec<OwnedFd>, _: &UnixStream) -> Value {
             self.seen.lock().unwrap().push(req.op_name().to_owned());
             match req {
                 Request::List {} => ok(json!({"grants": []})),
@@ -450,7 +620,7 @@ mod tests {
             fn authorize(&self, _: &UnixStream) -> Result<(), String> {
                 Ok(())
             }
-            fn handle(&self, _: Request, _: &UnixStream) -> Value {
+            fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream) -> Value {
                 thread::sleep(Duration::from_millis(150));
                 ok(json!({"late": true}))
             }
@@ -478,10 +648,179 @@ mod tests {
     }
 
     #[test]
+    fn exec_requests_parse_with_defaults() {
+        assert_eq!(
+            parse_request(r#"{"op":"exec","argv":["sh","-c","true"]}"#).unwrap(),
+            Request::Exec {
+                argv: vec!["sh".into(), "-c".into(), "true".into()],
+                cwd: None,
+                env: BTreeMap::new(),
+                tty: false
+            }
+        );
+        let r =
+            parse_request(r#"{"op":"exec","argv":["x"],"cwd":"/w","env":{"K":"V"},"tty":true}"#)
+                .unwrap();
+        assert_eq!(
+            r,
+            Request::Exec {
+                argv: vec!["x".into()],
+                cwd: Some("/w".into()),
+                env: BTreeMap::from([("K".into(), "V".into())]),
+                tty: true
+            }
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"exec","argv":["x"],"cwd":null}"#).unwrap(),
+            Request::Exec {
+                argv: vec!["x".into()],
+                cwd: None,
+                env: BTreeMap::new(),
+                tty: false
+            }
+        );
+        assert_eq!(
+            parse_request(r#"{"op":"signal","pid":7}"#).unwrap(),
+            Request::Signal {
+                pid: 7,
+                signal: "TERM".into()
+            }
+        );
+    }
+
+    /// Handler that records what reached it and streams two lines for exec.
+    struct Recorder {
+        got: Mutex<Vec<(String, usize)>>,
+    }
+    impl Handler for Recorder {
+        fn authorize(&self, _: &UnixStream) -> Result<(), String> {
+            Ok(())
+        }
+        fn handle(&self, req: Request, fds: Vec<OwnedFd>, conn: &UnixStream) -> Value {
+            self.got
+                .lock()
+                .unwrap()
+                .push((req.op_name().to_owned(), fds.len()));
+            if matches!(req, Request::Exec { .. }) {
+                let mut w = conn;
+                writeln!(w, "{}", ok(json!({"pid": 5}))).unwrap();
+                return json!({"exit": {"code": 0}});
+            }
+            ok(json!({}))
+        }
+    }
+
+    fn start_recorder() -> (tempfile::TempDir, std::path::PathBuf, Arc<Recorder>) {
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("r.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let h = Arc::new(Recorder {
+            got: Mutex::new(vec![]),
+        });
+        let hc: Arc<dyn Handler> = h.clone();
+        thread::spawn(move || serve(l, hc));
+        (d, sock, h)
+    }
+
+    fn three_fds() -> Vec<std::fs::File> {
+        (0..3).map(|_| tempfile::tempfile().unwrap()).collect()
+    }
+
+    fn read_resp(r: &mut BufReader<UnixStream>) -> Option<Value> {
+        read_line_limited(r)
+            .ok()
+            .flatten()
+            .map(|l| serde_json::from_str(&l).unwrap())
+    }
+
+    #[test]
+    fn exec_with_descriptors_reaches_the_handler_and_streams_lines() {
+        let (_d, sock, h) = start_recorder();
+        let s = UnixStream::connect(&sock).unwrap();
+        let files = three_fds();
+        let raw: Vec<RawFd> = files.iter().map(AsRawFd::as_raw_fd).collect();
+        crate::sys::send_with_fds(
+            s.as_raw_fd(),
+            b"{\"op\":\"exec\",\"argv\":[\"true\"]}\n",
+            &raw,
+        )
+        .unwrap();
+        let mut r = BufReader::new(s);
+        assert_eq!(read_resp(&mut r).unwrap()["pid"], 5);
+        assert_eq!(read_resp(&mut r).unwrap()["exit"]["code"], 0);
+        assert_eq!(*h.got.lock().unwrap(), [("exec".to_owned(), 3)]);
+    }
+
+    #[test]
+    fn descriptors_with_any_other_op_are_refused_and_closed() {
+        let (_d, sock, h) = start_recorder();
+        let s = UnixStream::connect(&sock).unwrap();
+        let files = three_fds();
+        let raw: Vec<RawFd> = files.iter().map(AsRawFd::as_raw_fd).collect();
+        crate::sys::send_with_fds(s.as_raw_fd(), b"{\"op\":\"list\"}\n", &raw).unwrap();
+        let mut r = BufReader::new(s);
+        assert_eq!(read_resp(&mut r).unwrap()["error"], E_BAD_REQUEST);
+        assert!(read_resp(&mut r).is_none(), "connection closed");
+        assert!(h.got.lock().unwrap().is_empty(), "never dispatched");
+    }
+
+    #[test]
+    fn exec_must_be_the_first_line_and_not_pipelined() {
+        let (_d, sock, h) = start_recorder();
+        // second line
+        let s = UnixStream::connect(&sock).unwrap();
+        let mut w = &s;
+        writeln!(w, r#"{{"op":"list"}}"#).unwrap();
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        assert_eq!(read_resp(&mut r).unwrap()["ok"], true);
+        let files = three_fds();
+        let raw: Vec<RawFd> = files.iter().map(AsRawFd::as_raw_fd).collect();
+        crate::sys::send_with_fds(
+            s.as_raw_fd(),
+            b"{\"op\":\"exec\",\"argv\":[\"true\"]}\n",
+            &raw,
+        )
+        .unwrap();
+        assert_eq!(read_resp(&mut r).unwrap()["error"], E_BAD_REQUEST);
+        // pipelined: a further line in the same segment as the exec request
+        let s = UnixStream::connect(&sock).unwrap();
+        crate::sys::send_with_fds(
+            s.as_raw_fd(),
+            b"{\"op\":\"exec\",\"argv\":[\"true\"]}\n{\"op\":\"list\"}\n",
+            &raw,
+        )
+        .unwrap();
+        let mut r = BufReader::new(s);
+        assert_eq!(read_resp(&mut r).unwrap()["error"], E_BAD_REQUEST);
+        let seen = h.got.lock().unwrap().clone();
+        assert_eq!(seen, [("list".to_owned(), 0)], "no exec was dispatched");
+    }
+
+    #[test]
+    fn too_many_descriptors_are_rejected_not_truncated_into_a_valid_request() {
+        let (_d, sock, h) = start_recorder();
+        let s = UnixStream::connect(&sock).unwrap();
+        let files: Vec<_> = (0..6).map(|_| tempfile::tempfile().unwrap()).collect();
+        let raw: Vec<RawFd> = files.iter().map(AsRawFd::as_raw_fd).collect();
+        crate::sys::send_with_fds(
+            s.as_raw_fd(),
+            b"{\"op\":\"exec\",\"argv\":[\"true\"]}\n",
+            &raw,
+        )
+        .unwrap();
+        let mut r = BufReader::new(s);
+        assert!(
+            read_resp(&mut r).is_none(),
+            "connection closed, no response"
+        );
+        assert!(h.got.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn unknown_op_closes_the_connection() {
         let (_d, sock, h) = start(true);
         let mut s = UnixStream::connect(&sock).unwrap();
-        writeln!(s, r#"{{"op":"exec"}}"#).unwrap();
+        writeln!(s, r#"{{"op":"detonate"}}"#).unwrap();
         let mut r = BufReader::new(s.try_clone().unwrap());
         let resp: Value =
             serde_json::from_str(&read_line_limited(&mut r).unwrap().unwrap()).unwrap();

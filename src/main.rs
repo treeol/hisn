@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use hisn::cli::{Cli, Command, PolicyCommand};
 use hisn::policy::{self, Overrides, Policy};
-use hisn::{mounts, session, supervisor};
+use hisn::{execcli, mounts, session, supervisor};
 
 /// Exit code for hisn-internal errors (policy, host); distinct from a
 /// command's own exit status.
@@ -87,10 +87,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
         },
         Command::Run(args) => {
+            args.check_command().map_err(anyhow::Error::msg)?;
             let allow = args.allow_host_abstract_sockets;
             let code = supervisor::run(args, allow, cli.verbose)?;
             Ok(exit_u8(code))
         }
+        Command::Exec(a) => Ok(exit_u8(execcli::run(a)?)),
         Command::Grant(a) => {
             let mode = if a.rw { "rw" } else { "ro" };
             let r = supervisor::client_request(

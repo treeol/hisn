@@ -19,7 +19,7 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -29,6 +29,7 @@ use crate::alias;
 use crate::cli::{RunArgs, parse_grant_spec};
 use crate::control::{self, Handler, Mode, Request, err, ok};
 use crate::env as senv;
+use crate::exec::{self, ExecClient, ExecContext, ExecRules, NsFds};
 use crate::grant::{self, Grant, GrantTable, HelperClient, Holder, HolderKind, Rules};
 use crate::init::{self, InitConfig, MSG_ERROR, MSG_GO, MSG_READY, MSG_START};
 use crate::landlock;
@@ -113,6 +114,15 @@ struct Shared {
     audit: Audit,
     /// Serialises grant/revoke so audit order = execution order.
     op_lock: Mutex<()>,
+    // ---- exec (DESIGN §14)
+    exec: ExecClient,
+    exec_rules: ExecRules,
+    /// Spawns hold it shared until the program is inside init's tree; a hard
+    /// revoke takes it exclusively before sweeping (DESIGN §14.6, D22).
+    spawn_gate: RwLock<()>,
+    /// Live exec'd programs: in-sandbox pid → a handle on their status socket
+    /// (only used to deliver `signal`).
+    live: Mutex<std::collections::BTreeMap<i32, OwnedFd>>,
 }
 
 impl Shared {
@@ -259,6 +269,10 @@ impl Shared {
             drop(self.held.lock().expect("held").remove(&p));
 
             if hard {
+                // No spawn may be half-way between "sent to the helper" and
+                // "inside init's tree" while we sweep (D22). Poisoning cannot
+                // matter: the guarded value is `()`.
+                let _gate = self.spawn_gate.write().unwrap_or_else(|e| e.into_inner());
                 self.kill_all_except_init()
                     .map_err(|e| (control::E_INTERNAL.into(), e))?;
                 return Ok(ok(json!({ "guarantee": "hard", "holders": [] })));
@@ -413,6 +427,92 @@ impl Shared {
         out
     }
 
+    /// `exec`: validate, spawn through the helper, stream the exit status
+    /// (DESIGN §14). Writes `{"ok":true,"pid":N}` to `conn` itself and returns
+    /// the final `{"exit":…}` line (or an error response).
+    fn do_exec(
+        &self,
+        req: ExecRequest,
+        stdio: Vec<OwnedFd>,
+        conn: &UnixStream,
+        peer: Option<i32>,
+    ) -> Value {
+        let argv0 = req.argv.first().cloned().unwrap_or_default();
+        self.log("exec", "request", Some(&argv0), None, None, peer);
+        let fail = |code: &str, msg: String| {
+            self.log("exec", "result", Some(&argv0), None, Some(code), None);
+            err(code, msg)
+        };
+        let spec = match exec::validate(
+            req.argv,
+            req.cwd,
+            req.env,
+            req.tty,
+            stdio.len(),
+            &self.exec_rules,
+        ) {
+            Ok(s) => s,
+            Err(e) => return fail(control::E_BAD_REQUEST, e.to_string()),
+        };
+        let spawned = {
+            let _gate = self.spawn_gate.read().unwrap_or_else(|e| e.into_inner());
+            self.exec.spawn(&spec, stdio, exec::SPAWN_TIMEOUT)
+        };
+        let sp = match spawned {
+            Ok(sp) => sp,
+            Err(exec::SpawnError::Exec { message, .. }) => {
+                return fail(control::E_EXEC, message);
+            }
+            Err(exec::SpawnError::Internal(m)) => return fail(control::E_INTERNAL, m),
+        };
+        // Register for `signal` before the client learns the pid.
+        let registered = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3)
+            .ok()
+            .map(|h| {
+                self.live.lock().expect("live").insert(sp.pid, h);
+                sp.pid
+            });
+        let mut w = conn;
+        let started = writeln!(w, "{}", ok(json!({ "pid": sp.pid })));
+        let outcome = if started.is_ok() {
+            exec::drive(&sp.status, sp.pending, conn.as_raw_fd(), exec::CANCEL_GRACE)
+        } else {
+            // Client already gone: cancel through the normal path.
+            exec::drive(&sp.status, sp.pending, -1, std::time::Duration::ZERO)
+        };
+        if let Some(pid) = registered {
+            self.live.lock().expect("live").remove(&pid);
+        }
+        let (res, line) = match outcome {
+            exec::Outcome::Exited(exec::Exit::Code(c)) => ("ok", json!({ "exit": { "code": c } })),
+            exec::Outcome::Exited(exec::Exit::Signal(n)) => (
+                "ok",
+                json!({ "exit": { "signal": control::signal_name(n) } }),
+            ),
+            exec::Outcome::Lost => ("lost", json!({ "exit": { "lost": true } })),
+        };
+        self.log("exec", "result", Some(&argv0), None, Some(res), None);
+        line
+    }
+
+    /// `signal`: deliver to a live exec'd program of *this* session only.
+    fn do_signal(&self, pid: i32, signal: &str) -> Value {
+        let Some(sig) = control::parse_signal(signal) else {
+            return err(control::E_BAD_REQUEST, format!("unknown signal {signal:?}"));
+        };
+        let live = self.live.lock().expect("live");
+        let Some(h) = live.get(&pid) else {
+            return err(
+                control::E_NOT_FOUND,
+                format!("no running exec with pid {pid}"),
+            );
+        };
+        match sys::send_all(h.as_raw_fd(), exec::format_kill(sig).as_bytes()) {
+            Ok(()) => ok(json!({})),
+            Err(e) => err(control::E_INTERNAL, e.to_string()),
+        }
+    }
+
     fn inspect(&self) -> Value {
         match fs::read_to_string(format!("/proc/{}/mountinfo", self.init_pid)) {
             Ok(mi) => ok(json!({ "mountinfo": mi, "policy": self.resolved_toml })),
@@ -422,6 +522,14 @@ impl Shared {
             ),
         }
     }
+}
+
+/// The fields of an `exec` request, as they arrive from the control socket.
+struct ExecRequest {
+    argv: Vec<String>,
+    cwd: Option<String>,
+    env: std::collections::BTreeMap<String, String>,
+    tty: bool,
 }
 
 struct Ctl {
@@ -456,9 +564,26 @@ impl Handler for Ctl {
         decision
     }
 
-    fn handle(&self, req: Request, peer: &UnixStream) -> Value {
+    fn handle(&self, req: Request, fds: Vec<OwnedFd>, peer: &UnixStream) -> Value {
         let peer_pid = sys::peer_cred(peer.as_raw_fd()).ok().map(|(p, _)| p);
         match req {
+            Request::Exec {
+                argv,
+                cwd,
+                env,
+                tty,
+            } => self.sh.do_exec(
+                ExecRequest {
+                    argv,
+                    cwd,
+                    env,
+                    tty,
+                },
+                fds,
+                peer,
+                peer_pid,
+            ),
+            Request::Signal { pid, signal } => self.sh.do_signal(pid, &signal),
             Request::Grant {
                 path,
                 mode,
@@ -670,7 +795,8 @@ fn run_session(
 ) -> Result<i32> {
     sdir.write_resolved_policy(&policy.to_toml())?;
     let audit = Audit::open(&sdir.audit_path())?;
-    let tty = sys::isatty(0);
+    // A detached session has no command, hence no terminal to relay.
+    let tty = !args.detach && sys::isatty(0);
     let root_dir = sdir.path.join("root");
     fs::create_dir(&root_dir).context("creating root dir")?;
     let mut rules = static_rules(&plan, &policy, &roots);
@@ -703,6 +829,17 @@ fn run_session(
         eprintln!("hisn: warning: env.pass forwards {n}, which looks like a secret");
     }
 
+    let exec_rules = ExecRules {
+        env_pass: policy.env_pass.clone(),
+        base_env: scrub.vars.clone(),
+        default_cwd: policy.cwd.display().to_string(),
+    };
+    let exec_policy = policy.clone();
+    let exec_ll = ll.clone();
+    let exec_require_scope = landlock::scope_required(&policy, allow_host_abstract);
+    let exec_seccomp = seccomp_progs.clone();
+    let exec_net = policy.network == Network::None;
+
     let cfg = InitConfig {
         policy: policy.clone(),
         plan: plan.clone(),
@@ -713,6 +850,7 @@ fn run_session(
         argv: args.command.clone(),
         env: scrub.vars,
         use_pty: tty,
+        detach: args.detach,
         uid,
         gid,
     };
@@ -745,6 +883,19 @@ fn run_session(
 
     // ---- 4. namespace fds, GO, READY
     let mntns_fd = open_ns(pid, "mnt")?;
+    // The exec helper's namespaces, opened now like the mount namespace (D24).
+    let exec_ns = NsFds {
+        user: open_ns(pid, "user")?,
+        mnt: open_ns(pid, "mnt")?,
+        ipc: open_ns(pid, "ipc")?,
+        uts: open_ns(pid, "uts")?,
+        pid: open_ns(pid, "pid")?,
+        net: if exec_net {
+            Some(open_ns(pid, "net")?)
+        } else {
+            None
+        },
+    };
     let sandbox_pidns = sys::ns_inode(pid, "pid").context("sandbox pid namespace")?;
     sys::send_with_fd(sup_end.as_raw_fd(), &[MSG_GO], None)?;
     let mut buf = [0u8; 4096];
@@ -771,6 +922,13 @@ fn run_session(
     // ---- 5. persistent helper, forked while still single-threaded
     let helper = spawn_helper(&mntns_fd)?;
     drop(mntns_fd);
+    let exec_client = spawn_exec_helper(ExecContext {
+        policy: exec_policy,
+        landlock: exec_ll,
+        require_scope: exec_require_scope,
+        seccomp: exec_seccomp,
+        ns: exec_ns,
+    })?;
 
     // ---- 6. control thread, initial grants, START
     let listener = bind_socket(&sdir.socket_path())?;
@@ -785,12 +943,17 @@ fn run_session(
         helper: Mutex::new(helper),
         audit,
         op_lock: Mutex::new(()),
+        exec: exec_client,
+        exec_rules,
+        spawn_gate: RwLock::new(()),
+        live: Mutex::new(Default::default()),
     });
     let handler: Arc<dyn Handler> = Arc::new(Ctl {
         sh: Arc::clone(&shared),
     });
-    thread::spawn(move || control::serve(listener, handler));
-
+    // The initial grants go through the same code as dynamic ones, called
+    // directly: the socket is bound (clients queue in its backlog) but only
+    // accepts once the session is fully set up (DESIGN §14.7).
     for (path, mode) in &initial {
         let r = shared.do_grant(path, *mode, false, None);
         if r["ok"] != true {
@@ -803,6 +966,7 @@ fn run_session(
         }
     }
     sys::send_with_fd(sup_end.as_raw_fd(), &[MSG_START], None)?;
+    thread::spawn(move || control::serve(listener, handler));
 
     // ---- 7. relay + wait
     let code = relay_and_wait(pid, master, tty);
@@ -865,6 +1029,24 @@ fn spawn_helper(mntns: &OwnedFd) -> Result<HelperClient> {
     }
     drop(child_end);
     Ok(HelperClient::new(parent_end, pid))
+}
+
+/// Fork the exec helper `E` (still single-threaded, like the grant helper).
+fn spawn_exec_helper(ctx: ExecContext) -> Result<ExecClient> {
+    let (parent_end, child_end) = sys::socketpair_seqpacket()?;
+    // SAFETY: single-threaded at this point; the child runs only `helper_serve`.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error()).context("fork exec helper");
+    }
+    if pid == 0 {
+        drop(parent_end);
+        exec::helper_serve(child_end, ctx);
+    }
+    drop(child_end);
+    // The parent's copies of the namespace fds must not outlive this call.
+    drop(ctx);
+    Ok(ExecClient::new(parent_end))
 }
 
 fn reap(pid: i32) -> i32 {
@@ -973,7 +1155,7 @@ fn relay_and_wait(init_pid: i32, master: Option<OwnedFd>, tty: bool) -> i32 {
     status.unwrap_or_else(|| reap(init_pid))
 }
 
-fn resize_to(from_fd: RawFd, to_fd: RawFd) {
+pub(crate) fn resize_to(from_fd: RawFd, to_fd: RawFd) {
     // SAFETY: winsize ioctl round-trip with a zeroed buffer.
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -984,13 +1166,13 @@ fn resize_to(from_fd: RawFd, to_fd: RawFd) {
 }
 
 /// Puts a tty into raw mode; restores on drop (every exit path).
-struct RawTerm {
+pub(crate) struct RawTerm {
     fd: RawFd,
     saved: libc::termios,
 }
 
 impl RawTerm {
-    fn enter(fd: RawFd) -> Option<Self> {
+    pub(crate) fn enter(fd: RawFd) -> Option<Self> {
         // SAFETY: termios get/set on a tty fd with zeroed storage.
         unsafe {
             let mut t: libc::termios = std::mem::zeroed();
@@ -1188,6 +1370,7 @@ mod tests {
             network: Some(crate::cli::NetworkArg::Host),
             allow_host_abstract_sockets: false,
             grants: vec!["/x:rw".into(), "/y".into()],
+            detach: false,
             command: vec!["true".into()],
         };
         let p = prepare(&args, 1000).unwrap();

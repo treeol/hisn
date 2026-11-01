@@ -59,6 +59,9 @@ pub struct InitConfig {
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub use_pty: bool,
+    /// `hisn run --detach`: no command; after START init only reaps and waits
+    /// for a termination signal (sessions are then used through `exec`).
+    pub detach: bool,
     /// Caller's uid/gid in the supervisor's namespace; mapped 1:1 (single id).
     pub uid: u32,
     pub gid: u32,
@@ -128,10 +131,11 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     sig::install(&handled)?;
     let old = sig::block(&handled)?;
 
-    let prog = resolve_program(&cfg.argv[0], cfg.env.get("PATH").map(String::as_str), |p| {
+    let argv0 = cfg.argv.first().map(String::as_str).unwrap_or_default();
+    let prog = resolve_program(argv0, cfg.env.get("PATH").map(String::as_str), |p| {
         is_executable(p)
     })
-    .ok_or_else(|| anyhow!("{}: command not found", cfg.argv[0]));
+    .ok_or_else(|| anyhow!("{argv0}: command not found"));
     let argv_c = cstrings(cfg.argv.iter().map(String::as_str))?;
     let envp_c = cstrings(
         cfg.env
@@ -161,6 +165,10 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
         bail!("supervisor aborted the session");
     }
 
+    if cfg.detach {
+        drop(slave);
+        return Ok(supervise_detached(&old));
+    }
     // SAFETY: init is single-threaded; the child only makes raw syscalls then
     // execs or `_exit`s.
     let child = unsafe { libc::fork() };
@@ -206,6 +214,35 @@ fn supervise(child: libc::pid_t, old: &libc::sigset_t) -> i32 {
             return code;
         }
         sig::wait(old);
+    }
+}
+
+/// `--detach` PID 1: no command, only reaping. Returns 0 on
+/// `SIGTERM`/`SIGINT`/`SIGHUP`; the kernel then kills everything left in the
+/// pid namespace (this is what ends a detached session and every `exec`).
+fn supervise_detached(old: &libc::sigset_t) -> i32 {
+    loop {
+        for s in sig::take_pending() {
+            if matches!(s, libc::SIGTERM | libc::SIGINT | libc::SIGHUP) {
+                return 0;
+            }
+        }
+        reap_all();
+        sig::wait(old);
+    }
+}
+
+/// Reap every zombie child (PID 1 inherits all orphans of the namespace).
+fn reap_all() -> usize {
+    let mut n = 0;
+    loop {
+        let mut st = 0;
+        // SAFETY: waitpid with a valid out pointer.
+        let pid = unsafe { libc::waitpid(-1, &mut st, libc::WNOHANG) };
+        if pid <= 0 {
+            return n;
+        }
+        n += 1;
     }
 }
 
@@ -278,13 +315,13 @@ fn exec_command(
     }
 }
 
-fn cstrings<'a>(items: impl Iterator<Item = &'a str>) -> Result<Vec<CString>> {
+pub fn cstrings<'a>(items: impl Iterator<Item = &'a str>) -> Result<Vec<CString>> {
     items
         .map(|s| CString::new(s).map_err(|_| anyhow!("NUL byte in {s:?}")))
         .collect()
 }
 
-fn is_executable(p: &Path) -> bool {
+pub fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
@@ -311,7 +348,7 @@ pub fn write_id_maps(uid: u32, gid: u32) -> io::Result<()> {
     std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))
 }
 
-fn set_rlimits(p: &ResolvedPolicy) -> io::Result<()> {
+pub fn set_rlimits(p: &ResolvedPolicy) -> io::Result<()> {
     for (res, val) in [
         (libc::RLIMIT_NOFILE, p.nofile),
         (libc::RLIMIT_NPROC, p.nproc),
@@ -456,7 +493,7 @@ pub fn status_field(status: &str, key: &str) -> Option<String> {
 }
 
 /// Re-read our own state and fail closed unless the hardening took effect.
-fn verify_hardening() -> Result<()> {
+pub fn verify_hardening() -> Result<()> {
     let status =
         std::fs::read_to_string("/proc/self/status").context("reading /proc/self/status")?;
     caps_all_zero(&status).map_err(|e| anyhow!(e))?;

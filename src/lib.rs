@@ -5,6 +5,8 @@ pub mod check;
 pub mod cli;
 pub mod control;
 pub mod env;
+pub mod exec;
+pub mod execcli;
 pub mod grant;
 pub mod init;
 pub mod landlock;

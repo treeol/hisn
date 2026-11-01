@@ -506,10 +506,10 @@ fn cmd_kill_pid(pid: &str) -> String {
 
 /// Bind an abstract unix socket `@NAME` (L22: exec A binds, exec B connects).
 fn cmd_abs_sock_bind(name: &str) -> String {
+    // Abstract socket address: the first byte of sun_path is NUL, followed by
+    // the name.  CString rejects NUL-containing bytes, so use the raw slice.
     let addr_name = format!("\0hisn-leak-{name}");
-    let Ok(c_addr) = CString::new(addr_name.as_bytes()) else {
-        return "BAD_NAME".into();
-    };
+    let name_bytes = addr_name.as_bytes();
     // SAFETY: socket + bind with a valid sockaddr_un.
     unsafe {
         let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
@@ -518,7 +518,6 @@ fn cmd_abs_sock_bind(name: &str) -> String {
         }
         let mut addr: libc::sockaddr_un = std::mem::zeroed();
         addr.sun_family = libc::AF_UNIX as _;
-        let name_bytes = c_addr.as_bytes();
         if name_bytes.len() >= addr.sun_path.len() {
             libc::close(s);
             return "NAME_TOO_LONG".into();
@@ -553,9 +552,7 @@ fn cmd_abs_sock_bind(name: &str) -> String {
 /// Connect to an abstract unix socket `@NAME` (L22: exec B connects to A's socket).
 fn cmd_abs_sock_connect(name: &str) -> String {
     let addr_name = format!("\0hisn-leak-{name}");
-    let Ok(c_addr) = CString::new(addr_name.as_bytes()) else {
-        return "BAD_NAME".into();
-    };
+    let name_bytes = addr_name.as_bytes();
     // SAFETY: socket + connect with a valid sockaddr_un.
     unsafe {
         let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
@@ -564,7 +561,6 @@ fn cmd_abs_sock_connect(name: &str) -> String {
         }
         let mut addr: libc::sockaddr_un = std::mem::zeroed();
         addr.sun_family = libc::AF_UNIX as _;
-        let name_bytes = c_addr.as_bytes();
         if name_bytes.len() >= addr.sun_path.len() {
             libc::close(s);
             return "NAME_TOO_LONG".into();

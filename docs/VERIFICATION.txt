@@ -22,6 +22,9 @@ namespace-dependent code path is "not run" — see the table below.
 | `cargo test` (unit tests) | this commit | sandbox | 182 passed, 0 failed | — |
 | `python3 tests/leak/test_l8.py` (L8 comparator self-tests) | this commit | sandbox | 12 passed | — |
 | `hisn check` | this commit | sandbox | not run (needs userns) | — |
+| `make leaktest` (L1-L24), CI | c4acf20 (log header: tree clean) | GitHub Actions ubuntu-24.04, kernel 7.0.0-1017-azure | 174 passed, 0 failed, 1 skipped (L12), 5 weak (L1 probes of absent paths x3, L14 R5, L20 terminal refusal: stdin not a tty) | workflow artifact `leaktest-log-ubuntu-24.04`, run https://github.com/treeol/hisn/actions/runs/41342519623 (artifacts expire; counts recorded here) |
+| `make leaktest` (L1-L24), CI | c4acf20 (log header: tree clean) | GitHub Actions ubuntu-22.04, kernel 6.8.0-1070-azure | 171 passed, 0 failed, 4 skipped (L12; L23 and both L24 cases: Landlock ABI < 6), 5 weak (same as above) | workflow artifact `leaktest-log-ubuntu-22.04`, same run |
+| `cargo fmt/clippy (x86_64 + aarch64)/test`, CI | c4acf20 | GitHub Actions ubuntu-latest | passed | same run, job `check` |
 | `make leaktest` (L1-L24, incl. L24 B1 host-mode abstract scope; D25 root check exercised end-to-end by L15-L24) | 34947f4 | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 175 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5) | `docs/leaktest-host-2026-11-01.log` |
 
 ## Not verified in the build sandbox
@@ -85,7 +88,7 @@ so.  The log file column points at the `docs/leaktest-host-*.log` produced by
 * The code at 0bb206b is the code that was released-prepared: the release-prep
   commits after it change only workflow files, docs and Cargo.toml metadata.
 * Not run on that host in this record: aarch64; any other kernel/distro.
-  GitHub Actions (`.github/workflows/ci.yml`) has not run yet: Ubuntu 22.04 and
-  24.04 are "not run".
+  GitHub Actions results are recorded in the table above (first green run,
+  commit c4acf20).
 * musl targets do not compile (OPEN-POINTS P22); checked in the build sandbox
   with `cargo build --release --target x86_64-unknown-linux-musl`.

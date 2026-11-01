@@ -1,4 +1,5 @@
 # hisn leaktest host log
+# Redacted before publication: home path -> <user>, repo path -> <repo>, hostname -> <redacted>. No other edits.
 commit:  0bb206b2e466fadfdb4695e44d70fda5269d6b7a
 tree:    clean
 date:    2026-11-01T18:17:08Z

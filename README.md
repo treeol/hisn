@@ -21,8 +21,10 @@ rlimits. See [DESIGN §1](docs/DESIGN.md) and [OPEN-POINTS](docs/OPEN-POINTS.md)
 > **Status: v0.2, single-maintainer.** The leak suite (L1-L24) was last
 > recorded green on one Fedora x86_64 host (175 passed, 0 failed, 1 skipped,
 > 1 weak; [log](docs/leaktest-host-2026-11-01.log)). CI runs it on Ubuntu 22.04
-> and 24.04 (x86_64), and a release is only built after that passes; the first
-> CI run has not happened yet, so nothing is claimed for Ubuntu. aarch64 is
+> and 24.04 (x86_64), and a release is only built after that passes. The first
+> green CI run (commit c4acf20) gave 174 passed on 24.04 and 171 passed on
+> 22.04, both with 0 failed; on 22.04 the Landlock-scoping tests (L23, L24) skip
+> because the runner kernel's Landlock ABI is below 6. aarch64 is
 > cross-checked by clippy only: it has never been leak-tested, and CI starts
 > the aarch64 binary only for `--version` at release time. Details:
 > [docs/VERIFICATION.txt](docs/VERIFICATION.txt).

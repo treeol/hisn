@@ -15,7 +15,8 @@ Everything else does not exist (ENOENT), not "permission denied".
 > 7.2, x86_64, Landlock ABI 10): **167 passed, 0 failed, 1 skipped, 1 weak**.
 > The skip is L12 (needs write access to `/etc`) and the weak one is R5
 > end-to-end (unit-tested only, OPEN-POINTS P16) — both inferred from earlier
-> runs, since only the summary line was reported. Not run: aarch64, other
+> runs, since only the summary line was reported. L21-L23 (P17: cross-exec
+> signal/scope tests) are new and await the host run. Not run: aarch64, other
 > kernels or distros, and `make lint && make test` on that host after the last
 > changes. See [docs/VERIFICATION.txt](docs/VERIFICATION.txt).
 

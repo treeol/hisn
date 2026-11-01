@@ -586,9 +586,10 @@ if HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/
 
     # ---- L22: exec B can connect to exec A's abstract unix socket (P17: default no abstract scope)
     # exec A binds an abstract socket (blocks in accept); exec B connects.
-    timeout 10 ex --cwd "$CX" -- "$CX/leakprobe" abs-sock-bind l22 >/dev/null 2>&1 &
+    # (ex is a shell function: it carries its own `timeout 30`; `timeout ex` cannot exec it)
+    ex --cwd "$CX" -- "$CX/leakprobe" abs-sock-bind l22 >/dev/null 2>&1 &
     L22_BINDER=$!
-    sleep 0.5
+    sleep 1
     got=$(exq abs-sock-connect l22)
     case "$got" in
       OK*) pass "L22 exec B connects to exec A's abstract unix socket ($got)" ;;

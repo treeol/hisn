@@ -1,9 +1,9 @@
 # Verification record
 
 hisn version : 0.2.0
-commit       : 947460c9fddaed9c7fcd53076e1d001d2936661c
-worktree     : DIRTY (uncommitted: docs/OPEN-POINTS.md src/exec.rs tools/verification.sh )
-generated    : 2026-11-01T15:20:03Z by tools/verification.sh
+commit       : f3b73f46e751cfb14bab46f6e923d5c6f16698be
+worktree     : clean (docs/VERIFICATION.txt itself excluded)
+generated    : 2026-11-01T15:20:09Z by tools/verification.sh
 where        : build sandbox, uid 1000, Linux 7.2.13-200.fc44.x86_64 x86_64
 scope        : the results in this half are for the code at the commit above
 
@@ -11,10 +11,10 @@ scope        : the results in this half are for the code at the commit above
 clean
 
 ## cargo clippy --all-targets -- -D warnings (x86_64)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
 
 ## cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
 
 ## cargo test
 test result: ok. 175 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s

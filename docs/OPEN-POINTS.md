@@ -243,3 +243,26 @@ L15-L20. No third round is allowed. Disposition:
   *observe* `W`'s death (only `C`'s). If `W` ignored the EOF, a hard revoke
   would still sweep it (it is in init's tree), so the gate release is safe;
   the residual is only about prompt resource reaping. **[HOST-VERIFY]**.
+
+## Review log — v0.2.0 P17 implementation (round 2)
+
+**Round 2 (P17 implementation review)** — a *weak* round, recorded as such.
+One reviewer answered (`openai/gpt-6-astra`); the second
+(`anthropic/claude-fable-5.1`) was again cut off at `max_tokens`. The
+answering reviewer's copy of `docs/DESIGN.md` was again truncated before
+§14, and `src/exec.rs` was truncated at the start of `child_d()`, so it
+could not review the confinement sequence in §14.4 or the actual
+`child_d`/`child_w`/`child_p` chain. It reported **no BLOCKING finding** and
+explicitly did not approve §14. Its non-blocking findings are below; only
+finding #4 led to a code change (tightening `apply`'s `require_scope` check
+to test *abstract* scope specifically, not just any scope). No third round
+is allowed.
+
+| # | finding | triage | resolution |
+|---|---------|--------|-----------|
+| 1 | incomplete confinement comparison (§14.4 not shown) | NON-BLOCKING (review truncation) | §14.4 is in DESIGN.md on disk; the reviewer's copy was truncated. L15 checks `Seccomp: 2` + EPERM + no-write; filter identity is unit-tested. **[HOST-VERIFY]** |
+| 2 | root adoption asserted, not established | NON-BLOCKING (review truncation) | `fchdir_chdir_root` + the supervisor's `/proc/<init>/root` fd are in `exec.rs`/`supervisor.rs`; L9 tests symlink escapes, L15 re-tests stat of host paths via exec |
+| 3 | sibling-domain docs vs host-network behavior | NON-BLOCKING (clarification) | `LandlockScope` docs say default empty = execs may reach each other's abstract sockets; `network = "host"` forces `scope_abstract`. For `network = "none"` the net ns already isolates abstract sockets. For `network = "host"` with `scoped = []`: abstract scope is still applied (required by §7), so siblings *cannot* connect to each other's abstract sockets — but that is the pre-P17 behavior and the expected trade-off of host networking. L22 tests `network = "none"` (default session). **[HOST-VERIFY]** |
+| 4 | `apply(require_scope)` accepts any scope, not specifically abstract | NON-BLOCKING (defense-in-depth) | **fixed**: `apply` now checks `abstract_applied` (not just `scoped`) when `require_scope` is set, so a future plan that only set signal scope would still fail for `network = "host"` |
+| 5 | spawn teardown postcondition not established | NON-BLOCKING | `tear_down` kills `C`, closes the status socket (→ `W` kills `P`), waits bounded by `reap_grace`; `hand_over` failure poisons the channel. P21 covers the `W` residual. **[HOST-VERIFY]** |
+| 6 | PDEATHSIG result ignored; getppid==0 race | NON-BLOCKING | `C` checks `getppid()==0` after `PDEATHSIG` (race with parent death between fork and prctl). `D` also sets PDEATHSIG. Both are PDEATHSIG-chained to the supervisor/helper. **[HOST-VERIFY]** |

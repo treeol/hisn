@@ -120,10 +120,13 @@ pub fn apply(plan: &LandlockPlan, require_scope: bool) -> Result<(bool, bool), L
     let enforced = status.ruleset != landlock::RulesetStatus::NotEnforced;
     // Best-effort mode drops unsupported features silently, so "requested" is
     // not "applied": scoping counts only if the kernel's effective ABI has it.
-    let scoped = scope_handled
-        && enforced
+    let abi_ok = enforced
         && matches!(status.landlock, landlock::LandlockStatus::Available { effective_abi, .. } if effective_abi >= ABI::V6);
-    if require_scope && !scoped {
+    let scoped = scope_handled && abi_ok;
+    // `require_scope` is set by `scope_required` for `network = "host"`:
+    // what it demands is *abstract-socket* scoping (§7), not just any scope.
+    let abstract_applied = scope_abstract && abi_ok;
+    if require_scope && !abstract_applied {
         return Err(LandlockError::ScopeUnavailable);
     }
     Ok((enforced, scoped))

@@ -1,0 +1,825 @@
+//! Mount-plan derivation (DESIGN §4): a pure function of the resolved policy
+//! and a snapshot of host facts. `rootfs` executes the plan; `hisn inspect`
+//! output is compared against [`expected_targets`] (leak test L8).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::policy::{Home, ResolvedPolicy};
+
+/// Toolchain directories bound read-only when they exist on the host.
+pub const TOOLCHAIN_DIRS: [&str; 7] = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/opt"];
+/// `/nix` is handled alongside; kept separate so the list in the brief reads 1:1.
+pub const NIX_DIR: &str = "/nix";
+/// Sandbox home directory (DESIGN §4.4).
+pub const SANDBOX_HOME: &str = "/run/hisn/home";
+/// Device nodes bind-mounted into `/dev` (DESIGN §4.3).
+pub const DEV_NODES: [&str; 6] = ["null", "zero", "full", "random", "urandom", "tty"];
+
+pub const TMP_SIZE: u64 = 1 << 30;
+pub const RUN_SIZE: u64 = 64 << 20;
+pub const HOME_SIZE: u64 = 1 << 30;
+pub const ETC_SIZE: u64 = 4 << 20;
+pub const DEV_SIZE: u64 = 1 << 20;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryKind {
+    Dir,
+    File,
+    Symlink(String),
+}
+
+impl EntryKind {
+    fn of(path: &Path) -> Option<Self> {
+        let md = fs::symlink_metadata(path).ok()?;
+        let ft = md.file_type();
+        if ft.is_symlink() {
+            let t = fs::read_link(path).ok()?;
+            Some(Self::Symlink(t.to_string_lossy().into_owned()))
+        } else if ft.is_dir() {
+            Some(Self::Dir)
+        } else {
+            Some(Self::File)
+        }
+    }
+}
+
+/// Everything the planner needs to know about the host, snapshotted once.
+#[derive(Debug, Clone, Default)]
+pub struct HostFacts {
+    /// Existing toolchain top-level entries (`/usr`, `/bin`, …).
+    pub toolchain: BTreeMap<PathBuf, EntryKind>,
+    /// Top-level entries of the host `/etc` at session start.
+    pub etc: BTreeMap<String, EntryKind>,
+    /// Whether `/etc/ssl/private` exists (nested default mask).
+    pub ssl_private: bool,
+    /// Existing policy mask targets.
+    pub masks: BTreeMap<PathBuf, EntryKind>,
+    pub uid: u32,
+    pub gid: u32,
+    pub username: String,
+    /// Host resolver config content, copied only for `network = "host"`.
+    pub resolv_conf: Option<String>,
+}
+
+impl HostFacts {
+    /// Snapshot the real host. Impure; everything else in this module is pure.
+    pub fn probe(policy: &ResolvedPolicy, uid: u32, gid: u32, username: &str) -> Self {
+        let mut toolchain = BTreeMap::new();
+        for d in TOOLCHAIN_DIRS.iter().chain(std::iter::once(&NIX_DIR)) {
+            if let Some(k) = EntryKind::of(Path::new(d)) {
+                toolchain.insert(PathBuf::from(d), k);
+            }
+        }
+        let mut etc = BTreeMap::new();
+        if let Ok(rd) = fs::read_dir("/etc") {
+            for e in rd.flatten() {
+                if let (Some(name), Some(k)) = (
+                    e.file_name().to_str().map(str::to_owned),
+                    EntryKind::of(&e.path()),
+                ) {
+                    etc.insert(name, k);
+                }
+            }
+        }
+        let masks = policy
+            .mask
+            .iter()
+            .filter_map(|m| EntryKind::of(m).map(|k| (m.clone(), k)))
+            .collect();
+        let resolv_conf = (policy.network == crate::policy::Network::Host)
+            .then(|| fs::read_to_string("/etc/resolv.conf").ok())
+            .flatten();
+        Self {
+            toolchain,
+            etc,
+            ssl_private: Path::new("/etc/ssl/private").is_dir(),
+            masks,
+            uid,
+            gid,
+            username: username.to_owned(),
+            resolv_conf,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountKind {
+    /// Bind of `source` (same path as target unless stated), read-only.
+    BindRo {
+        recursive: bool,
+    },
+    BindRw {
+        recursive: bool,
+    },
+    Tmpfs {
+        size: u64,
+        mode: u32,
+        readonly: bool,
+    },
+    /// A symlink created inside a tmpfs (not a mount).
+    Symlink {
+        link_target: String,
+    },
+    /// File bound over with the sandbox's `/dev/null`.
+    MaskFile,
+    /// Directory covered by an empty read-only tmpfs.
+    MaskDir,
+    /// File with generated content, bound read-only over the target.
+    Generated {
+        content: String,
+    },
+    /// New procfs for the sandbox pid namespace.
+    Proc,
+    /// New devpts instance.
+    Devpts,
+    /// Bind of a host device node (source is the host `/dev/<name>`).
+    BindDevice,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountOp {
+    pub target: PathBuf,
+    pub source: Option<PathBuf>,
+    pub kind: MountKind,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PlanError {
+    #[error("{path}: would expose /etc outside the generated allowlist view (R3)")]
+    EtcOverlap { path: PathBuf },
+    #[error("{path}: lies inside the masked /etc entry {entry} (R3)")]
+    MaskedEtcOverlap { path: PathBuf, entry: String },
+    #[error("mask {path}: not inside any allowed tree")]
+    MaskOutsideTree { path: PathBuf },
+}
+
+/// True if a top-level `/etc` entry name is masked by default (brief:
+/// `/etc/ssh /etc/shadow /etc/gshadow /etc/sudoers /etc/sudoers.d /etc/krb5*
+/// /etc/*.key /etc/*.pem`, plus the `-` backup files of shadow/gshadow).
+pub fn etc_masked(name: &str) -> bool {
+    matches!(
+        name,
+        "ssh" | "shadow" | "shadow-" | "gshadow" | "gshadow-" | "sudoers" | "sudoers.d"
+    ) || name.starts_with("krb5")
+        || name.ends_with(".key")
+        || name.ends_with(".pem")
+}
+
+/// Entries of `/etc` that are generated, never bound from the host.
+/// (`resolv.conf` is generated only for `network = "host"`; otherwise absent.)
+fn etc_generated(name: &str) -> bool {
+    matches!(name, "passwd" | "group" | "resolv.conf")
+}
+
+fn depth(p: &Path) -> usize {
+    p.components().count()
+}
+
+fn op(target: impl Into<PathBuf>, source: Option<PathBuf>, kind: MountKind) -> MountOp {
+    MountOp {
+        target: target.into(),
+        source,
+        kind,
+    }
+}
+
+fn bind(p: &Path, kind_is_rw: bool, recursive: bool) -> MountOp {
+    let kind = if kind_is_rw {
+        MountKind::BindRw { recursive }
+    } else {
+        MountKind::BindRo { recursive }
+    };
+    op(p, Some(p.to_path_buf()), kind)
+}
+
+fn passwd_stub(f: &HostFacts, home: &str) -> String {
+    format!(
+        "{0}:x:{1}:{2}:{0}:{3}:/bin/sh\n",
+        f.username, f.uid, f.gid, home
+    )
+}
+
+fn group_stub(f: &HostFacts) -> String {
+    format!("{0}:x:{1}:\n", f.username, f.gid)
+}
+
+/// Does `p` equal or lie inside `/etc` (lexically)?
+fn under_etc(p: &Path) -> Option<&Path> {
+    p.strip_prefix("/etc").ok()
+}
+
+/// Derive the ordered, de-duplicated list of mount operations.
+///
+/// Ordering: parents before children (by path depth, stable), later
+/// declaration wins on an equal target. This keeps `/tmp` tmpfs before a cwd
+/// below it, and masks after the trees they cover.
+pub fn plan(policy: &ResolvedPolicy, facts: &HostFacts) -> Result<Vec<MountOp>, PlanError> {
+    let host_net = policy.network == crate::policy::Network::Host;
+    let mut ops: Vec<MountOp> = Vec::new();
+
+    // 1. Toolchain: ro, recursive; symlinked entries (e.g. /bin -> usr/bin)
+    //    are recreated as symlinks, never followed.
+    for (path, kind) in &facts.toolchain {
+        match kind {
+            EntryKind::Symlink(t) => ops.push(op(
+                path,
+                None,
+                MountKind::Symlink {
+                    link_target: t.clone(),
+                },
+            )),
+            _ => ops.push(bind(path, false, true)),
+        }
+    }
+
+    // 1b. /etc: tmpfs holding one entry per non-masked top-level host entry.
+    ops.push(op(
+        "/etc",
+        None,
+        MountKind::Tmpfs {
+            size: ETC_SIZE,
+            mode: 0o755,
+            readonly: false,
+        },
+    ));
+    for (name, kind) in &facts.etc {
+        if etc_masked(name) || etc_generated(name) {
+            continue;
+        }
+        let p = Path::new("/etc").join(name);
+        match kind {
+            EntryKind::Symlink(t) => ops.push(op(
+                p,
+                None,
+                MountKind::Symlink {
+                    link_target: t.clone(),
+                },
+            )),
+            _ => ops.push(bind(&p, false, true)),
+        }
+    }
+    let home_str = match &policy.home {
+        Home::Tmpfs | Home::Path(_) => SANDBOX_HOME,
+    };
+    ops.push(op(
+        "/etc/passwd",
+        None,
+        MountKind::Generated {
+            content: passwd_stub(facts, home_str),
+        },
+    ));
+    ops.push(op(
+        "/etc/group",
+        None,
+        MountKind::Generated {
+            content: group_stub(facts),
+        },
+    ));
+    if let (true, Some(c)) = (host_net, &facts.resolv_conf) {
+        ops.push(op(
+            "/etc/resolv.conf",
+            None,
+            MountKind::Generated { content: c.clone() },
+        ));
+    }
+    if facts.ssl_private && matches!(facts.etc.get("ssl"), Some(EntryKind::Dir)) {
+        ops.push(op("/etc/ssl/private", None, MountKind::MaskDir));
+    }
+
+    // 2. User binds. A bind may never re-expose /etc or a masked /etc entry.
+    let user_paths = policy
+        .ro
+        .iter()
+        .chain(&policy.rw)
+        .chain(std::iter::once(&policy.cwd));
+    for p in user_paths {
+        if let Some(rest) = under_etc(p) {
+            match rest.components().next() {
+                None => return Err(PlanError::EtcOverlap { path: p.clone() }),
+                Some(c) => {
+                    let name = c.as_os_str().to_string_lossy().into_owned();
+                    if etc_masked(&name) || etc_generated(&name) {
+                        return Err(PlanError::MaskedEtcOverlap {
+                            path: p.clone(),
+                            entry: name,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    for p in &policy.ro {
+        ops.push(bind(p, false, true));
+    }
+
+    // 3. Private tmpfs areas.
+    ops.push(op(
+        "/tmp",
+        None,
+        MountKind::Tmpfs {
+            size: TMP_SIZE,
+            mode: 0o1777,
+            readonly: false,
+        },
+    ));
+    ops.push(op(
+        "/run",
+        None,
+        MountKind::Tmpfs {
+            size: RUN_SIZE,
+            mode: 0o755,
+            readonly: false,
+        },
+    ));
+    match &policy.home {
+        Home::Tmpfs => ops.push(op(
+            SANDBOX_HOME,
+            None,
+            MountKind::Tmpfs {
+                size: HOME_SIZE,
+                mode: 0o700,
+                readonly: false,
+            },
+        )),
+        Home::Path(p) => ops.push(op(
+            SANDBOX_HOME,
+            Some(p.clone()),
+            MountKind::BindRw { recursive: false },
+        )),
+    }
+
+    // 4. cwd (rw, recursive) and extra rw binds (non-recursive).
+    ops.push(bind(&policy.cwd, true, true));
+    for p in &policy.rw {
+        ops.push(bind(p, true, false));
+    }
+
+    // 5. Policy masks, only where something exists to hide. Must lie inside a
+    //    tree bound above (otherwise the path does not exist in the sandbox
+    //    anyway, and a mask would just invent a mount point).
+    let tree_roots: Vec<PathBuf> = ops
+        .iter()
+        .filter(|o| !matches!(o.kind, MountKind::Symlink { .. }))
+        .map(|o| o.target.clone())
+        .collect();
+    for m in &policy.mask {
+        let Some(kind) = facts.masks.get(m) else {
+            continue;
+        };
+        if !tree_roots.iter().any(|r| m != r && m.starts_with(r)) && !tree_roots.contains(m) {
+            return Err(PlanError::MaskOutsideTree { path: m.clone() });
+        }
+        match kind {
+            EntryKind::Dir => ops.push(op(m, None, MountKind::MaskDir)),
+            EntryKind::File => ops.push(op(m, None, MountKind::MaskFile)),
+            EntryKind::Symlink(_) => ops.push(op(m, None, MountKind::MaskFile)),
+        }
+    }
+
+    // 6. /proc and /dev (the only mounts not under policy control).
+    ops.push(op("/proc", None, MountKind::Proc));
+    ops.push(op(
+        "/dev",
+        None,
+        MountKind::Tmpfs {
+            size: DEV_SIZE,
+            mode: 0o755,
+            readonly: false,
+        },
+    ));
+    for n in DEV_NODES {
+        let t = Path::new("/dev").join(n);
+        ops.push(op(&t, Some(t.clone()), MountKind::BindDevice));
+    }
+    ops.push(op("/dev/pts", None, MountKind::Devpts));
+    for (name, target) in [
+        ("ptmx", "pts/ptmx"),
+        ("fd", "/proc/self/fd"),
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+    ] {
+        ops.push(op(
+            Path::new("/dev").join(name),
+            None,
+            MountKind::Symlink {
+                link_target: target.into(),
+            },
+        ));
+    }
+
+    Ok(order_and_dedupe(ops))
+}
+
+/// Stable sort by depth (parents first), then drop earlier ops whose target
+/// is repeated by a later one (later declaration wins).
+fn order_and_dedupe(ops: Vec<MountOp>) -> Vec<MountOp> {
+    let mut indexed: Vec<(usize, MountOp)> = ops.into_iter().enumerate().collect();
+    // Later declaration wins: keep only the last op per target.
+    let mut last: BTreeMap<PathBuf, usize> = BTreeMap::new();
+    for (i, o) in &indexed {
+        last.insert(o.target.clone(), *i);
+    }
+    indexed.retain(|(i, o)| last[&o.target] == *i);
+    // Parents before children. Declaration order breaks ties, which also keeps
+    // `/etc` (tmpfs) before `/etc/<entry>` since depth already orders them.
+    indexed.sort_by_key(|(i, o)| (depth(&o.target), *i));
+    indexed.into_iter().map(|(_, o)| o).collect()
+}
+
+/// Mount targets the sandbox must show in its mount table (symlinks excluded).
+/// Generated files are bound mounts and count. Used by L8 / `hisn inspect`.
+pub fn expected_targets(plan: &[MountOp]) -> BTreeSet<PathBuf> {
+    plan.iter()
+        .filter(|o| !matches!(o.kind, MountKind::Symlink { .. }))
+        .map(|o| o.target.clone())
+        .collect()
+}
+
+/// Directories that must exist (as plain tmpfs directories) before `op` can be
+/// mounted: every proper ancestor of its target.
+pub fn ancestors(target: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = target
+        .ancestors()
+        .skip(1)
+        .filter(|a| *a != Path::new("/") && !a.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect();
+    v.reverse();
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{Network, ResolvedPolicy};
+
+    fn pol(cwd: &str) -> ResolvedPolicy {
+        ResolvedPolicy {
+            version: "hisn-policy/v1".into(),
+            cwd: cwd.into(),
+            home: Home::Tmpfs,
+            network: Network::None,
+            hostname: "hisn".into(),
+            ro: vec![],
+            rw: vec![],
+            mask: vec![],
+            grantable_rw: vec![],
+            env_pass: vec![],
+            env_set: Default::default(),
+            extra_deny: vec![],
+            nofile: 1,
+            nproc: 1,
+        }
+    }
+
+    fn facts() -> HostFacts {
+        let mut f = HostFacts {
+            uid: 1000,
+            gid: 1000,
+            username: "u".into(),
+            ..Default::default()
+        };
+        for d in ["/usr", "/lib64", "/opt"] {
+            f.toolchain.insert(d.into(), EntryKind::Dir);
+        }
+        f.toolchain
+            .insert("/bin".into(), EntryKind::Symlink("usr/bin".into()));
+        for (n, k) in [
+            ("passwd", EntryKind::File),
+            ("group", EntryKind::File),
+            ("shadow", EntryKind::File),
+            ("ssh", EntryKind::Dir),
+            ("a.key", EntryKind::File),
+            ("b.pem", EntryKind::File),
+            ("krb5.conf", EntryKind::File),
+            ("sudoers.d", EntryKind::Dir),
+            ("ssl", EntryKind::Dir),
+            ("hosts", EntryKind::File),
+            (
+                "os-release",
+                EntryKind::Symlink("../usr/lib/os-release".into()),
+            ),
+            ("resolv.conf", EntryKind::File),
+        ] {
+            f.etc.insert(n.into(), k);
+        }
+        f.ssl_private = true;
+        f
+    }
+
+    fn targets(ops: &[MountOp]) -> Vec<String> {
+        ops.iter().map(|o| o.target.display().to_string()).collect()
+    }
+
+    fn find<'a>(ops: &'a [MountOp], t: &str) -> Option<&'a MountOp> {
+        ops.iter().find(|o| o.target == Path::new(t))
+    }
+
+    #[test]
+    fn default_masks_match_the_brief() {
+        for n in [
+            "ssh",
+            "shadow",
+            "gshadow",
+            "sudoers",
+            "sudoers.d",
+            "krb5.conf",
+            "krb5.keytab",
+            "x.key",
+            "x.pem",
+        ] {
+            assert!(etc_masked(n), "{n}");
+        }
+        for n in [
+            "ssl",
+            "hosts",
+            "passwd",
+            "ld.so.cache",
+            "keyboard",
+            "pemfile",
+        ] {
+            assert!(!etc_masked(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn etc_is_an_allowlist_without_secrets() {
+        let ops = plan(&pol("/work/p"), &facts()).unwrap();
+        let t = targets(&ops);
+        for secret in [
+            "/etc/shadow",
+            "/etc/ssh",
+            "/etc/a.key",
+            "/etc/b.pem",
+            "/etc/krb5.conf",
+            "/etc/sudoers.d",
+        ] {
+            assert!(
+                !t.contains(&secret.to_string()),
+                "{secret} must not be mounted"
+            );
+        }
+        assert!(find(&ops, "/etc").is_some_and(|o| matches!(o.kind, MountKind::Tmpfs { .. })));
+        assert!(
+            find(&ops, "/etc/hosts")
+                .is_some_and(|o| o.kind == MountKind::BindRo { recursive: true })
+        );
+        assert!(
+            find(&ops, "/etc/os-release")
+                .is_some_and(|o| matches!(o.kind, MountKind::Symlink { .. }))
+        );
+        assert!(find(&ops, "/etc/ssl/private").is_some_and(|o| o.kind == MountKind::MaskDir));
+        // generated stubs, not host files
+        let passwd = find(&ops, "/etc/passwd").unwrap();
+        assert_eq!(
+            passwd.kind,
+            MountKind::Generated {
+                content: "u:x:1000:1000:u:/run/hisn/home:/bin/sh\n".into()
+            }
+        );
+        assert!(passwd.source.is_none());
+        assert_eq!(
+            find(&ops, "/etc/group").unwrap().kind,
+            MountKind::Generated {
+                content: "u:x:1000:\n".into()
+            }
+        );
+        // network none: no resolv.conf at all
+        assert!(find(&ops, "/etc/resolv.conf").is_none());
+    }
+
+    #[test]
+    fn resolv_conf_only_for_host_network() {
+        let mut p = pol("/work/p");
+        p.network = Network::Host;
+        let mut f = facts();
+        f.resolv_conf = Some("nameserver 1.1.1.1\n".into());
+        let ops = plan(&p, &f).unwrap();
+        assert_eq!(
+            find(&ops, "/etc/resolv.conf").unwrap().kind,
+            MountKind::Generated {
+                content: "nameserver 1.1.1.1\n".into()
+            }
+        );
+    }
+
+    #[test]
+    fn toolchain_is_ro_and_symlinks_are_recreated() {
+        let ops = plan(&pol("/work/p"), &facts()).unwrap();
+        assert_eq!(
+            find(&ops, "/usr").unwrap().kind,
+            MountKind::BindRo { recursive: true }
+        );
+        assert_eq!(
+            find(&ops, "/usr").unwrap().source.as_deref(),
+            Some(Path::new("/usr"))
+        );
+        assert_eq!(
+            find(&ops, "/bin").unwrap().kind,
+            MountKind::Symlink {
+                link_target: "usr/bin".into()
+            }
+        );
+        // absent toolchain dirs produce nothing
+        assert!(find(&ops, "/nix").is_none());
+        assert!(find(&ops, "/lib32").is_none());
+        // never mounted: /var /sys /home /root
+        for n in ["/var", "/sys", "/home", "/root"] {
+            assert!(find(&ops, n).is_none(), "{n}");
+        }
+    }
+
+    #[test]
+    fn cwd_is_rw_recursive_at_identical_path_and_parents_come_first() {
+        let ops = plan(&pol("/tmp/proj"), &facts()).unwrap();
+        let cwd = find(&ops, "/tmp/proj").unwrap();
+        assert_eq!(cwd.kind, MountKind::BindRw { recursive: true });
+        assert_eq!(cwd.source.as_deref(), Some(Path::new("/tmp/proj")));
+        let pos = |t: &str| ops.iter().position(|o| o.target == Path::new(t)).unwrap();
+        assert!(
+            pos("/tmp") < pos("/tmp/proj"),
+            "tmpfs /tmp must precede cwd below it"
+        );
+        assert!(pos("/run") < pos(SANDBOX_HOME));
+        assert!(pos("/etc") < pos("/etc/hosts"));
+        assert!(pos("/dev") < pos("/dev/null") && pos("/dev") < pos("/dev/pts"));
+    }
+
+    #[test]
+    fn cwd_equal_to_tmp_replaces_the_private_tmp() {
+        let ops = plan(&pol("/tmp"), &facts()).unwrap();
+        let tmp: Vec<_> = ops
+            .iter()
+            .filter(|o| o.target == Path::new("/tmp"))
+            .collect();
+        assert_eq!(tmp.len(), 1);
+        assert_eq!(tmp[0].kind, MountKind::BindRw { recursive: true });
+    }
+
+    #[test]
+    fn home_modes() {
+        let ops = plan(&pol("/work/p"), &facts()).unwrap();
+        assert!(matches!(
+            find(&ops, SANDBOX_HOME).unwrap().kind,
+            MountKind::Tmpfs { mode: 0o700, .. }
+        ));
+        let mut p = pol("/work/p");
+        p.home = Home::Path("/cache/home".into());
+        let ops = plan(&p, &facts()).unwrap();
+        let h = find(&ops, SANDBOX_HOME).unwrap();
+        assert_eq!(h.kind, MountKind::BindRw { recursive: false });
+        assert_eq!(h.source.as_deref(), Some(Path::new("/cache/home")));
+    }
+
+    #[test]
+    fn extra_ro_rw_binds() {
+        let mut p = pol("/work/p");
+        p.ro = vec!["/opt/toolchains".into()];
+        p.rw = vec!["/data/out".into()];
+        let ops = plan(&p, &facts()).unwrap();
+        assert_eq!(
+            find(&ops, "/opt/toolchains").unwrap().kind,
+            MountKind::BindRo { recursive: true }
+        );
+        assert_eq!(
+            find(&ops, "/data/out").unwrap().kind,
+            MountKind::BindRw { recursive: false }
+        );
+    }
+
+    #[test]
+    fn masks_apply_after_their_tree_and_by_kind() {
+        let mut p = pol("/work/p");
+        p.mask = vec![
+            "/work/p/.secrets".into(),
+            "/work/p/.env".into(),
+            "/work/p/absent".into(),
+        ];
+        let mut f = facts();
+        f.masks.insert("/work/p/.secrets".into(), EntryKind::Dir);
+        f.masks.insert("/work/p/.env".into(), EntryKind::File);
+        let ops = plan(&p, &f).unwrap();
+        assert_eq!(
+            find(&ops, "/work/p/.secrets").unwrap().kind,
+            MountKind::MaskDir
+        );
+        assert_eq!(
+            find(&ops, "/work/p/.env").unwrap().kind,
+            MountKind::MaskFile
+        );
+        assert!(
+            find(&ops, "/work/p/absent").is_none(),
+            "absent paths are skipped"
+        );
+        let pos = |t: &str| ops.iter().position(|o| o.target == Path::new(t)).unwrap();
+        assert!(pos("/work/p") < pos("/work/p/.secrets"));
+    }
+
+    #[test]
+    fn mask_outside_any_tree_is_an_error() {
+        let mut p = pol("/work/p");
+        p.mask = vec!["/srv/thing".into()];
+        let mut f = facts();
+        f.masks.insert("/srv/thing".into(), EntryKind::File);
+        assert_eq!(
+            plan(&p, &f).unwrap_err(),
+            PlanError::MaskOutsideTree {
+                path: "/srv/thing".into()
+            }
+        );
+    }
+
+    #[test]
+    fn user_binds_cannot_reexpose_etc_or_masked_entries() {
+        for (path, is_masked) in [
+            ("/etc", false),
+            ("/etc/ssh", true),
+            ("/etc/ssh/keys", true),
+            ("/etc/a.key", true),
+            ("/etc/passwd", true),
+        ] {
+            let mut p = pol("/work/p");
+            p.ro = vec![path.into()];
+            let e = plan(&p, &facts()).unwrap_err();
+            if is_masked {
+                assert!(
+                    matches!(e, PlanError::MaskedEtcOverlap { .. }),
+                    "{path}: {e}"
+                );
+            } else {
+                assert!(matches!(e, PlanError::EtcOverlap { .. }), "{path}: {e}");
+            }
+        }
+        // cwd and rw too
+        let p = pol("/etc/ssh");
+        assert!(plan(&p, &facts()).is_err());
+        let mut p = pol("/work/p");
+        p.rw = vec!["/etc".into()];
+        assert!(plan(&p, &facts()).is_err());
+        // an unmasked etc subpath is fine
+        let mut p = pol("/work/p");
+        p.ro = vec!["/etc/ssl/certs".into()];
+        assert!(plan(&p, &facts()).is_ok());
+    }
+
+    #[test]
+    fn proc_dev_are_fixed_and_complete() {
+        let ops = plan(&pol("/work/p"), &facts()).unwrap();
+        assert_eq!(find(&ops, "/proc").unwrap().kind, MountKind::Proc);
+        let dev: Vec<_> = ops
+            .iter()
+            .filter(|o| o.target.starts_with("/dev") && o.target != Path::new("/dev"))
+            .map(|o| o.target.file_name().unwrap().to_str().unwrap().to_owned())
+            .collect();
+        let mut got = dev.clone();
+        got.sort();
+        let mut want: Vec<String> = [
+            "null", "zero", "full", "random", "urandom", "tty", "pts", "ptmx", "fd", "stdin",
+            "stdout", "stderr",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        want.sort();
+        assert_eq!(got, want);
+        assert!(find(&ops, "/sys").is_none());
+    }
+
+    #[test]
+    fn expected_targets_excludes_symlinks_and_is_exact() {
+        let ops = plan(&pol("/work/p"), &facts()).unwrap();
+        let exp = expected_targets(&ops);
+        assert!(exp.contains(Path::new("/usr")));
+        assert!(exp.contains(Path::new("/etc/hosts")));
+        assert!(exp.contains(Path::new("/work/p")));
+        assert!(!exp.contains(Path::new("/bin")), "symlink");
+        assert!(!exp.contains(Path::new("/etc/os-release")), "symlink");
+        assert!(!exp.contains(Path::new("/dev/stdin")), "symlink");
+        assert_eq!(
+            exp.len(),
+            ops.iter()
+                .filter(|o| !matches!(o.kind, MountKind::Symlink { .. }))
+                .count()
+        );
+    }
+
+    #[test]
+    fn plan_is_deterministic() {
+        assert_eq!(
+            plan(&pol("/work/p"), &facts()),
+            plan(&pol("/work/p"), &facts())
+        );
+    }
+
+    #[test]
+    fn ancestors_exclude_root_and_self() {
+        assert_eq!(
+            ancestors(Path::new("/a/b/c")),
+            vec![PathBuf::from("/a"), PathBuf::from("/a/b")]
+        );
+        assert!(ancestors(Path::new("/a")).is_empty());
+    }
+}

@@ -93,14 +93,15 @@ shows the whole run, the second only its tail, so it has no L1-L14 lines).
   1 skipped, 3 weak. Exec confinement checks pass through `hisn exec`
   (L15: ENOENT paths, EPERM syscalls, EROFS, /dev, /sys, symlink escape, env
   scrubbing, write in cwd), L16 grants before/during exec, L17 pid-ns view and
-  session-end death, L18 env rejection. The 4 failures were **test bugs**, not
-  product bugs: L15 `env passed var` (the detached session was started without
+  session-end death, L18 env rejection. The 4 failures are diagnosed as **test bugs**, not
+  product bugs (diagnosis from the output, not re-run): L15 `env passed var` (the detached session was started without
   the host env that the test then expected to be passed), L17 `ppid=1`
   (the program is a grandchild of init: observed `pid=88 ppid=87`, which is
   the P -> W -> init chain of DESIGN §14.3 / D21), L16 `revoked path` (stat of
-  a path that was never revoked), L19 `50 sequential` (the loop inherited the
-  caller's terminal, which `hisn exec` refuses by design; the concurrent
-  variant, run in background jobs, passed).
+  a path that was never revoked), L19 `50 sequential` ([inferred - confirm] the
+  loop inherited the caller's terminal, which `hisn exec` refuses by design
+  with exit 125; the concurrent variant ran as background jobs, whose stdin is
+  /dev/null, and passed).
 * Fixed in the tests since (**unrun on any host**): L15 starts the detached
   session with the host env; L17 asserts the 3-pid chain `P -> W -> 1`;
   L16 checks the revoked path and an unrevoked one; L19 reads the

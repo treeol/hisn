@@ -348,6 +348,104 @@ pub fn socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
+pub fn unshare(flags: c_int) -> io::Result<()> {
+    // SAFETY: plain syscall; the caller guarantees the process is single-threaded
+    // when `CLONE_NEWUSER` is requested (the kernel enforces it with EINVAL).
+    cvt_int(unsafe { libc::unshare(flags) }).map(drop)
+}
+
+/// `clone(2)` without a new stack or `CLONE_VM`: fork semantics plus
+/// namespace flags. Returns `0` in the child, the child's pid in the parent.
+///
+/// # Safety
+/// Like `fork`: the caller must be single-threaded, and the child may only
+/// run code that is safe after fork (here: our own init, which never returns
+/// into the parent's runtime state).
+pub unsafe fn clone_ns(flags: c_int) -> io::Result<libc::pid_t> {
+    // Argument order differs per arch for ptid/ctid/tls, but all are unused (0).
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_clone,
+            (flags | libc::SIGCHLD) as c_ulong,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    cvt(r).map(|p| p as libc::pid_t)
+}
+
+pub fn isatty(fd: RawFd) -> bool {
+    // SAFETY: isatty only inspects the descriptor.
+    unsafe { libc::isatty(fd) == 1 }
+}
+
+/// Peer credentials of a connected unix socket: `(pid, uid)`.
+pub fn peer_cred(fd: RawFd) -> io::Result<(i32, u32)> {
+    let mut c = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: valid out pointers of the sizes passed.
+    cvt_int(unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut c as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    })?;
+    Ok((c.pid, c.uid))
+}
+
+/// `SO_PEERPIDFD` (Linux 6.5+): a pidfd pinning the peer process.
+pub fn peer_pidfd(fd: RawFd) -> io::Result<OwnedFd> {
+    const SO_PEERPIDFD: c_int = 77;
+    let mut out: c_int = -1;
+    let mut len = std::mem::size_of::<c_int>() as libc::socklen_t;
+    // SAFETY: valid out pointers of the sizes passed.
+    cvt_int(unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_PEERPIDFD,
+            (&mut out as *mut c_int).cast(),
+            &mut len,
+        )
+    })?;
+    // SAFETY: the kernel returned a fresh descriptor that we now own.
+    Ok(unsafe { OwnedFd::from_raw_fd(out) })
+}
+
+/// Is the process behind `pidfd` still alive (signal 0 via the pidfd)?
+pub fn pidfd_alive(pidfd: RawFd) -> bool {
+    // SAFETY: signal 0 performs only the permission/existence check.
+    unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd, 0, 0usize, 0) == 0 }
+}
+
+pub fn kill(pid: i32, sig: c_int) -> io::Result<()> {
+    // SAFETY: plain kill(2).
+    cvt_int(unsafe { libc::kill(pid, sig) }).map(drop)
+}
+
+/// `ppoll` with an atomically-installed signal mask and no timeout.
+pub fn ppoll(fds: &mut [libc::pollfd], mask: &libc::sigset_t) -> io::Result<usize> {
+    // SAFETY: `fds` is a valid slice; `mask` a valid sigset; no timeout.
+    let r = unsafe {
+        libc::ppoll(
+            fds.as_mut_ptr(),
+            fds.len() as libc::nfds_t,
+            std::ptr::null(),
+            mask,
+        )
+    };
+    cvt_int(r).map(|n| n as usize)
+}
+
 /// `PathBuf`-free convenience: `path` relative to `/` (strip leading slashes).
 pub fn rel_to_root(p: &Path) -> &Path {
     p.strip_prefix("/").unwrap_or(p)

@@ -14,4 +14,5 @@ pub mod rootfs;
 pub mod seccomp;
 pub mod session;
 pub mod sig;
+pub mod supervisor;
 pub mod sys;

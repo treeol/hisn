@@ -305,27 +305,38 @@ pub fn parse_helper_cmd(line: &str) -> Option<HelperCmd> {
         .then(|| HelperCmd::Grant(PathBuf::from(p)))
 }
 
-/// Fixed fd layout of the helper process (set up by the supervisor).
-pub const HELPER_FD_MNTNS: RawFd = 3;
-/// Detached tree (grant) or mount-root fd (revoke).
-pub const HELPER_FD_OBJECT: RawFd = 4;
-/// Socket to report the result: `ok <mount-id>` + optional fd.
-pub const HELPER_FD_REPLY: RawFd = 5;
+/// Persistent helper (DESIGN §10, D17). Forked by the supervisor once, after
+/// the sandbox reported ready and **before any thread exists**, so it may use
+/// the full Rust runtime. It stays in the supervisor's user namespace S and
+/// joins only the sandbox mount namespace: S is the owner-ancestor of the
+/// sandbox userns, so the helper has `CAP_SYS_ADMIN` over that mntns *and*
+/// over the anonymous trees the supervisor creates with `open_tree`. (A
+/// re-exec'd helper would lose its capabilities on `execve`, and joining the
+/// sandbox userns would drop its authority over the detached tree.)
+///
+/// Wire protocol over the socketpair: request = `grant <abs path>` or
+/// `revoke` plus exactly one fd (the detached tree, or the mount-root fd);
+/// reply = `ok <mount id>` (+ the attached mount-root fd for grants) or
+/// `err <errno> <message>`. EOF on the socket ends the helper.
+///
+/// After `setns` the helper's `/proc` is the sandbox's procfs, where
+/// `/proc/self` does not resolve (it lives outside that pid namespace), so no
+/// `/proc/self/...` path may be used here.
+pub fn helper_serve(sock: OwnedFd, mntns: OwnedFd) -> ! {
+    let code = match helper_loop(&sock, &mntns) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("hisn helper: {e}");
+            1
+        }
+    };
+    // SAFETY: terminate without running the parent's atexit machinery.
+    unsafe { libc::_exit(code) }
+}
 
-/// Entry point of `hisn __helper <cmd...>`. Single-threaded by construction
-/// (a fresh exec).
-///
-/// The helper stays in the supervisor's user namespace S and joins **only the
-/// sandbox mount namespace**: S is the owner-ancestor of the sandbox userns,
-/// so it holds `CAP_SYS_ADMIN` over the sandbox mntns *and* over the
-/// anonymous tree it created with `open_tree`. Joining the sandbox userns
-/// would drop its authority over that tree (DESIGN §10, D1).
-///
-/// After `setns` the helper's `/proc` is the *sandbox's* procfs, where
-/// `/proc/self` does not resolve (the helper is outside that pid namespace),
-/// so no `/proc/self/...` path may be used here.
-pub fn helper_main(cmd: HelperCmd) -> io::Result<()> {
-    sys::setns(HELPER_FD_MNTNS, libc::CLONE_NEWNS)?;
+fn helper_loop(sock: &OwnedFd, mntns: &OwnedFd) -> io::Result<()> {
+    sys::prctl(1 /* PR_SET_PDEATHSIG */, libc::SIGKILL as u64, 0, 0, 0)?;
+    sys::setns(mntns.as_raw_fd(), libc::CLONE_NEWNS)?;
     // Work only through an explicit root dirfd of the sandbox mntns.
     std::env::set_current_dir("/")?;
     let root = sys::openat2(
@@ -335,44 +346,121 @@ pub fn helper_main(cmd: HelperCmd) -> io::Result<()> {
         0,
         0,
     )?;
-    match cmd {
-        HelperCmd::Grant(target) => {
-            let rel = sys::rel_to_root(&target);
-            let dir = crate::rootfs::ensure_dir(root.as_raw_fd(), rel)?;
-            sys::move_mount(
-                HELPER_FD_OBJECT,
-                c"",
-                dir.as_raw_fd(),
-                c"",
-                sys::MOVE_MOUNT_F_EMPTY_PATH | sys::MOVE_MOUNT_T_EMPTY_PATH,
-            )?;
-            // Reopen the *attached* mount root (not the covered mountpoint).
-            let attached = sys::openat2(
-                root.as_raw_fd(),
-                &sys::cstr(rel)?,
-                (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
-                0,
-                sys::RESOLVE_BENEATH | sys::RESOLVE_NO_SYMLINKS | sys::RESOLVE_NO_MAGICLINKS,
-            )?;
-            let id = sys::mnt_id(attached.as_raw_fd(), c"", libc::AT_EMPTY_PATH)?;
-            sys::send_with_fd(
-                HELPER_FD_REPLY,
-                format!("ok {id}").as_bytes(),
-                Some(attached.as_raw_fd()),
-            )
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let (n, fd) = sys::recv_with_fd(sock.as_raw_fd(), &mut buf)?;
+        if n == 0 {
+            return Ok(()); // supervisor closed its end
         }
-        HelperCmd::Revoke => {
-            // Detach by fd, never by path: renames, planted symlinks or a
-            // shadowing mount cannot make revoke miss (DESIGN D5). `fchdir`
-            // onto the mount root, then unmount ".".
-            // SAFETY: plain fchdir on a descriptor passed by the supervisor.
-            if unsafe { libc::fchdir(HELPER_FD_OBJECT) } != 0 {
-                return Err(io::Error::last_os_error());
+        let line = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let result = match (parse_helper_cmd(&line), fd) {
+            (Some(HelperCmd::Grant(target)), Some(tree)) => do_grant(&root, &target, &tree),
+            (Some(HelperCmd::Revoke), Some(mnt)) => do_revoke(&mnt).map(|()| (0, None)),
+            _ => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        };
+        match result {
+            Ok((id, attached)) => sys::send_with_fd(
+                sock.as_raw_fd(),
+                format!("ok {id}").as_bytes(),
+                attached.as_ref().map(AsRawFd::as_raw_fd),
+            )?,
+            Err(e) => {
+                let msg = format!("err {} {e}", e.raw_os_error().unwrap_or(0));
+                sys::send_with_fd(sock.as_raw_fd(), msg.as_bytes(), None)?;
             }
-            sys::umount2(Path::new("."), libc::MNT_DETACH)?;
-            sys::send_with_fd(HELPER_FD_REPLY, b"ok 0", None)
         }
     }
+}
+
+fn do_grant(root: &OwnedFd, target: &Path, tree: &OwnedFd) -> io::Result<(u64, Option<OwnedFd>)> {
+    let rel = sys::rel_to_root(target);
+    let dir = crate::rootfs::ensure_dir(root.as_raw_fd(), rel)?;
+    sys::move_mount(
+        tree.as_raw_fd(),
+        c"",
+        dir.as_raw_fd(),
+        c"",
+        sys::MOVE_MOUNT_F_EMPTY_PATH | sys::MOVE_MOUNT_T_EMPTY_PATH,
+    )?;
+    // Reopen the *attached* mount root (not the covered mountpoint fd).
+    let attached = sys::openat2(
+        root.as_raw_fd(),
+        &sys::cstr(rel)?,
+        (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        0,
+        sys::RESOLVE_BENEATH | sys::RESOLVE_NO_SYMLINKS | sys::RESOLVE_NO_MAGICLINKS,
+    )?;
+    let id = sys::mnt_id(attached.as_raw_fd(), c"", libc::AT_EMPTY_PATH)?;
+    Ok((id, Some(attached)))
+}
+
+/// Detach by fd, never by path: renames, planted symlinks or a shadowing mount
+/// cannot make revoke miss (DESIGN D5). `fchdir` onto the mount root, then
+/// `umount2(".")`.
+fn do_revoke(mount_root: &OwnedFd) -> io::Result<()> {
+    // SAFETY: plain fchdir on a descriptor we own.
+    if unsafe { libc::fchdir(mount_root.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let r = sys::umount2(Path::new("."), libc::MNT_DETACH);
+    std::env::set_current_dir("/")?; // leave the (now detached) mount
+    r
+}
+
+/// Supervisor-side client of the helper socket.
+pub struct HelperClient {
+    sock: OwnedFd,
+    pub pid: libc::pid_t,
+}
+
+impl HelperClient {
+    pub fn new(sock: OwnedFd, pid: libc::pid_t) -> Self {
+        Self { sock, pid }
+    }
+
+    fn call(&self, line: &str, fd: RawFd) -> io::Result<(String, Option<OwnedFd>)> {
+        sys::send_with_fd(self.sock.as_raw_fd(), line.as_bytes(), Some(fd))?;
+        let mut buf = vec![0u8; 4096];
+        let (n, got) = sys::recv_with_fd(self.sock.as_raw_fd(), &mut buf)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "helper exited"));
+        }
+        Ok((String::from_utf8_lossy(&buf[..n]).into_owned(), got))
+    }
+
+    /// Attach `tree` at `target` inside the sandbox; returns the attached
+    /// mount-root fd and its mount id.
+    pub fn grant(&self, target: &Path, tree: &OwnedFd) -> io::Result<(OwnedFd, u64)> {
+        let (reply, fd) = self.call(&format!("grant {}", target.display()), tree.as_raw_fd())?;
+        let id = parse_helper_reply(&reply)?;
+        Ok((
+            fd.ok_or_else(|| io::Error::other("helper returned no mount fd"))?,
+            id,
+        ))
+    }
+
+    pub fn revoke(&self, mount_root: &OwnedFd) -> io::Result<()> {
+        let (reply, _) = self.call("revoke", mount_root.as_raw_fd())?;
+        parse_helper_reply(&reply).map(drop)
+    }
+}
+
+/// `ok <id>` → id; `err <errno> <msg>` → `io::Error`.
+pub fn parse_helper_reply(reply: &str) -> io::Result<u64> {
+    if let Some(id) = reply.strip_prefix("ok ") {
+        return id
+            .trim()
+            .parse()
+            .map_err(|_| io::Error::other(format!("bad helper reply {reply:?}")));
+    }
+    if let Some(rest) = reply.strip_prefix("err ") {
+        let (errno, msg) = rest.split_once(' ').unwrap_or((rest, ""));
+        return Err(match errno.parse::<i32>() {
+            Ok(e) if e != 0 => io::Error::from_raw_os_error(e),
+            _ => io::Error::other(msg.to_owned()),
+        });
+    }
+    Err(io::Error::other(format!("bad helper reply {reply:?}")))
 }
 
 /// Holder kinds reported by revoke scans.
@@ -598,6 +686,17 @@ mod tests {
         ] {
             assert_eq!(parse_helper_cmd(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn helper_reply_parsing() {
+        assert_eq!(parse_helper_reply("ok 42").unwrap(), 42);
+        let e = parse_helper_reply("err 30 Read-only file system").unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(30));
+        let e = parse_helper_reply("err 0 something odd").unwrap_err();
+        assert!(e.to_string().contains("something odd"));
+        assert!(parse_helper_reply("garbage").is_err());
+        assert!(parse_helper_reply("ok notanumber").is_err());
     }
 
     #[test]

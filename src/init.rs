@@ -25,6 +25,8 @@ use crate::{rootfs, seccomp, sig, sys};
 
 /// supervisor → init: maps are written, proceed.
 pub const MSG_GO: u8 = b'G';
+/// supervisor → init: grants are in place, run the command.
+pub const MSG_START: u8 = b'S';
 /// init → supervisor: setup done (+ optional pty master fd).
 pub const MSG_READY: u8 = b'R';
 /// init → supervisor: fatal setup error, message follows.
@@ -80,6 +82,8 @@ pub fn init_main(cfg: InitConfig, chan: OwnedFd) -> ! {
 }
 
 fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
+    // Never outlive the supervisor (invariant 3).
+    sys::prctl(PR_SET_PDEATHSIG, libc::SIGKILL as u64, 0, 0, 0).context("PR_SET_PDEATHSIG")?;
     // 0. Single-id maps, written by ourselves: allowed for an unprivileged
     //    process mapping its own euid, with setgroups denied first.
     write_id_maps(cfg.uid, cfg.gid).context("writing uid/gid maps")?;
@@ -89,9 +93,6 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     if n != 1 || b[0] != MSG_GO {
         bail!("supervisor went away before setup");
     }
-    // 2. Never outlive the supervisor (invariant 3). Marking dumpable=0 comes
-    //    later, after the supervisor has had its chance to read /proc/<pid>/ns.
-    sys::prctl(PR_SET_PDEATHSIG, libc::SIGKILL as u64, 0, 0, 0).context("PR_SET_PDEATHSIG")?;
 
     // 3-9. Filesystem: private propagation, tmpfs root, plan, pivot.
     rootfs::mount_root(&cfg.root_dir)?;
@@ -154,6 +155,11 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     )
     .context("reporting ready")?;
     drop(master);
+    // Wait for the supervisor to apply initial grants before the command exists.
+    let (n, _) = sys::recv_with_fd(chan.as_raw_fd(), &mut b).context("waiting for START")?;
+    if n != 1 || b[0] != MSG_START {
+        bail!("supervisor aborted the session");
+    }
 
     // SAFETY: init is single-threaded; the child only makes raw syscalls then
     // execs or `_exit`s.
@@ -299,7 +305,7 @@ pub fn resolve_program(
         .find(|p| is_exec(p))
 }
 
-fn write_id_maps(uid: u32, gid: u32) -> io::Result<()> {
+pub fn write_id_maps(uid: u32, gid: u32) -> io::Result<()> {
     std::fs::write("/proc/self/setgroups", "deny")?;
     std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
     std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))

@@ -1,3 +1,4 @@
 target/
 *.swp
 __pycache__/
+*.pyc

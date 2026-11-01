@@ -224,6 +224,20 @@ L15-L20. No third round is allowed. Disposition:
   connect succeeds), L23 (with `scoped = ["signal"]` the kill fails with
   `EPERM`, skipped if ABI < 6) cover both defaults. Unit test: policy parsing
   of `scoped`, rejection of unknown values.
+* **P22 — musl targets do not compile (found 2026-11-01, release prep).**
+  `cargo build --release --target x86_64-unknown-linux-musl` fails with four
+  `E0308` errors in `src/init.rs` (lines 281, 390, 410, 414 at 0bb206b):
+  `TIOCSCTTY_REQ`, `SIOCSIFFLAGS`, `TIOCSPTLCK_REQ` and `TIOCGPTN_REQ` are
+  `u64` (glibc's `Ioctl = c_ulong`) but musl's `libc::ioctl` takes a `c_int`
+  request. Not fixed: 0.2.0 is host-verified and the release must not move the
+  code. Consequences: the release binaries are glibc builds on native runners
+  (x86_64 and aarch64, Ubuntu 22.04 so the glibc floor is 2.35); there is no
+  static binary. `clone3` -> ENOSYS (DESIGN §5) is a seccomp rule and does not
+  depend on the libc, but a musl build has never been run through the leak
+  suite. The aarch64-musl target was not tried (not installed in the build
+  sandbox); it is expected to fail the same way [inferred — confirm]. Fix
+  = cast the request per target (`as _`) plus a musl run of `make leaktest`;
+  target v0.2.1.
 * **P18 — Landlock write roots in exec are re-resolved by pathname** (§14.12).
   Can only weaken, never widen; fix = inode-anchored root fds captured at
   start.

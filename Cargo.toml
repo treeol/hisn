@@ -2,6 +2,19 @@
 name = "hisn"
 version = "0.2.0"
 edition = "2024"
+description = "Daemonless, rootless, single-binary Linux sandbox for AI coding agents: namespaces, pivot_root, seccomp, Landlock, no root"
+license = "Apache-2.0"
+repository = "https://github.com/treeol/hisn"
+homepage = "https://github.com/treeol/hisn"
+documentation = "https://github.com/treeol/hisn/blob/main/docs/DESIGN.md"
+readme = "README.md"
+keywords = ["sandbox", "landlock", "seccomp", "namespaces", "rootless"]
+categories = ["command-line-utilities", "os::linux-apis"]
+exclude = [
+    ".github/",
+    "docs/leaktest-host-*.log",
+    "target/",
+]
 
 [dependencies]
 anyhow = "1.0.104"

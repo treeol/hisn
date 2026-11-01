@@ -41,6 +41,7 @@ so.  The log file column points at the `docs/leaktest-host-*.log` produced by
 
 | check | commit | where | result | log file |
 |-------|--------|-------|--------|----------|
+| `make leaktest` (L1-L24) | 0bb206b (log header: tree clean) | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 175 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5) | `docs/leaktest-host-2026-11-01.log` |
 | `make leaktest` (L1-L24) | 34947f4 (log header: tree dirty -- the only modified file was the log being overwritten) | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 175 passed, 0 failed, 1 skipped, 1 weak | `docs/leaktest-host-2026-11-01.log` |
 | `make leaktest` (L1-L23) | 19af325 (log header: tree clean) | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 173 passed, 0 failed, 1 skipped, 1 weak | `docs/leaktest-host-2026-11-01.log` |
 | `make leaktest` (L1-L20) | e3bcd31 [inferred — confirm] | host (Fedora 7.2.13, x86_64, ABI 10) | 167 passed, 0 failed, 1 skipped, 1 weak | — (summary line only; `make leaktest-log` did not exist yet) |
@@ -74,3 +75,17 @@ so.  The log file column points at the `docs/leaktest-host-*.log` produced by
   `docs/leaktest-host-*.log` in that check.
 * Not run on that host in this record: `make lint && make test` on the final
   tip; aarch64; any other kernel/distro.
+
+### Notes on the 0bb206b host run
+
+* Rerun on the tip that the release is cut from; the log file now holds this
+  run (it replaced the 34947f4 log at the same path; the 34947f4 result stays
+  above as history).  Skip is L12, weak is L14 R5, as before.  The log header
+  says `tree: clean`.
+* The code at 0bb206b is the code that was released-prepared: the release-prep
+  commits after it change only workflow files, docs and Cargo.toml metadata.
+* Not run on that host in this record: aarch64; any other kernel/distro.
+  GitHub Actions (`.github/workflows/ci.yml`) has not run yet: Ubuntu 22.04 and
+  24.04 are "not run".
+* musl targets do not compile (OPEN-POINTS P22); checked in the build sandbox
+  with `cargo build --release --target x86_64-unknown-linux-musl`.

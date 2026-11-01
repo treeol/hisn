@@ -48,12 +48,20 @@ pub enum Refuse {
 }
 
 /// R5 (DESIGN §9): decide from facts, failing closed on anything missing.
-/// `peer_pidns`/`sandbox_pidns` are `/proc/<pid>/ns/pid` inodes.
+///
+/// Membership of the sandbox pid namespace is decided by `peer_in_tree` (the
+/// peer descends from the sandbox init, via world-readable `status` files).
+/// `peer_pidns`/`sandbox_pidns` (`/proc/<pid>/ns/pid` inodes) are an extra
+/// positive check when readable. The supervisor lives in a child user
+/// namespace, so for a host peer the ns link is *expectedly* unreadable
+/// (`cap_ptrace_access_check`); that alone is not a refusal, but an
+/// undecidable `peer_in_tree` is.
 pub fn authorize_peer(
     peer_uid: u32,
     our_uid: u32,
     peer_pidns: io::Result<u64>,
     sandbox_pidns: u64,
+    peer_in_tree: io::Result<bool>,
     peer_alive: bool,
 ) -> Result<(), Refuse> {
     if peer_uid != our_uid {
@@ -65,11 +73,14 @@ pub fn authorize_peer(
     if !peer_alive {
         return Err(Refuse::Unknown("peer process already gone".into()));
     }
-    match peer_pidns {
-        Ok(ino) if ino == sandbox_pidns => Err(Refuse::InSandboxPidns),
-        Ok(_) => Ok(()),
+    if matches!(peer_pidns, Ok(ino) if ino == sandbox_pidns) {
+        return Err(Refuse::InSandboxPidns);
+    }
+    match peer_in_tree {
+        Ok(true) => Err(Refuse::InSandboxPidns),
+        Ok(false) => Ok(()),
         Err(e) => Err(Refuse::Unknown(format!(
-            "cannot read peer pid namespace: {e}"
+            "cannot establish peer ancestry: {e}"
         ))),
     }
 }
@@ -280,39 +291,16 @@ impl Shared {
     }
 
     /// PIDs (in the supervisor's view) of every process in the sandbox pid
-    /// namespace. Found through the host-side `/proc`, by namespace inode.
+    /// namespace: the sandbox init and all its descendants (orphans reparent
+    /// to init, so nothing in the namespace is outside this tree).
     ///
-    /// Fail closed: a process of *our* uid whose namespace cannot be read
-    /// (other than because it just exited) makes the whole enumeration an
-    /// error, so an incomplete list is never mistaken for an empty one.
-    /// Processes of other users cannot be sandbox processes (the sandbox maps
-    /// only our own uid) and are skipped.
+    /// Not done by comparing `/proc/<pid>/ns/pid`: the supervisor lives in a
+    /// child user namespace and may not read that link for host processes of
+    /// the same user. Fail closed: any unreadable `status` (other than a
+    /// process that just exited) makes the enumeration an error, so an
+    /// incomplete list is never mistaken for an empty one.
     fn sandbox_pids(&self) -> io::Result<Vec<i32>> {
-        use std::os::unix::fs::MetadataExt;
-        let mut v = Vec::new();
-        for e in fs::read_dir("/proc")?.flatten() {
-            let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
-                continue;
-            };
-            match fs::metadata(e.path()) {
-                Ok(m) if m.uid() == self.uid => {}
-                Ok(_) => continue,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(err),
-            }
-            match sys::ns_inode(pid, "pid") {
-                Ok(ino) if ino == self.sandbox_pidns => v.push(pid),
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {} // exited meanwhile
-                Err(err) => {
-                    return Err(io::Error::new(
-                        err.kind(),
-                        format!("pid {pid}: cannot read pid namespace: {err}"),
-                    ));
-                }
-            }
-        }
-        Ok(v)
+        sys::descendants_of(self.init_pid)
     }
 
     /// Hard revoke: kill everything but init, repeat until none are left.
@@ -445,12 +433,19 @@ impl Handler for Ctl {
         let fd = peer.as_raw_fd();
         let (pid, uid) = sys::peer_cred(fd).map_err(|e| e.to_string())?;
         // Prefer a pidfd (immune to pid reuse); fall back to the credential pid.
-        let (pidns, alive) = match sys::peer_pidfd(fd) {
-            Ok(pfd) => (sys::ns_inode(pid, "pid"), sys::pidfd_alive(pfd.as_raw_fd())),
-            Err(_) => (sys::ns_inode(pid, "pid"), true),
+        let alive = match sys::peer_pidfd(fd) {
+            Ok(pfd) => sys::pidfd_alive(pfd.as_raw_fd()),
+            Err(_) => true,
         };
-        let decision = authorize_peer(uid, self.sh.uid, pidns, self.sh.sandbox_pidns, alive)
-            .map_err(|r| format!("{r:?}"));
+        let decision = authorize_peer(
+            uid,
+            self.sh.uid,
+            sys::ns_inode(pid, "pid"),
+            self.sh.sandbox_pidns,
+            sys::is_descendant_of(pid, self.sh.init_pid),
+            alive,
+        )
+        .map_err(|r| format!("{r:?}"));
         if let Err(reason) = &decision {
             // The peer is never told why (POLICY-SPEC §7), but the operator
             // must be able to see it: audit log + the supervisor's stderr.
@@ -1045,36 +1040,69 @@ mod tests {
 
     const SANDBOX_NS: u64 = 4_026_531_836;
 
-    fn authz(uid: u32, ns: io::Result<u64>, alive: bool) -> Result<(), Refuse> {
-        authorize_peer(uid, 1000, ns, SANDBOX_NS, alive)
+    fn authz(
+        uid: u32,
+        ns: io::Result<u64>,
+        tree: io::Result<bool>,
+        alive: bool,
+    ) -> Result<(), Refuse> {
+        authorize_peer(uid, 1000, ns, SANDBOX_NS, tree, alive)
+    }
+
+    fn eperm() -> io::Error {
+        io::Error::from_raw_os_error(libc::EACCES)
     }
 
     #[test]
     fn r5_allows_a_same_uid_peer_in_another_pidns() {
-        assert_eq!(authz(1000, Ok(4_026_531_836 + 1), true), Ok(()));
+        assert_eq!(authz(1000, Ok(SANDBOX_NS + 1), Ok(false), true), Ok(()));
+    }
+
+    #[test]
+    fn r5_allows_a_host_peer_whose_ns_link_is_unreadable() {
+        // The supervisor lives in a child userns: /proc/<host pid>/ns/pid is
+        // EACCES for it. Ancestry decides, and says "not in the sandbox".
+        assert_eq!(authz(1000, Err(eperm()), Ok(false), true), Ok(()));
     }
 
     #[test]
     fn r5_refuses_peers_inside_the_sandbox_pidns() {
+        // Either signal alone is enough to refuse.
         assert_eq!(
-            authz(1000, Ok(SANDBOX_NS), true),
+            authz(1000, Ok(SANDBOX_NS), Ok(false), true),
+            Err(Refuse::InSandboxPidns)
+        );
+        assert_eq!(
+            authz(1000, Err(eperm()), Ok(true), true),
+            Err(Refuse::InSandboxPidns)
+        );
+        assert_eq!(
+            authz(1000, Ok(SANDBOX_NS + 1), Ok(true), true),
             Err(Refuse::InSandboxPidns)
         );
     }
 
     #[test]
     fn r5_fails_closed_on_missing_facts() {
+        // Ancestry undecidable -> refuse, whatever the ns link says.
         assert!(matches!(
-            authz(1000, Err(io::Error::from_raw_os_error(libc::ENOENT)), true),
+            authz(1000, Ok(1), Err(eperm()), true),
             Err(Refuse::Unknown(_))
         ));
-        assert!(matches!(authz(1000, Ok(1), false), Err(Refuse::Unknown(_))));
+        assert!(matches!(
+            authz(1000, Err(eperm()), Err(eperm()), true),
+            Err(Refuse::Unknown(_))
+        ));
+        assert!(matches!(
+            authz(1000, Ok(1), Ok(false), false),
+            Err(Refuse::Unknown(_))
+        ));
     }
 
     #[test]
     fn r5_refuses_other_uids_first() {
         assert_eq!(
-            authz(0, Ok(1), true),
+            authz(0, Ok(1), Ok(false), true),
             Err(Refuse::WrongUid {
                 peer: 0,
                 ours: 1000

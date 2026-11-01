@@ -84,9 +84,10 @@ Applied to the canonical (symlink-free) form of every path in `cwd`,
   traversal;
 * **R1b** a recursive bind tree may not contain a mount aliasing the runtime
   root (mountinfo scan at start; DESIGN §9);
-* **R5** (not a path rule) the control socket rejects any peer inside the
-  sandbox pid namespace, so even a nameable `control.sock` is unusable from
-  inside (DESIGN §9).
+* **R5** (not a path rule) the control socket rejects any peer that is the
+  sandbox init or descends from it (i.e. is inside the sandbox pid
+  namespace), so even a nameable `control.sock` is unusable from inside
+  (DESIGN §9).
 
 Violations are errors (`E_PATH_FORBIDDEN`), never silently adjusted.
 

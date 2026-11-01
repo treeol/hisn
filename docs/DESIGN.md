@@ -327,15 +327,26 @@ paths):
 
 * **R5 (path-independent, primary defence; round-1 BLOCKING fix, D13)** — the
   control socket **refuses any peer inside the sandbox's pid namespace**.
-  On `accept` the supervisor obtains the peer identity with `SO_PEERPIDFD`
-  (kernel ≥ 6.5) or `SO_PEERCRED` pid, opens `/proc/<pid>/ns/pid`, and compares
-  its inode with that of `/proc/<init>/ns/pid` (held open since start). Equal,
-  unreadable, or process-already-gone ⇒ close the connection (fail closed). The
-  check is repeated for every request line. This holds even if a bind alias,
-  an inherited fd, or any other mount-topology accident makes `control.sock`
-  *nameable* from inside, because a sandbox process always carries the
-  sandbox pidns. (A sandbox process cannot hide in another pidns: seccomp
-  denies `unshare`/`setns`/`clone(CLONE_NEWPID)` and it has no caps.)
+  On `accept` the supervisor obtains the peer pid (`SO_PEERCRED`, plus a
+  `SO_PEERPIDFD` liveness check on kernel ≥ 6.5) and decides membership two
+  ways: (a) if `/proc/<pid>/ns/pid` is readable and has the inode of the
+  sandbox init's pid namespace ⇒ refuse; (b) walk `PPid:` upwards through the
+  world-readable `/proc/<pid>/status`: a peer equal to or descending from the
+  sandbox init ⇒ refuse (every process of a pid namespace descends from its
+  init; orphans reparent to it). (b) is the authoritative check because the
+  supervisor lives in a *child user namespace* (S): for an ordinary host
+  process of the same user `/proc/<pid>/ns/pid` is `EACCES` to it
+  (`ptrace_may_access`), so (a) can only ever be a positive hint — treating
+  its unreadability as a refusal (the first implementation) locked out every
+  legitimate client. Ancestry that cannot be established (unreadable status,
+  vanished parent chain, peer gone) ⇒ refuse (fail closed). The check is
+  repeated for every request line. This holds even if a bind alias, an
+  inherited fd, or any other mount-topology accident makes `control.sock`
+  *nameable* from inside, because a sandbox process always descends from
+  the sandbox init. (A sandbox process cannot escape the tree: seccomp denies
+  `unshare`/`setns`/`clone(CLONE_NEWPID)`, it has no caps, and init is its
+  reaper.) The same ancestry walk enumerates the sandbox's processes for
+  soft-revoke scans and hard revoke.
 * **R1b (defence in depth)** — at start, for every recursively bound tree,
   the supervisor scans the host `/proc/self/mountinfo` and rejects the session
   if any mount inside that tree has the same `major:minor` and a root that is

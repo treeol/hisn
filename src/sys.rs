@@ -252,6 +252,92 @@ pub fn ns_inode(pid: i32, name: &str) -> io::Result<u64> {
     std::fs::metadata(format!("/proc/{pid}/ns/{name}")).map(|m| m.ino())
 }
 
+/// Parent pid out of a `/proc/<pid>/status` body.
+pub fn parse_ppid(status: &str) -> Option<i32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("PPid:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Is `pid` equal to, or a descendant of, `ancestor`? Walks `PPid:` upwards
+/// through the world-readable `/proc/<pid>/status`. Every process in a pid
+/// namespace descends from that namespace's init, so for `ancestor` = the
+/// sandbox init this decides sandbox membership without needing ptrace
+/// access. `Err` if the chain cannot be followed (never guessed).
+pub fn is_descendant_of(pid: i32, ancestor: i32) -> io::Result<bool> {
+    let mut cur = pid;
+    for _ in 0..4096 {
+        if cur == ancestor {
+            return Ok(true);
+        }
+        if cur <= 1 {
+            return Ok(false);
+        }
+        // A parent that exits mid-walk reparents `cur` to the namespace
+        // init; one re-read of the child resolves that. Anything else errs.
+        let mut parent = None;
+        for _ in 0..3 {
+            let body = std::fs::read_to_string(format!("/proc/{cur}/status"))?;
+            let pp = parse_ppid(&body)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no PPid line"))?;
+            if pp == 0 || std::path::Path::new(&format!("/proc/{pp}")).exists() {
+                parent = Some(pp);
+                break;
+            }
+        }
+        cur = parent.ok_or_else(|| io::Error::other("parent vanished repeatedly"))?;
+    }
+    Err(io::Error::other("process ancestry too deep"))
+}
+
+/// `pid` and every descendant of `root`, as seen from our `/proc` (parent
+/// links from the world-readable `/proc/<pid>/status`). For `root` = the
+/// sandbox init this is exactly the sandbox's process set: orphans reparent
+/// to the namespace init, so no member can sit outside the tree. A process
+/// that vanishes mid-scan is skipped; any other read error is returned, so an
+/// incomplete list is never mistaken for a complete one.
+pub fn descendants_of(root: i32) -> io::Result<Vec<i32>> {
+    let mut parent_of = std::collections::HashMap::new();
+    for e in std::fs::read_dir("/proc")?.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        match std::fs::read_to_string(e.path().join("status")) {
+            Ok(body) => {
+                let pp = parse_ppid(&body)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no PPid line"))?;
+                parent_of.insert(pid, pp);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(tree_of(&parent_of, root))
+}
+
+/// `root` (if present in the map) plus all its descendants; pure helper.
+pub fn tree_of(parent_of: &std::collections::HashMap<i32, i32>, root: i32) -> Vec<i32> {
+    let mut out = Vec::new();
+    if !parent_of.contains_key(&root) {
+        return out;
+    }
+    let mut seen = std::collections::HashSet::from([root]);
+    let mut frontier = vec![root];
+    while let Some(p) = frontier.pop() {
+        out.push(p);
+        for (&child, &pp) in parent_of {
+            if pp == p && seen.insert(child) {
+                frontier.push(child);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 // ---------------------------------------------------------------- fd passing
 
 /// Send `data` plus (optionally) one fd over a unix stream socket.
@@ -544,5 +630,36 @@ mod tests {
         let me = std::process::id() as i32;
         assert_eq!(ns_inode(me, "pid").unwrap(), ns_inode(me, "pid").unwrap());
         assert!(ns_inode(me, "nonexistent").is_err());
+    }
+
+    #[test]
+    fn tree_of_collects_descendants_only() {
+        use std::collections::HashMap;
+        let m: HashMap<i32, i32> = [(10, 1), (11, 10), (12, 11), (13, 10), (20, 1), (21, 20)]
+            .into_iter()
+            .collect();
+        assert_eq!(tree_of(&m, 10), vec![10, 11, 12, 13]);
+        assert_eq!(tree_of(&m, 20), vec![20, 21]);
+        assert_eq!(tree_of(&m, 99), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn descendants_of_self_contains_self() {
+        let me = std::process::id() as i32;
+        assert!(descendants_of(me).unwrap().contains(&me));
+    }
+
+    #[test]
+    fn ppid_parsing_and_ancestry() {
+        assert_eq!(parse_ppid("Name:\tx\nPPid:\t77\nTracerPid:\t0\n"), Some(77));
+        assert_eq!(parse_ppid("Name:\tx\n"), None);
+        assert_eq!(parse_ppid("PPid:\tzz\n"), None);
+        let me = std::process::id() as i32;
+        // SAFETY: getppid has no preconditions.
+        let parent = unsafe { libc::getppid() };
+        assert!(is_descendant_of(me, me).unwrap());
+        assert!(is_descendant_of(me, parent).unwrap());
+        assert!(!is_descendant_of(me, i32::MAX - 1).unwrap());
+        assert!(is_descendant_of(i32::MAX - 1, me).is_err());
     }
 }

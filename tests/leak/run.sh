@@ -165,7 +165,21 @@ etc_ls=$(q "$CWD" ls /etc)
 for m in shadow gshadow sudoers ssh; do lacks "L1 /etc listing has no $m" ",$etc_ls," ",$m,"; done
 
 # ---- L2: pid namespace and /proc
-eq "L2 /proc/1/root is the sandbox root" "$(q "$CWD" sameino /proc/1/root /)" true
+# Init is non-dumpable (DESIGN §6/D6), so for the command /proc/1/root is
+# normally EACCES; resolving to the sandbox root is also acceptable. Anything
+# else (a different inode = the host root) is a leak. Either way the host's
+# /etc/shadow must not be reachable through it.
+got=$(q "$CWD" sameino /proc/1/root /)
+case $got in
+  true) pass "L2 /proc/1/root is the sandbox root" ;;
+  EACCES) pass "L2 /proc/1/root denied (non-dumpable init, DESIGN D6)" ;;
+  *) fail "L2 /proc/1/root" "got [$got], want true or EACCES" ;;
+esac
+got=$(q "$CWD" stat /proc/1/root/etc/shadow)
+case $got in
+  ENOENT | EACCES) pass "L2 /proc/1/root/etc/shadow unreachable ($got)" ;;
+  *) fail "L2 /proc/1/root/etc/shadow" "got [$got]" ;;
+esac
 eq "L2 /proc/self/root is the sandbox root" "$(q "$CWD" sameino /proc/self/root /)" true
 pids=$(q "$CWD" pids)
 has "L2 init is pid 1" ",${pids#OK }," ",1,"

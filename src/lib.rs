@@ -4,3 +4,4 @@ pub mod check;
 pub mod cli;
 pub mod mounts;
 pub mod policy;
+pub mod seccomp;

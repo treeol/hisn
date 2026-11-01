@@ -973,6 +973,18 @@ fn run_session(
         spawn_gate: RwLock::new(()),
         live: Mutex::new(Default::default()),
     });
+    // The only way to start `network = "host"` without abstract-socket
+    // scoping is the explicit flag; it is audited (DESIGN §7, B1).
+    if allow_host_abstract && policy.network == Network::Host {
+        shared.log(
+            "session",
+            "start",
+            None,
+            None,
+            Some("allow-host-abstract-sockets"),
+            None,
+        );
+    }
     let handler: Arc<dyn Handler> = Arc::new(Ctl {
         sh: Arc::clone(&shared),
     });

@@ -6,6 +6,8 @@ here except where residual risk remains.
 
 ## §14 external review pending (outside Wakil, 2026-11-01)
 
+> Superseded by "§14 external review — received" below; kept for the void-round history.
+
 No valid review of DESIGN §14 exists. Every attempted round (design round 1,
 implementation round 2, P17 round 2) is void: the answering reviewer's copy
 ended before §14 and the other reviewer returned nothing. No round was
@@ -16,6 +18,20 @@ P17 change (DESIGN §14.12, `[landlock] scoped`). Question for the reviewers:
 command, outlive the session, or reach anything on the host?* Only BLOCKING
 findings (demonstrable escape, leak, or grant persistence) change code; the
 rest goes here.
+
+## §14 external review — received (outside Wakil, 2026-11-01)
+
+The external review of DESIGN §14 + P17 has been done outside Wakil. It was
+not a Wakil round (the void rounds above stay void). One BLOCKING finding,
+four non-blocking.
+
+| # | finding | triage | resolution |
+|---|---------|--------|-----------|
+| B1 | with `network = "host"`, `AbstractUnixSocket` scope must apply regardless of `[landlock] scoped`; effective scopes = `scoped ∪ {abstract_unix_socket}` for host mode, only `--allow-host-abstract-sockets` removes it (audited); `signal` stays opt-in | BLOCKING (potential host leak: abstract sockets of host D-Bus/X11) | **Already enforced** by `landlock::plan` (`scope_abstract = scoped.contains(abstract) \|\| network == Host`) and `scope_required`/`apply` (refuses to start without it). **No behaviour change.** Added: unit test `host_network_effective_scopes_are_scoped_union_abstract`; leak test **L24** (host-side abstract listener, `network = "host"` session with default policy and with explicit `scoped = []`, exec connect must fail with `EPERM`; positive control from the host first); the `--allow-host-abstract-sockets` opt-out now writes an audit entry `session/start`; L22 documented as `network = "none"` only; DESIGN §7/§14.12 say host mode blocks inter-exec abstract sockets. **[HOST-VERIFY L24]** |
+| 1 | D25: `setns(CLONE_NEWNS)` does set root and cwd (the earlier claim that it does not was wrong); keep the `fchdir`, add a fail-closed root identity check | NON-BLOCKING | **done (small, fail-closed)**: `C` and `D` check `statx("/")` and `statx(".")` against the dev/ino of the root fd the supervisor opened from `/proc/<init>/root`; mismatch → setup failure, nothing runs. D25 row in DESIGN §12 corrected. Unit tests `dev_ino_matches_std_metadata`, `root_check_fails_closed_on_mismatch`. **[HOST-VERIFY]** (covered end-to-end by L15/L9; no negative end-to-end test exists) |
+| 2 | P18 stays open; align DESIGN §4.5 with §7 on root-tmpfs renames | NON-BLOCKING | P18 unchanged. **Pending**: §4.5 still says only "revoke never resolves a path"; it should state that D's pathname-resolved Landlock roots (§14.12) are affected by the same renames. Not edited in this task. |
+| 3 | a continuous stream of spawns can starve a hard revoke's exclusive spawn-gate | NON-BLOCKING | **Pending**: set a "no new spawns" flag before taking the gate exclusively (D22). Not implemented. |
+| 4 | Wakil must treat `{"exit":{"lost":true}}` as still-running, not as an exit | NON-BLOCKING (client contract) | Recorded here for the Wakil integration; no hisn change. |
 
 ## Review log
 

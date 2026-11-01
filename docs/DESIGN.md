@@ -289,6 +289,13 @@ Ruleset (best-effort ABI, `hisn check` reports the ABI; ≥3 preferred):
   **`network = "host"` therefore refuses to start when Landlock scope is
   unavailable** unless `--allow-host-abstract-sockets` is passed (logged in
   the audit file). With `network = "none"` the netns already isolates them.
+  **Effective scopes (B1)** = `[landlock] scoped` ∪ `{abstract_unix_socket}`
+  when `network = "host"`, whatever the policy lists (`scoped = []` included);
+  `signal` is only ever on when the policy asks for it. Only
+  `--allow-host-abstract-sockets` removes the forced abstract scope (audited
+  as `session/start`). Consequence: in host mode **exec A cannot reach exec
+  B's abstract sockets either** (nor the host's); inter-exec abstract sockets
+  work only with `network = "none"` (leak tests L22 vs L24).
 * ABI ≥4 TCP rules are not used (network is none/host in v0).
 
 ## 8. Environment
@@ -485,7 +492,7 @@ Properties:
 | D22 | (unspecified) | grants/revokes and exec spawns are ordered by a spawn gate (`RwLock`): spawns share it, a hard revoke takes it exclusively | a hard revoke must not sweep while an exec is half-started (§14.6) |
 | D23 | (unspecified) | exec uses a **second** persistent helper `E` (userns S, joins nothing itself); the grant helper is unchanged | the grant helper must stay in S + sandbox mntns only (D15); exec needs a per-exec child that joins userns U |
 | D24 | (unspecified) | **all** `/proc/<init>/ns/*` fds the exec helper needs are opened before `GO`, like the mount-ns fd already is | no later `/proc/<init>` access is needed; whether the supervisor *could* open them after init became non-dumpable (§6) is not relied on and not verified |
-| D25 | (unspecified) | `C` fchdirs onto `/proc/<init>/root` after `setns(mnt)` | `setns` swaps the mount tree but does **not** move the caller's root/cwd into it; without the fchdir, cwd and root still point into the *supervisor's* tree (round-2 review finding A) |
+| D25 | (unspecified) | `C` fchdirs onto `/proc/<init>/root` after `setns(mnt)` | `setns(CLONE_NEWNS)` swaps the mount tree and sets root and cwd to the new namespace's root, but the fchdir is kept as belt and braces (round-2 review finding A; external review 2026-11-01 corrected the claim that it does not). `C` and `D` additionally fail closed unless `statx("/")` and `statx(".")` both equal the dev/ino of the root fd the supervisor opened from `/proc/<init>/root` |
 | D26 | (unspecified) | helper protocol carries a request id; an ambiguous handover (timeout/EOF/garbage) **poisons** the channel: later execs fail with `E_INTERNAL` | a late reply would otherwise be consumed as the answer to the *next* request (round-2 review finding C) |
 | D27 | (unspecified) | `W` treats a partial/failed errno-pipe read as an exec failure (`EIO`), never as success | clean EOF (`CLOEXEC`) is the only evidence of a successful `execve` (round-2 review finding E) |
 | D28 | (unspecified) | a client that disconnects before the `{"ok":true,…}` line could be written enters `drive` **pre-cancelled**: `TERM` immediately, `KILL` after the grace — same sequence as a mid-run disconnect | the old path passed a dead fd and waited for a poll event that could never arrive (round-2 review finding D) |
@@ -818,10 +825,13 @@ for.
   domain. The default is now **no scoping** (`[landlock] scoped = []`):
   execs of the same session may signal each other and reach each other's
   abstract sockets — isolation is against the host, not between execs.
-  `network = "host"` still requires `AbstractUnixSocket` scope (§7).
-  A policy that wants inter-exec signal isolation sets `scoped =
+  `network = "host"` still requires `AbstractUnixSocket` scope (§7), so in
+  host mode inter-exec abstract sockets are blocked by design (B1; L24
+  checks the host-side listener is unreachable from an exec, default and
+  explicit `scoped = []`). A policy that wants inter-exec signal isolation sets `scoped =
   ["signal"]`; the leak tests L21 (cross-exec kill succeeds by default),
-  L22 (cross-exec abstract socket connect succeeds by default), and L23
+  L22 (cross-exec abstract socket connect succeeds by default, `network =
+  "none"` only), and L23
   (with `scoped = ["signal"]` the kill fails with `EPERM`, skipped if
   ABI < 6) cover both defaults.
 * `P` shares the pid namespace, mount namespace and (for `network="host"`) the

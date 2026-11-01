@@ -248,6 +248,21 @@ pub fn fchdir_chdir_root(dirfd: RawFd) -> io::Result<()> {
     cvt_int(unsafe { libc::fchdir(dirfd) }).map(drop)
 }
 
+/// `(st_dev, st_ino)` of `path` relative to `dirfd` (pass `AT_EMPTY_PATH` and
+/// an empty path to identify the descriptor itself). Fails closed when the
+/// kernel does not report the inode.
+pub fn dev_ino(dirfd: RawFd, path: &CStr, flags: c_int) -> io::Result<(u64, u64)> {
+    // SAFETY: zeroed statx is a valid out-buffer.
+    let mut st: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: valid pointers; flags/mask are plain integers.
+    cvt_int(unsafe { libc::statx(dirfd, path.as_ptr(), flags, libc::STATX_INO, &mut st) })?;
+    if st.stx_mask & libc::STATX_INO == 0 {
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+    }
+    let dev = libc::makedev(st.stx_dev_major, st.stx_dev_minor);
+    Ok((u64::from(dev), st.stx_ino))
+}
+
 pub fn set_dumpable(on: bool) -> io::Result<()> {
     prctl(4 /* PR_SET_DUMPABLE */, u64::from(on), 0, 0, 0).map(drop)
 }

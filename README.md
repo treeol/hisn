@@ -11,13 +11,14 @@ and paths the host side explicitly **grants** for the life of the session.
 Everything else does not exist (ENOENT), not "permission denied".
 
 > **Status: v0.2.0 (not yet tagged).** Unit tests and clippy pass in the build
-> sandbox. The leak suite (L1-L23, including `exec` and the P17 scoping tests)
+> sandbox. The leak suite (L1-L24, including `exec` and the P17 scoping tests)
 > last ran green on one real host (Fedora, kernel 7.2, x86_64, Landlock ABI
 > 10): **173 passed, 0 failed, 1 skipped, 1 weak** (user-reported summary line;
 > not yet recorded as a log in the repo). The skip is L12 (needs write access
 > to `/etc`) and the weak one is R5 end-to-end (unit-tested only, OPEN-POINTS
-> P16) — both inferred from earlier runs. The §14 (`exec`) design has had no
-> valid external review (OPEN-POINTS). Not run: aarch64, other kernels or
+> P16) — both inferred from earlier runs. The §14 (`exec`) design had one external review
+> outside Wakil (OPEN-POINTS); L24 and the D25 root check from it are new and
+> not yet run on a host. Not run: aarch64, other kernels or
 > distros. See [docs/VERIFICATION.txt](docs/VERIFICATION.txt).
 
 ## Install
@@ -107,8 +108,8 @@ hostname, kernel, `hisn --version`) — record that log in the host-run table in
 `docs/VERIFICATION.txt`.
 
 On 0.2.0 run `make lint && make test && make leaktest` in one go; the suite
-covers L1-L23 (L1-L14 plus the exec suite L15-L20 and the Landlock-scope suite
-L21-L23). Append host runs under the `## Host runs` heading of
+covers L1-L24 (L1-L14 plus the exec suite L15-L20 and the Landlock-scope suite
+L21-L24). Append host runs under the `## Host runs` heading of
 `docs/VERIFICATION.txt`; `tools/verification.sh` regenerates the build-sandbox
 half, stamped with the commit it ran on.
 

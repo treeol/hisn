@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hisn leak suite (L1-L23). Usage: tests/leak/run.sh PATH/TO/hisn
+# hisn leak suite (L1-L24). Usage: tests/leak/run.sh PATH/TO/hisn
 #
 # Each test runs a probe (examples/leakprobe) INSIDE a real `hisn run` session
 # and asserts from the host. Needs unprivileged user namespaces on the host.
@@ -585,6 +585,9 @@ if HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/
     wait "$L21_SLEEPER" >/dev/null 2>&1
 
     # ---- L22: exec B can connect to exec A's abstract unix socket (P17: default no abstract scope)
+    # Runs under network = "none" (the X session): with network = "host" the
+    # abstract-socket scope is always on (B1, L24) and inter-exec abstract
+    # sockets are blocked by design.
     # exec A binds an abstract socket (blocks in accept); exec B connects.
     # (ex is a shell function: it carries its own `timeout 30`; `timeout ex` cannot exec it)
     ex --cwd "$CX" -- "$CX/leakprobe" abs-sock-bind l22 >/dev/null 2>&1 &
@@ -664,6 +667,67 @@ L23EOF
     else
       fail "L23 scoped signal" "could not start a scoped-signal session"
     fi
+
+    # ---- L24 (B1): network = "host" always scopes abstract unix sockets
+    # A host-side process listens on an abstract socket; an exec in a
+    # network = "host" session must NOT be able to connect (EPERM), with the
+    # default policy and with an explicit `scoped = []`. A host-side connect
+    # first proves the listener is reachable (positive control).
+    L24_NAME="l24-$$"
+    L24_LISTENER=""
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - "$L24_NAME" >"$WORK/l24.listener" 2>&1 <<'PYEOF' &
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind("\0hisn-leak-" + sys.argv[1])
+s.listen(8)
+print("listening", flush=True)
+while True:
+    c, _ = s.accept()
+    c.close()
+PYEOF
+      L24_LISTENER=$!
+      for i in $(seq 1 50); do grep -q listening "$WORK/l24.listener" 2>/dev/null && break; sleep 0.1; done
+    fi
+    if [ -z "$L24_LISTENER" ] || ! grep -q listening "$WORK/l24.listener" 2>/dev/null; then
+      skip "L24 host-mode abstract scope" "python3 host-side abstract listener could not be started"
+    elif ! python3 -c "
+import socket,sys
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+s.connect('\0hisn-leak-'+sys.argv[1])" "$L24_NAME" 2>/dev/null; then
+      fail "L24 host-mode abstract scope" "positive control failed: the host cannot connect to its own listener"
+    else
+      for L24_VARIANT in default explicit; do
+        L24_CWD=$(new_cwd "l24$L24_VARIANT")
+        L24_POL="$WORK/L24$L24_VARIANT.toml"
+        write_policy "$L24_POL" "$L24_CWD" host
+        [ "$L24_VARIANT" = explicit ] && printf '[landlock]\nscoped = []\n' >>"$L24_POL"
+        L24_SID="l24$L24_VARIANT-$$"
+        HISN_LEAK_SECRET=topsecret HISN_LEAK_PASSED=visible-ok \
+          "$HISN" run --policy "$L24_POL" --session-id "$L24_SID" --detach </dev/null \
+          >"$WORK/$L24_SID.out" 2>"$WORK/$L24_SID.err" &
+        L24_SPID=$!
+        SESSIONS+=("$L24_SPID")
+        l24_ready=0
+        for i in $(seq 1 150); do
+          "$HISN" ls --json 2>/dev/null | grep -q "$L24_SID" && { l24_ready=1; break; }
+          kill -0 "$L24_SPID" 2>/dev/null || break
+          sleep 0.1
+        done
+        if [ "$l24_ready" = 1 ]; then
+          got=$(timeout 30 "$HISN" exec --session "$L24_SID" -- "$L24_CWD/leakprobe" abs-sock-connect "$L24_NAME" </dev/null 2>&1)
+          eq "L24 network=host ($L24_VARIANT policy): exec cannot connect to a host abstract socket" "$got" EPERM
+          hisn_json "$WORK/$L24_SID.kill.json" kill --session "$L24_SID" --signal TERM
+          kill -TERM "$L24_SPID" 2>/dev/null
+          wait "$L24_SPID" 2>/dev/null
+        elif grep -qi "landlock abi\|abstract unix socket scoping" "$WORK/$L24_SID.err" 2>/dev/null; then
+          skip "L24 network=host ($L24_VARIANT policy)" "host Landlock ABI < 6: hisn refuses network=host without abstract scoping (expected, DESIGN §7)"
+        else
+          fail "L24 network=host ($L24_VARIANT policy)" "session did not become ready; hisn said: $(head -c 300 "$WORK/$L24_SID.err")"
+        fi
+      done
+    fi
+    [ -n "$L24_LISTENER" ] && { kill "$L24_LISTENER" 2>/dev/null; wait "$L24_LISTENER" 2>/dev/null; }
 
     # ---- session end: every exec'd process dies with the session (L17)
     ex -- sh -c 'sleep 30' >/dev/null 2>&1 &

@@ -19,16 +19,17 @@ namespace-dependent code path is "not run" — see the table below.
 | `cargo fmt --check` | this commit | sandbox | clean | — |
 | `cargo clippy --all-targets -- -D warnings` (x86_64) | this commit | sandbox | clean | — |
 | `cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings` | this commit | sandbox | clean | — |
-| `cargo test` (unit tests) | this commit | sandbox | 179 passed, 0 failed | — |
+| `cargo test` (unit tests) | this commit | sandbox | 182 passed, 0 failed | — |
 | `python3 tests/leak/test_l8.py` (L8 comparator self-tests) | this commit | sandbox | 12 passed | — |
 | `hisn check` | this commit | sandbox | not run (needs userns) | — |
 | `make leaktest` (L1-L23) | 19af325 | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 173 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5) | `docs/leaktest-host-2026-11-01.log` |
+| `make leaktest` L24 (B1 host-mode abstract scope) + D25 root check | this commit | host | not run | — |
 
 ## Not verified in the build sandbox
 
 rootfs::execute, init (pivot_root, caps, post-setup verification), grant helper
 (move_mount/umount), supervisor lifecycle, exec helper, pty relay, R5
-end-to-end, and every leak test (L1-L23).  Kernel-enforced here (real syscalls,
+end-to-end, and every leak test (L1-L24).  Kernel-enforced here (real syscalls,
 no userns needed): seccomp filter stack, Landlock write-set, rlimits, fd
 passing, openat2 symlink refusal.
 

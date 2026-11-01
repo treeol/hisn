@@ -208,6 +208,23 @@ mod tests {
     }
 
     #[test]
+    fn host_network_effective_scopes_are_scoped_union_abstract() {
+        // B1: effective scopes = policy.scoped ∪ {abstract_unix_socket} when
+        // network = "host", whatever the policy lists (empty, signal only).
+        for scoped in [vec![], vec![LandlockScope::Signal]] {
+            let mut pl = pol(Network::Host);
+            pl.landlock_scoped = scoped.clone();
+            let p = plan(&pl, &[]);
+            assert!(p.scope_abstract, "host + {scoped:?} must scope abstract");
+            assert_eq!(p.scope_signal, scoped.contains(&LandlockScope::Signal));
+        }
+        // network = "none": nothing implied
+        let mut pl = pol(Network::None);
+        pl.landlock_scoped = vec![LandlockScope::Signal];
+        assert!(!plan(&pl, &[]).scope_abstract);
+    }
+
+    #[test]
     fn plan_defaults_to_no_signal_scope() {
         // P17: default is no signal scoping — execs may signal each other.
         let p = plan(&pol(Network::None), &[]);

@@ -873,6 +873,15 @@ fn child_c(ctx: &ExecContext, spec: &ExecSpec, fds: Vec<OwnedFd>) -> ! {
         sys::setns(ctx.ns.pid.as_raw_fd(), libc::CLONE_NEWPID),
     );
     step("chdir", std::env::set_current_dir("/"));
+    // D25: the sandbox root is established twice (setns(mnt) sets root and
+    // cwd, the fchdir adopts the fd). Fail closed unless "/" and "." really
+    // are the directory the supervisor opened as init's root. The expected
+    // identity is handed to `D`, which no longer holds the root fd.
+    let root_id = match sys::dev_ino(ctx.ns.root.as_raw_fd(), c"", sys::AT_EMPTY_PATH as _) {
+        Ok(id) => id,
+        Err(e) => die(status, &format!("root identity: {e}")),
+    };
+    step("root check", check_root(root_id));
     // Nothing but the stdio and status fds may reach `D`: no namespace fds,
     // no channel to the helper.
     let keep: Vec<RawFd> = fds.iter().map(AsRawFd::as_raw_fd).collect();
@@ -883,7 +892,7 @@ fn child_c(ctx: &ExecContext, spec: &ExecSpec, fds: Vec<OwnedFd>) -> ! {
         die(status, &format!("fork: {}", io::Error::last_os_error()));
     }
     if d == 0 {
-        child_d(ctx, spec, &keep);
+        child_d(ctx, spec, &keep, root_id);
     }
     let mut st = 0;
     // SAFETY: waiting for our own child.
@@ -892,11 +901,26 @@ fn child_c(ctx: &ExecContext, spec: &ExecSpec, fds: Vec<OwnedFd>) -> ! {
     unsafe { libc::_exit(0) }
 }
 
+/// D25: `/` and the current directory must both be the sandbox root
+/// (`expected` = device/inode of init's root, as opened by the supervisor).
+fn check_root(expected: (u64, u64)) -> io::Result<()> {
+    for path in [c"/", c"."] {
+        let got = sys::dev_ino(libc::AT_FDCWD, path, 0)?;
+        if got != expected {
+            return Err(io::Error::other(format!(
+                "{} is {got:?}, not the sandbox root {expected:?}",
+                path.to_string_lossy()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `D`: inside the pid namespace (its parent `C` is outside), holding
 /// capabilities in the sandbox user namespace until `drop_all_caps`.
 /// Re-applies exactly what init applied (DESIGN §14.4), then forks `W` and
 /// exits. Any failure is reported and nothing is started (fail closed).
-fn child_d(ctx: &ExecContext, spec: &ExecSpec, keep: &[RawFd]) -> ! {
+fn child_d(ctx: &ExecContext, spec: &ExecSpec, keep: &[RawFd], root_id: (u64, u64)) -> ! {
     let status = *keep.last().expect("status fd");
     let step = |what: &str, r: io::Result<()>| {
         if let Err(e) = r {
@@ -913,6 +937,8 @@ fn child_d(ctx: &ExecContext, spec: &ExecSpec, keep: &[RawFd]) -> ! {
     // 3-5. same functions and inputs as init
     step("setrlimit", init::set_rlimits(&ctx.policy));
     step("chdir", std::env::set_current_dir("/"));
+    // D25: re-verify before any Landlock root is resolved by pathname.
+    step("root check", check_root(root_id));
     if let Err(e) = landlock::apply(&ctx.landlock, ctx.require_scope) {
         die(status, &format!("landlock: {e}"));
     }
@@ -1140,6 +1166,34 @@ mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
     use std::process::Command;
+
+    #[test]
+    fn dev_ino_matches_std_metadata() {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata("/").unwrap();
+        let (dev, ino) = sys::dev_ino(libc::AT_FDCWD, c"/", 0).unwrap();
+        assert_eq!(ino, m.ino());
+        assert_eq!(dev, m.dev());
+        // by descriptor, as the supervisor's root fd is identified
+        let f = std::fs::File::open("/").unwrap();
+        let id = sys::dev_ino(f.as_raw_fd(), c"", sys::AT_EMPTY_PATH as _).unwrap();
+        assert_eq!(id, (dev, ino));
+    }
+
+    #[test]
+    fn root_check_fails_closed_on_mismatch() {
+        // D25: a root identity that is not this "/" must be refused.
+        let e = check_root((0, 0)).expect_err("mismatched root must fail");
+        assert!(e.to_string().contains("not the sandbox root"), "{e}");
+        // "/" alone matches; "." only matches when the cwd is "/", so only
+        // assert the "/" half here (the test must not chdir the process).
+        let real = sys::dev_ino(libc::AT_FDCWD, c"/", 0).unwrap();
+        if std::env::current_dir().unwrap() == std::path::Path::new("/") {
+            check_root(real).unwrap();
+        } else {
+            assert!(check_root(real).is_err(), "cwd != / must fail the check");
+        }
+    }
 
     fn rules() -> ExecRules {
         ExecRules {

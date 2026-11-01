@@ -41,9 +41,10 @@ disposition (no third round is allowed, so everything is closed here or listed):
 
 ## Open
 
-* **P1 — grant mechanism is unverified on real kernels.** Cross-userns
+* **P1 — grant mechanism verified on one host only.** Cross-userns
   `move_mount` of a detached tree after `setns(U)+setns(M)` is the brief's
-  mechanism; its acceptance for an unprivileged owner is **[HOST-VERIFY]**.
+  mechanism. L6/L11/L13 pass on one Fedora host (kernel 7.2, x86_64); other
+  kernels/distros and aarch64 remain **[HOST-VERIFY]**.
   The shared-subtree fallback (DESIGN §10) is a *separate design* with its own
   proof burden: it needs a shared root in S, a slave in U, atomic ro
   publication and fd-based revoke equivalent. It must **not** be auto-selected

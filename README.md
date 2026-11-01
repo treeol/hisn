@@ -10,10 +10,11 @@ host path** (rw), a read-only toolchain, private tmpfs `$HOME`/`/tmp`/`/run`,
 and paths the host side explicitly **grants** for the life of the session.
 Everything else does not exist (ENOENT), not "permission denied".
 
-> **Status: v0, not yet verified on a real host.** Unit tests, clippy and the
-> seccomp/Landlock kernel checks pass in the build sandbox, but user
-> namespaces are blocked there, so the namespace/mount/grant machinery and the
-> leak suite (L1-L14) have **not been run**. See [Verifying](#verifying).
+> **Status: v0.** Unit tests and clippy pass in the build sandbox. The leak
+> suite (L1-L14) was run on one real host (Fedora, kernel 7.2, x86_64, Landlock
+> ABI 10): 111 passed, 0 failed, 1 skipped (L12 needs write access to `/etc`),
+> 1 weak (R5 end-to-end is covered by unit tests only). It has **not** been run
+> on aarch64 or on other kernels/distros. See [Verifying](#verifying).
 
 ## Install
 

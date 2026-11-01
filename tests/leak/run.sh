@@ -133,6 +133,26 @@ hisn_json() { # hisn_json OUTFILE args... ; stdout of hisn into OUTFILE
   timeout 20 "$HISN" "$@" >"$out" 2>"$out.err"
 }
 
+# reap_bounded PID SECS LABEL: wait for a background child, but never forever.
+# On timeout: FAIL, print the process table (DIAG lines) so a hang on a CI
+# runner is diagnosable from the log, SIGKILL the child, and return 1.
+reap_bounded() {
+  local pid=$1 secs=$2 label=$3 i st t
+  for i in $(seq 1 $((secs * 10))); do
+    st=$(ps -o stat= -p "$pid" 2>/dev/null)
+    case "$st" in ""|Z*) wait "$pid" 2>/dev/null; return 0 ;; esac
+    sleep 0.1
+  done
+  fail "$label" "pid $pid still alive ${secs}s after it was told to exit; process table follows"
+  ps -eo pid,ppid,pgid,stat,wchan:24,etime,args 2>&1 | sed 's/^/DIAG /'
+  for t in /proc/"$pid"/task/*; do
+    printf 'DIAG task %s wchan=%s\n' "${t##*/}" "$(cat "$t/wchan" 2>/dev/null)"
+  done
+  kill -9 "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  return 1
+}
+
 host_mounts() { cut -d' ' -f5 /proc/self/mountinfo | sort; }
 
 # ================================================================ main session
@@ -660,7 +680,7 @@ L23EOF
         # Clean up the L23 session
         hisn_json "$WORK/l23kill.json" kill --session l23-$$ --signal TERM
         kill -TERM "$L23_PID" 2>/dev/null
-        wait "$L23_PID" 2>/dev/null
+        reap_bounded "$L23_PID" 30 "L23 session exit after kill"
       else
         fail "L23 scoped signal" "session l23 did not become ready; hisn said: $(head -c 300 "$WORK/l23.err")"
       fi
@@ -719,7 +739,7 @@ s.connect('\0hisn-leak-'+sys.argv[1])" "$L24_NAME" 2>/dev/null; then
           eq "L24 network=host ($L24_VARIANT policy): exec cannot connect to a host abstract socket" "$got" EPERM
           hisn_json "$WORK/$L24_SID.kill.json" kill --session "$L24_SID" --signal TERM
           kill -TERM "$L24_SPID" 2>/dev/null
-          wait "$L24_SPID" 2>/dev/null
+          reap_bounded "$L24_SPID" 30 "L24 session exit after kill ($L24_VARIANT)"
         elif grep -qi "landlock abi\|abstract unix socket scoping" "$WORK/$L24_SID.err" 2>/dev/null; then
           skip "L24 network=host ($L24_VARIANT policy)" "host Landlock ABI < 6: hisn refuses network=host without abstract scoping (expected, DESIGN §7)"
         else
@@ -727,7 +747,7 @@ s.connect('\0hisn-leak-'+sys.argv[1])" "$L24_NAME" 2>/dev/null; then
         fi
       done
     fi
-    [ -n "$L24_LISTENER" ] && { kill "$L24_LISTENER" 2>/dev/null; wait "$L24_LISTENER" 2>/dev/null; }
+    [ -n "$L24_LISTENER" ] && { kill "$L24_LISTENER" 2>/dev/null; reap_bounded "$L24_LISTENER" 5 "L24 listener teardown"; }
 
     # ---- session end: every exec'd process dies with the session (L17)
     ex -- sh -c 'sleep 30' >/dev/null 2>&1 &
@@ -735,7 +755,7 @@ s.connect('\0hisn-leak-'+sys.argv[1])" "$L24_NAME" 2>/dev/null; then
     sleep 0.5
     hisn_json "$WORK/xkill.json" kill --session xdet-$$ --signal TERM
     kill -TERM "$DET_PID" 2>/dev/null
-    wait "$DET_PID" 2>/dev/null
+    reap_bounded "$DET_PID" 30 "L17 detached supervisor exit after kill"
     # The exec'd sleeper was a child of THIS shell (hisn exec is a child
     # process); the sandboxed `sleep 30` dies with the session, so `wait`
     # must return promptly.

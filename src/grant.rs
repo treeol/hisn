@@ -245,6 +245,13 @@ pub fn require_granted<'a>(table: &'a GrantTable, path: &Path) -> Result<&'a Gra
 /// canonical path read back from the kernel.
 pub fn open_source(path: &Path) -> io::Result<(OwnedFd, PathBuf)> {
     let rel = sys::rel_to_root(path);
+    // `/` has an empty relative path, which openat2 rejects with ENOENT; open
+    // the root itself so the policy check (R2) sees it and refuses.
+    let rel = if rel.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        rel
+    };
     let root = sys::openat2(
         libc::AT_FDCWD,
         c"/",
@@ -761,5 +768,7 @@ mod tests {
         let e = open_source(&link).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e}");
         assert!(open_source(&real.join("missing")).is_err());
+        let (_fd, canon) = open_source(Path::new("/")).unwrap();
+        assert_eq!(canon, Path::new("/"));
     }
 }

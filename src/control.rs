@@ -18,6 +18,11 @@ use serde_json::{Value, json};
 /// Maximum accepted request line (bytes, excluding the newline).
 pub const MAX_LINE: usize = 64 * 1024;
 
+/// Maximum accepted *response* line on the client side. Responses such as
+/// `inspect` (full mountinfo + resolved policy) are legitimately larger than
+/// any request.
+pub const MAX_RESPONSE_LINE: usize = 16 * 1024 * 1024;
+
 pub const E_BAD_REQUEST: &str = "E_BAD_REQUEST";
 pub const E_PATH_FORBIDDEN: &str = "E_PATH_FORBIDDEN";
 pub const E_NOT_FOUND: &str = "E_NOT_FOUND";
@@ -143,31 +148,28 @@ pub trait Handler: Send + Sync + 'static {
 /// Read one `\n`-terminated line of at most [`MAX_LINE`] bytes.
 /// `Ok(None)` = clean EOF; `Err(InvalidData)` = oversized line.
 pub fn read_line_limited<R: BufRead>(r: &mut R) -> io::Result<Option<String>> {
+    read_line_max(r, MAX_LINE)
+}
+
+/// Like [`read_line_limited`] with an explicit byte limit.
+pub fn read_line_max<R: BufRead>(r: &mut R, max: usize) -> io::Result<Option<String>> {
     let mut buf = Vec::new();
     let n = r
         .by_ref()
-        .take(MAX_LINE as u64 + 1)
+        .take(max as u64 + 1)
         .read_until(b'\n', &mut buf)?;
     if n == 0 {
         return Ok(None);
     }
     if buf.last() == Some(&b'\n') {
         buf.pop();
-    } else if buf.len() > MAX_LINE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "request line too long",
-        ));
     }
-    if buf.len() > MAX_LINE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "request line too long",
-        ));
+    if buf.len() > max {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
     }
     String::from_utf8(buf)
         .map(Some)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "request is not UTF-8"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "line is not UTF-8"))
 }
 
 /// Requests currently being handled or answered.
@@ -250,7 +252,7 @@ pub fn request(socket: &std::path::Path, req: &Value) -> io::Result<Value> {
     let mut s = UnixStream::connect(socket)?;
     writeln!(s, "{req}")?;
     let mut r = BufReader::new(s);
-    let line = read_line_limited(&mut r)?
+    let line = read_line_max(&mut r, MAX_RESPONSE_LINE)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no response"))?;
     serde_json::from_str(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
@@ -361,6 +363,18 @@ mod tests {
         // no newline, over the limit
         assert!(read_line_limited(&mut Cursor::new(vec![b'a'; MAX_LINE + 10])).is_err());
         assert!(read_line_limited(&mut Cursor::new(vec![0xff, b'\n'])).is_err());
+    }
+
+    #[test]
+    fn responses_larger_than_a_request_are_accepted_by_the_client_reader() {
+        // `inspect` replies (mountinfo + policy) exceed MAX_LINE.
+        let mut big = vec![b'a'; MAX_LINE * 4];
+        big.push(b'\n');
+        assert!(read_line_limited(&mut Cursor::new(big.clone())).is_err());
+        let got = read_line_max(&mut Cursor::new(big), MAX_RESPONSE_LINE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.len(), MAX_LINE * 4);
     }
 
     struct Fake {

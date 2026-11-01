@@ -524,6 +524,7 @@ mod tests {
             env_pass: vec![],
             env_set: Default::default(),
             extra_deny: vec![],
+            landlock_scoped: vec![],
             nofile: 1,
             nproc: 1,
         }

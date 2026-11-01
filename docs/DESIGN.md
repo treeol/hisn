@@ -810,15 +810,20 @@ for.
   (open the roots once in the supervisor before the pivot and pass the fds) —
   open point P18.
 
-* **Sibling Landlock domains.** Each exec gets its *own* Landlock domain
-  (`landlock::apply` in `D`), a sibling of init's domain and of every other
-  exec's. With ABI >= 6 the ruleset scopes `Signal` and `AbstractUnixSocket`
-  (§7): a scoped process cannot signal, or connect an abstract unix socket to, a
-  process in a *different* (non-descendant) domain. So an exec'd program cannot
-  signal the main command or another exec's processes, nor reach their abstract
-  sockets. This is stricter, not looser, but it changes behaviour (`kill`
-  between tool calls fails with `EPERM` on such kernels); the supervisor-side
-  `signal` op is unaffected. Open point P17.
+* **Sibling Landlock domains (P17 — resolved).** Each exec gets its *own*
+  Landlock domain (`landlock::apply` in `D`), a sibling of init's domain and
+  of every other exec's. With ABI >= 6 the ruleset can scope `Signal` and
+  `AbstractUnixSocket` (§7): a scoped process cannot signal, or connect an
+  abstract unix socket to, a process in a *different* (non-descendant)
+  domain. The default is now **no scoping** (`[landlock] scoped = []`):
+  execs of the same session may signal each other and reach each other's
+  abstract sockets — isolation is against the host, not between execs.
+  `network = "host"` still requires `AbstractUnixSocket` scope (§7).
+  A policy that wants inter-exec signal isolation sets `scoped =
+  ["signal"]`; the leak tests L21 (cross-exec kill succeeds by default),
+  L22 (cross-exec abstract socket connect succeeds by default), and L23
+  (with `scoped = ["signal"]` the kill fails with `EPERM`, skipped if
+  ABI < 6) cover both defaults.
 * `P` shares the pid namespace, mount namespace and (for `network="host"`) the
   network with the main command; exec does not add isolation between tool calls.
 * The ns-pid returned in `{"ok":true,"pid":N}` is only meaningful for the

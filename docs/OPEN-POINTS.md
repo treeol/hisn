@@ -132,6 +132,14 @@ L15-L20. No third round is allowed. Disposition:
   running session must be refused (`E_PATH_FORBIDDEN`). The R5 half of the
   original L14 idea (socket still refuses the sandbox peer with R1b disabled)
   was **not** built; see P16.
+* **L21** exec A starts `sleep 300`; exec B `kill`s it by PID → exits; exec B
+  still cannot stat `/home`, `/root`, `/etc/shadow` (reuse L1 probes). P17:
+  default `scoped = []` means cross-exec signal works.
+* **L22** exec A binds an abstract unix socket; exec B connects → succeeds.
+  P17: default `scoped = []` means cross-exec abstract socket works.
+* **L23** with `scoped = ["signal"]` in the policy, L21's kill fails with
+  `EPERM`; skip with reason if Landlock ABI < 6 (the kill succeeds instead of
+  failing, which means the kernel lacks scope support).
 * **P13 — absent Landlock write roots are skipped**, so a `grantable_rw`
   prefix that cannot be opened gives no write rule. The mount plan pre-creates
   every grantable prefix as an empty directory, so this should not trigger;
@@ -166,13 +174,21 @@ L15-L20. No third round is allowed. Disposition:
   `cfg(test)`/feature-gated build of the supervisor, so the leak suite would no
   longer test the shipped binary; (b) does not exist, because R1b exists to
   prevent it. Revisit if R1b is ever relaxed.
-* **P17 — exec'd processes are sibling Landlock domains.** Each exec applies
-  its own ruleset (DESIGN §14.12), so with ABI >= 6 scoping an exec'd program
-  cannot signal, or connect abstract unix sockets of, the main command or
-  another exec's processes (`EPERM`). Stricter than needed but a behaviour
-  change tool authors may trip over; the supervisor-side `signal` op is not
-  affected. Alternatives (one shared domain) would need init to fork the
-  program, which §14.10 rejects.
+* **P17 — RESOLVED (v0.2.0): Landlock scoping no longer blocks cross-exec
+  signals by default.** Each exec gets its own Landlock domain (DESIGN
+  §14.12); with ABI >= 6 `Scope::Signal` and `Scope::AbstractUnixSocket`
+  prevent an exec'd process from signalling, or connecting abstract unix
+  sockets to, processes in other domains. This broke real use (Wakil starts
+  dev servers in one exec and kills them in another). The default is now
+  `[landlock] scoped = []`: no signal or abstract-socket scoping; execs of
+  the same session share one PID ns and one uid and may signal each other.
+  Isolation remains against the host, not between execs. The filesystem
+  ruleset, caps, no_new_privs, seccomp, and env scrubbing are untouched.
+  `network = "host"` still requires `Scope::AbstractUnixSocket` (§7).
+  Leak tests L21 (cross-exec kill succeeds), L22 (cross-exec abstract socket
+  connect succeeds), L23 (with `scoped = ["signal"]` the kill fails with
+  `EPERM`, skipped if ABI < 6) cover both defaults. Unit test: policy parsing
+  of `scoped`, rejection of unknown values.
 * **P18 — Landlock write roots in exec are re-resolved by pathname** (§14.12).
   Can only weaken, never widen; fix = inode-anchored root fds captured at
   start.

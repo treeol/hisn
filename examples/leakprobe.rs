@@ -490,6 +490,103 @@ fn cmd_fds() -> String {
     )
 }
 
+/// Send SIGTERM to `pid` (L21: exec B kills exec A's sleeper by PID).
+fn cmd_kill_pid(pid: &str) -> String {
+    let Ok(p) = pid.parse::<i32>() else {
+        return format!("BAD_PID {pid:?}");
+    };
+    // SAFETY: kill with a parsed pid; expected to succeed or fail with EPERM.
+    let r = unsafe { libc::kill(p, libc::SIGTERM) };
+    if r == 0 {
+        "OK killed".into()
+    } else {
+        last_errno()
+    }
+}
+
+/// Bind an abstract unix socket `@NAME` (L22: exec A binds, exec B connects).
+fn cmd_abs_sock_bind(name: &str) -> String {
+    let addr_name = format!("\0hisn-leak-{name}");
+    let Ok(c_addr) = CString::new(addr_name.as_bytes()) else {
+        return "BAD_NAME".into();
+    };
+    // SAFETY: socket + bind with a valid sockaddr_un.
+    unsafe {
+        let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if s < 0 {
+            return last_errno();
+        }
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as _;
+        let name_bytes = c_addr.as_bytes();
+        if name_bytes.len() >= addr.sun_path.len() {
+            libc::close(s);
+            return "NAME_TOO_LONG".into();
+        }
+        std::ptr::copy_nonoverlapping(
+            name_bytes.as_ptr(),
+            addr.sun_path.as_mut_ptr().cast::<u8>(),
+            name_bytes.len(),
+        );
+        let len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + name_bytes.len())
+            as libc::socklen_t;
+        let r = libc::bind(s, (&addr as *const libc::sockaddr_un).cast(), len);
+        if r < 0 {
+            let e = last_errno();
+            libc::close(s);
+            return e;
+        }
+        let r = libc::listen(s, 1);
+        if r < 0 {
+            let e = last_errno();
+            libc::close(s);
+            return e;
+        }
+        // Park: accept will block until a peer connects (or the probe exits).
+        // The listening fd stays alive until the probe process exits.
+        let _ = libc::accept(s, std::ptr::null_mut(), std::ptr::null_mut());
+        libc::close(s);
+        "OK bound".into()
+    }
+}
+
+/// Connect to an abstract unix socket `@NAME` (L22: exec B connects to A's socket).
+fn cmd_abs_sock_connect(name: &str) -> String {
+    let addr_name = format!("\0hisn-leak-{name}");
+    let Ok(c_addr) = CString::new(addr_name.as_bytes()) else {
+        return "BAD_NAME".into();
+    };
+    // SAFETY: socket + connect with a valid sockaddr_un.
+    unsafe {
+        let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if s < 0 {
+            return last_errno();
+        }
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as _;
+        let name_bytes = c_addr.as_bytes();
+        if name_bytes.len() >= addr.sun_path.len() {
+            libc::close(s);
+            return "NAME_TOO_LONG".into();
+        }
+        std::ptr::copy_nonoverlapping(
+            name_bytes.as_ptr(),
+            addr.sun_path.as_mut_ptr().cast::<u8>(),
+            name_bytes.len(),
+        );
+        let len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + name_bytes.len())
+            as libc::socklen_t;
+        let r = libc::connect(s, (&addr as *const libc::sockaddr_un).cast(), len);
+        if r < 0 {
+            let e = last_errno();
+            libc::close(s);
+            return e;
+        }
+        libc::close(s);
+        "OK connected".into()
+    }
+}
+
 fn dispatch(a: &[String]) -> String {
     let arg = |i: usize| a.get(i).map(String::as_str).unwrap_or("");
     match arg(0) {
@@ -514,6 +611,9 @@ fn dispatch(a: &[String]) -> String {
         "hold-queued" => cmd_hold_queued(arg(1)),
         "recv-write" => cmd_recv_write(),
         "mountinfo" => cmd_mountinfo(),
+        "kill-pid" => cmd_kill_pid(arg(1)),
+        "abs-sock-bind" => cmd_abs_sock_bind(arg(1)),
+        "abs-sock-connect" => cmd_abs_sock_connect(arg(1)),
         other => format!("UNKNOWN_COMMAND {other}"),
     }
 }

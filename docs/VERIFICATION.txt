@@ -19,9 +19,9 @@ namespace-dependent code path is "not run" — see the table below.
 | `cargo fmt --check` | this commit | sandbox | clean | — |
 | `cargo clippy --all-targets -- -D warnings` (x86_64) | this commit | sandbox | clean | — |
 | `cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings` | this commit | sandbox | clean | — |
-| `cargo test` (unit tests) | this commit | sandbox | not run (run after Item 2) | — |
-| `python3 tests/leak/test_l8.py` (L8 comparator self-tests) | this commit | sandbox | not run (run after Item 2) | — |
-| `hisn check` | this commit | sandbox | not run (run after Item 2) | — |
+| `cargo test` (unit tests) | this commit | sandbox | 179 passed, 0 failed | — |
+| `python3 tests/leak/test_l8.py` (L8 comparator self-tests) | this commit | sandbox | 12 passed | — |
+| `hisn check` | this commit | sandbox | not run (needs userns) | — |
 | `make leaktest` (L1-L23) | — | host | not run | — |
 
 ## Not verified in the build sandbox

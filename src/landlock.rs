@@ -15,7 +15,7 @@ use landlock::{
 };
 
 use crate::mounts::SANDBOX_HOME;
-use crate::policy::{Network, ResolvedPolicy};
+use crate::policy::{LandlockScope, Network, ResolvedPolicy};
 
 /// Newest ABI hisn knows how to use. Older kernels degrade (best-effort).
 pub const TARGET_ABI: ABI = ABI::V6;
@@ -38,8 +38,12 @@ pub struct LandlockPlan {
     pub read_roots: Vec<PathBuf>,
     /// Full write access allowed beneath these roots.
     pub write_roots: Vec<PathBuf>,
-    /// Scope abstract unix sockets and signals (ABI >= 6).
-    pub scope: bool,
+    /// Apply `LANDLOCK_SCOPE_SIGNAL` (ABI >= 6). Default false (P17): execs of
+    /// the same session may signal each other.
+    pub scope_signal: bool,
+    /// Apply `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` (ABI >= 6). Default false
+    /// (P17), but `network = "host"` requires it (`scope_required`).
+    pub scope_abstract: bool,
 }
 
 /// Compute the ruleset from the resolved policy. `initial_rw_grants` are the
@@ -57,13 +61,16 @@ pub fn plan(policy: &ResolvedPolicy, initial_rw_grants: &[PathBuf]) -> LandlockP
     write.extend(initial_rw_grants.iter().cloned());
     write.sort();
     write.dedup();
+    let scope_signal = policy.landlock_scoped.contains(&LandlockScope::Signal);
+    let scope_abstract = policy
+        .landlock_scoped
+        .contains(&LandlockScope::AbstractUnixSocket)
+        || policy.network == Network::Host;
     LandlockPlan {
         read_roots: vec!["/".into()],
         write_roots: write,
-        // For network=none the net namespace already isolates abstract
-        // sockets; scoping is still applied when available, and *required*
-        // for host networking.
-        scope: true,
+        scope_signal,
+        scope_abstract,
     }
 }
 
@@ -85,11 +92,14 @@ pub fn apply(plan: &LandlockPlan, require_scope: bool) -> Result<(bool, bool), L
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(all)
         .map_err(|e| err(&e))?;
-    let scope_handled = plan.scope && TARGET_ABI >= ABI::V6;
-    if scope_handled {
-        rs = rs
-            .scope(Scope::AbstractUnixSocket | Scope::Signal)
-            .map_err(|e| err(&e))?;
+    let scope_signal = plan.scope_signal && TARGET_ABI >= ABI::V6;
+    let scope_abstract = plan.scope_abstract && TARGET_ABI >= ABI::V6;
+    let scope_handled = scope_signal || scope_abstract;
+    if scope_signal {
+        rs = rs.scope(Scope::Signal).map_err(|e| err(&e))?;
+    }
+    if scope_abstract {
+        rs = rs.scope(Scope::AbstractUnixSocket).map_err(|e| err(&e))?;
     }
     let mut created = rs.create().map_err(|e| err(&e))?;
     for root in &plan.read_roots {
@@ -138,6 +148,7 @@ mod tests {
             env_pass: vec![],
             env_set: Default::default(),
             extra_deny: vec![],
+            landlock_scoped: vec![],
             nofile: 1,
             nproc: 1,
         }
@@ -183,8 +194,31 @@ mod tests {
     }
 
     #[test]
-    fn plan_requests_scoping() {
-        assert!(plan(&pol(Network::Host), &[]).scope);
+    fn host_network_implies_abstract_scope_by_default() {
+        // network=host requires abstract socket scope (scope_required); the
+        // plan reflects this by setting scope_abstract even when the policy's
+        // landlock.scoped is empty.
+        let p = plan(&pol(Network::Host), &[]);
+        assert!(p.scope_abstract);
+        // signal scope is opt-in only (P17): default off even for host networking
+        assert!(!p.scope_signal);
+    }
+
+    #[test]
+    fn plan_defaults_to_no_signal_scope() {
+        // P17: default is no signal scoping — execs may signal each other.
+        let p = plan(&pol(Network::None), &[]);
+        assert!(!p.scope_signal);
+        assert!(!p.scope_abstract);
+    }
+
+    #[test]
+    fn plan_applies_policy_scoped_values() {
+        let mut p = pol(Network::None);
+        p.landlock_scoped = vec![LandlockScope::Signal, LandlockScope::AbstractUnixSocket];
+        let plan = plan(&p, &[]);
+        assert!(plan.scope_signal);
+        assert!(plan.scope_abstract);
     }
 
     /// Real kernel check in a forked child: write inside an allowed dir works,

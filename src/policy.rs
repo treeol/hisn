@@ -96,6 +96,27 @@ pub struct SeccompPolicy {
     pub extra_deny: Vec<String>,
 }
 
+/// Which Landlock IPC scopes to apply (ABI >= 6). Default empty: execs of the
+/// same session may signal each other and reach each other's abstract unix
+/// sockets. Isolation is against the host, not between execs (P17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LandlockScope {
+    /// `LANDLOCK_SCOPE_SIGNAL` — execs cannot signal processes in other
+    /// Landlock domains of the same session.
+    Signal,
+    /// `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` — execs cannot connect to
+    /// abstract unix sockets bound by processes in other domains.
+    AbstractUnixSocket,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct LandlockPolicy {
+    /// IPC scopes to apply (ABI >= 6). Default empty.
+    pub scoped: Vec<LandlockScope>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Limits {
@@ -130,6 +151,8 @@ pub struct Policy {
     #[serde(default)]
     pub seccomp: SeccompPolicy,
     #[serde(default)]
+    pub landlock: LandlockPolicy,
+    #[serde(default)]
     pub limits: Limits,
 }
 
@@ -141,6 +164,7 @@ impl Default for Policy {
             mounts: Mounts::default(),
             env: EnvPolicy::default(),
             seccomp: SeccompPolicy::default(),
+            landlock: LandlockPolicy::default(),
             limits: Limits::default(),
         }
     }
@@ -168,6 +192,7 @@ pub struct ResolvedPolicy {
     pub env_pass: Vec<String>,
     pub env_set: BTreeMap<String, String>,
     pub extra_deny: Vec<String>,
+    pub landlock_scoped: Vec<LandlockScope>,
     pub nofile: u64,
     pub nproc: u64,
 }
@@ -408,6 +433,7 @@ impl Policy {
             env_pass: self.env.pass.clone(),
             env_set: self.env.set.clone(),
             extra_deny: self.seccomp.extra_deny.clone(),
+            landlock_scoped: self.landlock.scoped.clone(),
             nofile: self.limits.nofile,
             nproc: self.limits.nproc,
         })
@@ -517,6 +543,7 @@ nproc  = 4096
             "version = \"hisn-policy/v1\"\n[mounts]\nbogus = []",
             "version = \"hisn-policy/v1\"\n[env]\nbogus = []",
             "version = \"hisn-policy/v1\"\n[seccomp]\nbogus = []",
+            "version = \"hisn-policy/v1\"\n[landlock]\nbogus = []",
             "version = \"hisn-policy/v1\"\n[limits]\nbogus = 1",
             "version = \"hisn-policy/v1\"\n[bogus]\nx = 1",
         ] {
@@ -525,6 +552,43 @@ nproc  = 4096
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn landlock_scoped_parses_and_rejects_unknown_values() {
+        let p = Policy::parse(
+            r#"
+version = "hisn-policy/v1"
+[landlock]
+scoped = ["signal", "abstract_unix_socket"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p.landlock.scoped,
+            [LandlockScope::Signal, LandlockScope::AbstractUnixSocket]
+        );
+        // default is empty
+        let d = Policy::parse("version = \"hisn-policy/v1\"").unwrap();
+        assert!(d.landlock.scoped.is_empty());
+        // unknown value is a parse error
+        assert!(
+            Policy::parse(
+                r#"
+version = "hisn-policy/v1"
+[landlock]
+scoped = ["bogus"]
+"#
+            )
+            .is_err()
+        );
+        // the resolved policy carries the scopes
+        let d = tempfile::tempdir().unwrap();
+        let r = p.resolve(d.path(), &Overrides::default(), &[]).unwrap();
+        assert_eq!(
+            r.landlock_scoped,
+            [LandlockScope::Signal, LandlockScope::AbstractUnixSocket]
+        );
     }
 
     #[test]

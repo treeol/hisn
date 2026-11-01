@@ -140,6 +140,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             extra_deny: vec![],
+            landlock_scoped: vec![],
             nofile: 1,
             nproc: 1,
         }

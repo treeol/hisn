@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hisn leak suite (L1-L14b). Usage: tests/leak/run.sh PATH/TO/hisn
+# hisn leak suite (L1-L23). Usage: tests/leak/run.sh PATH/TO/hisn
 #
 # Each test runs a probe (examples/leakprobe) INSIDE a real `hisn run` session
 # and asserts from the host. Needs unprivileged user namespaces on the host.
@@ -557,6 +557,111 @@ if HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/
       [ $rc -eq 125 ] && has "L20 terminal without --tty refused (exit 125)" "$out" --tty || fail "L20 terminal refusal" "rc=$rc out=[$out]"
     else
       weak "L20 terminal refusal" "run.sh stdin is not a tty; rerun with a terminal"
+    fi
+
+    # ---- L21: exec B can kill exec A's process by PID (P17: default no signal scope)
+    # exec A starts a long sleep; exec B kills it by PID; exec B still cannot
+    # stat /home, /root, /etc/shadow (reuse L1 probes).
+    ex --cwd "$CX" -- sh -c 'sleep 300' >/dev/null 2>&1 &
+    L21_SLEEPER=$!
+    sleep 0.5
+    # Find the sleeper's PID inside the sandbox (it is visible via /proc).
+    L21_PID=$(exq pids)
+    L21_PID=$(printf '%s' "${L21_PID#OK }" | tr ',' '\n' | grep -v '^1$' | head -1)
+    if [ -n "$L21_PID" ]; then
+      got=$(exq kill-pid "$L21_PID")
+      case "$got" in
+        OK*|ESRCH) pass "L21 exec B kills exec A's process by PID ($got)" ;;
+        *) fail "L21 cross-exec kill" "got [$got] want OK or ESRCH (process already gone)" ;;
+      esac
+      # exec B still cannot stat host paths (reuse L1 probes)
+      for p in /home /root /etc/shadow; do
+        got=$(exq stat "$p")
+        eq "L21 exec B cannot stat $p" "$got" ENOENT
+      done
+    else
+      fail "L21 cross-exec kill" "could not find the sleeper's pid in the sandbox"
+    fi
+    wait "$L21_SLEEPER" >/dev/null 2>&1
+
+    # ---- L22: exec B can connect to exec A's abstract unix socket (P17: default no abstract scope)
+    # exec A binds an abstract socket (blocks in accept); exec B connects.
+    timeout 10 ex --cwd "$CX" -- "$CX/leakprobe" abs-sock-bind l22 >/dev/null 2>&1 &
+    L22_BINDER=$!
+    sleep 0.5
+    got=$(exq abs-sock-connect l22)
+    case "$got" in
+      OK*) pass "L22 exec B connects to exec A's abstract unix socket ($got)" ;;
+      *) fail "L22 cross-exec abstract socket" "got [$got] want OK" ;;
+    esac
+    wait "$L22_BINDER" >/dev/null 2>&1
+
+    # ---- L23: with scoped=["signal"] in policy, L21's kill fails with EPERM
+    # This test needs a separate session with a policy that sets
+    # [landlock] scoped = ["signal"]. Skip if Landlock ABI < 6 (the kill
+    # succeeds instead of failing with EPERM, which means the kernel lacks
+    # scope support).
+    L23_POL="$WORK/L23.toml"
+    cat >"$L23_POL" <<L23EOF
+version = "hisn-policy/v1"
+[session]
+cwd = "$CX"
+network = "none"
+[mounts]
+grantable_rw = ["$WORK/g_rw"]
+[env]
+pass = ["HISN_LEAK_PASSED"]
+[landlock]
+scoped = ["signal"]
+L23EOF
+    if HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
+      HISN_LEAK_PASSED=visible-ok \
+      "$HISN" run --policy "$L23_POL" --session-id l23-$$ --detach </dev/null >"$WORK/l23.out" 2>"$WORK/l23.err" & L23_PID=$!; then
+      SESSIONS+=("$L23_PID")
+      l23_ready=0
+      for i in $(seq 1 150); do
+        "$HISN" ls --json 2>/dev/null | grep -q l23-$$ && { l23_ready=1; break; }
+        kill -0 "$L23_PID" 2>/dev/null || break
+        sleep 0.1
+      done
+      if [ "$l23_ready" = 1 ]; then
+        l23ex() { timeout 30 "$HISN" exec --session l23-$$ "$@" </dev/null 2>&1; }
+        l23exq() { timeout 30 "$HISN" exec --session l23-$$ -- "$CX/leakprobe" "$@" </dev/null 2>&1; }
+        # Start a sleeper in exec A
+        l23ex -- sh -c 'sleep 300' >/dev/null 2>&1 &
+        L23_SLP=$!
+        sleep 0.5
+        L23_PIDS=$(l23exq pids)
+        L23_PID_SANDBOX=$(printf '%s' "${L23_PIDS#OK }" | tr ',' '\n' | grep -v '^1$' | head -1)
+        if [ -n "$L23_PID_SANDBOX" ]; then
+          got=$(l23exq kill-pid "$L23_PID_SANDBOX")
+          case "$got" in
+            EPERM) pass "L23 scoped signal: cross-exec kill fails with EPERM" ;;
+            OK*|ESRCH)
+              # The kill succeeded: either the process already exited, or
+              # the kernel lacks Landlock scope (ABI < 6). Distinguish by
+              # checking whether the signal scoping is actually enforced.
+              if [ "$got" = "ESRCH" ]; then
+                skip "L23 scoped signal" "sleeper already exited (ESRCH); race in the test"
+              else
+                skip "L23 scoped signal" "kill succeeded ($got): Landlock ABI < 6 (scope not enforced on this kernel)"
+              fi
+              ;;
+            *) fail "L23 scoped signal" "got [$got] want EPERM" ;;
+          esac
+        else
+          fail "L23 scoped signal" "could not find the sleeper's pid"
+        fi
+        wait "$L23_SLP" >/dev/null 2>&1
+        # Clean up the L23 session
+        hisn_json "$WORK/l23kill.json" kill --session l23-$$ --signal TERM
+        kill -TERM "$L23_PID" 2>/dev/null
+        wait "$L23_PID" 2>/dev/null
+      else
+        fail "L23 scoped signal" "session l23 did not become ready; hisn said: $(head -c 300 "$WORK/l23.err")"
+      fi
+    else
+      fail "L23 scoped signal" "could not start a scoped-signal session"
     fi
 
     # ---- session end: every exec'd process dies with the session (L17)

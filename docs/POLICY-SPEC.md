@@ -30,6 +30,9 @@ set  = {}               # literal values
 [seccomp]
 extra_deny = []         # syscall names added to the built-in denylist
 
+[landlock]
+scoped = []             # Landlock IPC scopes to apply (ABI >= 6): "signal", "abstract_unix_socket"
+
 [limits]                # setrlimit only in v0
 nofile = 65536
 nproc  = 4096
@@ -48,6 +51,7 @@ nproc  = 4096
 | `env.pass` | list of names | `[]` | `[A-Za-z_][A-Za-z0-9_]*`; cannot name `HOME` |
 | `env.set` | table name→string | `{}` | wins over `pass`; cannot set `HOME` |
 | `seccomp.extra_deny` | list of syscall names | `[]` | must be known for the build arch, else error |
+| `landlock.scoped` | list of `"signal"` \| `"abstract_unix_socket"` | `[]` | Landlock IPC scopes (ABI >= 6). Default empty: execs of the same session may signal each other and reach each other's abstract unix sockets (isolation is against the host, not between execs — P17). `"abstract_unix_socket"` is implied by `network = "host"` (required for host networking). No OCI equivalent; carried as annotation `org.hisn.landlock.scoped=…` |
 | `limits.nofile` / `.nproc` | u64 | 65536 / 4096 | `RLIMIT_NOFILE` / `RLIMIT_NPROC`; ≥ 1 |
 
 Validation failures print `path.to.key: reason` and exit 125.
@@ -173,7 +177,7 @@ construct expressible in `config.json` for the v2 conformance work.
 | caps all dropped | `process.capabilities.{bounding,effective,inheritable,permitted,ambient}` = `[]` |
 | `no_new_privs` | `process.noNewPrivileges=true` |
 | seccomp denylist | `linux.seccomp` `{defaultAction:"SCMP_ACT_ALLOW", architectures:[…], syscalls:[{names:[…], action:"SCMP_ACT_ERRNO"\|"SCMP_ACT_KILL_PROCESS"}]}` — clone/clone3 rules need `args[]` (`SCMP_CMP_MASKED_EQ`) |
-| Landlock | **no OCI equivalent** (hisn extension; carry as annotation `org.hisn.landlock=…`) |
+| Landlock | **no OCI equivalent** (hisn extension; carry as annotation `org.hisn.landlock=…`, including `org.hisn.landlock.scoped=…` for IPC scopes) |
 | env scrub + `env.set` | `process.env[]` (fully explicit list; runtime must not inherit) |
 | `limits.nofile/nproc` | `process.rlimits[]` `RLIMIT_NOFILE`, `RLIMIT_NPROC` |
 | `no_new_privs` + securebits | `process.noNewPrivileges` (securebits: no OCI field → annotation) |

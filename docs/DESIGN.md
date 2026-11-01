@@ -485,6 +485,10 @@ Properties:
 | D22 | (unspecified) | grants/revokes and exec spawns are ordered by a spawn gate (`RwLock`): spawns share it, a hard revoke takes it exclusively | a hard revoke must not sweep while an exec is half-started (§14.6) |
 | D23 | (unspecified) | exec uses a **second** persistent helper `E` (userns S, joins nothing itself); the grant helper is unchanged | the grant helper must stay in S + sandbox mntns only (D15); exec needs a per-exec child that joins userns U |
 | D24 | (unspecified) | **all** `/proc/<init>/ns/*` fds the exec helper needs are opened before `GO`, like the mount-ns fd already is | no later `/proc/<init>` access is needed; whether the supervisor *could* open them after init became non-dumpable (§6) is not relied on and not verified |
+| D25 | (unspecified) | `C` fchdirs onto `/proc/<init>/root` after `setns(mnt)` | `setns` swaps the mount tree but does **not** move the caller's root/cwd into it; without the fchdir, cwd and root still point into the *supervisor's* tree (round-2 review finding A) |
+| D26 | (unspecified) | helper protocol carries a request id; an ambiguous handover (timeout/EOF/garbage) **poisons** the channel: later execs fail with `E_INTERNAL` | a late reply would otherwise be consumed as the answer to the *next* request (round-2 review finding C) |
+| D27 | (unspecified) | `W` treats a partial/failed errno-pipe read as an exec failure (`EIO`), never as success | clean EOF (`CLOEXEC`) is the only evidence of a successful `execve` (round-2 review finding E) |
+| D28 | (unspecified) | a client that disconnects before the `{"ok":true,…}` line could be written enters `drive` **pre-cancelled**: `TERM` immediately, `KILL` after the grace — same sequence as a mid-run disconnect | the old path passed a dead fd and waited for a poll event that could never arrive (round-2 review finding D) |
 
 ## 13. Module map
 

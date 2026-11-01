@@ -884,6 +884,9 @@ fn run_session(
     // ---- 4. namespace fds, GO, READY
     let mntns_fd = open_ns(pid, "mnt")?;
     // The exec helper's namespaces, opened now like the mount namespace (D24).
+    // `root` is the sandbox root as reached from the supervisor:
+    // `/proc/<init>/root` — after pivot_root that is the sandbox tmpfs root.
+    // `C` fchdirs onto it because `setns(mnt)` does not move root/cwd (D25).
     let exec_ns = NsFds {
         user: open_ns(pid, "user")?,
         mnt: open_ns(pid, "mnt")?,
@@ -894,6 +897,15 @@ fn run_session(
             Some(open_ns(pid, "net")?)
         } else {
             None
+        },
+        root: {
+            let f = fs::File::open(format!("/proc/{pid}/root"))
+                .with_context(|| format!("opening /proc/{pid}/root"))?;
+            let m = f.metadata()?;
+            if !m.is_dir() {
+                bail!("/proc/{pid}/root is not a directory");
+            }
+            f.into()
         },
     };
     let sandbox_pidns = sys::ns_inode(pid, "pid").context("sandbox pid namespace")?;

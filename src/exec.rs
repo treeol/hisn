@@ -399,7 +399,13 @@ pub struct Spawned {
 
 /// Supervisor-side handle on the exec helper `E`.
 pub struct ExecClient {
-    chan: Mutex<OwnedFd>,
+    /// `None` once a handover went ambiguous: the channel is no longer in a
+    /// known state (a reply may still arrive and would otherwise be consumed
+    /// as the answer to the *next* request). Every later exec then fails
+    /// closed with `E_INTERNAL` instead of desynchronising.
+    chan: Mutex<Option<OwnedFd>>,
+    /// Monotonic request id echoed by the helper, correlating replies.
+    next_id: std::sync::atomic::AtomicU64,
     /// How long to wait for a failed spawn's `C` to disappear.
     pub reap_grace: Duration,
 }
@@ -407,7 +413,8 @@ pub struct ExecClient {
 impl ExecClient {
     pub fn new(chan: OwnedFd) -> Self {
         Self {
-            chan: Mutex::new(chan),
+            chan: Mutex::new(Some(chan)),
+            next_id: std::sync::atomic::AtomicU64::new(1),
             reap_grace: Duration::from_secs(2),
         }
     }
@@ -431,9 +438,13 @@ impl ExecClient {
             .map_err(|e| SpawnError::Internal(format!("encoding request: {e}")))?;
         let mut raw: Vec<RawFd> = stdio.iter().map(AsRawFd::as_raw_fd).collect();
         raw.push(theirs.as_raw_fd());
-        let cpid = self.hand_over(&body, &raw)?;
+        let cpid = self.hand_over(&body, &raw);
         drop(stdio);
         drop(theirs);
+        let cpid = match cpid {
+            Ok(cpid) => cpid,
+            Err(e) => return Err(e),
+        };
         match wait_started(&mine, timeout) {
             Ok((pid, pending)) => Ok(Spawned {
                 pid,
@@ -447,11 +458,25 @@ impl ExecClient {
         }
     }
 
-    /// Send one request to `E`; returns the pid of the `C` it forked.
+    /// Send one request to `E` and wait for its acknowledgement. The channel
+    /// lock is held for the whole exchange: the reply is correlated by a
+    /// request id, and on any ambiguity (timeout, EOF, garbage) the channel
+    /// is *poisoned* (`None`) so no later exec can misread a stale reply.
+    /// Returns the pid of the `C` it forked.
     fn hand_over(&self, body: &[u8], fds: &[RawFd]) -> Result<i32, SpawnError> {
-        let ch = self.chan.lock().expect("exec channel");
+        let mut guard = self.chan.lock().expect("exec channel");
         let internal = |m: String| SpawnError::Internal(m);
-        sys::send_with_fds(ch.as_raw_fd(), body, fds)
+        let Some(ch) = guard.as_ref() else {
+            return Err(internal(
+                "exec helper is unreachable (earlier failure)".into(),
+            ));
+        };
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut line = format!("{id} ").into_bytes();
+        line.extend_from_slice(body);
+        sys::send_with_fds(ch.as_raw_fd(), &line, fds)
             .map_err(|e| internal(format!("exec helper unreachable: {e}")))?;
         let mut p = [libc::pollfd {
             fd: ch.as_raw_fd(),
@@ -460,24 +485,34 @@ impl ExecClient {
         }];
         let ready = sys::poll(&mut p, 5_000).map_err(|e| internal(e.to_string()))?;
         if ready == 0 {
+            *guard = None; // the reply may still arrive later: poisoned
             return Err(internal("exec helper did not answer".into()));
         }
         let mut buf = [0u8; 512];
         let r = sys::recv_with_fds(ch.as_raw_fd(), &mut buf)
             .map_err(|e| internal(format!("exec helper: {e}")))?;
         if r.len == 0 {
+            *guard = None;
             return Err(internal("exec helper exited".into()));
         }
         let reply = String::from_utf8_lossy(&buf[..r.len]).into_owned();
-        match reply
-            .strip_prefix("ok ")
-            .and_then(|p| p.trim().parse().ok())
-        {
-            Some(pid) => Ok(pid),
-            None => Err(internal(format!(
+        let Some(rest) = reply.strip_prefix("ok ") else {
+            *guard = None; // could be a stale reply to an earlier request
+            return Err(internal(format!(
                 "exec helper refused: {}",
                 reply.strip_prefix("err ").unwrap_or(&reply)
-            ))),
+            )));
+        };
+        // Correlate: the id must match this request.
+        match rest.split_once(' ') {
+            Some((their_id, cpid)) if their_id.trim() == id.to_string() => cpid
+                .trim()
+                .parse()
+                .map_err(|_| internal(format!("bad helper reply {reply:?}"))),
+            _ => {
+                *guard = None;
+                Err(internal(format!("uncorrelated helper reply {reply:?}")))
+            }
         }
     }
 
@@ -554,7 +589,29 @@ pub enum Outcome {
 /// client connection `conn`. A client that disconnects (or sends anything
 /// further) cancels: `TERM` at once, `KILL` after `grace`.
 pub fn drive(status: &OwnedFd, mut lines: Lines, conn: RawFd, grace: Duration) -> Outcome {
+    drive_from(status, lines, conn, grace, false)
+}
+
+/// [`drive`] with the client already gone at entry (`already_cancelled`):
+/// starts in the `TERM`-then-`KILL` path instead of waiting for a poll event
+/// that a dead connection can never produce.
+pub fn drive_from(
+    status: &OwnedFd,
+    mut lines: Lines,
+    conn: RawFd,
+    grace: Duration,
+    already_cancelled: bool,
+) -> Outcome {
     let mut cancelled: Option<Instant> = None;
+    let mut sent_term = false;
+    if already_cancelled {
+        // The client is already gone: the cancellation sequence (TERM, then
+        // KILL after the grace) starts immediately instead of on a poll
+        // event that a dead connection can never produce.
+        let _ = sys::send_all(status.as_raw_fd(), format_kill(libc::SIGTERM).as_bytes());
+        cancelled = Some(Instant::now());
+        sent_term = true;
+    }
     let mut killed = false;
     let mut buf = [0u8; 512];
     loop {
@@ -592,9 +649,10 @@ pub fn drive(status: &OwnedFd, mut lines: Lines, conn: RawFd, grace: Duration) -
             let _ = sys::send_all(status.as_raw_fd(), format_kill(libc::SIGKILL).as_bytes());
             killed = true;
         }
-        if cancelled.is_none() && fds[1].revents != 0 {
+        if !sent_term && cancelled.is_none() && fds[1].revents != 0 {
             let _ = sys::send_all(status.as_raw_fd(), format_kill(libc::SIGTERM).as_bytes());
             cancelled = Some(Instant::now());
+            sent_term = true;
         }
         if fds[0].revents != 0 {
             match read_some(status.as_raw_fd(), &mut buf) {
@@ -616,6 +674,11 @@ pub struct NsFds {
     pub pid: OwnedFd,
     /// Present iff the session has its own network namespace.
     pub net: Option<OwnedFd>,
+    /// The sandbox root directory (opened by the supervisor from
+    /// `/proc/<init>/root`). `setns(mnt)` does NOT move the caller's root/cwd
+    /// into the target namespace: `C` fchdirs onto this fd so every later
+    /// path resolution happens inside the sandbox (review finding A).
+    pub root: OwnedFd,
 }
 
 impl NsFds {
@@ -685,26 +748,40 @@ fn helper_loop(chan: &OwnedFd, ctx: &ExecContext) -> io::Result<()> {
         if r.len == 0 {
             return Ok(()); // supervisor closed its end
         }
-        let reply = match prepare_request(&buf[..r.len], r.fds, r.truncated) {
-            Ok((spec, fds)) => {
-                // SAFETY: the helper is single-threaded (forked before any
-                // supervisor thread); the child only runs `child_c`.
-                let pid = unsafe { libc::fork() };
-                if pid == 0 {
-                    child_c(ctx, &spec, fds);
+        let (id, reply) = match parse_helper_line(&buf[..r.len]) {
+            None => (0u64, "err bad request line".to_string()),
+            Some((id, body)) => match prepare_request(body, r.fds, r.truncated) {
+                Ok((spec, fds)) => {
+                    // SAFETY: the helper is single-threaded (forked before
+                    // any supervisor thread); the child only runs `child_c`.
+                    let pid = unsafe { libc::fork() };
+                    if pid == 0 {
+                        child_c(ctx, &spec, fds);
+                    }
+                    // The parent's copies of the stdio and status fds close here.
+                    drop(fds);
+                    (
+                        id,
+                        if pid < 0 {
+                            format!("err fork: {}", io::Error::last_os_error())
+                        } else {
+                            format!("ok {id} {pid}")
+                        },
+                    )
                 }
-                // The parent's copies of the stdio and status fds close here.
-                drop(fds);
-                if pid < 0 {
-                    format!("err fork: {}", io::Error::last_os_error())
-                } else {
-                    format!("ok {pid}")
-                }
-            }
-            Err(e) => format!("err {e}"),
+                Err(e) => (id, format!("err {id} {e}")),
+            },
         };
         sys::send_with_fds(chan.as_raw_fd(), reply.as_bytes(), &[])?;
     }
+}
+
+/// Split `<id> <json>`; `None` if there is no id prefix.
+fn parse_helper_line(body: &[u8]) -> Option<(u64, &[u8])> {
+    let text = std::str::from_utf8(body).ok()?;
+    let (id, rest) = text.split_once(' ')?;
+    let id = id.parse().ok()?;
+    Some((id, rest.as_bytes()))
 }
 
 /// Decode one helper request and move its descriptors above [`HIGH_FD`].
@@ -753,6 +830,12 @@ fn child_c(ctx: &ExecContext, spec: &ExecSpec, fds: Vec<OwnedFd>) -> ! {
         }
     };
     let _ = sys::prctl(1 /* PR_SET_PDEATHSIG */, libc::SIGKILL as u64, 0, 0, 0);
+    // PDEATHSIG race: if the parent died between fork and prctl we are
+    // already orphaned — fail closed instead of running unparented.
+    // SAFETY: plain getppid.
+    if unsafe { libc::getppid() } == 0 {
+        die(status, "helper died before the exec could start");
+    }
     // Dumpable is reset by credential changes (joining a userns), so it is
     // cleared before and after (DESIGN §14.2).
     step("dumpable", sys::set_dumpable(false));
@@ -768,6 +851,11 @@ fn child_c(ctx: &ExecContext, spec: &ExecSpec, fds: Vec<OwnedFd>) -> ! {
         "setns(mnt)",
         sys::setns(ctx.ns.mnt.as_raw_fd(), libc::CLONE_NEWNS),
     );
+    // setns(mnt) swaps the mount tree but NOT this process's root/cwd:
+    // adopt the sandbox root by fd, never by path (a path would resolve in
+    // the old namespace first). Every later lookup — /dev/null, the Landlock
+    // roots, cwd, the executable — then happens inside the sandbox.
+    step("root", sys::fchdir_chdir_root(ctx.ns.root.as_raw_fd()));
     step(
         "setns(ipc)",
         sys::setns(ctx.ns.ipc.as_raw_fd(), libc::CLONE_NEWIPC),
@@ -912,12 +1000,24 @@ fn child_w(spec: &ExecSpec, argv: &[CString], envp: &[CString], keep: &[RawFd], 
     // From here `W` holds only the status socket: the stdio copies must go,
     // or a pty master would never see the slave close.
     sys::close_all_except(&[status, pipe[0]]);
+    // A 4-byte record = `P` reported an exec failure before `execve`.
+    // Clean EOF = the write end was closed by CLOEXEC: `execve` succeeded.
+    // Anything else (read error, partial record) is ambiguous and treated
+    // as an exec failure — `Started` is never reported on ambiguous evidence.
     let mut errno = [0u8; 4];
-    let got = read_some(pipe[0], &mut errno).unwrap_or(0);
+    let got = match read_some(pipe[0], &mut errno) {
+        Ok(4) => 4,
+        Ok(0) => 0,
+        _ => 1,
+    };
     // SAFETY: closing the read end.
     unsafe { libc::close(pipe[0]) };
-    if got == 4 {
-        let e = i32::from_le_bytes(errno);
+    if got != 0 {
+        let e = if got == 4 {
+            i32::from_le_bytes(errno)
+        } else {
+            libc::EIO
+        };
         let mut st = 0;
         // SAFETY: reaping our exited child.
         unsafe { libc::waitpid(p, &mut st, 0) };
@@ -1478,13 +1578,16 @@ mod tests {
         let t = std::thread::spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
             let r = sys::recv_with_fds(helper.as_raw_fd(), &mut buf).unwrap();
-            let spec: ExecSpec = serde_json::from_slice(&buf[..r.len]).unwrap();
+            // Real protocol: `<id> <json>`.
+            let (id, body) = parse_helper_line(&buf[..r.len]).expect("id prefix");
+            let spec: ExecSpec = serde_json::from_slice(body).unwrap();
             assert_eq!(r.fds.len(), spec.fd_count() + 1, "stdio + status socket");
             let mut fds = r.fds;
             let status = fds.pop().unwrap();
             // A pid that is nobody in particular: a fake reply must not let the
             // supervisor kill anything of ours.
-            sys::send_with_fds(helper.as_raw_fd(), b"ok 1", &[]).unwrap();
+            let reply = format!("ok {id} 1");
+            sys::send_with_fds(helper.as_raw_fd(), reply.as_bytes(), &[]).unwrap();
             script(status);
             spec
         });
@@ -1563,9 +1666,11 @@ mod tests {
         let vpid = victim.id();
         let (sup, helper) = sys::socketpair_seqpacket().unwrap();
         let t = std::thread::spawn(move || {
-            let mut buf = vec![0u8; 64 * 1024];
-            let r = sys::recv_with_fds(helper.as_raw_fd(), &mut buf).unwrap();
-            sys::send_with_fds(helper.as_raw_fd(), format!("ok {vpid}").as_bytes(), &[]).unwrap();
+            let mut buf2 = vec![0u8; 64 * 1024];
+            let r = sys::recv_with_fds(helper.as_raw_fd(), &mut buf2).unwrap();
+            let id = parse_helper_line(&buf2[..r.len]).expect("id prefix").0;
+            let raw = format!("ok {id} {vpid}");
+            sys::send_with_fds(helper.as_raw_fd(), raw.as_bytes(), &[]).unwrap();
             std::thread::sleep(Duration::from_millis(600));
             drop(r);
         });
@@ -1589,9 +1694,12 @@ mod tests {
     fn a_refusing_helper_is_an_internal_error_and_stdio_is_closed() {
         let (sup, helper) = sys::socketpair_seqpacket().unwrap();
         let t = std::thread::spawn(move || {
-            let mut buf = vec![0u8; 64 * 1024];
-            let _ = sys::recv_with_fds(helper.as_raw_fd(), &mut buf).unwrap();
-            sys::send_with_fds(helper.as_raw_fd(), b"err request truncated", &[]).unwrap();
+            let mut buf3 = vec![0u8; 64 * 1024];
+            let r = sys::recv_with_fds(helper.as_raw_fd(), &mut buf3).unwrap();
+            let id = parse_helper_line(&buf3[..r.len]).expect("id prefix").0;
+            let raw = format!("err {id} request truncated");
+            sys::send_with_fds(helper.as_raw_fd(), raw.as_bytes(), &[]).unwrap();
+            drop(r);
         });
         let c = ExecClient::new(sup);
         let e = c
@@ -1617,6 +1725,90 @@ mod tests {
 
     // ---- helper-side request decoding
 
+    #[test]
+    fn replies_are_correlated_and_stale_replies_poison_the_channel() {
+        use std::sync::atomic::Ordering;
+        // Helper: answers the FIRST request with the id of a LATER one.
+        let (sup, helper) = sys::socketpair_seqpacket().unwrap();
+        let t = std::thread::spawn(move || {
+            let mut b = vec![0u8; 64 * 1024];
+            let r = sys::recv_with_fds(helper.as_raw_fd(), &mut b).unwrap();
+            let id = parse_helper_line(&b[..r.len]).expect("id prefix").0;
+            let raw = format!("ok {} 99", id + 1);
+            let _ = sys::send_with_fds(helper.as_raw_fd(), raw.as_bytes(), &[]);
+        });
+        let mut c = ExecClient::new(sup);
+        assert_eq!(c.next_id.load(Ordering::SeqCst), 1);
+        let e = c
+            .spawn(&a_spec(), stdio3(), Duration::from_secs(1))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&e, SpawnError::Internal(m) if m.contains("uncorrelated")),
+            "{e:?}"
+        );
+        // Poisoned: a later exec fails without contacting the helper.
+        let e2 = c
+            .spawn(&a_spec(), stdio3(), Duration::from_secs(1))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&e2, SpawnError::Internal(m) if m.contains("unreachable")),
+            "{e2:?}"
+        );
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn drive_pre_cancelled_kills_without_waiting_for_the_dead_client() {
+        // A program that ignores TERM must still be killed after the grace
+        // when drive starts already cancelled.
+        let (mine, w) = sys::socketpair().unwrap();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let wpid = child.id() as i32;
+        std::mem::forget(child);
+        let t = std::thread::spawn(move || {
+            // Fake W: ignores TERM, dies on KILL.
+            let mut lines = Lines::default();
+            let mut buf = [0u8; 64];
+            let mut seen = Vec::new();
+            loop {
+                let n = read_some(w.as_raw_fd(), &mut buf).unwrap();
+                lines.push(&buf[..n]);
+                while let Some(l) = lines.pop_line() {
+                    if let Some(sig) = parse_kill(&l) {
+                        seen.push(sig);
+                        if sig == libc::SIGKILL {
+                            let _ = sys::kill(wpid, libc::SIGKILL);
+                            sys::send_all(w.as_raw_fd(), b"X sig 9\n").unwrap();
+                            return seen;
+                        } else {
+                            let _ = sys::kill(wpid, sig); // ignore TERM like a stubborn program
+                        }
+                    }
+                }
+            }
+        });
+        let start = Instant::now();
+        let o = drive_from(
+            &mine,
+            Lines::default(),
+            -1,
+            Duration::from_millis(200),
+            true,
+        );
+        assert_eq!(o, Outcome::Exited(Exit::Signal(9)));
+        assert!(
+            start.elapsed() >= Duration::from_millis(200),
+            "KILL waited for the grace"
+        );
+        assert_eq!(t.join().unwrap(), [libc::SIGTERM, libc::SIGKILL]);
+    }
     #[test]
     fn helper_decoding_checks_counts_truncation_and_moves_fds_high() {
         let s = a_spec();

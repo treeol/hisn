@@ -58,7 +58,26 @@ triaging (not by the panel): `C` sets non-dumpable before and after
 stdio fds at high numbers until `P`; the `getppid()==1` wait is bounded and the
 spawn gate is held until `C` is reaped on failure.
 
-## Open
+## Review log — v0.2 implementation (round 2)
+
+**Round 2 (implementation + tests)** — one reviewer answered
+(`openai/gpt-6-astra`), the second (`anthropic/claude-fable-5.1`) was again
+cut off at `max_tokens`. The reviewer saw `src/exec.rs` (partly), `src/
+control.rs`, `src/supervisor.rs`, `src/init.rs` — but **not** `docs/DESIGN.md`
+§14, `tests/leak/run.sh`, `src/execcli.rs` (its copy was truncated), so its
+"which leak test is weaker" answer is generic guidance, not a verdict on
+L15-L20. No third round is allowed. Disposition:
+
+| # | finding | triage | resolution |
+|---|---------|--------|-----------|
+| A | `setns(mnt)` does not move root/cwd into the sandbox | BLOCKING (real) | **fixed**: supervisor opens `/proc/<init>/root`, `C` fchdirs onto it after `setns(mnt)` (D25) |
+| B | failed-spawn teardown waits only for `C`; `W` may outlive it | NON-BLOCKING (contained) | teardown closes the status socket → `W` SIGKILLs `P` and exits; `C` waits for `D`; `W`/`P` are PDEATHSIG-chained. Residual: if `W` forks `P` *during* the teardown window, `P` is killed by the socket EOF path. **[HOST-VERIFY]** L17 |
+| C | handover failure desyncs the helper protocol | BLOCKING (real) | **fixed**: request ids + channel poisoning on ambiguity (D26), unit-tested |
+| D | pre-reply client disconnect never cancels | BLOCKING (real) | **fixed**: `drive` pre-cancelled path, TERM-then-KILL (D28), unit-tested (caught the missing TERM) |
+| E | errno-pipe EOF conflation | NON-BLOCKING (hardening) | **fixed**: partial/failed read ⇒ exec failure, never success (D27) |
+| F | PDEATHSIG race parent died before prctl | NON-BLOCKING | **fixed**: `C` checks `getppid()==0` after setting PDEATHSIG |
+| G | leak tests weaker than claimed (L15 filter-identity, L17 reaping, L19 helper fds) | NON-BLOCKING | L15 now asserts `Seccomp: 2` + EPERM set + no-write (filter identity itself is unit-tested); L17 keeps a sleeper alive across session end; L19 watches the supervisor fd only (helpers are short-lived per exec) — **[HOST-VERIFY]** what actually runs on a host |
+| H | "reaped by PID 1" wording: P is reaped by W | NON-BLOCKING (wording) | DESIGN §14.3 states the arrangement; W is reaped by init, P by W |
 
 * **P1 — grant mechanism verified on one host only.** Cross-userns
   `move_mount` of a detached tree after `setns(U)+setns(M)` is the brief's
@@ -179,3 +198,8 @@ spawn gate is held until `C` is reaped on failure.
   (signal delivery to a running exec, 50+10 execs) plus a targeted burst test
   would settle it. The test now waits for the child to be signalable before
   writing (`8287313`), which removes the spawn/exec race as a cause.
+* **P21 — teardown-B residual.** A `W` that exists when a failed spawn is
+  torn down gets the socket-EOF kill path, but the supervisor does not
+  *observe* `W`'s death (only `C`'s). If `W` ignored the EOF, a hard revoke
+  would still sweep it (it is in init's tree), so the gate release is safe;
+  the residual is only about prompt resource reaping. **[HOST-VERIFY]**.

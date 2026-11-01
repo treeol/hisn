@@ -241,6 +241,13 @@ pub fn dup_cloexec_min(fd: RawFd, min: RawFd) -> io::Result<OwnedFd> {
     Ok(owned(r as c_long))
 }
 
+/// `chroot(2)` onto `dirfd`'s directory *without* a path lookup: the caller
+/// passes the sandbox-root directory fd opened after `setns(mnt)`.
+pub fn fchdir_chdir_root(dirfd: RawFd) -> io::Result<()> {
+    // SAFETY: fchdir on a descriptor the caller owns.
+    cvt_int(unsafe { libc::fchdir(dirfd) }).map(drop)
+}
+
 pub fn set_dumpable(on: bool) -> io::Result<()> {
     prctl(4 /* PR_SET_DUMPABLE */, u64::from(on), 0, 0, 0).map(drop)
 }

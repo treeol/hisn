@@ -438,13 +438,9 @@ impl ExecClient {
             .map_err(|e| SpawnError::Internal(format!("encoding request: {e}")))?;
         let mut raw: Vec<RawFd> = stdio.iter().map(AsRawFd::as_raw_fd).collect();
         raw.push(theirs.as_raw_fd());
-        let cpid = self.hand_over(&body, &raw);
+        let cpid = self.hand_over(&body, &raw)?;
         drop(stdio);
         drop(theirs);
-        let cpid = match cpid {
-            Ok(cpid) => cpid,
-            Err(e) => return Err(e),
-        };
         match wait_started(&mine, timeout) {
             Ok((pid, pending)) => Ok(Spawned {
                 pid,
@@ -588,7 +584,7 @@ pub enum Outcome {
 /// Drive a started exec to its end: relay the status socket and watch the
 /// client connection `conn`. A client that disconnects (or sends anything
 /// further) cancels: `TERM` at once, `KILL` after `grace`.
-pub fn drive(status: &OwnedFd, mut lines: Lines, conn: RawFd, grace: Duration) -> Outcome {
+pub fn drive(status: &OwnedFd, lines: Lines, conn: RawFd, grace: Duration) -> Outcome {
     drive_from(status, lines, conn, grace, false)
 }
 
@@ -748,8 +744,8 @@ fn helper_loop(chan: &OwnedFd, ctx: &ExecContext) -> io::Result<()> {
         if r.len == 0 {
             return Ok(()); // supervisor closed its end
         }
-        let (id, reply) = match parse_helper_line(&buf[..r.len]) {
-            None => (0u64, "err bad request line".to_string()),
+        let (_id, reply) = match parse_helper_line(&buf[..r.len]) {
+            None => (0, "err bad request line".to_string()),
             Some((id, body)) => match prepare_request(body, r.fds, r.truncated) {
                 Ok((spec, fds)) => {
                     // SAFETY: the helper is single-threaded (forked before
@@ -1737,7 +1733,7 @@ mod tests {
             let raw = format!("ok {} 99", id + 1);
             let _ = sys::send_with_fds(helper.as_raw_fd(), raw.as_bytes(), &[]);
         });
-        let mut c = ExecClient::new(sup);
+        let c = ExecClient::new(sup);
         assert_eq!(c.next_id.load(Ordering::SeqCst), 1);
         let e = c
             .spawn(&a_spec(), stdio3(), Duration::from_secs(1))

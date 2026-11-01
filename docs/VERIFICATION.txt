@@ -22,7 +22,7 @@ namespace-dependent code path is "not run" — see the table below.
 | `cargo test` (unit tests) | this commit | sandbox | 179 passed, 0 failed | — |
 | `python3 tests/leak/test_l8.py` (L8 comparator self-tests) | this commit | sandbox | 12 passed | — |
 | `hisn check` | this commit | sandbox | not run (needs userns) | — |
-| `make leaktest` (L1-L23) | — | host | not run | — |
+| `make leaktest` (L1-L23) | 19af325 | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 173 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5) | `docs/leaktest-host-2026-11-01.log` |
 
 ## Not verified in the build sandbox
 
@@ -41,6 +41,7 @@ so.  The log file column points at the `docs/leaktest-host-*.log` produced by
 
 | check | commit | where | result | log file |
 |-------|--------|-------|--------|----------|
+| `make leaktest` (L1-L23) | 19af325 (log header: tree clean) | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 173 passed, 0 failed, 1 skipped, 1 weak | `docs/leaktest-host-2026-11-01.log` |
 | `make leaktest` (L1-L20) | e3bcd31 [inferred — confirm] | host (Fedora 7.2.13, x86_64, ABI 10) | 167 passed, 0 failed, 1 skipped, 1 weak | — (summary line only; `make leaktest-log` did not exist yet) |
 
 ### Notes on the host run above
@@ -50,3 +51,10 @@ so.  The log file column points at the `docs/leaktest-host-*.log` produced by
   L14 R5 (unit coverage only, P16), the same two as in the v0.1.0 run.
 * Not run on that host: `make lint && make test` after the last changes;
   aarch64; any other kernel/distro.
+
+### Notes on the 19af325 host run
+
+* Full per-test log recorded; the skip is L12 (host-creates-secret-after-start,
+  needs write access to /etc) and the weak is L14 R5 (unit coverage only, P16).
+* Not run on that host in this record: `make lint && make test`; aarch64; any
+  other kernel/distro.

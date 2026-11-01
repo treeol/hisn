@@ -896,31 +896,6 @@ fn run_session(
 
     // ---- 4. namespace fds, GO, READY
     let mntns_fd = open_ns(pid, "mnt")?;
-    // The exec helper's namespaces, opened now like the mount namespace (D24).
-    // `root` is the sandbox root as reached from the supervisor:
-    // `/proc/<init>/root` — after pivot_root that is the sandbox tmpfs root.
-    // `C` fchdirs onto it because `setns(mnt)` does not move root/cwd (D25).
-    let exec_ns = NsFds {
-        user: open_ns(pid, "user")?,
-        mnt: open_ns(pid, "mnt")?,
-        ipc: open_ns(pid, "ipc")?,
-        uts: open_ns(pid, "uts")?,
-        pid: open_ns(pid, "pid")?,
-        net: if exec_net {
-            Some(open_ns(pid, "net")?)
-        } else {
-            None
-        },
-        root: {
-            let f = fs::File::open(format!("/proc/{pid}/root"))
-                .with_context(|| format!("opening /proc/{pid}/root"))?;
-            let m = f.metadata()?;
-            if !m.is_dir() {
-                bail!("/proc/{pid}/root is not a directory");
-            }
-            f.into()
-        },
-    };
     let sandbox_pidns = sys::ns_inode(pid, "pid").context("sandbox pid namespace")?;
     sys::send_with_fd(sup_end.as_raw_fd(), &[MSG_GO], None)?;
     let mut buf = [0u8; 4096];
@@ -943,6 +918,33 @@ fn run_session(
         }
         other => bail!("unexpected message {other:#x} from sandbox init"),
     }
+
+    // The exec helper's namespaces (D24). Opened only after init reported
+    // READY: `root` is `/proc/<init>/root`, which is the sandbox tmpfs root
+    // only once init has done its pivot_root. Opened before MSG_GO it would be
+    // the pre-pivot root and `C`'s D25 root check would (rightly) refuse every
+    // exec. `C` fchdirs onto it because `setns(mnt)` does not move root/cwd.
+    let exec_ns = NsFds {
+        user: open_ns(pid, "user")?,
+        mnt: open_ns(pid, "mnt")?,
+        ipc: open_ns(pid, "ipc")?,
+        uts: open_ns(pid, "uts")?,
+        pid: open_ns(pid, "pid")?,
+        net: if exec_net {
+            Some(open_ns(pid, "net")?)
+        } else {
+            None
+        },
+        root: {
+            let f = fs::File::open(format!("/proc/{pid}/root"))
+                .with_context(|| format!("opening /proc/{pid}/root"))?;
+            let m = f.metadata()?;
+            if !m.is_dir() {
+                bail!("/proc/{pid}/root is not a directory");
+            }
+            f.into()
+        },
+    };
 
     // ---- 5. persistent helper, forked while still single-threaded
     let helper = spawn_helper(&mntns_fd)?;

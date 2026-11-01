@@ -81,6 +81,19 @@ Hand-maintained. One entry per run on a real host, newest first. The commit is
 the one the host *reported or checked out*; if it was inferred, the entry says so.
 
 
+### Fedora, kernel 7.2.13-200.fc44, x86_64, same host — v0.2.0, `make leaktest` (L1-L20): **green**
+* Result line, as reported by the user: **167 passed, 0 failed, 1 skipped, 1 weak**.
+  Only the summary line was reported: the individual lines were not seen.
+* commit: e3bcd31 (tip when the run was requested) [inferred - confirm]. The
+  run follows 4c57323, which fixed the four test bugs from run B.
+* The skip and the weak are **inferred** to be L12 (needs write access to /etc)
+  and L14 R5 (unit coverage only), the same two as in the v0.1.0 run. L19's fd
+  baseline and L20 (pty, resize) were WEAK in run B; the count (0 weak beyond
+  one) implies they ran this time, but that is an inference from the totals, not
+  something the output shows.
+* NOT run on that host: `make lint && make test` after the last changes;
+  aarch64; any other kernel/distro.
+
 ### Fedora, kernel 7.2.13-200.fc44, x86_64, same host — v0.2.0 exec, **two partial runs, not green**
 Both pastes came from the user; neither is a full-suite record (the first
 shows the whole run, the second only its tail, so it has no L1-L14 lines).

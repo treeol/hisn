@@ -10,15 +10,14 @@ host path** (rw), a read-only toolchain, private tmpfs `$HOME`/`/tmp`/`/run`,
 and paths the host side explicitly **grants** for the life of the session.
 Everything else does not exist (ENOENT), not "permission denied".
 
-> **Status: v0.2.0.** Unit tests and clippy pass in the build sandbox. The leak
-> suite (L1-L14) was run on one real host (Fedora, kernel 7.2, x86_64, Landlock
-> ABI 10): 111 passed, 0 failed, 1 skipped (L12 needs write access to `/etc`),
-> 1 weak (R5 end-to-end is covered by unit tests only, see OPEN-POINTS P16) —
-> but on **0.1.0**, before exec existed. **Nothing has been run on 0.2.0 yet**:
-> L14b and the exec suite (L15-L20) have not been executed anywhere, and exec's
-> helper chain (`setns`, confinement re-application) is design- and
-> unit-tested only. Run `make leaktest` on a host with unprivileged user
-> namespaces. See [docs/VERIFICATION.txt](docs/VERIFICATION.txt).
+> **Status: v0.2.0.** Unit tests and clippy pass in the build sandbox. The full
+> leak suite (L1-L20, including `exec`) was run on one real host (Fedora, kernel
+> 7.2, x86_64, Landlock ABI 10): **167 passed, 0 failed, 1 skipped, 1 weak**.
+> The skip is L12 (needs write access to `/etc`) and the weak one is R5
+> end-to-end (unit-tested only, OPEN-POINTS P16) — both inferred from earlier
+> runs, since only the summary line was reported. Not run: aarch64, other
+> kernels or distros, and `make lint && make test` on that host after the last
+> changes. See [docs/VERIFICATION.txt](docs/VERIFICATION.txt).
 
 ## Install
 

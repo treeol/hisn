@@ -22,8 +22,7 @@ namespace-dependent code path is "not run" — see the table below.
 | `cargo test` (unit tests) | this commit | sandbox | 182 passed, 0 failed | — |
 | `python3 tests/leak/test_l8.py` (L8 comparator self-tests) | this commit | sandbox | 12 passed | — |
 | `hisn check` | this commit | sandbox | not run (needs userns) | — |
-| `make leaktest` (L1-L23) | 19af325 | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 173 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5) | `docs/leaktest-host-2026-11-01.log` |
-| `make leaktest` L24 (B1 host-mode abstract scope) + D25 root check | this commit | host | not run | — |
+| `make leaktest` (L1-L24, incl. L24 B1 host-mode abstract scope; D25 root check exercised end-to-end by L15-L24) | 34947f4 | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 175 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5) | `docs/leaktest-host-2026-11-01.log` |
 
 ## Not verified in the build sandbox
 
@@ -42,6 +41,7 @@ so.  The log file column points at the `docs/leaktest-host-*.log` produced by
 
 | check | commit | where | result | log file |
 |-------|--------|-------|--------|----------|
+| `make leaktest` (L1-L24) | 34947f4 (log header: tree dirty -- the only modified file was the log being overwritten) | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 175 passed, 0 failed, 1 skipped, 1 weak | `docs/leaktest-host-2026-11-01.log` |
 | `make leaktest` (L1-L23) | 19af325 (log header: tree clean) | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 173 passed, 0 failed, 1 skipped, 1 weak | `docs/leaktest-host-2026-11-01.log` |
 | `make leaktest` (L1-L20) | e3bcd31 [inferred — confirm] | host (Fedora 7.2.13, x86_64, ABI 10) | 167 passed, 0 failed, 1 skipped, 1 weak | — (summary line only; `make leaktest-log` did not exist yet) |
 
@@ -59,3 +59,18 @@ so.  The log file column points at the `docs/leaktest-host-*.log` produced by
   needs write access to /etc) and the weak is L14 R5 (unit coverage only, P16).
 * Not run on that host in this record: `make lint && make test`; aarch64; any
   other kernel/distro.
+
+### Notes on the 34947f4 host run
+
+* Full per-test log committed (this replaces the 19af325 log at the same path;
+  the 173-pass result of 19af325 is kept above as history only).
+* Skip is L12, weak is L14 R5, as before.  New in this run: L24 (both
+  variants) PASS, L22 PASS under `network = "none"`.  Two earlier host runs on
+  intermediate commits failed (every exec refused by the D25 root check; then
+  `opening ns/user: Permission denied`) and led to the fixes in 5c16fba and
+  34947f4; those logs were overwritten and are not kept.
+* The header's `tree: dirty` was only the log file itself (an earlier run's
+  log, rewritten by `make leaktest-log`); the Makefile now ignores
+  `docs/leaktest-host-*.log` in that check.
+* Not run on that host in this record: `make lint && make test` on the final
+  tip; aarch64; any other kernel/distro.

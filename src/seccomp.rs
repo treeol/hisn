@@ -16,9 +16,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(target_arch = "x86_64")]
+use seccompiler::sock_filter;
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
-    SeccompRule, TargetArch, sock_filter,
+    SeccompRule, TargetArch,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -312,6 +314,7 @@ fn build_x32_guard() -> BpfProgram {
 /// Build the filter stack for `extra_deny`. Validates names.
 pub fn build(extra_deny: &[String]) -> Result<Vec<BpfProgram>, SeccompError> {
     let denied = denied_names(extra_deny)?;
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut progs = vec![build_main(&denied)?, build_clone3()?];
     #[cfg(target_arch = "x86_64")]
     progs.push(build_x32_guard());
@@ -330,6 +333,7 @@ pub fn install(progs: &[BpfProgram]) -> Result<(), SeccompError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seccompiler::sock_filter;
 
     const AUDIT_ARCH: u32 = {
         #[cfg(target_arch = "x86_64")]

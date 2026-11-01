@@ -405,6 +405,157 @@ else
   skip "L14 alias fixture" "'unshare -Urm' unavailable, cannot build the bind-alias fixture"
 fi
 
+# ============================================== L15-L20: exec into the session
+# These tests use `hisn exec --session`. A live session is needed; reuse
+# a detached one so the tests do not end it.
+CX=$(new_cwd exec)
+write_policy "$WORK/X.toml" "$CX"
+if "$HISN" run --policy "$WORK/X.toml" --session-id xdet-$$ --detach </dev/null >"$WORK/xdet.out" 2>"$WORK/xdet.err" & DET_PID=$!; then
+  SESSIONS+=("$DET_PID")
+  ok_ready=0
+  for i in $(seq 1 150); do
+    "$HISN" ls --json 2>/dev/null | grep -q xdet-$$ && { ok_ready=1; break; }
+    kill -0 "$DET_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [ "$ok_ready" = 1 ]; then
+    ex() { timeout 30 "$HISN" exec --session xdet-$$ "$@" ; }
+    exq() { # exq ARGS... : one probe command through exec; prints its output
+      local out
+      out=$(timeout 30 "$HISN" exec --session xdet-$$ -- "$CX/leakprobe" "$@" </dev/null 2>&1)
+      printf '%s' "$out"
+    }
+
+    # ---- L15: every L1/L3/L4/L5/L9/L10 probe passes identically via exec
+    for p in /home /root /tankz /var /etc/shadow /etc/ssh "$HOME/.ssh" "$HOME/.aws"; do
+      got=$(exq stat "$p")
+      eq "L15 exec stat $p -> ENOENT" "$got" ENOENT
+    done
+    for sc in mount unshare_mnt unshare_user setns ptrace chroot pivot_root open_tree bpf io_uring_setup clone_newuser tiocsti; do
+      got=$(exq syscall "$sc")
+      case $got in EPERM) pass "L15 exec $sc -> EPERM" ;; *) fail "L15 exec $sc" "got [$got]" ;; esac
+    done
+    eq "L15 exec clone3 -> ENOSYS" "$(exq syscall clone3)" ENOSYS
+    envo=$(exq env)
+    lacks "L15 exec env: host secret absent" "$envo" topsecret
+    lacks "L15 exec env: AWS secret absent" "$envo" hunter2
+    has "L15 exec env: passed var present" "$envo" "HISN_LEAK_PASSED=visible-ok"
+    has "L15 exec env: HOME forced" "$envo" "HOME=/run/hisn/home"
+    eq "L15 exec write in cwd" "$(exq write "$CX/exec-write")" OK
+    [ "$(cat "$CX/exec-write" 2>/dev/null)" = leak ] && pass "L15 exec write visible on host" || fail "L15 exec write" "missing"
+    eq "L15 exec /usr write -> EROFS" "$(exq write /usr/x)" EROFS
+    eq "L15 exec /tmp writable" "$(exq write /tmp/x)" OK
+    ln -sf /etc/shadow "$CX/el_shadow"
+    got=$(exq cat "$CX/el_shadow")
+    case $got in ENOENT | ELOOP | EACCES) pass "L15 exec symlink escape -> not readable ($got)" ;; *) fail "L15 exec symlink escape" "got [$got]" ;; esac
+    eq "L15 exec /dev contents" "$(exq ls /dev)" "OK fd,full,null,ptmx,pts,random,stderr,stdin,stdout,tty,urandom,zero"
+    eq "L15 exec /sys absent" "$(exq stat /sys)" ENOENT
+
+    # ---- L17: ancestry and lifecycle
+    ppid_line=$(exq ppid)
+    has "L17 exec'd process descends from sandbox init (PPid 1)" "$ppid_line" "ppid=1"
+    pidsv=$(exq pids)
+    has "L17 exec'd process is in the sandbox pid ns (init=1 visible)" ",${pidsv#OK }," ",1,"
+    n=$(printf '%s' "${pidsv#OK }" | tr ',' '\n' | grep -c .)
+    [ "$n" -le 10 ] && pass "L17 only $n pids visible via exec" || fail "L17 exec pids" "$pidsv"
+
+    # ---- L18: env keys outside env.pass reject the whole request
+    out=$(timeout 30 env AWS_SECRET_ACCESS_KEY=hunter2 "$HISN" exec --session xdet-$$ --env AWS_SECRET_ACCESS_KEY=hunter2 -- /bin/true </dev/null 2>&1)
+    rc=$?
+    [ $rc -ne 0 ] && case "$out" in *"AWS_SECRET_ACCESS_KEY"*) pass "L18 env key not in env.pass rejected (exit $rc)" ;; *) fail "L18 env rejection" "rc=$rc out=[$out]" ;; esac
+    out=$(timeout 30 "$HISN" exec --session xdet-$$ --env HISN_LEAK_PASSED=v2 -- "$CX/leakprobe" env </dev/null 2>&1)
+    has "L18 passed key present in the exec environment" "$out" "HISN_LEAK_PASSED=v2"
+    out=$(timeout 30 "$HISN" exec --session xdet-$$ --env HOME=/evil -- /bin/true </dev/null 2>&1)
+    [ $? -ne 0 ] && pass "L18 computed name (HOME) rejected" || fail "L18 HOME override" "accepted"
+
+    # ---- L16: grants before/during/after exec; revoke applies to a running exec
+    hisn_json "$WORK/xg.json" grant --session xdet-$$ "$WORK/g_ro"
+    $PY json-ok "$WORK/xg.json" && pass "L16 grant before exec accepted" || fail "L16 grant" "$(cat "$WORK/xg.json")"
+    eq "L16 grant made before exec is visible in it" "$(exq cat "$WORK/g_ro/hello")" "OK ro-secret-content"
+    # a long-running exec, then a grant while it runs: it must see it
+    ex --cwd "$CX" -- sh -c 'sleep 5' >/dev/null 2>&1 &
+    SLEEPER=$!
+    sleep 0.4
+    hisn_json "$WORK/xgr.json" grant --session xdet-$$ --rw "$WORK/g_rw/execmid"
+    $PY json-ok "$WORK/xgr.json" && pass "L16 rw grant during a running exec accepted" || fail "L16 mid-exec grant" "$(cat "$WORK/xgr.json")"
+    eq "L16 grant during a running exec is visible to a later one" "$(exq write "$WORK/g_rw/execmid/f")" OK
+    # a running exec that resolves the revoked path after the revoke
+    ex --cwd "$CX" -- sh -c 'while [ ! -e "'"$CX"'/go" ]; do sleep 0.05; done; cat '"$WORK/g_ro"'/hello > '"$CX"'/after 2>/dev/null; echo "rc=$?" > '"$CX"'/rc' >/dev/null 2>&1 &
+    WATCHER=$!
+    sleep 0.5
+    hisn_json "$WORK/xrv.json" revoke --session xdet-$$ "$WORK/g_ro"
+    $PY json-ok "$WORK/xrv.json" && pass "L16 revoke of a live grant accepted" || fail "L16 revoke" "$(cat "$WORK/xrv.json")"
+    printf go >"$CX/go"
+    wait "$WATCHER" >/dev/null 2>&1
+    after=$(cat "$CX/after" 2>/dev/null); rcc=$(cat "$CX/rc" 2>/dev/null)
+    case "${after:-}" in
+      ro-secret-content) fail "L16 mid-exec revoke" "the running exec re-read the revoked grant" ;;
+      *) pass "L16 mid-exec revoke: the running exec cannot re-read the grant (rc=${rcc:-gone})" ;;
+    esac
+    eq "L16 revoked path -> ENOENT for a later exec" "$(exq stat "$WORK/g_rw/execmid")" ENOENT
+    wait "$SLEEPER" >/dev/null 2>&1
+
+    # ---- L19: 50 sequential + 10 concurrent execs, no fd/zombie leak
+    SUP=$(pgrep -f "hisn run --policy.*xdet-$\$" | head -1)
+    [ -n "$SUP" ] && fds_before=$(ls /proc/$SUP/fd 2>/dev/null | wc -l) || fds_before=0
+    okseq=0
+    for i in $(seq 1 50); do ex -- /bin/true >/dev/null 2>&1 && okseq=$((okseq+1)); done
+    eq "L19 50 sequential execs all succeed" "$okseq" 50
+    pids=""; okconc=0
+    for i in $(seq 1 10); do ex -- sh -c 'sleep 0.4' >/dev/null 2>&1 & pids="$pids $!"; done
+    for p in $pids; do wait "$p" && okconc=$((okconc+1)); done
+    eq "L19 10 concurrent execs all succeed" "$okconc" 10
+    sleep 0.5
+    if [ "$fds_before" -gt 0 ]; then
+      fds_after=$(ls "/proc/$SUP/fd" 2>/dev/null | wc -l)
+      [ "$fds_after" -le $((fds_before + 2)) ] && pass "L19 supervisor fd count back to baseline ($fds_before -> $fds_after)" || weak "L19 supervisor fds" "$fds_before -> $fds_after (leaked or held descriptors)"
+    else
+      weak "L19 supervisor fd baseline" "could not read /proc/$SUP/fd"
+    fi
+
+    # ---- L20: --tty exec gets a working pty (isatty, resize propagates)
+    if command -v script >/dev/null; then
+      # `script` starts a new shell, so its $$ differs from ours: pass the
+      # session id through the environment, expanded by THIS shell.
+      XDET_ID=xdet-$$ out=$(timeout 20 script -qec "stty rows 24 cols 80; $HISN exec --session \"\$XDET_ID\" --tty -- $CX/leakprobe tty" /dev/null </dev/null 2>&1)
+      has "L20 --tty exec: probe sees a tty (isatty=1)" "$out" "isatty=1"
+      has "L20 --tty exec: pty has a winsize" "$out" "24x80"
+    else
+      weak "L20 --tty exec" "'script' is unavailable to drive a pty"
+    fi
+    # without --tty and a terminal on stdin, hisn must refuse
+    if [ -t 0 ]; then
+      out=$("$HISN" exec --session xdet-$$ -- /bin/true 2>&1); rc=$?
+      [ $rc -eq 125 ] && has "L20 terminal without --tty refused (exit 125)" "$out" --tty || fail "L20 terminal refusal" "rc=$rc out=[$out]"
+    else
+      weak "L20 terminal refusal" "run.sh stdin is not a tty; rerun with a terminal"
+    fi
+
+    # ---- session end: every exec'd process dies with the session (L17)
+    ex -- sh -c 'sleep 30' >/dev/null 2>&1 &
+    SLEEPER=$!
+    sleep 0.5
+    hisn_json "$WORK/xkill.json" kill --session xdet-$$ --signal TERM
+    kill -TERM "$DET_PID" 2>/dev/null
+    wait "$DET_PID" 2>/dev/null
+    # The exec'd sleeper was a child of THIS shell (hisn exec is a child
+    # process); the sandboxed `sleep 30` dies with the session, so `wait`
+    # must return promptly.
+    wait "$SLEEPER" >/dev/null 2>&1 && rc2=0 || rc2=$?
+    sleep 0.5
+    if kill -0 "$SLEEPER" 2>/dev/null; then
+      fail "L17 sleeper" "still running after session death"
+    else
+      pass "L17 exec'd sleeper died with the session (hisn exec rc=$rc2)"
+    fi
+    [ ! -e "$RUNTIME_ROOT/xdet-$$" ] && pass "L17 detached session dir removed" || fail "L17 session dir" "$RUNTIME_ROOT/xdet-$$ exists"
+  else
+    fail "L15-L20" "detached session did not become ready; hisn said: $(head -c 300 "$WORK/xdet.err")"
+  fi
+else
+  fail "L15-L20" "could not start a detached session"
+fi
+
 # ----------------------------------------------------------------- summary
 printf '\nRESULT: %d passed, %d failed, %d skipped, %d weak\n' "$PASSES" "$FAILS" "$SKIPS" "$WEAKS"
 [ "$FAILS" -eq 0 ] && [ "$PASSES" -gt 0 ]

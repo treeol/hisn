@@ -354,9 +354,57 @@ fn cmd_mountinfo() -> String {
     )
 }
 
+fn cmd_ppid() -> String {
+    // SAFETY: getppid has no preconditions; reading /proc/self/status is plain IO.
+    let me = std::process::id();
+    let ppid = unsafe { libc::getppid() };
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let walk = status
+        .lines()
+        .find_map(|l| l.strip_prefix("PPid:"))
+        .map(|v| v.trim().to_string());
+    format!(
+        "OK pid={} ppid={} status_ppid={} ns_self={}",
+        me,
+        ppid,
+        walk.unwrap_or_default(),
+        Path::new("/proc/self").exists()
+    )
+}
+
+fn cmd_tty() -> String {
+    // SAFETY: isatty and ioctl with a zeroed winsize on fd 0.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        let is = libc::isatty(0) == 1;
+        let got = libc::ioctl(0, libc::TIOCGWINSZ, &mut ws);
+        format!(
+            "OK isatty={} winsize={}x{}",
+            is,
+            if got == 0 { ws.ws_col } else { 0 },
+            if got == 0 { ws.ws_row } else { 0 }
+        )
+    }
+}
+
+fn cmd_fds() -> String {
+    let mut v: Vec<i32> = fs::read_dir("/proc/self/fd")
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_unstable();
+    format!("OK {}", v.iter().map(i32::to_string).collect::<Vec<_>>().join(","))
+}
+
 fn dispatch(a: &[String]) -> String {
     let arg = |i: usize| a.get(i).map(String::as_str).unwrap_or("");
     match arg(0) {
+        "ppid" => cmd_ppid(),
+        "tty" => cmd_tty(),
+        "fds" => cmd_fds(),
         "stat" => cmd_stat(arg(1)),
         "ls" => cmd_ls(arg(1)),
         "cat" => cmd_cat(arg(1)),

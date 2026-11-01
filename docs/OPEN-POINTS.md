@@ -186,7 +186,20 @@ L15-L20. No third round is allowed. Disposition:
   A hostile-probe test that races `/proc/<pid>/{mem,fd,status}` of new
   processes during a burst of execs is a v0.3 candidate.
 
-* **P20 — `exec` `K`-line delivery observed lost twice (unreproduced).** In
+* **P20 — `monitor_forwards_signals_to_the_process_group` fails under
+  `tools/verification.sh` (unit-level, test-only).** Under the script the test
+  fails after exactly the child's sleep timeout with `got=Code(0)`;
+  40+ direct runs are green. Instrumented runs (commit history) proved the
+  shipped path works: the monitor pops every `K` line from the status socket
+  and calls `signal_group` (no error), i.e. the forward mechanism itself is
+  correct; the anomaly is the *child's* exit-status attribution
+  (`sh -c 'sleep 60'` exiting 0 despite a delivered SIGHUP to its group) in
+  the double-run script context. The on-failure diagnostic in the test
+  (`P20 diag: got=… child_alive=… unread_status_bytes=…`) captures the facts
+  if it recurs. Because the shipped `monitor`/`signal_group` path is
+  instrument-verified and the failure mode is confined to this unit test,
+  P20 stays open as a test-quality question, with **[HOST-VERIFY]** L16/L19
+  as the authoritative check of signal delivery to real exec'd programs. In
   two `tools/verification.sh` runs, `exec::tests::monitor_forwards_signals_to_
   the_process_group` failed after exactly the child's `sleep` timeout: the
   `K <sig>` line the test wrote to the status socket never reached

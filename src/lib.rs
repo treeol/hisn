@@ -4,6 +4,7 @@ pub mod check;
 pub mod cli;
 pub mod control;
 pub mod env;
+pub mod grant;
 pub mod landlock;
 pub mod mounts;
 pub mod policy;

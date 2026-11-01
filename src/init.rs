@@ -106,6 +106,17 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     }
     rootfs::enter(&cfg.root_dir)?;
     sys::close_all_except(&[chan.as_raw_fd()]);
+    // The sandbox root, post-pivot, for the supervisor's exec helper (D25).
+    // Handed over with READY: init is non-dumpable by then, so the supervisor
+    // cannot open `/proc/<init>/root` itself.
+    let root_fd = sys::openat2(
+        libc::AT_FDCWD,
+        c"/",
+        (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        0,
+        0,
+    )
+    .context("opening the sandbox root")?;
 
     // Pty (must exist before seccomp/landlock; /dev is the sandbox's own).
     let pty = if cfg.use_pty {
@@ -152,13 +163,11 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
         Some((m, s)) => (Some(m), Some(s)),
         None => (None, None),
     };
-    sys::send_with_fd(
-        chan.as_raw_fd(),
-        &[MSG_READY],
-        master.as_ref().map(AsRawFd::as_raw_fd),
-    )
-    .context("reporting ready")?;
+    let mut ready_fds = vec![root_fd.as_raw_fd()];
+    ready_fds.extend(master.as_ref().map(AsRawFd::as_raw_fd));
+    sys::send_with_fds(chan.as_raw_fd(), &[MSG_READY], &ready_fds).context("reporting ready")?;
     drop(master);
+    drop(root_fd);
     // Wait for the supervisor to apply initial grants before the command exists.
     let (n, _) = sys::recv_with_fd(chan.as_raw_fd(), &mut b).context("waiting for START")?;
     if n != 1 || b[0] != MSG_START {

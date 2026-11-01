@@ -896,11 +896,31 @@ fn run_session(
 
     // ---- 4. namespace fds, GO, READY
     let mntns_fd = open_ns(pid, "mnt")?;
+    // The exec helper's namespaces, opened before `GO` while init is still
+    // dumpable (D24). The root fd is not among them: see below.
+    let ns_user = open_ns(pid, "user")?;
+    let ns_mnt = open_ns(pid, "mnt")?;
+    let ns_ipc = open_ns(pid, "ipc")?;
+    let ns_uts = open_ns(pid, "uts")?;
+    let ns_pid = open_ns(pid, "pid")?;
+    let ns_net = if exec_net {
+        Some(open_ns(pid, "net")?)
+    } else {
+        None
+    };
     let sandbox_pidns = sys::ns_inode(pid, "pid").context("sandbox pid namespace")?;
     sys::send_with_fd(sup_end.as_raw_fd(), &[MSG_GO], None)?;
     let mut buf = [0u8; 4096];
-    let (n, master) =
-        sys::recv_with_fd(sup_end.as_raw_fd(), &mut buf).context("waiting for sandbox setup")?;
+    let ready =
+        sys::recv_with_fds(sup_end.as_raw_fd(), &mut buf).context("waiting for sandbox setup")?;
+    if ready.truncated {
+        bail!("sandbox init sent an oversized setup message");
+    }
+    let n = ready.len;
+    // READY carries the sandbox root fd, then (with a pty) the pty master.
+    let mut ready_fds = ready.fds.into_iter();
+    let ready_root = ready_fds.next();
+    let master = ready_fds.next();
     if n == 0 {
         let code = reap(pid);
         bail!(
@@ -919,31 +939,21 @@ fn run_session(
         other => bail!("unexpected message {other:#x} from sandbox init"),
     }
 
-    // The exec helper's namespaces (D24). Opened only after init reported
-    // READY: `root` is `/proc/<init>/root`, which is the sandbox tmpfs root
-    // only once init has done its pivot_root. Opened before MSG_GO it would be
-    // the pre-pivot root and `C`'s D25 root check would (rightly) refuse every
-    // exec. `C` fchdirs onto it because `setns(mnt)` does not move root/cwd.
+    // The sandbox root comes from init itself, passed with READY (D25): by
+    // now init is non-dumpable (D6), so `/proc/<init>/root` is out of reach,
+    // and before `GO` it would still be the host root.
+    let root = ready_root.ok_or_else(|| anyhow!("sandbox init sent READY without its root fd"))?;
+    if !fs::File::from(root.try_clone()?).metadata()?.is_dir() {
+        bail!("sandbox root descriptor is not a directory");
+    }
     let exec_ns = NsFds {
-        user: open_ns(pid, "user")?,
-        mnt: open_ns(pid, "mnt")?,
-        ipc: open_ns(pid, "ipc")?,
-        uts: open_ns(pid, "uts")?,
-        pid: open_ns(pid, "pid")?,
-        net: if exec_net {
-            Some(open_ns(pid, "net")?)
-        } else {
-            None
-        },
-        root: {
-            let f = fs::File::open(format!("/proc/{pid}/root"))
-                .with_context(|| format!("opening /proc/{pid}/root"))?;
-            let m = f.metadata()?;
-            if !m.is_dir() {
-                bail!("/proc/{pid}/root is not a directory");
-            }
-            f.into()
-        },
+        user: ns_user,
+        mnt: ns_mnt,
+        ipc: ns_ipc,
+        uts: ns_uts,
+        pid: ns_pid,
+        net: ns_net,
+        root,
     };
 
     // ---- 5. persistent helper, forked while still single-threaded

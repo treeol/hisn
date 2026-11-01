@@ -227,19 +227,25 @@ impl Shared {
                     .map_err(|r| (r.code.to_owned(), r.message))?
                     .mount_id
             };
-            let held = self.held.lock().expect("held").remove(&p).ok_or_else(|| {
-                (
-                    control::E_INTERNAL.to_owned(),
-                    "grant has no mount handle".to_owned(),
-                )
-            })?;
-            self.helper
-                .lock()
-                .expect("helper")
-                .revoke(&p, &held.mount_root)
-                .map_err(|e| (control::E_INTERNAL.into(), format!("detach: {e}")))?;
+            // Keep the handle and the table entry until the detach succeeded, so a
+            // failed detach can be retried instead of orphaning the grant.
+            let detach = {
+                let held = self.held.lock().expect("held");
+                let h = held.get(&p).ok_or_else(|| {
+                    (
+                        control::E_INTERNAL.to_owned(),
+                        "grant has no mount handle".to_owned(),
+                    )
+                })?;
+                self.helper
+                    .lock()
+                    .expect("helper")
+                    .revoke(&p, &h.mount_root)
+            };
+            detach.map_err(|e| (control::E_INTERNAL.into(), format!("detach: {e}")))?;
             self.table.lock().expect("table").remove(&p);
-            drop(held); // releases our reference to the (now detached) mount
+            // Dropping the handle releases our reference to the detached mount.
+            drop(self.held.lock().expect("held").remove(&p));
 
             if hard {
                 self.kill_all_except_init()
@@ -275,16 +281,35 @@ impl Shared {
 
     /// PIDs (in the supervisor's view) of every process in the sandbox pid
     /// namespace. Found through the host-side `/proc`, by namespace inode.
+    ///
+    /// Fail closed: a process of *our* uid whose namespace cannot be read
+    /// (other than because it just exited) makes the whole enumeration an
+    /// error, so an incomplete list is never mistaken for an empty one.
+    /// Processes of other users cannot be sandbox processes (the sandbox maps
+    /// only our own uid) and are skipped.
     fn sandbox_pids(&self) -> io::Result<Vec<i32>> {
+        use std::os::unix::fs::MetadataExt;
         let mut v = Vec::new();
         for e in fs::read_dir("/proc")?.flatten() {
             let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
                 continue;
             };
-            if let Ok(ino) = sys::ns_inode(pid, "pid")
-                && ino == self.sandbox_pidns
-            {
-                v.push(pid);
+            match fs::metadata(e.path()) {
+                Ok(m) if m.uid() == self.uid => {}
+                Ok(_) => continue,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            }
+            match sys::ns_inode(pid, "pid") {
+                Ok(ino) if ino == self.sandbox_pidns => v.push(pid),
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {} // exited meanwhile
+                Err(err) => {
+                    return Err(io::Error::new(
+                        err.kind(),
+                        format!("pid {pid}: cannot read pid namespace: {err}"),
+                    ));
+                }
             }
         }
         Ok(v)
@@ -353,11 +378,16 @@ impl Shared {
                     for fd in rd.flatten() {
                         match fs::read_to_string(fd.path()) {
                             Ok(body) => {
-                                if grant::fdinfo_mount_id(&body) == Some(mount_id) {
-                                    out.insert(Holder {
-                                        pid,
-                                        kind: HolderKind::Fd,
-                                    });
+                                match grant::fdinfo_mount_id(&body) {
+                                    Some(id) if id == mount_id => {
+                                        out.insert(Holder {
+                                            pid,
+                                            kind: HolderKind::Fd,
+                                        });
+                                    }
+                                    Some(_) => {}
+                                    // unparsable: never counted as clean
+                                    None => unknown(&mut out),
                                 }
                             }
                             Err(e) if e.kind() == io::ErrorKind::NotFound => {} // fd closed meanwhile
@@ -373,15 +403,19 @@ impl Shared {
                 Ok(rd) => {
                     for m in rd.flatten() {
                         let Ok(c) = sys::cstr(&m.path()) else {
+                            unknown(&mut out);
                             continue;
                         };
-                        if let Ok(id) = sys::mnt_id(libc::AT_FDCWD, &c, 0)
-                            && id == mount_id
-                        {
-                            out.insert(Holder {
-                                pid,
-                                kind: HolderKind::Map,
-                            });
+                        match sys::mnt_id(libc::AT_FDCWD, &c, 0) {
+                            Ok(id) if id == mount_id => {
+                                out.insert(Holder {
+                                    pid,
+                                    kind: HolderKind::Map,
+                                });
+                            }
+                            Ok(_) => {}
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {} // unmapped meanwhile
+                            Err(_) => unknown(&mut out),
                         }
                     }
                 }
@@ -636,7 +670,7 @@ fn run_session(
     let tty = sys::isatty(0);
     let root_dir = sdir.path.join("root");
     fs::create_dir(&root_dir).context("creating root dir")?;
-    let rules = static_rules(&plan, &policy, &roots);
+    let mut rules = static_rules(&plan, &policy, &roots);
 
     // Landlock write set includes initial rw grants.
     let initial_rw: Vec<PathBuf> = initial
@@ -644,6 +678,9 @@ fn run_session(
         .filter(|(_, m)| *m == Mode::Rw)
         .map(|(p, _)| PathBuf::from(p))
         .collect();
+    // An initial rw grant is part of the Landlock write set by construction, so
+    // the grant rules must accept it (round-2 finding).
+    rules.grantable_rw.extend(initial_rw.iter().cloned());
     let ll = landlock::plan(&policy, &initial_rw);
     let seccomp_progs = seccomp::build(&policy.extra_deny)?;
 

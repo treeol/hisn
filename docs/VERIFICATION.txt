@@ -1,16 +1,16 @@
-# Verification record (generated 2026-11-01T04:05:56Z, host: Wakil build sandbox, uid 1000)
+# Verification record (generated 2026-11-01T04:13:47Z, host: Wakil build sandbox, uid 1000)
 
 ## cargo fmt --check
 clean
 
 ## cargo clippy --all-targets -- -D warnings (x86_64)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
 
 ## cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
 
 ## cargo test
-test result: ok. 120 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 121 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
 
 ## unit tests per module
       8 alias
@@ -21,7 +21,7 @@ test result: ok. 120 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fi
      13 grant
       7 init
       4 landlock
-     18 mounts
+     19 mounts
      11 policy
       4 rootfs
      12 seccomp

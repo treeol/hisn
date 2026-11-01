@@ -7,6 +7,7 @@ build:
 
 test:
 	$(CARGO) test
+	python3 tests/leak/test_l8.py
 
 lint:
 	$(CARGO) fmt --check

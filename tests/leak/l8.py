@@ -4,17 +4,21 @@
   l8.py json-get FILE KEY            print a top-level JSON string value
   l8.py json-ok  FILE                exit 0 iff {"ok": true}
   l8.py json-has FILE KEY VALUE      exit 0 iff top-level KEY == VALUE
-  l8.py l8 INSPECT.json PLAN.json HOST_MOUNTINFO [GRANT_PATH ...]
-                                     L8: sandbox mount table == plan (see below)
+  l8.py l8 INSPECT.json PLAN.json HOST_MOUNTINFO [GRANT_PATH:MODE ...]
+                                     L8: sandbox mount table == plan, typed
 
-L8 compares the sandbox's mountpoints (from `hisn inspect`) with the set
-derived from the policy by `hisn policy plan`, plus "/" (the root tmpfs) and
-the paths of live grants. Two documented, bounded exceptions:
-  * submounts of /proc created by procfs hardening (fixed name list);
-  * mounts that a *recursive* bind imports because they exist at the same path
-    in the host mount table (e.g. a separate filesystem below /usr).
-Anything else is reported as an extra mount, and any planned mount that is
-missing is reported too.
+L8 compares the sandbox's mount table (from `hisn inspect`) with the plan from
+`hisn policy plan` (target, recursive, ro) plus "/" and the live grants:
+
+  * every planned/granted mountpoint must exist in the sandbox, and a planned
+    read-only mount must carry the `ro` option (a ro->rw regression fails);
+  * a mountpoint in the sandbox that is neither planned nor granted is allowed
+    ONLY if (a) it is one of the fixed /proc hardening mounts, or (b) it lies
+    beneath a planned *recursive* bind AND the same path is a mountpoint in the
+    host's mount table (a submount that the recursive bind imports) -- and such
+    an imported submount must be read-only wherever the bind it sits under is
+    read-only. Planned non-recursive mounts (tmpfs areas, /dev, non-recursive
+    binds) import nothing, so an extra mount beneath them is a failure.
 """
 import json
 import sys
@@ -54,44 +58,85 @@ def under(path, root):
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
+def load_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def read_text(path):
+    with open(path) as f:
+        return f.read()
+
+
+def mount_table(text):
+    """mountpoint -> set of per-mount options (the 6th mountinfo field)."""
+    rows = {}
+    for line in text.splitlines():
+        f = line.split(" ")
+        if len(f) >= 7:
+            rows[unescape(f[4])] = set(f[5].split(","))
+    return rows
+
+
 def l8(inspect_file, plan_file, host_mi_file, grants):
-    ins = json.load(open(inspect_file))
+    ins = load_json(inspect_file)
     if ins.get("ok") is not True:
         print("inspect failed:", ins)
         return 1
-    sandbox = set(mountpoints(ins["mountinfo"]))
-    plan = set(json.load(open(plan_file)))
-    host = set(mountpoints(open(host_mi_file).read()))
-    expected = plan | {"/"} | set(grants)
-    recursive_roots = [p for p in plan if p.startswith(("/usr", "/bin", "/sbin", "/lib", "/opt", "/nix"))
-                       and p.count("/") == 1]
-    missing = sorted(expected - sandbox)
-    extra = []
-    for m in sorted(sandbox - expected):
+    sandbox = mount_table(ins["mountinfo"])
+    plan = {r["target"]: r for r in load_json(plan_file)}
+    host = set(mount_table(read_text(host_mi_file)))
+    live = {}
+    for g in grants:
+        path, _, mode = g.rpartition(":")
+        live[path] = mode == "ro"
+    problems = []
+
+    expected = set(plan) | {"/"} | set(live)
+    for m in sorted(expected - set(sandbox)):
+        problems.append(f"missing from sandbox: {m}")
+    for m, r in plan.items():
+        if m in sandbox and r["ro"] is True and "ro" not in sandbox[m]:
+            problems.append(f"planned read-only but mounted rw: {m}")
+        if m in sandbox and r["ro"] is False and "ro" in sandbox[m]:
+            problems.append(f"planned rw but mounted ro: {m}")
+    for m, ro in live.items():
+        if m in sandbox and ro and "ro" not in sandbox[m]:
+            problems.append(f"ro grant mounted rw: {m}")
+        if m in sandbox and not ro and "ro" in sandbox[m]:
+            problems.append(f"rw grant mounted ro: {m}")
+
+    recursive_roots = [m for m, r in plan.items() if r["recursive"]]
+    for m in sorted(set(sandbox) - expected):
         if m in PROC_HARDENING:
             continue
-        if m in host and any(under(m, r) for r in recursive_roots + sorted(plan)):
+        parents = [r for r in recursive_roots if under(m, r)]
+        if parents and m in host:
+            parent = max(parents, key=len)
+            if plan[parent]["ro"] and "ro" not in sandbox[m]:
+                problems.append(f"imported submount {m} is rw under read-only bind {parent}")
             continue
-        extra.append(m)
-    if missing or extra:
+        problems.append(f"extra mount: {m}")
+
+    if problems:
         print("L8 mismatch")
-        print("  missing from sandbox:", missing)
-        print("  extra in sandbox:   ", extra)
+        for p in problems:
+            print("  " + p)
         return 1
-    print(f"L8 ok: {len(sandbox)} mounts, all accounted for")
+    print(f"L8 ok: {len(sandbox)} mounts, all accounted for, modes match")
     return 0
 
 
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else ""
     if cmd == "json-get":
-        v = json.load(open(argv[2])).get(argv[3], "")
+        v = load_json(argv[2]).get(argv[3], "")
         print(v if isinstance(v, str) else json.dumps(v))
         return 0
     if cmd == "json-ok":
-        return 0 if json.load(open(argv[2])).get("ok") is True else 1
+        return 0 if load_json(argv[2]).get("ok") is True else 1
     if cmd == "json-has":
-        return 0 if str(json.load(open(argv[2])).get(argv[3])) == argv[4] else 1
+        return 0 if str(load_json(argv[2]).get(argv[3])) == argv[4] else 1
     if cmd == "l8":
         return l8(argv[2], argv[3], argv[4], argv[5:])
     print(__doc__)

@@ -247,7 +247,7 @@ done
 "$HISN" policy plan "$POL" >"$WORK/plan.json" 2>"$WORK/plan.err" || fail "L8 policy plan" "$(cat "$WORK/plan.err")"
 hisn_json "$WORK/inspect.json" inspect --session main --json
 cp /proc/self/mountinfo "$WORK/host.mountinfo"
-if out=$($PY l8 "$WORK/inspect.json" "$WORK/plan.json" "$WORK/host.mountinfo" "$WORK/g_ro" 2>&1); then pass "L8 $out"; else fail "L8 mount table" "$out"; fi
+if out=$($PY l8 "$WORK/inspect.json" "$WORK/plan.json" "$WORK/host.mountinfo" "$WORK/g_ro:ro" 2>&1); then pass "L8 $out"; else fail "L8 mount table" "$out"; fi
 
 # ---- L6: grants
 eq "L6 initial ro grant readable" "$(q "$CWD" cat "$WORK/g_ro/hello")" "OK ro-secret-content"
@@ -269,7 +269,7 @@ $PY json-has "$WORK/grant_root.json" error E_PATH_FORBIDDEN && pass "L6 / cannot
 
 # L8 again with live grants
 hisn_json "$WORK/inspect2.json" inspect --session main --json
-if out=$($PY l8 "$WORK/inspect2.json" "$WORK/plan.json" "$WORK/host.mountinfo" "$WORK/g_ro" "$WORK/g_rw/sub" 2>&1); then pass "L8 with live grants: $out"; else fail "L8 with grants" "$out"; fi
+if out=$($PY l8 "$WORK/inspect2.json" "$WORK/plan.json" "$WORK/host.mountinfo" "$WORK/g_ro:ro" "$WORK/g_rw/sub:rw" 2>&1); then pass "L8 with live grants: $out"; else fail "L8 with grants" "$out"; fi
 [ -z "$(grep -F "$WORK" /proc/self/mountinfo)" ] && pass "L6 grant mounts invisible in the host mount table" || fail "L6 host mount table" "$(grep -F "$WORK" /proc/self/mountinfo | head -3)"
 
 # L13a: soft revoke must claim only "lookup"

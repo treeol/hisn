@@ -247,8 +247,10 @@ fn harden_proc(root: RawFd) -> Result<()> {
         let rel = Path::new("proc").join(name);
         let parent = ensure_dir(root, rel.parent().expect("has parent"))?;
         let c = sys::cstr(Path::new(name))?;
-        let Ok(t) = sys::openat2(parent.as_raw_fd(), &c, O_PATH_ANY, 0, RESOLVE_SAFE) else {
-            continue; // not present on this kernel
+        let t = match sys::openat2(parent.as_raw_fd(), &c, O_PATH_ANY, 0, RESOLVE_SAFE) {
+            Ok(t) => t,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue, // absent on this kernel
+            Err(e) => return Err(e).with_context(|| format!("opening /proc/{name} to mask it")),
         };
         // SAFETY: valid fd; fstat into a zeroed buffer.
         let is_dir = unsafe {
@@ -262,8 +264,13 @@ fn harden_proc(root: RawFd) -> Result<()> {
         let rel = Path::new("proc").join(name);
         let parent = ensure_dir(root, rel.parent().expect("has parent"))?;
         let c = sys::cstr(Path::new(name))?;
-        let Ok(t) = sys::openat2(parent.as_raw_fd(), &c, O_PATH_ANY, 0, RESOLVE_SAFE) else {
-            continue;
+        let t = match sys::openat2(parent.as_raw_fd(), &c, O_PATH_ANY, 0, RESOLVE_SAFE) {
+            Ok(t) => t,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("opening /proc/{name} to remount it read-only"));
+            }
         };
         // Bind the entry onto itself read-only. The *source* is addressed via
         // the (safe) fd, so no path is re-resolved.

@@ -471,6 +471,18 @@ pub fn expected_targets(plan: &[MountOp]) -> BTreeSet<PathBuf> {
         .collect()
 }
 
+/// `(recursive, read_only)` of a mount op, for the leak tests' typed comparison
+/// (`hisn policy plan`). `read_only` is `None` when the mount has no fixed mode.
+pub fn mount_traits(k: &MountKind) -> (bool, Option<bool>) {
+    match k {
+        MountKind::BindRo { recursive } => (*recursive, Some(true)),
+        MountKind::BindRw { recursive } => (*recursive, Some(false)),
+        MountKind::Tmpfs { readonly, .. } => (false, Some(*readonly)),
+        MountKind::MaskFile | MountKind::MaskDir => (false, Some(true)),
+        _ => (false, None),
+    }
+}
+
 /// Does executing this op create a mount (as opposed to a symlink, a plain
 /// file, or a directory)?
 pub fn is_mount(k: &MountKind) -> bool {
@@ -887,6 +899,17 @@ mod tests {
         let e = plan(&pol("/bin/proj"), &facts(), &[]).unwrap_err();
         assert!(matches!(e, PlanError::UnderSymlink { .. }), "{e}");
         assert!(plan(&pol("/work/p"), &facts(), &[]).is_ok());
+    }
+
+    #[test]
+    fn mount_traits_describe_recursion_and_mode() {
+        let ops = plan(&pol("/work/p"), &facts(), &[]).unwrap();
+        let t = |p: &str| mount_traits(&find(&ops, p).unwrap().kind);
+        assert_eq!(t("/usr"), (true, Some(true)));
+        assert_eq!(t("/work/p"), (true, Some(false)));
+        assert_eq!(t("/tmp"), (false, Some(false)));
+        assert_eq!(t("/etc"), (false, Some(true)));
+        assert_eq!(t("/proc"), (false, None));
     }
 
     #[test]

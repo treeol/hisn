@@ -362,9 +362,9 @@ fn helper_loop(sock: &OwnedFd, mntns: &OwnedFd) -> io::Result<()> {
         let line = String::from_utf8_lossy(&buf[..n]).into_owned();
         let result = match (parse_helper_cmd(&line), fd) {
             (Some(HelperCmd::Grant(target)), Some(tree)) => {
-                do_grant(&root, &target, &tree).map(|(id, attached, made)| {
+                do_grant(&root, &target, tree).map(|(id, handle, made)| {
                     created.insert(target, made);
-                    (id, attached)
+                    (id, Some(handle))
                 })
             }
             (Some(HelperCmd::Revoke(target)), Some(mnt)) => do_revoke(&mnt).map(|()| {
@@ -389,9 +389,14 @@ fn helper_loop(sock: &OwnedFd, mntns: &OwnedFd) -> io::Result<()> {
     }
 }
 
-type Granted = (u64, Option<OwnedFd>, Vec<PathBuf>);
+type Granted = (u64, OwnedFd, Vec<PathBuf>);
 
-fn do_grant(root: &OwnedFd, target: &Path, tree: &OwnedFd) -> io::Result<Granted> {
+/// Attach `tree` at `target`. The mount handle returned for later revoke is
+/// the `open_tree` descriptor itself: it keeps referring to *that* mount after
+/// `move_mount`, so nothing is looked up by pathname afterwards and a sandbox
+/// renaming an ancestor between attach and "reopen" cannot substitute another
+/// mount (round-2 finding). Any failure after the attach detaches it again.
+fn do_grant(root: &OwnedFd, target: &Path, tree: OwnedFd) -> io::Result<Granted> {
     let rel = sys::rel_to_root(target);
     let (dir, made) = crate::rootfs::ensure_dir_tracked(root.as_raw_fd(), rel)?;
     let attach = sys::move_mount(
@@ -405,16 +410,15 @@ fn do_grant(root: &OwnedFd, target: &Path, tree: &OwnedFd) -> io::Result<Granted
         crate::rootfs::remove_created(root.as_raw_fd(), &made); // leave no trace on failure
         return Err(e);
     }
-    // Reopen the *attached* mount root (not the covered mountpoint fd).
-    let attached = sys::openat2(
-        root.as_raw_fd(),
-        &sys::cstr(rel)?,
-        (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
-        0,
-        sys::RESOLVE_BENEATH | sys::RESOLVE_NO_SYMLINKS | sys::RESOLVE_NO_MAGICLINKS,
-    )?;
-    let id = sys::mnt_id(attached.as_raw_fd(), c"", libc::AT_EMPTY_PATH)?;
-    Ok((id, Some(attached), made))
+    match sys::mnt_id(tree.as_raw_fd(), c"", libc::AT_EMPTY_PATH) {
+        Ok(id) => Ok((id, tree, made)),
+        Err(e) => {
+            // Roll back: never leave an attached grant the supervisor cannot track.
+            let _ = do_revoke(&tree);
+            crate::rootfs::remove_created(root.as_raw_fd(), &made);
+            Err(e)
+        }
+    }
 }
 
 /// Detach by fd, never by path: renames, planted symlinks or a shadowing mount

@@ -191,8 +191,11 @@ explicit grant.
   exist and `/proc/1/root`, `/proc/self/root` resolve to the sandbox root
   (L2). Afterwards `/proc/sys` is remounted ro and `/proc/kcore`,
   `/proc/keys`, `/proc/latency_stats`, `/proc/timer_list`, `/proc/sched_debug`,
-  `/proc/sysrq-trigger`, `/proc/acpi`, `/proc/scsi`, `/proc/bus` are masked
-  (same list as runc). **Caveat [HOST-VERIFY]:** the kernel refuses to mount
+  `/proc/acpi`, `/proc/scsi` are masked (file → `/dev/null`, dir → empty ro
+  tmpfs) and `/proc/bus`, `/proc/fs`, `/proc/irq`, `/proc/sys`,
+  `/proc/sysrq-trigger` are bound onto themselves read-only (runc's set, with
+  the latter group read-only rather than masked). Only `ENOENT` counts as
+  "absent on this kernel"; any other error aborts setup. **Caveat [HOST-VERIFY]:** the kernel refuses to mount
   procfs inside a userns when the *inherited* mount tree already has
   over-mounted procfs (typical inside Docker: masked `/proc/kcore`, …). In that
   case hisn **fails closed** with a clear error; it never falls back to
@@ -365,8 +368,8 @@ sequenceDiagram
     H->>M: setns(mntns M)  (stays in userns S: S is U's owner-ancestor ⇒ caps over M and over the tree)
     H->>M: walk components of /abs/x with openat2(NO_SYMLINKS), mkdirat as needed
     H->>M: move_mount(tree, "", dirfd, "", F_EMPTY_PATH|T_EMPTY_PATH)
-    H->>M: mnt = open(dirfd-of-target, O_PATH)  (the mount root)
-    H-->>S: ok + mnt fd (SCM_RIGHTS) + mount_id
+    H->>M: id = statx(tree fd).mnt_id  (the open_tree fd *is* the handle: no pathname is re-resolved after attaching)
+    H-->>S: ok + tree fd back (SCM_RIGHTS) + mount_id; any failure after move_mount detaches again
     S->>S: remember grant{path, mode, mnt fd, mount_id}; audit "ok"
     S-->>W: {"ok":true,"mount_id":N}
 ```
@@ -388,8 +391,10 @@ Properties:
   opts in. `ro` is applied to the whole detached tree before it is attached,
   so a ro grant is never visible rw, not even for an instant.
 * **Revoke is fd-based, never path-based.** `{"op":"revoke","path":P}` looks up
-  the stored grant, spawns the helper with the stored mount-root fd, and the
-  helper does `setns(U); setns(M); umount2("/proc/self/fd/N", MNT_DETACH)`.
+  the stored grant and sends the stored mount handle (the original
+  `open_tree` fd) to the helper, which does `setns(M); fchdir(fd);
+  umount2(".", MNT_DETACH)`. The supervisor keeps the handle and the table
+  entry until the detach succeeded, so a failed detach is retryable.
   Renamed ancestors, planted symlinks, or a shadowing mount cannot make
   revoke miss. After detach, new lookups of that path yield ENOENT (or the
   underlying empty mountpoint dir).
@@ -461,6 +466,8 @@ Properties:
 | D16 | supervisor writes init's uid/gid maps | init writes its own single-id maps (`setgroups=deny` first) | an unprivileged process may map its own euid in a userns it created; avoids a supervisor↔init race and needs no helper |
 | D17 | helper "single-threaded fresh re-exec" per operation | one persistent helper, `fork`ed after READY and before the control thread; talks over a socketpair | an `execve` drops the capabilities S grants, so a re-exec'd helper could not mount; a fork keeps them |
 | D18 | (unspecified) | revoke removes the directories the grant created; `ro` initial grants get no pre-created dir | so a revoked path is ENOENT again, not an empty directory (L6); rw prefixes stay as empty dirs (Landlock needs an inode) |
+| D19 | revoke handle = reopened mount root | revoke handle = the `open_tree` fd itself | round-2 finding: reopening the target by pathname after `move_mount` can be redirected by a sandbox that renames an ancestor, so revoke would hit the wrong mount |
+| D20 | (unspecified) | `landlock::apply` counts scoping as applied only if the kernel's *effective ABI* >= 6 | round-2 finding: best-effort mode drops unsupported scopes silently; "requested" is not "applied" |
 | D11 | mkdir -p mountpoint by path | component walk with `openat2(NO_SYMLINKS)` + `move_mount` to a dirfd | no path TOCTOU in the helper |
 
 ## 13. Module map

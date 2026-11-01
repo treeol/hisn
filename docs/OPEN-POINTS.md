@@ -22,6 +22,23 @@ documents*, to be confirmed by host leak tests.
 | 6 | holder scan: races, unreadable `/proc` entries, PID reuse | NON-BLOCKING | P3 (unreadable ⇒ holder `unknown`, done in D14) |
 | 7 | securebits ordering; `clone3→ENOSYS` is caller-dependent | NON-BLOCKING | P4 |
 
+**Round 2 (implementation review)** — panel: one model answered
+(`openai/gpt-6-astra`); the other (`anthropic/claude-fable-5.1`) was cut off at
+`max_tokens` and returned nothing. The reviewer saw only part of the files
+(not `mounts.rs`, `run.sh`, BRIEF) and, like round 1, ran nothing. Findings and
+disposition (no third round is allowed, so everything is closed here or listed):
+
+| # | finding | triage | resolution |
+|---|---------|--------|-----------|
+| 1 | grant reopens the target by pathname after `move_mount` (rename race); revoke drops its handle before detach succeeds; no rollback | BLOCKING | fixed: handle = the `open_tree` fd (D19), rollback on failure, handle/table entry kept until detach succeeded |
+| 2 | L8 accepted any host submount beneath any planned mount, and ignored mount flags | BLOCKING (weak test) | fixed: typed comparator (recursion + ro), 12 self-tests in `tests/leak/test_l8.py` incl. the reviewer's case |
+| 3 | Landlock scope "applied" inferred from "requested" | NON-BLOCKING | fixed anyway (D20) |
+| 4 | init ordering differs from DESIGN prose; unit test cannot prove caplessness | NON-BLOCKING | DESIGN updated where it differs; runtime caplessness is checked by init's own post-setup verification and by L3 on a host |
+| 5 | DESIGN §10 prose contradicted D15/D17 | NON-BLOCKING | DESIGN §10 corrected |
+| 6 | proc hardening differs from DESIGN; every `openat2` error treated as "absent" | NON-BLOCKING | fixed: only ENOENT is skipped; DESIGN §4.3 describes the real set |
+| 7 | initial rw grants rejected by `grantable_rw` although in the write set; absent Landlock roots skipped silently | NON-BLOCKING | initial rw grants now count as grantable; skipping an absent root remains (nothing to anchor) — P13 |
+| 8 | holder enumeration not fail-closed | NON-BLOCKING | fixed: unreadable same-uid process ⇒ enumeration error; unparsable fdinfo / failed map lookup ⇒ `unknown` holder |
+
 ## Open
 
 * **P1 — grant mechanism is unverified on real kernels.** Cross-userns
@@ -74,3 +91,15 @@ documents*, to be confirmed by host leak tests.
 * **L14** fixture with a runtime-dir bind alias under cwd: session start must
   be rejected (R1b) *and*, with R1b disabled by a test hook, the socket must
   still refuse the sandbox peer (R5).
+* **P13 — absent Landlock write roots are skipped**, so a `grantable_rw`
+  prefix that cannot be opened gives no write rule. The mount plan pre-creates
+  every grantable prefix as an empty directory, so this should not trigger;
+  unverified on a host.
+* **P14 — bind sources are still passed to `open_tree` as pathnames** in
+  `rootfs::execute` (targets are fd-walked, sources are the policy's canonical
+  paths). A sandbox cannot influence them before it exists, but a concurrent
+  host-side rename between policy resolution and session start could redirect
+  a source. Dynamic grant sources *are* resolved with `openat2(NO_SYMLINKS)`.
+* **P15 — `hisn inspect` and L8 trust the sandbox's own mountinfo** as read by
+  the supervisor from `/proc/<init>/mountinfo`; an init that lied would be a
+  kernel bug, not a policy bug.

@@ -73,11 +73,16 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 let gid = rustix::process::getgid().as_raw();
                 let facts = mounts::HostFacts::probe(&resolved, uid, gid, "user");
                 let plan = mounts::plan(&resolved, &facts, &[])?;
-                let targets: Vec<String> = mounts::expected_targets(&plan)
+                let mut rows: Vec<Value> = plan
                     .iter()
-                    .map(|p| p.display().to_string())
+                    .filter(|o| mounts::is_mount(&o.kind))
+                    .map(|o| {
+                        let (recursive, ro) = mounts::mount_traits(&o.kind);
+                        json!({"target": o.target, "recursive": recursive, "ro": ro})
+                    })
                     .collect();
-                println!("{}", serde_json::to_string_pretty(&targets)?);
+                rows.sort_by_key(|r| r["target"].as_str().unwrap_or("").to_owned());
+                println!("{}", serde_json::to_string_pretty(&rows)?);
                 Ok(ExitCode::SUCCESS)
             }
         },

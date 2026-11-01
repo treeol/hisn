@@ -108,7 +108,11 @@ pub fn apply(plan: &LandlockPlan, require_scope: bool) -> Result<(bool, bool), L
     }
     let status = created.restrict_self().map_err(|e| err(&e))?;
     let enforced = status.ruleset != landlock::RulesetStatus::NotEnforced;
-    let scoped = scope_handled && enforced;
+    // Best-effort mode drops unsupported features silently, so "requested" is
+    // not "applied": scoping counts only if the kernel's effective ABI has it.
+    let scoped = scope_handled
+        && enforced
+        && matches!(status.landlock, landlock::LandlockStatus::Available { effective_abi, .. } if effective_abi >= ABI::V6);
     if require_scope && !scoped {
         return Err(LandlockError::ScopeUnavailable);
     }

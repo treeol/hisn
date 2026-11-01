@@ -53,6 +53,8 @@ WORK=$(cd "$WORK" && pwd -P)
 SESSIONS=()
 cleanup() {
   for p in "${SESSIONS[@]:-}"; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done
+  # Supervisors killed above cannot remove their own session dirs.
+  [ -n "${RUNTIME_ROOT:-}" ] && rm -rf "$RUNTIME_ROOT"/*-$$ 2>/dev/null
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -141,7 +143,7 @@ for p in "$HOME/.ssh" "$HOME/.aws"; do :; done
 ETC_BEFORE=$(ls -A /etc | sort | tr '\n' ',')
 HOST_MOUNTS_BEFORE=$(host_mounts)
 
-if ! start_session main "$CWD" "$POL" --grant "$WORK/g_ro:ro"; then
+if ! start_session main-$$ "$CWD" "$POL" --grant "$WORK/g_ro:ro"; then
   fail "session start" "see output above"
   printf '\nRESULT: %d passed, %d failed, %d skipped, %d weak\n' $PASSES $FAILS $SKIPS $WEAKS
   exit 1
@@ -245,7 +247,7 @@ done
 
 # ---- L8: mount table == plan (before dynamic grants; initial ro grant counts)
 "$HISN" policy plan "$POL" >"$WORK/plan.json" 2>"$WORK/plan.err" || fail "L8 policy plan" "$(cat "$WORK/plan.err")"
-hisn_json "$WORK/inspect.json" inspect --session main --json
+hisn_json "$WORK/inspect.json" inspect --session main-$$ --json
 cp /proc/self/mountinfo "$WORK/host.mountinfo"
 if out=$($PY l8 "$WORK/inspect.json" "$WORK/plan.json" "$WORK/host.mountinfo" "$WORK/g_ro:ro" 2>&1); then pass "L8 $out"; else fail "L8 mount table" "$out"; fi
 
@@ -255,42 +257,42 @@ eq "L6 ro grant write -> EROFS" "$(q "$CWD" write "$WORK/g_ro/new")" EROFS
 [ ! -e "$WORK/g_ro/new" ] && pass "L6 ro grant: nothing written on host" || fail "L6 ro grant" "host file appeared"
 
 mkdir -p "$WORK/g_rw/sub"
-hisn_json "$WORK/grant_rw.json" grant --session main --rw "$WORK/g_rw/sub"
+hisn_json "$WORK/grant_rw.json" grant --session main-$$ --rw "$WORK/g_rw/sub"
 $PY json-ok "$WORK/grant_rw.json" && pass "L6 rw grant accepted" || fail "L6 rw grant" "$(cat "$WORK/grant_rw.json" "$WORK/grant_rw.json.err")"
 eq "L6 rw grant writable" "$(q "$CWD" write "$WORK/g_rw/sub/f")" OK
 [ "$(cat "$WORK/g_rw/sub/f" 2>/dev/null)" = leak ] && pass "L6 rw write visible on host" || fail "L6 rw write" "missing on host"
 
-hisn_json "$WORK/grant_bad.json" grant --session main --rw "$WORK/other"
+hisn_json "$WORK/grant_bad.json" grant --session main-$$ --rw "$WORK/other"
 $PY json-has "$WORK/grant_bad.json" error E_NOT_GRANTABLE && pass "L6 rw outside grantable prefix refused" || fail "L6 grantable" "$(cat "$WORK/grant_bad.json")"
-hisn_json "$WORK/grant_rt.json" grant --session main "$RUNTIME_ROOT"
+hisn_json "$WORK/grant_rt.json" grant --session main-$$ "$RUNTIME_ROOT"
 $PY json-has "$WORK/grant_rt.json" error E_PATH_FORBIDDEN && pass "L6 runtime dir cannot be granted (R1)" || fail "L6 R1" "$(cat "$WORK/grant_rt.json")"
-hisn_json "$WORK/grant_root.json" grant --session main /
+hisn_json "$WORK/grant_root.json" grant --session main-$$ /
 $PY json-has "$WORK/grant_root.json" error E_PATH_FORBIDDEN && pass "L6 / cannot be granted (R2)" || fail "L6 R2" "$(cat "$WORK/grant_root.json")"
 
 # L8 again with live grants
-hisn_json "$WORK/inspect2.json" inspect --session main --json
+hisn_json "$WORK/inspect2.json" inspect --session main-$$ --json
 if out=$($PY l8 "$WORK/inspect2.json" "$WORK/plan.json" "$WORK/host.mountinfo" "$WORK/g_ro:ro" "$WORK/g_rw/sub:rw" 2>&1); then pass "L8 with live grants: $out"; else fail "L8 with grants" "$out"; fi
 [ -z "$(grep -F "$WORK" /proc/self/mountinfo)" ] && pass "L6 grant mounts invisible in the host mount table" || fail "L6 host mount table" "$(grep -F "$WORK" /proc/self/mountinfo | head -3)"
 
 # L13a: soft revoke must claim only "lookup"
 eq "L13 queue an fd" "$(q "$CWD" hold-queued "$WORK/g_rw/sub/queued")" "OK queued"
-hisn_json "$WORK/revoke_soft.json" revoke --session main "$WORK/g_rw/sub"
+hisn_json "$WORK/revoke_soft.json" revoke --session main-$$ "$WORK/g_rw/sub"
 $PY json-ok "$WORK/revoke_soft.json" && pass "L6 revoke rw accepted" || fail "L6 revoke" "$(cat "$WORK/revoke_soft.json")"
 $PY json-has "$WORK/revoke_soft.json" guarantee lookup && pass "L13 soft revoke reports guarantee=lookup, never 'hard'" || fail "L13 soft guarantee" "$(cat "$WORK/revoke_soft.json")"
 eq "L6 revoked rw path -> ENOENT" "$(q "$CWD" stat "$WORK/g_rw/sub")" ENOENT
 eq "L6 revoked rw file -> ENOENT" "$(q "$CWD" cat "$WORK/g_rw/sub/f")" ENOENT
 echo "INFO  L13 soft revoke: recv-write through the queued fd says: $(q "$CWD" recv-write)  (documented residual of soft revoke, see DESIGN D14)"
 
-hisn_json "$WORK/revoke_ro.json" revoke --session main "$WORK/g_ro"
+hisn_json "$WORK/revoke_ro.json" revoke --session main-$$ "$WORK/g_ro"
 $PY json-ok "$WORK/revoke_ro.json" && pass "L6 revoke ro accepted" || fail "L6 revoke ro" "$(cat "$WORK/revoke_ro.json")"
 eq "L6 revoked ro path -> ENOENT" "$(q "$CWD" stat "$WORK/g_ro")" ENOENT
-hisn_json "$WORK/revoke_again.json" revoke --session main "$WORK/g_ro"
+hisn_json "$WORK/revoke_again.json" revoke --session main-$$ "$WORK/g_ro"
 $PY json-has "$WORK/revoke_again.json" error E_NOT_GRANTED && pass "L6 double revoke -> E_NOT_GRANTED" || fail "L6 double revoke" "$(cat "$WORK/revoke_again.json")"
 
 end_session "$CWD" "$MAIN_PID"
 sleep 0.3
 [ -z "$(grep -F "$WORK" /proc/self/mountinfo)" ] && pass "L6 session end: no grant mountpoint in the host mount table" || fail "L6 after end" "mounts remain"
-[ ! -e "$RUNTIME_ROOT/main" ] && pass "L6 session end: session dir removed" || fail "L6 session dir" "$RUNTIME_ROOT/main still exists"
+[ ! -e "$RUNTIME_ROOT/main-$$" ] && pass "L6 session end: session dir removed" || fail "L6 session dir" "$RUNTIME_ROOT/main-$$ still exists"
 [ "$(host_mounts)" = "$HOST_MOUNTS_BEFORE" ] && pass "L6 host mount table identical before/after the session" || weak "L6 host mount table" "differs, but other processes may mount concurrently: $(diff <(echo "$HOST_MOUNTS_BEFORE") <(host_mounts) | head -4 | tr '\n' ' ')"
 
 # ============================================================ L11: two sessions
@@ -300,19 +302,19 @@ mkdir -p "$WORK/gB"
 echo b-only >"$WORK/gB/data"
 write_policy "$WORK/A.toml" "$CA"
 write_policy "$WORK/B.toml" "$CB"
-if start_session sessA "$CA" "$WORK/A.toml" && PA=$S_PID && start_session sessB "$CB" "$WORK/B.toml" --grant "$WORK/gB:ro" && PB=$S_PID; then
+if start_session sessA-$$ "$CA" "$WORK/A.toml" && PA=$S_PID && start_session sessB-$$ "$CB" "$WORK/B.toml" --grant "$WORK/gB:ro" && PB=$S_PID; then
   eq "L11 B's grant visible in B" "$(q "$CB" cat "$WORK/gB/data")" "OK b-only"
   eq "L11 A cannot see B's grant" "$(q "$CA" stat "$WORK/gB")" ENOENT
   eq "L11 A cannot see B's cwd" "$(q "$CA" stat "$CB")" ENOENT
   # g_rw exists as an empty directory because it is a declared grantable_rw prefix (DESIGN D3)
   eq "L11 A sees only its own cwd (+ the empty grantable prefix dir) under the shared parent" "$(q "$CA" ls "$WORK")" "OK g_rw,sessA"
   eq "L11 A cannot see the runtime dir" "$(q "$CA" stat "$RUNTIME_ROOT")" ENOENT
-  eq "L11 A cannot see B's session dir" "$(q "$CA" stat "$RUNTIME_ROOT/sessB")" ENOENT
-  eq "L11 B cannot see A's session dir" "$(q "$CB" stat "$RUNTIME_ROOT/sessA")" ENOENT
+  eq "L11 A cannot see B's session dir" "$(q "$CA" stat "$RUNTIME_ROOT/sessB-$$")" ENOENT
+  eq "L11 B cannot see A's session dir" "$(q "$CB" stat "$RUNTIME_ROOT/sessA-$$")" ENOENT
   both=$("$HISN" ls)
   has "L11 host sees session A" "$both" sessA
   has "L11 host sees session B" "$both" sessB
-  hisn_json "$WORK/gl.json" ls --session sessA --json
+  hisn_json "$WORK/gl.json" ls --session sessA-$$ --json
   lacks "L11 A's grant list has no B grant" "$(cat "$WORK/gl.json")" gB
   end_session "$CA" "$PA"
   end_session "$CB" "$PB"
@@ -324,12 +326,12 @@ fi
 CH=$(new_cwd hard)
 write_policy "$WORK/H.toml" "$CH"
 mkdir -p "$WORK/g_rw/hard"
-if start_session hard "$CH" "$WORK/H.toml"; then
+if start_session hard-$$ "$CH" "$WORK/H.toml"; then
   HP=$S_PID
-  hisn_json "$WORK/hg.json" grant --session hard --rw "$WORK/g_rw/hard"
-  $PY json-ok "$WORK/hg.json" 2>/dev/null || fail "L13 hard: grant" "stdout=[$(cat "$WORK/hg.json")] stderr=[$(cat "$WORK/hg.json.err")] supervisor-stderr=[$(cat "$S_LOG")] audit=[$(cat "$RUNTIME_ROOT/hard/grants.jsonl" 2>&1 | tail -5)]"
+  hisn_json "$WORK/hg.json" grant --session hard-$$ --rw "$WORK/g_rw/hard"
+  $PY json-ok "$WORK/hg.json" 2>/dev/null || fail "L13 hard: grant" "stdout=[$(cat "$WORK/hg.json")] stderr=[$(cat "$WORK/hg.json.err")] supervisor-stderr=[$(cat "$S_LOG")] audit=[$(cat "$RUNTIME_ROOT/hard-$$/grants.jsonl" 2>&1 | tail -5)]"
   q "$CH" hold-queued "$WORK/g_rw/hard/queued" >/dev/null
-  hisn_json "$WORK/hr.json" revoke --session hard --hard "$WORK/g_rw/hard"
+  hisn_json "$WORK/hr.json" revoke --session hard-$$ --hard "$WORK/g_rw/hard"
   $PY json-has "$WORK/hr.json" guarantee hard 2>/dev/null && pass "L13 hard revoke reports guarantee=hard" || fail "L13 hard guarantee" "stdout=[$(cat "$WORK/hr.json")] stderr=[$(cat "$WORK/hr.json.err")] supervisor-stderr=[$(cat "$S_LOG")]"
   # Hard revoke ends the session; never wait unboundedly if it did not.
   for _ in $(seq 1 50); do kill -0 "$HP" 2>/dev/null || break; sleep 0.1; done
@@ -347,7 +349,7 @@ fi
 if [ -w /etc ]; then
   CE=$(new_cwd etc)
   write_policy "$WORK/E.toml" "$CE"
-  if start_session etc "$CE" "$WORK/E.toml"; then
+  if start_session etc-$$ "$CE" "$WORK/E.toml"; then
     EP=$S_PID
     echo "late-secret" >/etc/hisn-leaktest.key
     got=$(q "$CE" stat /etc/hisn-leaktest.key)

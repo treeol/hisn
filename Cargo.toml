@@ -1,0 +1,19 @@
+[package]
+name = "hisn"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+landlock = "0.4.7"
+libc = "0.2.191"
+rustix = { version = "1.1.6", features = ["fs", "mount", "process", "thread", "system", "pty", "stdio", "termios", "net", "pipe", "event"] }
+schemars = "1.2.3"
+seccompiler = "0.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"

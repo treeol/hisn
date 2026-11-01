@@ -1,0 +1,4 @@
+//! hisn — rootless, daemonless sandbox for AI coding agents.
+
+pub mod check;
+pub mod cli;

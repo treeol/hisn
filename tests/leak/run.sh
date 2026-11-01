@@ -327,10 +327,16 @@ mkdir -p "$WORK/g_rw/hard"
 if start_session hard "$CH" "$WORK/H.toml"; then
   HP=$S_PID
   hisn_json "$WORK/hg.json" grant --session hard --rw "$WORK/g_rw/hard"
-  $PY json-ok "$WORK/hg.json" || fail "L13 hard: grant" "$(cat "$WORK/hg.json")"
+  $PY json-ok "$WORK/hg.json" 2>/dev/null || fail "L13 hard: grant" "stdout=[$(cat "$WORK/hg.json")] stderr=[$(cat "$WORK/hg.json.err")] supervisor-stderr=[$(cat "$S_LOG")] audit=[$(cat "$RUNTIME_ROOT/hard/grants.jsonl" 2>&1 | tail -5)]"
   q "$CH" hold-queued "$WORK/g_rw/hard/queued" >/dev/null
   hisn_json "$WORK/hr.json" revoke --session hard --hard "$WORK/g_rw/hard"
-  $PY json-has "$WORK/hr.json" guarantee hard && pass "L13 hard revoke reports guarantee=hard" || fail "L13 hard guarantee" "$(cat "$WORK/hr.json" "$WORK/hr.json.err")"
+  $PY json-has "$WORK/hr.json" guarantee hard 2>/dev/null && pass "L13 hard revoke reports guarantee=hard" || fail "L13 hard guarantee" "stdout=[$(cat "$WORK/hr.json")] stderr=[$(cat "$WORK/hr.json.err")] supervisor-stderr=[$(cat "$S_LOG")]"
+  # Hard revoke ends the session; never wait unboundedly if it did not.
+  for _ in $(seq 1 50); do kill -0 "$HP" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$HP" 2>/dev/null; then
+    fail "L13 hard: session still alive after hard revoke" "killing it so the suite can continue"
+    kill -9 "$HP" 2>/dev/null
+  fi
   wait "$HP" 2>/dev/null
   [ "$(cat "$WORK/g_rw/hard/queued" 2>/dev/null)" != "after-revoke" ] && pass "L13 queued fd unusable after hard revoke (no write landed)" || fail "L13 hard" "write through queued fd landed"
 else

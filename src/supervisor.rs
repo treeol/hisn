@@ -449,8 +449,16 @@ impl Handler for Ctl {
             Ok(pfd) => (sys::ns_inode(pid, "pid"), sys::pidfd_alive(pfd.as_raw_fd())),
             Err(_) => (sys::ns_inode(pid, "pid"), true),
         };
-        authorize_peer(uid, self.sh.uid, pidns, self.sh.sandbox_pidns, alive)
-            .map_err(|r| format!("{r:?}"))
+        let decision = authorize_peer(uid, self.sh.uid, pidns, self.sh.sandbox_pidns, alive)
+            .map_err(|r| format!("{r:?}"));
+        if let Err(reason) = &decision {
+            // The peer is never told why (POLICY-SPEC §7), but the operator
+            // must be able to see it: audit log + the supervisor's stderr.
+            self.sh
+                .log("auth", "refused", None, None, Some(reason), Some(pid));
+            eprintln!("hisn: control: refused peer pid {pid} uid {uid}: {reason}");
+        }
+        decision
     }
 
     fn handle(&self, req: Request, peer: &UnixStream) -> Value {

@@ -158,6 +158,8 @@ pub enum PlanError {
     MaskedEtcOverlap { path: PathBuf, entry: String },
     #[error("mask {path}: not inside any allowed tree")]
     MaskOutsideTree { path: PathBuf },
+    #[error("{path}: lies below the symlink {link}; the executor never traverses symlinks")]
+    UnderSymlink { path: PathBuf, link: PathBuf },
 }
 
 /// True if a top-level `/etc` entry name is masked by default (brief:
@@ -425,7 +427,23 @@ pub fn plan(
         ));
     }
 
-    Ok(order_and_dedupe(ops))
+    let ops = order_and_dedupe(ops);
+    // The executor builds paths lexically under the new root and must never
+    // walk a symlink it created (an absolute link would resolve on the host).
+    for o in &ops {
+        for a in ancestors(&o.target) {
+            if let Some(l) = ops
+                .iter()
+                .find(|x| x.target == a && matches!(x.kind, MountKind::Symlink { .. }))
+            {
+                return Err(PlanError::UnderSymlink {
+                    path: o.target.clone(),
+                    link: l.target.clone(),
+                });
+            }
+        }
+    }
+    Ok(ops)
 }
 
 /// Stable sort by depth (parents first), then drop earlier ops whose target
@@ -861,6 +879,14 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn targets_below_a_symlink_are_rejected() {
+        // /bin is a symlink in the test facts; a cwd below it must not plan.
+        let e = plan(&pol("/bin/proj"), &facts(), &[]).unwrap_err();
+        assert!(matches!(e, PlanError::UnderSymlink { .. }), "{e}");
+        assert!(plan(&pol("/work/p"), &facts(), &[]).is_ok());
     }
 
     #[test]

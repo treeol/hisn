@@ -6,4 +6,6 @@ pub mod env;
 pub mod landlock;
 pub mod mounts;
 pub mod policy;
+pub mod rootfs;
 pub mod seccomp;
+pub mod sys;

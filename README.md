@@ -80,6 +80,11 @@ Everything pure is tested anywhere:
 make lint && make test          # fmt + clippy -D warnings + unit tests
 ```
 
+`make lint` needs the `rustfmt` and `clippy` components. `rust-toolchain.toml`
+requests them, so rustup installs them on the first `cargo` run; without
+rustup, install them by hand (`rustup component add rustfmt clippy`). `make
+test` and `make leaktest` need neither.
+
 The leak suite needs a host that allows unprivileged user namespaces (it will
 refuse to run, exit 77, and report nothing otherwise):
 

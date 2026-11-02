@@ -49,6 +49,15 @@ so.  The log file column points at the `docs/leaktest-host-*.log` produced by
 | `make leaktest` (L1-L23) | 19af325 (log header: tree clean) | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 173 passed, 0 failed, 1 skipped, 1 weak | `docs/leaktest-host-2026-11-01.log` |
 | `make leaktest` (L1-L20) | e3bcd31 [inferred — confirm] | host (Fedora 7.2.13, x86_64, ABI 10) | 167 passed, 0 failed, 1 skipped, 1 weak | — (summary line only; `make leaktest-log` did not exist yet) |
 
+### 0.2.1 — not run on host yet
+
+| check | commit | where | result | log file |
+|-------|--------|-------|--------|----------|
+| `make leaktest` (L1-L24, L33-L35) | — | not run | not run | — |
+| `hisn ls --prune` (L17b) | — | not run | not run | — |
+| `hisn ls` 200x rapid (L14c) | — | not run | not run | — |
+| `x86_64-unknown-linux-musl` build + leak | — | not run | not run (stdlib not in build sandbox) | — |
+
 ### Notes on the host run above
 
 * Only the summary line was reported; the individual lines were not seen.  The

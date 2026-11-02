@@ -6,6 +6,9 @@ cwd = "."            # mounted rw at the identical path
 home = "tmpfs"       # or an absolute host path for warm caches
 network = "none"     # "none" | "host"
 hostname = "hisn"
+shm = false           # mount /dev/shm (0.2.1); default false
+shm_size = 64         # /dev/shm size in MiB (1..=65536); 0.2.1
+tmp_size = 1024       # /tmp size in MiB (16..=65536); 0.2.1
 
 [mounts]
 ro = []              # e.g. ["/opt/toolchains"]

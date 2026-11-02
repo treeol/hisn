@@ -16,6 +16,9 @@ cwd      = "."          # path; relative → resolved against the policy file's 
 home     = "tmpfs"      # "tmpfs" | absolute host path (persistent, rw)
 network  = "none"       # "none" | "host"
 hostname = "hisn"       # RFC 1123 label, ≤ 63 chars
+shm      = false        # mount /dev/shm (tmpfs); 0.2.1
+shm_size = 64           # /dev/shm size in MiB (1..=65536); 0.2.1
+tmp_size = 1024         # /tmp size in MiB (16..=65536); 0.2.1
 
 [mounts]
 ro   = []               # extra read-only binds (absolute paths, recursive)
@@ -45,6 +48,9 @@ nproc  = 4096
 | `session.home` | `"tmpfs"` \| abs path | `"tmpfs"` | a path must exist, be owned by the caller, and not overlap runtime dir |
 | `session.network` | enum | `"none"` | `"host"` additionally requires Landlock scope support (DESIGN §7) or CLI `--allow-host-abstract-sockets` |
 | `session.hostname` | string | `"hisn"` | |
+| `session.shm` | bool | `false` | mount `/dev/shm` (tmpfs); 0.2.1. Default off = no `/dev/shm` (0.2 behavior) |
+| `session.shm_size` | u64 (MiB) | `64` | `/dev/shm` size; range `1..=65536`; 0.2.1 |
+| `session.tmp_size` | u64 (MiB) | `1024` | `/tmp` size; range `16..=65536`; 0.2.1 |
 | `mounts.ro` / `.rw` | list of abs paths | `[]` | each must exist at session start; canonicalised; no symlinked final component accepted |
 | `mounts.mask` | list of abs paths | `[]` | paths that must lie inside another allowed tree; non-existent → skipped, logged |
 | `mounts.grantable_rw` | list of abs paths | `[]` | Landlock write prefixes for dynamic rw grants; also bounds `hisn grant --rw` |
@@ -136,8 +142,8 @@ response line per request, in order. Max line 64 KiB.
 | `list` | — | `{"ok":true,"grants":[{"path","mode","recursive","mount_id","ts"}]}` |
 | `inspect` | — | `{"ok":true,"mountinfo":"<text of /proc/<init>/mountinfo>","policy":"<resolved toml>","supervisor_fds":N}` (`supervisor_fds`: the supervisor's own open-descriptor count, reported because `/proc/<supervisor>/fd` is not readable from outside; used by leak test L19, `null` if it could not be counted) |
 | `kill` | `signal` (name or number; default `TERM`) | `{"ok":true}` |
-| `exec` | `argv` (1-4096 entries), `cwd` (abs or null; default the session cwd), `env` (`K`→`V`; every key must be in `env.pass` and not be computed (`HOME`, `XDG_*`, `CARGO_HOME`, `GOMODCACHE`, `GOCACHE`, `npm_config_cache`, `PIP_CACHE_DIR`) — otherwise the **whole request is refused**), `tty` (bool; default false) | first `{"ok":true,"pid":N}` (N = pid **inside the sandbox pid ns**, a handle for `signal`), then on exit `{"exit":{"code":N}}` / `{"exit":{"signal":"TERM"}}` / `{"exit":{"lost":true}}` (monitor gone: status unknown). Failures: `E_BAD_REQUEST` (validation, rejected env keys — names only), `E_EXEC` (confinement failed or `execve`), `E_INTERNAL`. The request line travels with `SCM_RIGHTS` fds in the same message: 3 (stdin/stdout/stderr) or, with `tty`, exactly 1 (the slave of a **pty the client allocated** — never the caller's terminal). Fds are accepted only on the first request line of a connection and only for `exec`. Closing the connection cancels: `TERM`, then `KILL` after 5 s. Confinement is re-applied identically to `execve` (DESIGN §14.4): the program is indistinguishable from the original command. |
-| `signal` | `pid` (as returned by `exec`), `signal` (name or number; default `TERM`) | `{"ok":true}` — delivered to the program's process group. `E_NOT_FOUND` for a pid that is not a live exec of this session. |
+| `exec` | `argv` (1-4096 entries), `cwd` (abs or null; default the session cwd), `env` (`K`→`V`; every key must be in `env.pass` and not be computed (`HOME`, `XDG_*`, `CARGO_HOME`, `GOMODCACHE`, `GOCACHE`, `npm_config_cache`, `PIP_CACHE_DIR`) — otherwise the **whole request is refused**), `tty` (bool; default false) | first `{"ok":true,"pid":N,"exec_id":"e-n"}` (N = pid **inside the sandbox pid ns**, a handle for `signal`; `exec_id` is the preferred handle, 0.2.1), then on exit `{"exit":{"code":N}}` / `{"exit":{"signal":"TERM"}}` / `{"exit":{"lost":true}}` (monitor gone: status unknown). Failures: `E_BAD_REQUEST` (validation, rejected env keys — names only), `E_EXEC` (confinement failed or `execve`), `E_INTERNAL`. The request line travels with `SCM_RIGHTS` fds in the same message: 3 (stdin/stdout/stderr) or, with `tty`, exactly 1 (the slave of a **pty the client allocated** — never the caller's terminal). Fds are accepted only on the first request line of a connection and only for `exec`. Closing the connection cancels: `TERM`, then `KILL` after 5 s. Confinement is re-applied identically to `execve` (DESIGN §14.4): the program is indistinguishable from the original command. |
+| `signal` | `exec_id` (preferred, 0.2.1) or `pid` (deprecated, kept for 0.2 clients), `signal` (name or number; default `TERM`) | `{"ok":true}` — delivered to the program's process group. `E_NOT_FOUND` for a stale `exec_id`, a recycled `pid`, or a pid that is not a live exec of this session. |
 
 Error response: `{"ok":false,"error":"<CODE>","message":"..."}` with codes
 `E_BAD_REQUEST E_PATH_FORBIDDEN E_NOT_FOUND E_NOT_GRANTABLE E_EXISTS E_NOT_GRANTED
@@ -166,6 +172,7 @@ construct expressible in `config.json` for the v2 conformance work.
 | mask file | `mounts[]` bind of `/dev/null`, `["ro"]` (or `linux.maskedPaths[]`) |
 | mask dir | `mounts[]` `{type:"tmpfs", options:["ro","size=0"]}` (or `linux.maskedPaths[]`) |
 | `/tmp /run $HOME` | `mounts[]` `{type:"tmpfs", options:["nosuid","nodev","mode=…","size=…"]}` |
+| `/dev/shm` (0.2.1, `session.shm = true`) | `mounts[]` `{destination:"/dev/shm", type:"tmpfs", options:["nosuid","nodev","noexec","mode=1777","size=…m"]}` |
 | `/proc` | `mounts[]` `{type:"proc", source:"proc"}` + `linux.readonlyPaths[]` (`/proc/sys`, …) |
 | `/dev` devices + devpts | `mounts[]` `tmpfs` + `devpts` (`newinstance,ptmxmode=0666`) + `linux.devices[]` (null, zero, full, random, urandom, tty) |
 | no `/sys` | omit the `sysfs` mount |

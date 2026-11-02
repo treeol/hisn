@@ -87,7 +87,12 @@ hisn revoke --session agent1 --hard /srv/out            # also kills every sandb
 hisn ls --session agent1
 hisn inspect --session agent1                           # mount table and resolved policy
 hisn kill --session agent1
+hisn ls --prune                                          # remove stale session dirs
 ```
+
+`hisn run --ready-fd N` writes `"ready\n"` to fd N after the session is live,
+for programmatic readiness. `hisn ls --prune` removes session directories whose
+supervisor has died (stale = socket refuses AND pid gone or starttime mismatch).
 
 ### Policy
 

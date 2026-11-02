@@ -7,11 +7,48 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1]
+
+### Added
+- **`/dev/shm`** (`session.shm`, default `false`): optional tmpfs at `/dev/shm`
+  with configurable size (`session.shm_size`, MiB, default 64). Default off =
+  no `/dev/shm` (0.2 behavior).
+- **`/tmp` size** (`session.tmp_size`, MiB, default 1024, range 16..=65536):
+  replaces the hardcoded 1 GiB constant with a policy key.
+- **`--ready-fd N`** on `hisn run`: after the session is live, writes `"ready\n"`
+  to fd N and closes it. For programmatic readiness (Wakil).
+- **Opaque exec ids**: every exec gets `exec_id = "e-<n>"` (monotonic, never
+  reused). `signal` accepts `exec_id` (preferred) or `pid` (deprecated, kept
+  for 0.2 clients); a recycled `pid` is rejected with `E_NOT_FOUND`.
+- **Frozen `--json` schemas**: `hisn ls --json` and `hisn inspect --json` emit
+  `{"schema":"hisn-ls/v1",…}` / `{"schema":"hisn-inspect/v1",…}`. `cwd`,
+  `hostname`, `network` are included in `ls --json`.
+- **`hisn ls --prune`**: remove stale session directories (no live
+  supervisor). Stale = control socket refuses AND supervisor pid is gone or
+  has a different starttime. Removal is symlink-safe, mount-safe
+  (`st_dev` check), owner-checked, and confined to the runtime root.
+- **Stale session cleanup on `hisn run --session-id X`**: if the dir is
+  stale, remove it and proceed; if live, `E_EXISTS` stands.
+- **Stale session cleanup on `hisn kill --session X`**: if stale, remove the
+  dir and exit 0 with `"session X was stale; removed"`.
+- **`supervisor.pid`** file in the session dir: written at start with the
+  supervisor pid and starttime for stale-detection.
+- **R5 ancestry retry** (OPEN-POINTS P16): `is_descendant_of` retries the
+  whole `/proc/<pid>/status` walk on `ENOENT`/`ESRCH`/`EINTR` (3 attempts,
+  50 ms apart). The retry targets the sandbox init (a specific pid), not
+  "any pid 1".
+
+### Changed
+- **passwd/group stub** verified to use the host username (`HostFacts.username`
+  from `$USER`); `id -un` inside the sandbox prints the host username.
+- **init argv scrub**: after START, init overwrites its argv memory in place
+  with `"hisn-init"` so the session id, policy path, and session dir do not
+  appear in `/proc/1/cmdline` inside the sandbox. Best-effort.
+- **musl ioctl casts** (OPEN-POINTS P22): ioctl request constants cast with
+  `as _` so `x86_64`/`aarch64-unknown-linux-musl` compile. The musl target
+  has not been leak-tested (stdlib not installed in the build sandbox).
+
 ### Known issues
-- The `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` targets do
-  not compile (`src/init.rs` passes `u64` ioctl request constants where musl's
-  `libc::ioctl` takes `c_int`). Release binaries are therefore glibc builds
-  (OPEN-POINTS P22).
 - Pending from the external §14 review (OPEN-POINTS): align DESIGN §4.5 with §7
   on root-tmpfs renames; stop a continuous stream of spawns from starving a
   hard revoke.

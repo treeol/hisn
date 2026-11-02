@@ -336,7 +336,7 @@ pub fn plan(
         "/tmp",
         None,
         MountKind::Tmpfs {
-            size: TMP_SIZE,
+            size: policy.tmp_size << 20,
             mode: 0o1777,
             readonly: false,
         },
@@ -365,6 +365,19 @@ pub fn plan(
             Some(p.clone()),
             MountKind::BindRw { recursive: false },
         )),
+    }
+
+    // 3b. /dev/shm (optional, opt-in via session.shm).
+    if policy.shm {
+        ops.push(op(
+            "/dev/shm",
+            None,
+            MountKind::Tmpfs {
+                size: policy.shm_size << 20,
+                mode: 0o1777,
+                readonly: false,
+            },
+        ));
     }
 
     // 4. cwd (rw, recursive) and extra rw binds (non-recursive).
@@ -527,6 +540,9 @@ mod tests {
             landlock_scoped: vec![],
             nofile: 1,
             nproc: 1,
+            shm: false,
+            shm_size: 64,
+            tmp_size: 1024,
         }
     }
 
@@ -644,6 +660,43 @@ mod tests {
         );
         // network none: no resolv.conf at all
         assert!(find(&ops, "/etc/resolv.conf").is_none());
+    }
+
+    #[test]
+    fn shm_mount_present_when_enabled() {
+        let mut p = pol("/work/p");
+        p.shm = true;
+        p.shm_size = 32;
+        let ops = plan(&p, &facts(), &[]).unwrap();
+        let shm = find(&ops, "/dev/shm").expect("/dev/shm must be in plan");
+        let expected = 32u64 << 20;
+        assert!(matches!(
+            shm.kind,
+            MountKind::Tmpfs {
+                size,
+                mode: 0o1777,
+                ..
+            } if size == expected
+        ));
+    }
+
+    #[test]
+    fn shm_absent_by_default() {
+        let ops = plan(&pol("/work/p"), &facts(), &[]).unwrap();
+        assert!(
+            find(&ops, "/dev/shm").is_none(),
+            "/dev/shm must not be in plan by default"
+        );
+    }
+
+    #[test]
+    fn tmp_size_controls_tmpfs() {
+        let mut p = pol("/work/p");
+        p.tmp_size = 512;
+        let ops = plan(&p, &facts(), &[]).unwrap();
+        let tmp = find(&ops, "/tmp").unwrap();
+        let expected = 512u64 << 20;
+        assert!(matches!(tmp.kind, MountKind::Tmpfs { size, .. } if size == expected));
     }
 
     #[test]

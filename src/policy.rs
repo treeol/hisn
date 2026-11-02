@@ -54,6 +54,12 @@ pub struct Session {
     pub network: Network,
     /// RFC 1123 label, at most 63 characters.
     pub hostname: String,
+    /// Mount /dev/shm (tmpfs) inside the sandbox. Default false.
+    pub shm: bool,
+    /// /dev/shm size in MiB (default 64; range 1..=65536).
+    pub shm_size: u64,
+    /// /tmp size in MiB (default 1024; range 16..=65536).
+    pub tmp_size: u64,
 }
 
 impl Default for Session {
@@ -63,6 +69,9 @@ impl Default for Session {
             home: "tmpfs".into(),
             network: Network::None,
             hostname: "hisn".into(),
+            shm: false,
+            shm_size: 64,
+            tmp_size: 1024,
         }
     }
 }
@@ -195,6 +204,9 @@ pub struct ResolvedPolicy {
     pub landlock_scoped: Vec<LandlockScope>,
     pub nofile: u64,
     pub nproc: u64,
+    pub shm: bool,
+    pub shm_size: u64,
+    pub tmp_size: u64,
 }
 
 /// CLI flags that take precedence over the policy file.
@@ -367,6 +379,12 @@ impl Policy {
         if self.limits.nproc < 1 {
             return Err(invalid("limits.nproc", "must be >= 1"));
         }
+        if self.session.shm_size < 1 || self.session.shm_size > 65536 {
+            return Err(invalid("session.shm_size", "must be in 1..=65536"));
+        }
+        if self.session.tmp_size < 16 || self.session.tmp_size > 65536 {
+            return Err(invalid("session.tmp_size", "must be in 16..=65536"));
+        }
         Ok(())
     }
 
@@ -436,6 +454,9 @@ impl Policy {
             landlock_scoped: self.landlock.scoped.clone(),
             nofile: self.limits.nofile,
             nproc: self.limits.nproc,
+            shm: self.session.shm,
+            shm_size: self.session.shm_size,
+            tmp_size: self.session.tmp_size,
         })
     }
 
@@ -504,6 +525,31 @@ mod tests {
         assert_eq!(p, Policy::default());
         assert_eq!(p.limits.nofile, 65536);
         assert_eq!(p.session.network, Network::None);
+        assert!(!p.session.shm);
+        assert_eq!(p.session.shm_size, 64);
+        assert_eq!(p.session.tmp_size, 1024);
+    }
+
+    #[test]
+    fn shm_and_tmp_size_parse_and_resolve() {
+        let p = Policy::parse(
+            r#"
+version = "hisn-policy/v1"
+[session]
+shm = true
+shm_size = 128
+tmp_size = 512
+"#,
+        )
+        .unwrap();
+        assert!(p.session.shm);
+        assert_eq!(p.session.shm_size, 128);
+        assert_eq!(p.session.tmp_size, 512);
+        let d = tempfile::tempdir().unwrap();
+        let r = p.resolve(d.path(), &Overrides::default(), &[]).unwrap();
+        assert!(r.shm);
+        assert_eq!(r.shm_size, 128);
+        assert_eq!(r.tmp_size, 512);
     }
 
     #[test]
@@ -616,6 +662,8 @@ scoped = ["bogus"]
             ),
             ("[limits]\nnofile = 0", "limits.nofile"),
             ("[limits]\nnproc = -1", ""),
+            ("[session]\nshm_size = 0", "session.shm_size"),
+            ("[session]\ntmp_size = 1", "session.tmp_size"),
         ] {
             let e = Policy::parse(&format!("{base}{extra}"))
                 .unwrap_err()

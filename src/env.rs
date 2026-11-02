@@ -143,6 +143,9 @@ mod tests {
             landlock_scoped: vec![],
             nofile: 1,
             nproc: 1,
+            shm: false,
+            shm_size: 64,
+            tmp_size: 1024,
         }
     }
 

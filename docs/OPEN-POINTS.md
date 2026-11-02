@@ -317,3 +317,28 @@ was allowed in that task.
 | 4 | `apply(require_scope)` accepts any scope, not specifically abstract | NON-BLOCKING (defense-in-depth) | **fixed**: `apply` now checks `abstract_applied` (not just `scoped`) when `require_scope` is set, so a future plan that only set signal scope would still fail for `network = "host"` |
 | 5 | spawn teardown postcondition not established | NON-BLOCKING | `tear_down` kills `C`, closes the status socket (→ `W` kills `P`), waits bounded by `reap_grace`; `hand_over` failure poisons the channel. P21 covers the `W` residual. **[HOST-VERIFY]** |
 | 6 | PDEATHSIG result ignored; getppid==0 race | NON-BLOCKING | `C` checks `getppid()==0` after `PDEATHSIG` (race with parent death between fork and prctl). `D` also sets PDEATHSIG. Both are PDEATHSIG-chained to the supervisor/helper. **[HOST-VERIFY]** |
+
+## Review log — 0.2.1 patch spec (round 1)
+
+**Round 1 (patch spec review of `docs/PATCH-0.2.1.md`)** — both reviewers
+answered (`openai/gpt-6-astra`, `anthropic/claude-fable-5.1`); both quoted
+patches 5 and 6, so the round is valid and spent. BLOCKING findings are
+folded into `docs/PATCH-0.2.1.md` (patches 1, 4, 5, 6, 7, 8). Non-blocking
+findings are recorded here.
+
+| # | finding | triage | resolution |
+|---|---------|--------|-----------|
+| 1 | patch 1: `/dev/shm` has `nosuid,nodev` but no `noexec` — a world-writable, executable, shared tmpfs | BLOCKING | **fixed in spec**: `/dev/shm` gets `noexec` (matching `/dev`'s flags, not `/tmp`'s) |
+| 2 | patch 4: zero-fill does not shorten `/proc/1/cmdline`; "exactly `hisn-init\0`" is wrong | BLOCKING | **fixed in spec**: L34 asserts content starts with `hisn-init\0` and no non-NUL bytes after; `PR_SET_MM_ARG_START/END` needs `CAP_SYS_RESOURCE` (unavailable); NUL padding to original argv length is acceptable |
+| 3 | patch 5: `RESOLVE_NO_SYMLINKS` does not stop bind-mount traversal | BLOCKING | **fixed in spec**: add `RESOLVE_NO_XDEV` to the openat2 flags; L17b plants a bind mount, not only a symlink |
+| 4 | patch 5: "refuses connection" undefined — timeout/EAGAIN could flip a live session to stale | BLOCKING | **fixed in spec**: only `ECONNREFUSED`/`ENOENT` count as refusal; timeout/transient = not stale |
+| 5 | patch 5: missing/malformed `supervisor.pid` unspecified | BLOCKING | **fixed in spec**: missing or malformed → not stale (fail safe); 0.2.0 dirs and startup-race dirs are never deleted |
+| 6 | patch 5: `kill`/`run` output contradiction (behavior says print, errors says silent) | BLOCKING | **fixed in spec**: `kill` prints to stderr; `run` logs at `-v`; `--prune` prints to stderr |
+| 7 | patch 6: peer pid reuse across retries — `SO_PEERCRED` gives pid, not identity | BLOCKING | **fixed in spec**: capture starttime on first attempt, compare on retry; prefer `SO_PEERPIDFD` on ≥6.5 |
+| 8 | patch 6: reparenting could turn a refuse into an accept | BLOCKING | **fixed in spec**: retry targets the sandbox init pid, not "reaches pid 1"; a reparented chain to a different init is a refuse |
+| 9 | patch 6: error list contradiction (four errors vs "only ENOENT/ESRCH") | BLOCKING | **fixed in spec**: `EINTR` is retried; `ETXTBSY` removed (does not occur on `/proc` reads); parse/permission/depth errors are not retried |
+| 10 | patch 7: ready-fd is a capability — must not be inherited by sandbox | BLOCKING | **fixed in spec**: fd closed by supervisor after writing, before `START`; `close_range` in init closes everything >2 |
+| 11 | patch 8: bare-pid recycling rule underspecified | BLOCKING | **fixed in spec**: once a pid is reused by a different exec, `signal` by that pid → `E_NOT_FOUND` even if the new exec is live; client must use `exec_id` |
+| 12 | patch 9: `cwd` exposes host-path metadata to anyone who can query `ls`/`inspect` | NON-BLOCKING | R5 (uid check + pidns refusal) already gates the control socket; `ls`/`inspect` are same-uid only. The `cwd` is the session's resolved cwd, not the host `$HOME`. Acceptable for 0.2.1; a 0.3 profile may hide it. |
+| 13 | patch 3: `$USER` is input, not demonstrated account identity | NON-BLOCKING | `getids()` already validates `$USER` (alphanumeric + `_-.`, fallback `"user"`); the stub is generated from it at session start. No change. |
+| 14 | patch 2: resource envelope grows (no new boundary but more writable space) | NON-BLOCKING | True; the default (1024 MiB) matches the current constant. Range validation rejects extreme values. |

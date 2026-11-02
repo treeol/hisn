@@ -134,6 +134,15 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     drop_all_caps().context("dropping capabilities")?;
     // 12. Seccomp (installs on init; the command inherits it).
     seccomp::install(&cfg.seccomp)?;
+
+    // Scrub argv BEFORE PR_SET_DUMPABLE=0: the /proc/self/mem write in
+    // scrub_argv requires the process to be dumpable (ptrace_may_access
+    // must succeed for self-access to /proc/self/mem). After
+    // PR_SET_DUMPABLE=0, /proc/self/mem becomes EACCES and the scrub
+    // silently fails — leaving the session id, policy path, and session
+    // dir visible in /proc/1/cmdline inside the sandbox.
+    scrub_argv("hisn-init");
+
     sys::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0).context("PR_SET_DUMPABLE")?;
     verify_hardening().context("post-setup verification")?;
 
@@ -173,12 +182,6 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     if n != 1 || b[0] != MSG_START {
         bail!("supervisor aborted the session");
     }
-
-    // Scrub argv: overwrite /proc/self/cmdline with "hisn-init" so the
-    // session id, policy path, and session dir do not appear in
-    // /proc/1/cmdline inside the sandbox. Best-effort: failure is not
-    // fatal (the confinement is already in place).
-    scrub_argv("hisn-init");
 
     if cfg.detach {
         drop(slave);

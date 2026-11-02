@@ -1,17 +1,17 @@
 # hisn leaktest host log
-commit:  a1d238b800f0b4ee5e2cab47e96e95bffd6e09bb
+commit:  ff6e10e573b0f2be1df7af7945a5669d26a9f87f
 tree:    clean
-date:    2026-11-02T09:19:31Z
+date:    2026-11-02T09:46:01Z
 host:    rubin
 kernel:  7.2.13-200.fc44.x86_64
 hisn:    hisn 0.2.1
 ---
 make[1]: Verzeichnis „/home/valon/Coding/hisn“ wird betreten
 cargo build --release
-    Finished `release` profile [optimized] target(s) in 0.03s
+    Finished `release` profile [optimized] target(s) in 0.02s
 cargo build --release --example leakprobe
    Compiling hisn v0.2.1 (/home/valon/Coding/hisn)
-    Finished `release` profile [optimized] target(s) in 0.67s
+    Finished `release` profile [optimized] target(s) in 0.69s
 bash tests/leak/run.sh ./target/release/hisn
 PASS  L1 stat /home -> ENOENT
 PASS  L1 open /home -> ENOENT
@@ -38,8 +38,8 @@ PASS  L2 /proc/1/root/etc/shadow unreachable (EACCES)
 PASS  L2 /proc/self/root is the sandbox root
 PASS  L2 init is pid 1
 PASS  L2 only 2 pids visible
-PASS  L2 host hisn pid 1936800 invisible
-PASS  L2 host shell pid 1936776 invisible
+PASS  L2 host hisn pid 1950050 invisible
+PASS  L2 host shell pid 1950026 invisible
 PASS  L3 mount -> EPERM
 PASS  L3 umount -> EPERM
 PASS  L3 unshare_mnt -> EPERM
@@ -128,6 +128,7 @@ SKIP  L12 host-creates-secret-after-start -- needs write access to /etc (not ava
 PASS  L14 runtime-dir bind alias under cwd is rejected (R1b)
 PASS  L14b runtime-dir bind alias offered as a grant source is refused
 WEAK  L14 R5 -- the control-socket pid-namespace check (R5) is covered by unit tests only; no end-to-end test can place the socket inside the sandbox without a test hook
+PASS  L14c 200 rapid hisn ls invocations: 0 refusals
 PASS  L15 exec stat /home -> ENOENT
 PASS  L15 exec stat /root -> ENOENT
 PASS  L15 exec stat /tankz -> ENOENT
@@ -191,6 +192,47 @@ PASS  L24 network=host (default policy): exec cannot connect to a host abstract 
 PASS  L24 network=host (explicit policy): exec cannot connect to a host abstract socket
 PASS  L17 exec'd sleeper died with the session (hisn exec rc=125)
 PASS  L17 detached session dir removed
+PASS  L17b --prune removes a stale session dir
+PASS  L17b dir without supervisor.pid is not pruned
+tests/leak/run.sh: Zeile 125: 1952346 Getötet                   HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent HISN_LEAK_PASSED=visible-ok "$HISN" run --policy "$pol" --session-id "$name" "$@" -- "$cwd/leakprobe" loop "$cwd/ctl" < /dev/null > "$S_LOG.out" 2> "$S_LOG"
+PASS  L33 /dev/shm is present when shm=true
+PASS  L33 file in /dev/shm is visible across execs
+PASS  L33 /dev/shm is a private tmpfs
+PASS  L33 /dev/shm is absent by default (shm=false)
+FAIL  L34 argv scrub -- got [OK ./target/release/hisn run --policy /tmp/hisn-leak.o99n9i/L34.toml --session-id l34-1950026 -- /tmp/hisn-leak.o99n9i/l34/leakprobe loop /tmp/hisn-leak.o99n9i/l34/ctl ] want [OK hisn-init ...]
+session l35-1950026 did not become ready; hisn said:
+    hisn: --detach starts a session without a command; run commands in it with `hisn exec`
+FAIL  L35 exec_id -- could not start detached session
+FAIL  manifest L1 -- test id L1 produced no line (silently dropped?)
+FAIL  manifest L2 -- test id L2 produced no line (silently dropped?)
+FAIL  manifest L3 -- test id L3 produced no line (silently dropped?)
+FAIL  manifest L4 -- test id L4 produced no line (silently dropped?)
+FAIL  manifest L5 -- test id L5 produced no line (silently dropped?)
+FAIL  manifest L6 -- test id L6 produced no line (silently dropped?)
+FAIL  manifest L7 -- test id L7 produced no line (silently dropped?)
+FAIL  manifest L8 -- test id L8 produced no line (silently dropped?)
+FAIL  manifest L9 -- test id L9 produced no line (silently dropped?)
+FAIL  manifest L10 -- test id L10 produced no line (silently dropped?)
+FAIL  manifest L11 -- test id L11 produced no line (silently dropped?)
+FAIL  manifest L12 -- test id L12 produced no line (silently dropped?)
+FAIL  manifest L13 -- test id L13 produced no line (silently dropped?)
+FAIL  manifest L14 -- test id L14 produced no line (silently dropped?)
+FAIL  manifest L14b -- test id L14b produced no line (silently dropped?)
+FAIL  manifest L14c -- test id L14c produced no line (silently dropped?)
+FAIL  manifest L15 -- test id L15 produced no line (silently dropped?)
+FAIL  manifest L16 -- test id L16 produced no line (silently dropped?)
+FAIL  manifest L17 -- test id L17 produced no line (silently dropped?)
+FAIL  manifest L17b -- test id L17b produced no line (silently dropped?)
+FAIL  manifest L18 -- test id L18 produced no line (silently dropped?)
+FAIL  manifest L19 -- test id L19 produced no line (silently dropped?)
+FAIL  manifest L20 -- test id L20 produced no line (silently dropped?)
+FAIL  manifest L21 -- test id L21 produced no line (silently dropped?)
+FAIL  manifest L22 -- test id L22 produced no line (silently dropped?)
+FAIL  manifest L23 -- test id L23 produced no line (silently dropped?)
+FAIL  manifest L24 -- test id L24 produced no line (silently dropped?)
+FAIL  manifest L33 -- test id L33 produced no line (silently dropped?)
+FAIL  manifest L34 -- test id L34 produced no line (silently dropped?)
 
-RESULT: 175 passed, 0 failed, 1 skipped, 1 weak
+RESULT: 182 passed, 31 failed, 1 skipped, 1 weak
+make[1]: *** [Makefile:26: leaktest] Fehler 1
 make[1]: Verzeichnis „/home/valon/Coding/hisn“ wird verlassen

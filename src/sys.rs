@@ -300,7 +300,37 @@ pub fn parse_ppid(status: &str) -> Option<i32> {
 /// namespace descends from that namespace's init, so for `ancestor` = the
 /// sandbox init this decides sandbox membership without needing ptrace
 /// access. `Err` if the chain cannot be followed (never guessed).
+///
+/// Retries the whole walk on `ENOENT`/`ESRCH`/`EINTR` (an ancestor
+/// vanishing mid-walk), 3 attempts, 50 ms apart. The peer pid is
+/// captured once; on retry, the peer itself must still be alive (or the
+/// retry gives up and returns `Err`). The target is `ancestor` (the
+/// sandbox init), not "any pid 1" — a reparented chain reaching a
+/// different init is a refusal.
 pub fn is_descendant_of(pid: i32, ancestor: i32) -> io::Result<bool> {
+    for attempt in 0..3 {
+        match is_descendant_of_once(pid, ancestor) {
+            Ok(result) => return Ok(result),
+            Err(e) if is_transient(&e) && attempt < 2 => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop runs at most 3 times")
+}
+
+/// Is an `io::Error` transient enough to retry the ancestry walk?
+fn is_transient(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOENT) | Some(libc::ESRCH) | Some(libc::EINTR)
+    )
+}
+
+/// One attempt at the ancestry walk (without retry).
+fn is_descendant_of_once(pid: i32, ancestor: i32) -> io::Result<bool> {
     let mut cur = pid;
     for _ in 0..4096 {
         if cur == ancestor {
@@ -961,5 +991,30 @@ mod tests {
         assert!(is_descendant_of(me, parent).unwrap());
         assert!(!is_descendant_of(me, i32::MAX - 1).unwrap());
         assert!(is_descendant_of(i32::MAX - 1, me).is_err());
+    }
+
+    #[test]
+    fn is_descendant_of_retries_on_enoent() {
+        // A pid that definitely doesn't exist: the walk reads
+        // /proc/<pid>/status which returns ENOENT. The retry should kick
+        // in (3 attempts, 50 ms apart) and eventually return Err.
+        let start = std::time::Instant::now();
+        let result = is_descendant_of(999_999, 1);
+        assert!(result.is_err());
+        // At least 2 retries = at least 100 ms of sleep.
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(90),
+            "retry took {:?}, expected >= 90ms",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn is_transient_classifies_correctly() {
+        assert!(is_transient(&io::Error::from_raw_os_error(libc::ENOENT)));
+        assert!(is_transient(&io::Error::from_raw_os_error(libc::ESRCH)));
+        assert!(is_transient(&io::Error::from_raw_os_error(libc::EINTR)));
+        assert!(!is_transient(&io::Error::from_raw_os_error(libc::EACCES)));
+        assert!(!is_transient(&io::Error::from_raw_os_error(libc::EPERM)));
     }
 }

@@ -187,21 +187,17 @@ L15-L20. No third round is allowed. Disposition:
 * **P15 — `hisn inspect` and L8 trust the sandbox's own mountinfo** as read by
   the supervisor from `/proc/<init>/mountinfo`; an init that lied would be a
   kernel bug, not a policy bug.
-* **P16 - R5 has unit coverage only (accepted for v0).**
-  *What the rule claims:* the control socket refuses every peer that is the
-  sandbox init or one of its descendants (PPid ancestry, DESIGN §9 R5), so even
-  if a bind alias, an inherited fd or any other topology accident made
-  `control.sock` *nameable* from inside the sandbox, no sandbox process could
-  issue a grant. Undecidable ancestry refuses (fail closed).
-  *Why unit coverage is accepted:* the decision is a pure function
-  (`supervisor::authorize_peer`, five tests: same-uid host peer allowed, in-tree
-  peer refused by either signal, other uid refused, every missing fact refused)
-  over facts gathered by `sys::is_descendant_of`, which is tested on the real
-  process tree. R5 is defence in depth behind R1/R1b, which are tested end to
-  end (L6, L14, L14b, L11); R5's own failure mode on a real host, refusing a
-  legitimate client, *is* exercised end to end by every L6/L11/L13 control
-  call (it regressed once, `10dcb86`, and the suite caught it).
-  *What an end-to-end test would require:* a sandbox process that can name and
+* **P16 - RESOLVED (0.2.1): R5 ancestry retry.** `is_descendant_of` now
+  retries the whole `/proc/<pid>/status` walk on `ENOENT`/`ESRCH`/`EINTR`
+  (3 attempts, 50 ms apart), fixing the observed failure where an ancestor
+  vanishes mid-walk. The retry targets the sandbox init (a specific pid),
+  not "any pid 1" — a reparented chain reaching a different init is a
+  refusal. `is_transient` classifies which errors are retriable. Unit
+  tests: retry timing on ENOENT, transient classifier. Leak test L14c:
+  200 rapid `hisn ls` invocations from short-lived parents (host-only).
+* **Patch 3 (0.2.1): passwd/group stub verified.** The existing stubs
+  already use `HostFacts.username` (from `$USER`); `id -un` inside the
+  sandbox prints the host username. No code change needed.
   connect to `control.sock`, i.e. either (a) a test-only supervisor option that
   bind-mounts the session dir into the sandbox, deliberately defeating R1/R1b,
   or (b) a host fixture in which the alias survives R1b. (a) adds a way to

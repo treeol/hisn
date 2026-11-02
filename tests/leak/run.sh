@@ -855,6 +855,82 @@ else
   fail "L17b stale cleanup" "could not start the first session"
 fi
 
+# L17b (symlink): a symlink planted inside a stale session dir must not be
+# followed by --prune. The canary lives outside the runtime root; it must
+# survive and the stale dir must be gone. One result line.
+L17BC_CWD=$(new_cwd l17bc)
+L17BC_POL="$WORK/L17bc.toml"
+write_policy "$L17BC_POL" "$L17BC_CWD"
+L17BC_DIR="$RUNTIME_ROOT/l17b-c-$$"
+if start_session l17b-c-$$ "$L17BC_CWD" "$L17BC_POL"; then
+  L17BC_PID=$S_PID
+  kill -9 "$L17BC_PID" 2>/dev/null
+  wait "$L17BC_PID" 2>/dev/null
+  sleep 0.5
+  L17BC_CANARY="$WORK/l17bc-canary"
+  mkdir -p "$L17BC_CANARY"
+  echo keep >"$L17BC_CANARY/canary"
+  if [ -d "$L17BC_DIR" ]; then
+    # A top-level symlink to the directory and one inside a subdirectory.
+    ln -s "$L17BC_CANARY" "$L17BC_DIR/escape-dir"
+    ln -s "$L17BC_CANARY/canary" "$L17BC_DIR/escape-file"
+    mkdir "$L17BC_DIR/sub" && ln -s "$L17BC_CANARY" "$L17BC_DIR/sub/escape-dir"
+    "$HISN" ls --prune >/dev/null 2>&1
+    if [ ! -f "$L17BC_CANARY/canary" ]; then
+      fail "L17b symlink in a stale dir" "--prune followed a symlink: the canary file was deleted"
+    elif [ -e "$L17BC_DIR" ] || [ -L "$L17BC_DIR" ]; then
+      fail "L17b symlink in a stale dir" "canary survived but the stale dir $L17BC_DIR is still there (prune refused or incomplete)"
+    else
+      pass "L17b symlink in a stale dir is not followed by --prune (canary kept, stale dir removed)"
+    fi
+  else
+    fail "L17b symlink in a stale dir" "no session dir $L17BC_DIR after SIGKILL; nothing to test"
+  fi
+else
+  fail "L17b symlink in a stale dir" "could not start the session"
+fi
+
+# L17b (run over a stale dir): `hisn run --session-id X` with a stale dir for
+# X must succeed, and the old supervisor.pid (and everything else in the old
+# dir) must be gone: the new session's supervisor.pid is a different file
+# content and a marker planted in the old dir does not exist any more.
+L17BD_ID="l17b-d-$$"
+L17BD_DIR="$RUNTIME_ROOT/$L17BD_ID"
+L17BD1_CWD=$(new_cwd l17bd1)
+L17BD1_POL="$WORK/L17bd1.toml"
+write_policy "$L17BD1_POL" "$L17BD1_CWD"
+if start_session "$L17BD_ID" "$L17BD1_CWD" "$L17BD1_POL"; then
+  L17BD1_PID=$S_PID
+  kill -9 "$L17BD1_PID" 2>/dev/null
+  wait "$L17BD1_PID" 2>/dev/null
+  sleep 0.5
+  L17BD_OLDPID=$(cat "$L17BD_DIR/supervisor.pid" 2>/dev/null)
+  if [ -z "$L17BD_OLDPID" ]; then
+    fail "L17b run over a stale dir" "the killed session left no supervisor.pid to start from"
+  else
+    : >"$L17BD_DIR/stale-marker"
+    L17BD2_CWD=$(new_cwd l17bd2)
+    L17BD2_POL="$WORK/L17bd2.toml"
+    write_policy "$L17BD2_POL" "$L17BD2_CWD"
+    if start_session "$L17BD_ID" "$L17BD2_CWD" "$L17BD2_POL"; then
+      L17BD2_PID=$S_PID
+      L17BD_NEWPID=$(cat "$L17BD_DIR/supervisor.pid" 2>/dev/null)
+      if [ -e "$L17BD_DIR/stale-marker" ]; then
+        fail "L17b run over a stale dir" "the old dir content survived (stale-marker still exists)"
+      elif [ -z "$L17BD_NEWPID" ] || [ "$L17BD_NEWPID" = "$L17BD_OLDPID" ]; then
+        fail "L17b run over a stale dir" "supervisor.pid is missing or still the old one [$L17BD_OLDPID]"
+      else
+        pass "L17b run over a stale dir: --session-id succeeds; old supervisor.pid and dir content are gone"
+      fi
+      end_session "$L17BD2_CWD" "$L17BD2_PID"
+    else
+      fail "L17b run over a stale dir" "hisn run with the same id as a stale dir did not start"
+    fi
+  fi
+else
+  fail "L17b run over a stale dir" "could not start the first session"
+fi
+
 # ================================================ L33: /dev/shm (0.2.1)
 L33_CWD=$(new_cwd l33)
 L33_POL="$WORK/L33.toml"
@@ -984,7 +1060,17 @@ if [ -f "$MANIFEST" ]; then
   while IFS= read -r id; do
     [ -z "$id" ] && continue
     case "$id" in \#*) continue ;; esac
-    printf '%s\n' "$EMITTED" | grep -qxF "$id" || MISSING="$MISSING $id"
+    case "$id" in
+      *": "*)
+        # "L17b: text" -- a line of test L17b whose name contains "text".
+        want_id=${id%%: *} want_txt=${id#*: }
+        printf '%s\n' "$OUTPUT_LOG" | grep -F -- "$want_id " | grep -qF -- "$want_txt" ||
+          { fail "manifest $id" "no $want_id line containing [$want_txt] (check silently dropped?)"; }
+        ;;
+      *)
+        printf '%s\n' "$EMITTED" | grep -qxF "$id" || MISSING="$MISSING $id"
+        ;;
+    esac
   done <"$MANIFEST"
   if [ -n "$MISSING" ]; then
     for id in $MISSING; do

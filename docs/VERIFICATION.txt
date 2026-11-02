@@ -53,29 +53,33 @@ so.  The log file column points at the `docs/leaktest-host-*.log` produced by
 
 The 0.2.1 suite adds L14c, L17b, L33, L34, L35 to L1-L24; every id in
 `tests/leak/MANIFEST` must print a line or the suite fails. Three host runs
-have been seen, newest first. Only the last has a log file.
+have been seen, newest first. The 5ea2fc2 and f298ca5 runs have a log file.
 
 | check | commit | where | result | log file |
 |-------|--------|-------|--------|----------|
-| `make leaktest` (L1-L35) | f298ca5 (log header: tree clean) | host (rubin, Fedora 7.2.13-200.fc44.x86_64) | **184 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5)** | `docs/leaktest-host-2026-11-02.log` |
+| `make leaktest` (L1-L35) | after 5ea2fc2 (new L17b symlink and run-over-stale checks) | — | **not run**; expected 186 passed (184 + the two new L17b lines), 0 failed, 1 skipped, 1 weak | — |
+| `make leaktest` (L1-L35) | 5ea2fc2 (log header: tree clean) | host (rubin, Fedora 7.2.13-200.fc44.x86_64) | **184 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5)**; no `Killed` line | `docs/leaktest-host-2026-11-02.log` (this file; it replaced the f298ca5 log, which stays in git history) |
+| `make leaktest` (L1-L35) | f298ca5 | host (rubin, same kernel) | 184 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5); one `Killed` line from L17b | log at commit 5ea2fc2: `git show 5ea2fc2:docs/leaktest-host-2026-11-02.log` |
 | `make leaktest` (L1-L35) | 5543e7e | host (rubin, same kernel) | 183 passed, 30 failed (L34, 29 manifest), 1 skipped, 1 weak; summary and failing lines pasted by the maintainer, no log file kept | — |
 | `make leaktest` (L1-L35) | a1d238b | host (rubin, same kernel) | 182 passed, 31 failed (L34, L35, 29 manifest), 1 skipped, 1 weak; the log file was overwritten by the next run | — |
-| `make leaktest` after the L17b reaping edit | after f298ca5 | — | not run | — |
-| `hisn ls` 200x rapid (L14c) | f298ca5 | host (rubin) | PASS, 0 refusals (line in the f298ca5 log) | `docs/leaktest-host-2026-11-02.log` |
+| `hisn ls` 200x rapid (L14c) | 5ea2fc2 | host (rubin) | PASS, 0 refusals | `docs/leaktest-host-2026-11-02.log` |
 | `x86_64-unknown-linux-musl` build + leak | — | not run | not run (stdlib not in build sandbox) | — |
 
-What the f298ca5 log shows for the new tests (read from the log, not assumed):
+What the 5ea2fc2 log shows for the new tests (read from the log, not assumed):
 L14c 1 PASS; L17b 2 PASS (`--prune` removes a stale dir; a dir without
 `supervisor.pid` is not pruned); L33 4 PASS; L34 1 PASS; L35 1 PASS. Total
 passes 184 = the 175 of the 0.2.0 run + these 9. The one skip is L12
 (needs write access to `/etc`) and the one weak is L14 R5 (unit coverage only,
 P16); both lines are in the log.
 
-Not in L17b: the plan listed "a symlink planted inside a stale dir is not
-followed" and "`run` with the same id succeeds and the old dir is gone". The
-suite has no line for either (the `run` case is commented in `run.sh` but
-asserts nothing). They are covered by unit tests only and are **not**
-host-verified.
+L17b checks added after the 5ea2fc2 run, **not yet run on a host**: (a) a
+symlink to a canary directory and file planted inside a stale session dir (also
+one in a subdirectory) must not be followed by `hisn ls --prune` (canary kept,
+stale dir gone); (b) `hisn run --session-id X` over a stale dir for X must
+start, and the old `supervisor.pid` and a marker planted in the old dir must be
+gone. Until a host log shows their lines, these two are covered by unit tests
+only. `tests/leak/MANIFEST` lists them as `L17b: <text>` entries, so a run that
+prints no such line fails.
 
 Causes of the two failed runs (fixed in `5543e7e` and `f298ca5`):
 
@@ -92,25 +96,18 @@ Causes of the two failed runs (fixed in `5543e7e` and `f298ca5`):
 * L35: `--detach` and a command are mutually exclusive (`a1d238b`); fixed in
   `5543e7e`, PASS since.
 
-### The `Getötet` line in the f298ca5 log
+### The `Getötet` line
 
-The log contains one bash job-control line,
-`run.sh: line 125: <pid> Killed ... "$HISN" run --policy ... loop`
-(line 197 of the log, after the L17b `PASS` lines and before the L33 ones). It
-is the command line of `start_session`, so it is a *session supervisor* that
-was killed with SIGKILL. The only unreaped `kill -9` of a session in the
-suite is the deliberate one in L17b (`run.sh`, "SIGKILL the second
-supervisor"): L17b needs a supervisor that dies without cleaning up. Bash
-reports an unreaped background job that died of a signal at the next command
-boundary, which is why the message appears after the L17b lines. The other
-`kill -9` sites in `run.sh` are followed by `wait` or run in the EXIT trap.
-The 0.2.0 logs have no such line, and L17b is new in 0.2.1. A bash reproduction
-of kill-without-wait prints the same message and kill-then-`wait ... 2>/dev/null`
-prints nothing. The edit that adds the `wait` is *not yet host-verified*: the
-f298ca5 run predates it. The next host log should have no `Killed` line; if
-it still has one, the explanation above is wrong.
+The f298ca5 log contained one bash job-control line,
+`run.sh: line 125: <pid> Killed ... "$HISN" run --policy ... loop`, after the
+L17b `PASS` lines. It is the command line of `start_session`, so a session
+supervisor killed with SIGKILL: the deliberate kill in L17b, which was not
+reaped. The edit in 5ea2fc2 adds `wait ... 2>/dev/null` after the kill. The
+5ea2fc2 host log has no such line (checked with `grep -c 'Killed\|Getötet'`:
+0), which confirms the explanation and the fix. The two new L17b checks use the
+same kill-then-wait pattern.
 
-### Notes on the 19af325 host run### Notes on the 19af325 host run
+### Notes on the 19af325 host run
 
 * Full per-test log recorded; the skip is L12 (host-creates-secret-after-start,
   needs write access to /etc) and the weak is L14 R5 (unit coverage only, P16).

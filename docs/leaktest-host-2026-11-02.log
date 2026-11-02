@@ -1,7 +1,7 @@
 # hisn leaktest host log
-commit:  f298ca5387c2ee0fe7da147f0fa010b7c104b079
+commit:  5ea2fc20766d200c65d30da2caa5940374c6727a
 tree:    clean
-date:    2026-11-02T10:12:37Z
+date:    2026-11-02T10:23:04Z
 host:    rubin
 kernel:  7.2.13-200.fc44.x86_64
 hisn:    hisn 0.2.1
@@ -10,8 +10,7 @@ make[1]: Verzeichnis „/home/valon/Coding/hisn“ wird betreten
 cargo build --release
     Finished `release` profile [optimized] target(s) in 0.03s
 cargo build --release --example leakprobe
-   Compiling hisn v0.2.1 (/home/valon/Coding/hisn)
-    Finished `release` profile [optimized] target(s) in 0.69s
+    Finished `release` profile [optimized] target(s) in 0.03s
 bash tests/leak/run.sh ./target/release/hisn
 PASS  L1 stat /home -> ENOENT
 PASS  L1 open /home -> ENOENT
@@ -38,8 +37,8 @@ PASS  L2 /proc/1/root/etc/shadow unreachable (EACCES)
 PASS  L2 /proc/self/root is the sandbox root
 PASS  L2 init is pid 1
 PASS  L2 only 2 pids visible
-PASS  L2 host hisn pid 1997430 invisible
-PASS  L2 host shell pid 1997407 invisible
+PASS  L2 host hisn pid 2005244 invisible
+PASS  L2 host shell pid 2005220 invisible
 PASS  L3 mount -> EPERM
 PASS  L3 umount -> EPERM
 PASS  L3 unshare_mnt -> EPERM
@@ -194,7 +193,6 @@ PASS  L17 exec'd sleeper died with the session (hisn exec rc=125)
 PASS  L17 detached session dir removed
 PASS  L17b --prune removes a stale session dir
 PASS  L17b dir without supervisor.pid is not pruned
-tests/leak/run.sh: Zeile 125: 1999713 Getötet                   HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent HISN_LEAK_PASSED=visible-ok "$HISN" run --policy "$pol" --session-id "$name" "$@" -- "$cwd/leakprobe" loop "$cwd/ctl" < /dev/null > "$S_LOG.out" 2> "$S_LOG"
 PASS  L33 /dev/shm is present when shm=true
 PASS  L33 file in /dev/shm is visible across execs
 PASS  L33 /dev/shm is a private tmpfs

@@ -10,11 +10,50 @@
   <img src="assets/logo.png" alt="hisn logo" width="256">
 </p>
 
-hisn runs a command in a private view of your machine. The command sees its
+**hisn** runs a command in a private view of your machine. The command sees its
 working directory at the *same path* as on the host, a read-only toolchain, and
 private `$HOME`, `/tmp` and `/run`. Anything else exists only if you grant it,
 and every grant ends with the session. Paths outside the view are not denied,
 they are absent: `ENOENT`.
+
+- **Rootless and daemonless.** One binary, no root, no setuid helper, no file
+  capabilities, no background service.
+- **Absent, not blocked.** The root is an empty tmpfs entered with `pivot_root`;
+  the host filesystem is not reachable, so there is nothing to probe.
+- **Path parity.** Your project lives at the identical path inside, so tools,
+  error messages and editors keep working.
+- **Steerable while it runs.** Add and remove access, run more commands, and
+  signal them from outside, over a control socket the sandbox cannot reach.
+- **Agent-agnostic.** A plain CLI with exit codes and versioned JSON; see
+  [programmatic use](#programmatic-use).
+
+## Contents
+
+[Quick start](#quick-start) · [What the sandbox contains](#what-the-sandbox-contains) ·
+[Install](#install) · [Usage](#usage) · [Policy](#policy) ·
+[Programmatic use](#programmatic-use) · [Security model](#security-model) ·
+[Verifying a build](#verifying-a-build) · [Status](#status) ·
+[Documentation](#documentation)
+
+## Quick start
+
+```sh
+hisn check                                              # does this host qualify?
+hisn run -- make test                                   # cwd rw, toolchain ro, nothing else
+hisn run --policy hisn.toml --grant ~/data:ro -- ./job  # with a policy and a read-only grant
+```
+
+`hisn run` passes stdio through unchanged and allocates a pty inside the sandbox
+when stdin is a terminal. It exits with the command's status.
+
+| Exit code | Meaning |
+|---|---|
+| `0`-`124` | the command's own status (a command that itself exits 125-127 is indistinguishable from the cases below) |
+| `128+N` | the command was killed by signal `N` |
+| `125` | hisn error (policy, host, refused request) |
+| `126` / `127` | the command could not be executed / was not found |
+
+Add `-v` (repeatable) for logs on stderr.
 
 ## What the sandbox contains
 
@@ -22,7 +61,8 @@ they are absent: `ENOENT`.
 |---|---|
 | working directory | read-write, at the identical host path |
 | system toolchain (`/usr` and friends) | read-only |
-| `$HOME`, `/tmp`, `/run` | private tmpfs, discarded with the session |
+| `$HOME`, `/tmp`, `/run` | private tmpfs, discarded with the session (`/tmp` size is configurable) |
+| `/dev/shm` | absent unless `session.shm = true` |
 | `/etc` | the entries present at start, minus secrets |
 | `/proc`, `/dev` | the sandbox's own; `/sys` is absent |
 | granted paths | present until revoked or the session ends |
@@ -30,11 +70,14 @@ they are absent: `ENOENT`.
 
 The environment is rebuilt from scratch: `PATH`, `HOME`, `TERM`, `LANG`, `LC_*`,
 `TZ`, plus the keys you list in `env.pass`. Host secrets in the environment never
-enter.
+enter. Inside, `/etc/passwd` and `/etc/group` hold a stub for your uid (user name
+taken from `$USER`), and `/proc/1/cmdline` reads only `hisn-init`, so the
+session id and host paths are not exposed.
 
 ## Install
 
-**Release binary** (Linux x86_64 or aarch64):
+**Release binary** (Linux x86_64 or aarch64), from the
+[latest release](https://github.com/treeol/hisn/releases/latest):
 
 ```sh
 # x86_64; use hisn-aarch64-linux-gnu on aarch64
@@ -52,27 +95,28 @@ cargo install --path . --locked
 hisn check
 ```
 
-`hisn check` reports whether the host qualifies (exit 2 if not). hisn needs no
-root, no setuid binary and no file capabilities. It requires kernel 5.12 or
-newer with unprivileged user namespaces, Landlock and seccomp. On Ubuntu 24.04
-AppArmor restricts unprivileged user namespaces by default
+`hisn check` reports whether the host qualifies (exit 2 if not; `--json` for a
+machine-readable report). hisn needs no root, no setuid binary and no file
+capabilities. It requires kernel 5.12 or newer with unprivileged user
+namespaces, Landlock and seccomp. On Ubuntu 24.04 AppArmor restricts
+unprivileged user namespaces by default
 (`kernel.apparmor_restrict_unprivileged_userns`); `hisn check` shows the value.
 
 The release binaries are dynamically linked glibc builds (glibc 2.35 or newer).
-Static musl builds do not compile yet; see [OPEN-POINTS P22](docs/OPEN-POINTS.md).
+The ioctl casts that blocked musl were fixed in 0.2.1 (OPEN-POINTS P22), but a
+musl build has not been verified to compile or been leak-tested, so no static
+binary is published.
 
 ## Usage
 
-```sh
-hisn run -- make test                                  # cwd rw, toolchain ro, nothing else
-hisn run --policy hisn.toml --grant ~/data:ro -- ./job # with a policy and a read-only grant
-hisn policy validate hisn.toml                         # print the resolved policy
-```
+### One-shot commands
 
-`hisn run` passes stdio through unchanged and allocates a pty inside the sandbox
-when stdin is a terminal. It exits with the command's status (`128+sig` if
-signalled). Exit `125` is a hisn error; `126` and `127` mean the command could
-not be executed or was not found. Add `-v` for logs on stderr.
+```sh
+hisn run -- make test
+hisn run --cwd ~/src/app --network none -- cargo test
+hisn policy validate hisn.toml          # print the resolved policy
+hisn policy schema                      # JSON Schema of hisn-policy/v1
+```
 
 ### Long-lived sessions
 
@@ -80,7 +124,7 @@ A session can be steered from outside while it runs. This is how an agent
 runtime hands a sandboxed process more access, or runs further commands in it.
 
 ```sh
-hisn run --session-id agent1 -- sleep 3600 &
+hisn run --session-id agent1 --detach &      # a session with no command of its own
 
 hisn exec   --session agent1 -- ls -la                  # another command, same confinement
 hisn exec   --session agent1 --tty -- bash              # interactive, on its own pty
@@ -88,40 +132,86 @@ hisn grant  --session agent1 /srv/reference             # read-only, gone with t
 hisn grant  --session agent1 --rw /srv/out              # needs a mounts.grantable_rw prefix
 hisn revoke --session agent1 /srv/reference             # the path becomes ENOENT
 hisn revoke --session agent1 --hard /srv/out            # also kills every sandbox process
-hisn ls --session agent1
+hisn ls --session agent1                                # grants of one session
 hisn inspect --session agent1                           # mount table and resolved policy
 hisn kill --session agent1
-hisn ls --prune                                          # remove stale session dirs
 ```
 
-`hisn run --ready-fd N` writes `"ready\n"` to fd N after the session is live,
-for programmatic readiness. `hisn ls --prune` removes session directories whose
-supervisor has died (stale = socket refuses AND pid gone or starttime mismatch).
+Every `exec` runs in the same namespaces, with the same seccomp filter,
+Landlock domain and dropped capabilities as the original command, and sees the
+same grants.
 
-### Policy
+### Housekeeping
 
-A policy is a small TOML file (`hisn-policy/v1`):
+```sh
+hisn ls                  # all your sessions
+hisn ls --json           # same, as versioned JSON
+hisn ls --prune          # remove session directories whose supervisor has died
+hisn kill --session X    # on a stale session: removes the directory, exits 0
+```
+
+A session is *stale* when its control socket refuses connections and its
+supervisor process is gone (checked twice, 300 ms apart). Removal is
+fd-relative and confined to that one directory: a planted symlink is unlinked,
+never followed, and a planted bind mount is never entered.
+`hisn run --session-id X` over a stale directory removes it and proceeds; over a
+live one it fails.
+
+## Policy
+
+A policy is a small TOML file (`hisn-policy/v1`). A file that declares nothing
+gives the default sandbox described above.
 
 ```toml
 version = "hisn-policy/v1"
 
 [session]
 cwd = "."            # mounted rw at the identical path
-home = "tmpfs"
+home = "tmpfs"       # or an absolute host path for warm caches
 network = "none"     # "none" | "host"
+shm = false          # true: tmpfs at /dev/shm
+shm_size = 64        # MiB, only with shm = true
+tmp_size = 1024      # MiB, 16..=65536
 
 [mounts]
 ro = ["/opt/toolchains"]
-grantable_rw = ["/srv/out"]
+grantable_rw = ["/srv/out"]     # prefixes where `hisn grant --rw` is allowed
+mask = ["/work/app/.secrets"]   # hidden inside allowed trees
 
 [env]
 pass = ["GOFLAGS", "RUSTFLAGS"]
 set  = { CI = "1" }
 ```
 
-The full format is in [docs/POLICY-SPEC.md](docs/POLICY-SPEC.md); a complete
-example is [`hisn.toml`](hisn.toml) and the JSON schema is
-[`schemas/hisn-policy.v1.json`](schemas/hisn-policy.v1.json).
+Everything that widens the sandbox is opt-in. `network = "host"` additionally
+requires Landlock abstract-socket scoping (ABI 6) or an explicit
+`--allow-host-abstract-sockets`. The full format is in
+[docs/POLICY-SPEC.md](docs/POLICY-SPEC.md); a complete example is
+[`hisn.toml`](hisn.toml) and the JSON schema is
+[`schemas/hisn-policy.v1.json`](schemas/hisn-policy.v1.json). Unknown keys are
+errors.
+
+## Programmatic use
+
+hisn is designed to be driven by an agent runtime. [Wakil](docs/WAKIL-INTEGRATION.md)
+is one consumer; nothing in the contract is specific to it.
+
+- **Readiness.** `hisn run --ready-fd N` writes `"ready\n"` to fd `N` once the
+  session is live (after the control socket accepts), then closes it. On a
+  failed start nothing is written; the exit status carries the error. Works
+  with and without `--detach`.
+- **Stable exec handles.** Every exec gets an opaque `exec_id` (`"e-<n>"`,
+  monotonic per session, never reused). `signal` takes the `exec_id`; the bare
+  `pid` form is deprecated, and a pid recycled by a different exec is rejected
+  with `E_NOT_FOUND`.
+- **Frozen JSON.** `hisn ls --json` and `hisn inspect --json` carry a
+  `schema` field (`hisn-ls/v1`, `hisn-inspect/v1`). Fields are only ever added.
+  `hisn ls --json` with no sessions returns an empty list.
+- **Control socket.** `<session>/control.sock`, one JSON object per line
+  (`grant`, `revoke`, `list`, `inspect`, `exec`, `signal`, `kill`). The
+  protocol is in [POLICY-SPEC §7](docs/POLICY-SPEC.md). A `{"exit":{"lost":true}}`
+  reply means the monitor died and the status is unknown, not that the program
+  finished.
 
 ## Security model
 
@@ -138,7 +228,8 @@ issues grants. The sandboxed command is treated as hostile.
    non-dumpable.
 3. **Only the supervisor mounts.** Grants and revokes are performed by the
    host-side supervisor over a control socket that the sandbox can neither name
-   nor use. A grant is a bind mount in the session's mount namespace and nothing
+   nor use; the socket also refuses any peer that descends from the sandbox's
+   init. A grant is a bind mount in the session's mount namespace and nothing
    else, so it cannot outlive the session.
 4. **Defined revoke semantics.** A soft revoke guarantees that the path no
    longer resolves; file descriptors that were already open or queued can
@@ -149,6 +240,10 @@ issues grants. The sandboxed command is treated as hostile.
    rlimits, and network isolation under `network = "host"` are outside it (for
    `network = "none"` the sandbox has only loopback).
 
+**What hisn does not do:** it has no images, no registry and no OCI runtime, it
+does not filter network traffic, and it does not use cgroups. See the
+[roadmap](docs/ROADMAP.md).
+
 The reasoning behind each decision is in [docs/DESIGN.md](docs/DESIGN.md);
 known limits are tracked in [docs/OPEN-POINTS.md](docs/OPEN-POINTS.md). To
 report a vulnerability, see [SECURITY.md](SECURITY.md).
@@ -156,10 +251,13 @@ report a vulnerability, see [SECURITY.md](SECURITY.md).
 ## Verifying a build
 
 The isolation claims are backed by a leak suite, `tests/leak/run.sh`, that runs
-real probes from inside the sandbox (L1 to L24): it tries to stat host paths,
-read secrets, escape through `/proc`, use denied syscalls, reach sibling
-sessions, and use revoked grants. It prints one line per check and a final
-`RESULT:` line, and exits non-zero on any `FAIL`.
+real probes from inside the sandbox: it tries to stat host paths, read secrets,
+escape through `/proc`, use denied syscalls, reach sibling sessions, use revoked
+grants, follow planted symlinks, and read what init exposes about the host. It
+prints one line per check and a final `RESULT:` line, and exits non-zero on any
+`FAIL`. A manifest (`tests/leak/MANIFEST`) lists every expected test id, and the
+run fails if a listed test printed no line, so a test cannot be silently
+dropped.
 
 ```sh
 make lint && make test     # rustfmt, clippy -D warnings, unit tests (runs anywhere)
@@ -170,29 +268,38 @@ make leaktest-log          # same, saved to docs/leaktest-host-YYYY-MM-DD.log wi
 The leak suite needs a host that allows unprivileged user namespaces; without
 one it refuses to run (exit 77) and reports nothing. `SKIP` and `WEAK` lines are
 never counted as passes. `WEAK` means a check passed without the fixture that
-would make it meaningful, for example a host with no `~/.ssh` to hide. On kernels
-with Landlock ABI below 6, L23 and L24 skip.
+would make it meaningful. On kernels with Landlock ABI below 6, L23 and L24
+skip.
 
 To check a downloaded binary, run `sha256sum -c SHA256SUMS`, then
 `hisn --version` and `hisn check`.
 
 ## Status
 
-hisn 0.2 is maintained by one person. The leak suite was last recorded green on
-a Fedora x86_64 host: 175 passed, 0 failed, 1 skipped, 1 weak
-([log](docs/leaktest-host-2026-11-01.log)). CI runs it on Ubuntu 22.04 and 24.04
-(x86_64) and builds a release only after it passes. aarch64 is cross-checked by
-clippy and has not been leak-tested. [docs/VERIFICATION.txt](docs/VERIFICATION.txt)
-lists what was run, where, and with which log; anything without a log is
-recorded as "not run".
+hisn 0.2.1 is maintained by one person. The leak suite was last recorded on a
+Fedora x86_64 host at commit `a478d5d`: **186 passed, 0 failed, 1 skipped
+(L12, needs write access to `/etc`), 1 weak (L14, the R5 peer check is covered
+by unit tests only)** ([log](docs/leaktest-host-2026-11-02.log)). CI runs the
+suite on Ubuntu 22.04 and 24.04 (x86_64) and builds a release only after it
+passes. aarch64 is cross-checked by clippy and has not been leak-tested.
+[docs/VERIFICATION.txt](docs/VERIFICATION.txt) lists what was run, where, and
+with which log; anything without a log is recorded as "not run".
+
+**Next:** a 0.3 plan (profiles, in-sandbox and host-side services, a filtering
+Docker proxy, risk labels) is written up in
+[docs/PLAN-0.3.md](docs/PLAN-0.3.md). It is a plan, not a commitment, and none
+of it is implemented.
 
 ## Documentation
 
-[DESIGN](docs/DESIGN.md) · [POLICY-SPEC](docs/POLICY-SPEC.md) ·
-[ROADMAP](docs/ROADMAP.md) · [WAKIL-INTEGRATION](docs/WAKIL-INTEGRATION.md) ·
-[OPEN-POINTS](docs/OPEN-POINTS.md) · [VERIFICATION](docs/VERIFICATION.txt) ·
-[CHANGELOG](CHANGELOG.md) · [SECURITY](SECURITY.md) ·
-[CONTRIBUTING](CONTRIBUTING.md)
+| | |
+|---|---|
+| [DESIGN](docs/DESIGN.md) | how it works and why |
+| [POLICY-SPEC](docs/POLICY-SPEC.md) | policy format, control protocol, OCI mapping |
+| [ROADMAP](docs/ROADMAP.md), [PLAN-0.3](docs/PLAN-0.3.md) | where it is going |
+| [WAKIL-INTEGRATION](docs/WAKIL-INTEGRATION.md) | driving hisn from an agent runtime |
+| [OPEN-POINTS](docs/OPEN-POINTS.md), [VERIFICATION](docs/VERIFICATION.txt) | known limits; what was run and where |
+| [CHANGELOG](CHANGELOG.md), [SECURITY](SECURITY.md), [CONTRIBUTING](CONTRIBUTING.md) | project |
 
 ## License
 

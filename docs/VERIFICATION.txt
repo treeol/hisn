@@ -1,6 +1,6 @@
 # Verification record
 
-hisn version : 0.2.0
+hisn version : 0.2.1
 
 This file records what was actually run, where, and with what result.  No
 entry is "inferred": anything not backed by a log file or by a run in this
@@ -19,7 +19,7 @@ namespace-dependent code path is "not run" — see the table below.
 | `cargo fmt --check` | this commit | sandbox | clean | — |
 | `cargo clippy --all-targets -- -D warnings` (x86_64) | this commit | sandbox | clean | — |
 | `cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings` | this commit | sandbox | clean | — |
-| `cargo test` (unit tests) | this commit | sandbox | 182 passed, 0 failed | — |
+| `cargo test` (unit tests) | this commit | sandbox | 200 passed, 0 failed | — |
 | `python3 tests/leak/test_l8.py` (L8 comparator self-tests) | this commit | sandbox | 12 passed | — |
 | `hisn check` | this commit | sandbox | not run (needs userns) | — |
 | `make leaktest` (L1-L24), CI | c4acf20 (log header: tree clean) | GitHub Actions ubuntu-24.04, kernel 7.0.0-1017-azure | 174 passed, 0 failed, 1 skipped (L12), 5 weak (L1 probes of absent paths x3, L14 R5, L20 terminal refusal: stdin not a tty) | workflow artifact `leaktest-log-ubuntu-24.04`, run https://github.com/treeol/hisn/actions/runs/41342519623 (artifacts expire; counts recorded here) |
@@ -49,56 +49,68 @@ so.  The log file column points at the `docs/leaktest-host-*.log` produced by
 | `make leaktest` (L1-L23) | 19af325 (log header: tree clean) | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 173 passed, 0 failed, 1 skipped, 1 weak | `docs/leaktest-host-2026-11-01.log` |
 | `make leaktest` (L1-L20) | e3bcd31 [inferred — confirm] | host (Fedora 7.2.13, x86_64, ABI 10) | 167 passed, 0 failed, 1 skipped, 1 weak | — (summary line only; `make leaktest-log` did not exist yet) |
 
-### 0.2.1 — not run on host yet (with the new tests wired in)
+### 0.2.1 host runs
 
-The 0.2.1 leak suite adds L14c, L17b, L33, L34, L35 to the existing
-L1–L24. The expected total on a host that runs all tests (no skips)
-is approximately **180** (L1–L24 = 175 + L14c = 1 + L17b = ~3 + L33 = ~3
-+ L34 = 1 + L35 = 1). The actual total depends on host-specific skips
-(L12 needs /etc write; L23/L24 need Landlock ABI 6).
-
-Two host runs of the 0.2.1 suite have been seen so far, both with failures:
-
-* a1d238b: 182 passed, 31 failed. L34 FAIL, L35 FAIL (--detach + command are
-  mutually exclusive), and 29 manifest FAILs.
-* 5543e7e: 183 passed, 30 failed. L35 now PASSes. **L34 still FAILs and the
-  manifest check still reports every id as missing**; the fixes in 5543e7e
-  for those two were wrong.
-
-Causes found afterwards (fixed in the commit after 5543e7e, unverified on a
-host):
-
-* L34: `scrub_argv` writes `/proc/self/mem`. 5543e7e moved it before
-  `PR_SET_DUMPABLE=0`, but it still ran after `landlock::apply`, and Landlock
-  has no write rule for `/proc`, so the open failed with EACCES and the scrub
-  silently did nothing. It now runs before Landlock. Unit tests:
-  `landlock::tests::proc_self_mem_is_not_writable_after_apply` (the ordering
-  constraint, real kernel) and `init::tests::scrub_argv_overwrites_cmdline`
-  (the scrub changes `/proc/self/cmdline`, not only comm). The L34 assertion
-  also accepted only a trailing space; it now ignores NUL padding (shown as
-  spaces) and fails on any other content.
-* Manifest: `run.sh` records ids in `OUTPUT_LOG` as the bare test name
-  (`L1 stat ...`), without the `PASS  ` prefix, so the regex that expects the
-  prefix matched nothing. The regex now matches the bare name; checked
-  against every name in the host log.
+The 0.2.1 suite adds L14c, L17b, L33, L34, L35 to L1-L24; every id in
+`tests/leak/MANIFEST` must print a line or the suite fails. Three host runs
+have been seen, newest first. Only the last has a log file.
 
 | check | commit | where | result | log file |
 |-------|--------|-------|--------|----------|
-| `make leaktest` (L1-L35) | after 5543e7e | — | not run | — |
-| `make leaktest` (L1-L35) | 5543e7e | host (rubin, Fedora 7.2.13-200.fc44.x86_64) | 183 passed, 30 failed (L34, 29 manifest), 1 skipped, 1 weak; summary and failing lines pasted by the maintainer, no log file kept | — |
-| `make leaktest` (L1-L35) | a1d238b (pre-fix) | host (rubin, Fedora 7.2.13-200.fc44.x86_64) | 182 passed, 31 failed (L34, L35, 29 manifest), 1 skipped, 1 weak | `docs/leaktest-host-2026-11-02.log` |
-| `hisn ls` 200x rapid (L14c) | — | not run | not run | — |
+| `make leaktest` (L1-L35) | f298ca5 (log header: tree clean) | host (rubin, Fedora 7.2.13-200.fc44.x86_64) | **184 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5)** | `docs/leaktest-host-2026-11-02.log` |
+| `make leaktest` (L1-L35) | 5543e7e | host (rubin, same kernel) | 183 passed, 30 failed (L34, 29 manifest), 1 skipped, 1 weak; summary and failing lines pasted by the maintainer, no log file kept | — |
+| `make leaktest` (L1-L35) | a1d238b | host (rubin, same kernel) | 182 passed, 31 failed (L34, L35, 29 manifest), 1 skipped, 1 weak; the log file was overwritten by the next run | — |
+| `make leaktest` after the L17b reaping edit | after f298ca5 | — | not run | — |
+| `hisn ls` 200x rapid (L14c) | f298ca5 | host (rubin) | PASS, 0 refusals (line in the f298ca5 log) | `docs/leaktest-host-2026-11-02.log` |
 | `x86_64-unknown-linux-musl` build + leak | — | not run | not run (stdlib not in build sandbox) | — |
 
-### Notes on the host run above
+What the f298ca5 log shows for the new tests (read from the log, not assumed):
+L14c 1 PASS; L17b 2 PASS (`--prune` removes a stale dir; a dir without
+`supervisor.pid` is not pruned); L33 4 PASS; L34 1 PASS; L35 1 PASS. Total
+passes 184 = the 175 of the 0.2.0 run + these 9. The one skip is L12
+(needs write access to `/etc`) and the one weak is L14 R5 (unit coverage only,
+P16); both lines are in the log.
 
-* Only the summary line was reported; the individual lines were not seen.  The
-  skip and the weak are *inferred* to be L12 (needs write access to `/etc`) and
-  L14 R5 (unit coverage only, P16), the same two as in the v0.1.0 run.
-* Not run on that host: `make lint && make test` after the last changes;
-  aarch64; any other kernel/distro.
+Not in L17b: the plan listed "a symlink planted inside a stale dir is not
+followed" and "`run` with the same id succeeds and the old dir is gone". The
+suite has no line for either (the `run` case is commented in `run.sh` but
+asserts nothing). They are covered by unit tests only and are **not**
+host-verified.
 
-### Notes on the 19af325 host run
+Causes of the two failed runs (fixed in `5543e7e` and `f298ca5`):
+
+* L34: `scrub_argv` writes `/proc/self/mem`. `5543e7e` moved it before
+  `PR_SET_DUMPABLE=0`, but it still ran after `landlock::apply`, and Landlock
+  has no write rule for `/proc`, so the open failed with EACCES and the scrub
+  silently did nothing. `f298ca5` runs it before Landlock. Unit tests:
+  `landlock::tests::proc_self_mem_is_not_writable_after_apply` and
+  `init::tests::scrub_argv_overwrites_cmdline`. The L34 assertion ignores NUL
+  padding and fails on any other content.
+* Manifest: `run.sh` records ids in `OUTPUT_LOG` as the bare test name
+  (`L1 stat ...`), without the `PASS  ` prefix, so the regex that expected the
+  prefix matched nothing. `f298ca5` matches the bare name.
+* L35: `--detach` and a command are mutually exclusive (`a1d238b`); fixed in
+  `5543e7e`, PASS since.
+
+### The `Getötet` line in the f298ca5 log
+
+The log contains one bash job-control line,
+`run.sh: line 125: <pid> Killed ... "$HISN" run --policy ... loop`
+(line 197 of the log, after the L17b `PASS` lines and before the L33 ones). It
+is the command line of `start_session`, so it is a *session supervisor* that
+was killed with SIGKILL. The only unreaped `kill -9` of a session in the
+suite is the deliberate one in L17b (`run.sh`, "SIGKILL the second
+supervisor"): L17b needs a supervisor that dies without cleaning up. Bash
+reports an unreaped background job that died of a signal at the next command
+boundary, which is why the message appears after the L17b lines. The other
+`kill -9` sites in `run.sh` are followed by `wait` or run in the EXIT trap.
+The 0.2.0 logs have no such line, and L17b is new in 0.2.1. A bash reproduction
+of kill-without-wait prints the same message and kill-then-`wait ... 2>/dev/null`
+prints nothing. The edit that adds the `wait` is *not yet host-verified*: the
+f298ca5 run predates it. The next host log should have no `Killed` line; if
+it still has one, the explanation above is wrong.
+
+### Notes on the 19af325 host run### Notes on the 19af325 host run
 
 * Full per-test log recorded; the skip is L12 (host-creates-secret-after-start,
   needs write access to /etc) and the weak is L14 R5 (unit coverage only, P16).

@@ -66,8 +66,8 @@ session before the command runs (fail closed).
 
 1. Write `setgroups=deny`, `uid_map`, `gid_map` (own single id); then wait for the supervisor's `GO` (it has opened `/proc/<init>/ns/*` by then).
 2. `prctl(PR_SET_PDEATHSIG, SIGKILL)` — init dies if the supervisor dies, so
-   no sandbox outlives its supervisor (invariant 3). Mark init
-   `PR_SET_DUMPABLE=0` (see §6).
+   no sandbox outlives its supervisor (invariant 3). (Init is marked
+   `PR_SET_DUMPABLE=0` only at the end of setup, step 12; see §6.)
 3. `mount(NULL, "/", MS_REC|MS_PRIVATE)` — no propagation in either direction.
 4. Mount tmpfs (`size=4m`) on `<session-dir>/root` (an empty dir created by the
    supervisor, 0700). This becomes the new root `R`; create `R/.old`.
@@ -85,6 +85,12 @@ session before the command runs (fail closed).
 9. `chdir(R)`, `pivot_root(R, R/.old)`, `chdir("/")`, `umount2("/.old",
    MNT_DETACH)`, `rmdir("/.old")` (invariant 1). Close every fd > 2 that is
    not the control channel (`close_range`).
+9b. Scrub argv: overwrite init's own argv memory with `hisn-init` (zero-filled
+    after it) and `PR_SET_NAME`, so the session id, policy path and session
+    dir are not readable from `/proc/1/cmdline` inside the sandbox. This runs
+    after `GO` and **before** Landlock, `PR_SET_DUMPABLE=0` and the capability
+    drop, because it writes `/proc/self/mem`, which Landlock (no write rule for
+    `/proc`) and a non-dumpable process both refuse (L34).
 10. Apply Landlock (§7), `setrlimit`s, `RLIMIT_CORE=0`, fresh session keyring.
 11. `PR_SET_NO_NEW_PRIVS`; clear ambient, drop **bounding**, clear
     inheritable/permitted/effective (**init itself ends up capless**, §6);

@@ -820,8 +820,12 @@ if start_session l17b-a-$$ "$L17B_CWD" "$L17B_POL"; then
   write_policy "$L17B2_POL" "$L17B2_CWD"
   if start_session l17b-b-$$ "$L17B2_CWD" "$L17B2_POL"; then
     L17B2_PID=$S_PID
-    # SIGKILL the second supervisor — it becomes stale
+    # SIGKILL the second supervisor — it becomes stale. The deliberate kill
+    # is reaped at once, with stderr discarded: an unreaped job makes bash
+    # print "<pid> Killed ..." at the next command boundary, which showed up
+    # as an unexplained line in the middle of a green log.
     kill -9 "$L17B2_PID" 2>/dev/null
+    wait "$L17B2_PID" 2>/dev/null
     sleep 0.5
     # ls shows it (not an error — it lists all dirs; stale is not an error)
     "$HISN" ls >/dev/null 2>&1

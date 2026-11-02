@@ -590,6 +590,35 @@ mod tests {
     }
 
     #[test]
+    fn stubs_use_the_host_username_not_a_constant() {
+        let mut f = facts();
+        f.username = "alice".into();
+        f.uid = 1234;
+        f.gid = 5678;
+        assert_eq!(
+            passwd_stub(&f, SANDBOX_HOME),
+            "alice:x:1234:5678:alice:/run/hisn/home:/bin/sh\n"
+        );
+        assert_eq!(group_stub(&f), "alice:x:5678:\n");
+        let ops = plan(&pol("/w"), &f, &[]).unwrap();
+        for (t, want) in [
+            (
+                "/etc/passwd",
+                "alice:x:1234:5678:alice:/run/hisn/home:/bin/sh\n",
+            ),
+            ("/etc/group", "alice:x:5678:\n"),
+        ] {
+            let o = ops.iter().find(|o| o.target == Path::new(t)).unwrap();
+            assert_eq!(
+                o.kind,
+                MountKind::Generated {
+                    content: want.into()
+                }
+            );
+        }
+    }
+
+    #[test]
     fn default_masks_match_the_brief() {
         for n in [
             "ssh",

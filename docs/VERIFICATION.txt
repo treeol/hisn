@@ -1,6 +1,6 @@
 # Verification record
 
-hisn version : 0.2.1
+hisn version : 0.2.2
 
 This file records what was actually run, where, and with what result.  No
 entry is "inferred": anything not backed by a log file or by a run in this
@@ -142,3 +142,18 @@ same kill-then-wait pattern.
   commit c4acf20).
 * musl targets do not compile (OPEN-POINTS P22); checked in the build sandbox
   with `cargo build --release --target x86_64-unknown-linux-musl`.
+
+### 0.2.2 host runs
+
+The 0.2.2 suite adds L1c (`tests/leak/MANIFEST` lists it): 4 checks (`id -un`,
+`$USER`, `$LOGNAME`, `getent passwd`, the last compared with the whole
+generated record) in each of 3 sessions (the suite's exec session, one started
+under `env -i`, one under `env -i USER=notme LOGNAME=notme`) = 12 new lines when `getent` is
+installed and the host user name is a portable one (otherwise a SKIP line
+replaces the affected checks).
+
+| check | commit | where | result | log file |
+|-------|--------|-------|--------|----------|
+| `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (x86_64 and aarch64) | this commit | sandbox | clean | -- |
+| `cargo test` (unit tests) | this commit | sandbox | 205 passed, 0 failed | -- |
+| `make leaktest` (L1-L35) | this commit | -- | **not run**; expected 198 passed (186 + the 12 L1c lines), 0 failed, 1 skipped (L12), 1 weak (L14 R5) | -- |

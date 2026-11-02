@@ -54,8 +54,8 @@ nproc  = 4096
 | `mounts.ro` / `.rw` | list of abs paths | `[]` | each must exist at session start; canonicalised; no symlinked final component accepted |
 | `mounts.mask` | list of abs paths | `[]` | paths that must lie inside another allowed tree; non-existent → skipped, logged |
 | `mounts.grantable_rw` | list of abs paths | `[]` | Landlock write prefixes for dynamic rw grants; also bounds `hisn grant --rw` |
-| `env.pass` | list of names | `[]` | `[A-Za-z_][A-Za-z0-9_]*`; cannot name `HOME` |
-| `env.set` | table name→string | `{}` | wins over `pass`; cannot set `HOME` |
+| `env.pass` | list of names | `[]` | `[A-Za-z_][A-Za-z0-9_]*`; cannot name `HOME` (`USER`/`LOGNAME` are accepted but ignored: the computed value wins, 0.2.2) |
+| `env.set` | table name→string | `{}` | wins over `pass`; cannot set `HOME` (`USER`/`LOGNAME` are accepted but overridden by the computed value, 0.2.2) |
 | `seccomp.extra_deny` | list of syscall names | `[]` | must be known for the build arch, else error |
 | `landlock.scoped` | list of `"signal"` \| `"abstract_unix_socket"` | `[]` | Landlock IPC scopes (ABI >= 6). Default empty (but `network = "host"` always adds `abstract_unix_socket`, see DESIGN §7; only `--allow-host-abstract-sockets` removes it): execs of the same session may signal each other and reach each other's abstract unix sockets (isolation is against the host, not between execs — P17). `"abstract_unix_socket"` is implied by `network = "host"` (required for host networking). No OCI equivalent; carried as annotation `org.hisn.landlock.scoped=…` |
 | `limits.nofile` / `.nproc` | u64 | 65536 / 4096 | `RLIMIT_NOFILE` / `RLIMIT_NPROC`; ≥ 1 |
@@ -75,7 +75,7 @@ function of it plus a snapshot of which default toolchain paths exist.
 Toolchain ro binds (`/usr /bin /sbin /lib /lib32 /lib64 /opt /nix`, only
 existing), the allowlist `/etc` view and its default masks (DESIGN §4.2), tmpfs sizes, `/dev` node list,
 the seccomp base denylist, capability set (empty), `no_new_privs`, and the
-env allowlist base (`PATH HOME TERM LANG LC_* TZ`). The brief's DO NOT ALTER
+env allowlist base (`PATH HOME TERM LANG LC_* TZ`; `USER` and `LOGNAME` are not passed through but computed as the host user name, 0.2.2). The brief's DO NOT ALTER
 invariants forbid weakening them from policy; `seccomp.extra_deny` can only
 add.
 
@@ -142,7 +142,7 @@ response line per request, in order. Max line 64 KiB.
 | `list` | — | `{"ok":true,"grants":[{"path","mode","recursive","mount_id","ts"}]}` |
 | `inspect` | — | `{"ok":true,"mountinfo":"<text of /proc/<init>/mountinfo>","policy":"<resolved toml>","supervisor_fds":N}` (`supervisor_fds`: the supervisor's own open-descriptor count, reported because `/proc/<supervisor>/fd` is not readable from outside; used by leak test L19, `null` if it could not be counted) |
 | `kill` | `signal` (name or number; default `TERM`) | `{"ok":true}` |
-| `exec` | `argv` (1-4096 entries), `cwd` (abs or null; default the session cwd), `env` (`K`→`V`; every key must be in `env.pass` and not be computed (`HOME`, `XDG_*`, `CARGO_HOME`, `GOMODCACHE`, `GOCACHE`, `npm_config_cache`, `PIP_CACHE_DIR`) — otherwise the **whole request is refused**), `tty` (bool; default false) | first `{"ok":true,"pid":N,"exec_id":"e-n"}` (N = pid **inside the sandbox pid ns**, a handle for `signal`; `exec_id` is the preferred handle, 0.2.1), then on exit `{"exit":{"code":N}}` / `{"exit":{"signal":"TERM"}}` / `{"exit":{"lost":true}}` (monitor gone: status unknown). Failures: `E_BAD_REQUEST` (validation, rejected env keys — names only), `E_EXEC` (confinement failed or `execve`), `E_INTERNAL`. The request line travels with `SCM_RIGHTS` fds in the same message: 3 (stdin/stdout/stderr) or, with `tty`, exactly 1 (the slave of a **pty the client allocated** — never the caller's terminal). Fds are accepted only on the first request line of a connection and only for `exec`. Closing the connection cancels: `TERM`, then `KILL` after 5 s. Confinement is re-applied identically to `execve` (DESIGN §14.4): the program is indistinguishable from the original command. |
+| `exec` | `argv` (1-4096 entries), `cwd` (abs or null; default the session cwd), `env` (`K`→`V`; every key must be in `env.pass` and not be computed (`HOME`, `USER`, `LOGNAME`, `XDG_*`, `CARGO_HOME`, `GOMODCACHE`, `GOCACHE`, `npm_config_cache`, `PIP_CACHE_DIR`) — otherwise the **whole request is refused**), `tty` (bool; default false) | first `{"ok":true,"pid":N,"exec_id":"e-n"}` (N = pid **inside the sandbox pid ns**, a handle for `signal`; `exec_id` is the preferred handle, 0.2.1), then on exit `{"exit":{"code":N}}` / `{"exit":{"signal":"TERM"}}` / `{"exit":{"lost":true}}` (monitor gone: status unknown). Failures: `E_BAD_REQUEST` (validation, rejected env keys — names only), `E_EXEC` (confinement failed or `execve`), `E_INTERNAL`. The request line travels with `SCM_RIGHTS` fds in the same message: 3 (stdin/stdout/stderr) or, with `tty`, exactly 1 (the slave of a **pty the client allocated** — never the caller's terminal). Fds are accepted only on the first request line of a connection and only for `exec`. Closing the connection cancels: `TERM`, then `KILL` after 5 s. Confinement is re-applied identically to `execve` (DESIGN §14.4): the program is indistinguishable from the original command. |
 | `signal` | `exec_id` (preferred, 0.2.1) or `pid` (deprecated, kept for 0.2 clients), `signal` (name or number; default `TERM`) | `{"ok":true}` — delivered to the program's process group. `E_NOT_FOUND` for a stale `exec_id`, a recycled `pid`, or a pid that is not a live exec of this session. |
 
 Error response: `{"ok":false,"error":"<CODE>","message":"..."}` with codes

@@ -36,11 +36,11 @@ pub struct ScrubbedEnv {
     pub secretish_passed: Vec<String>,
 }
 
-/// Names the session computes itself (`HOME` and the cache variables): they
-/// can neither be passed through nor overridden, by `env.pass` or by an
-/// `exec` request (DESIGN §14.5).
+/// Names the session computes itself (`HOME`, `USER`, `LOGNAME` and the cache
+/// variables): they can neither be passed through nor overridden, by
+/// `env.pass`, `env.set` or an `exec` request (DESIGN §14.5).
 pub fn is_computed(name: &str) -> bool {
-    name == "HOME" || CACHE_VARS.iter().any(|(n, _)| *n == name)
+    matches!(name, "HOME" | "USER" | "LOGNAME") || CACHE_VARS.iter().any(|(n, _)| *n == name)
 }
 
 pub fn looks_secret(name: &str) -> bool {
@@ -66,10 +66,12 @@ pub fn filter_path(host_path: Option<&str>, visible: impl Fn(&Path) -> bool) -> 
 /// Build the child environment.
 ///
 /// `host` is the host environment (iterated only for the allowlist);
-/// `path_visible` decides which host `PATH` entries exist inside the sandbox.
+/// `username` is the sandbox user name (the one in the generated
+/// `/etc/passwd`; never read from `host`); `path_visible` decides which host `PATH` entries exist inside the sandbox.
 pub fn scrub<'a>(
     policy: &ResolvedPolicy,
     host: impl IntoIterator<Item = (&'a str, &'a str)>,
+    username: &str,
     path_visible: impl Fn(&Path) -> bool,
 ) -> ScrubbedEnv {
     let host: BTreeMap<&str, &str> = host.into_iter().collect();
@@ -107,8 +109,11 @@ pub fn scrub<'a>(
         vars.insert(k.clone(), v.clone());
     }
 
-    // 4. Computed variables; HOME and the cache dirs cannot be overridden.
+    // 4. Computed variables; HOME, USER, LOGNAME and the cache dirs cannot be
+    //    overridden (they replace anything `env.pass`/`env.set` produced).
     vars.insert("HOME".into(), SANDBOX_HOME.into());
+    vars.insert("USER".into(), username.to_owned());
+    vars.insert("LOGNAME".into(), username.to_owned());
     for (name, sub) in CACHE_VARS {
         vars.insert(name.into(), format!("{SANDBOX_HOME}/{sub}"));
     }
@@ -172,13 +177,12 @@ mod tests {
 
     #[test]
     fn host_secrets_not_in_pass_are_absent() {
-        let e = scrub(&pol(&["GOFLAGS"], &[]), HOST, visible);
+        let e = scrub(&pol(&["GOFLAGS"], &[]), HOST, "alice", visible);
         for gone in [
             "AWS_SECRET_ACCESS_KEY",
             "GITHUB_TOKEN",
             "SSH_AUTH_SOCK",
             "API_KEY",
-            "USER",
             "RUSTFLAGS",
             "LCX",
         ] {
@@ -189,7 +193,7 @@ mod tests {
 
     #[test]
     fn only_documented_names_reach_the_child() {
-        let e = scrub(&pol(&[], &[]), HOST, visible);
+        let e = scrub(&pol(&[], &[]), HOST, "alice", visible);
         let mut keys: Vec<&str> = e.vars.keys().map(String::as_str).collect();
         keys.sort_unstable();
         let mut want = vec![
@@ -199,10 +203,12 @@ mod tests {
             "HOME",
             "LANG",
             "LC_ALL",
+            "LOGNAME",
             "PATH",
             "PIP_CACHE_DIR",
             "TERM",
             "TZ",
+            "USER",
             "XDG_CACHE_HOME",
             "XDG_CONFIG_HOME",
             "XDG_DATA_HOME",
@@ -214,7 +220,7 @@ mod tests {
 
     #[test]
     fn home_is_forced_and_caches_live_under_it() {
-        let e = scrub(&pol(&[], &[]), HOST, visible);
+        let e = scrub(&pol(&[], &[]), HOST, "alice", visible);
         assert_eq!(e.vars["HOME"], SANDBOX_HOME);
         for (n, _) in CACHE_VARS {
             assert!(
@@ -226,6 +232,28 @@ mod tests {
     }
 
     #[test]
+    fn user_and_logname_are_computed_not_taken_from_the_host_or_policy() {
+        // The host env says USER=u; the sandbox name is the argument.
+        let e = scrub(&pol(&[], &[]), HOST, "alice", visible);
+        assert_eq!(e.vars["USER"], "alice");
+        assert_eq!(e.vars["LOGNAME"], "alice");
+        // Neither env.pass nor env.set can override them (a 0.2.1 policy that
+        // lists USER keeps loading; the computed value wins).
+        let e = scrub(
+            &pol(&["USER", "LOGNAME"], &[("LOGNAME", "root")]),
+            HOST,
+            "alice",
+            visible,
+        );
+        assert_eq!(e.vars["USER"], "alice");
+        assert_eq!(e.vars["LOGNAME"], "alice");
+        // A scrubbed host environment (no USER at all) still yields both.
+        let e = scrub(&pol(&[], &[]), [("PATH", "/usr/bin")], "alice", visible);
+        assert_eq!(e.vars["USER"], "alice");
+        assert_eq!(e.vars["LOGNAME"], "alice");
+    }
+
+    #[test]
     fn set_beats_pass_but_cannot_override_computed_vars() {
         let e = scrub(
             &pol(
@@ -233,6 +261,7 @@ mod tests {
                 &[("GOFLAGS", "-x"), ("CARGO_HOME", "/evil"), ("CI", "1")],
             ),
             HOST,
+            "alice",
             visible,
         );
         assert_eq!(e.vars["GOFLAGS"], "-x");
@@ -241,7 +270,9 @@ mod tests {
     }
 
     #[test]
-    fn computed_names_are_exactly_home_and_the_cache_vars() {
+    fn computed_names_are_exactly_home_user_logname_and_the_cache_vars() {
+        assert!(is_computed("USER") && is_computed("LOGNAME"));
+        assert!(!is_computed("user") && !is_computed("LOGIN"));
         assert!(
             is_computed("HOME") && is_computed("CARGO_HOME") && is_computed("npm_config_cache")
         );
@@ -253,7 +284,7 @@ mod tests {
 
     #[test]
     fn pass_of_unset_name_is_noop() {
-        let e = scrub(&pol(&["NOT_SET_ANYWHERE"], &[]), HOST, visible);
+        let e = scrub(&pol(&["NOT_SET_ANYWHERE"], &[]), HOST, "alice", visible);
         assert!(!e.vars.contains_key("NOT_SET_ANYWHERE"));
     }
 
@@ -262,6 +293,7 @@ mod tests {
         let e = scrub(
             &pol(&["GITHUB_TOKEN", "GOFLAGS", "UNSET_TOKEN"], &[]),
             HOST,
+            "alice",
             visible,
         );
         assert_eq!(e.secretish_passed, vec!["GITHUB_TOKEN".to_owned()]);
@@ -275,7 +307,7 @@ mod tests {
 
     #[test]
     fn path_is_filtered_to_visible_entries() {
-        let e = scrub(&pol(&[], &[]), HOST, visible);
+        let e = scrub(&pol(&[], &[]), HOST, "alice", visible);
         assert_eq!(e.vars["PATH"], "/usr/local/bin:/usr/bin:/bin");
         assert_eq!(
             filter_path(Some("/home/u/bin:relative:/nope"), visible),
@@ -286,7 +318,7 @@ mod tests {
 
     #[test]
     fn missing_host_vars_do_not_appear() {
-        let e = scrub(&pol(&[], &[]), [("PATH", "/usr/bin")], visible);
+        let e = scrub(&pol(&[], &[]), [("PATH", "/usr/bin")], "alice", visible);
         assert!(!e.vars.contains_key("TERM") && !e.vars.contains_key("LANG"));
         assert_eq!(e.vars["PATH"], "/usr/bin");
     }

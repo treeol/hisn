@@ -78,7 +78,8 @@ session before the command runs (fail closed).
    from the host).
 6. Mount new `/proc` (see §4.3 caveat), `/dev` tmpfs + device bind-mounts +
    new devpts, `/tmp`, `/run`, `$HOME` tmpfs (or the persistent home bind).
-7. Generate `/etc/passwd`, `/etc/group` (mapped uid only), `/etc/resolv.conf`
+7. Generate `/etc/passwd`, `/etc/group` (mapped uid only; the user name is
+   the host's `getpwuid_r(euid)` name, §8), `/etc/resolv.conf`
    (only for `network = "host"`) in `R/.stage`, bind over the `/etc` entries,
    unlink the staging names (the bind keeps the inode alive).
 8. `sethostname`; for `network = "none"` bring `lo` up (`SIOCSIFFLAGS`).
@@ -314,6 +315,24 @@ the sandbox (under a mounted prefix), falling back to
 always the sandbox home. A name in `env.pass` that looks secret (`*TOKEN*`,
 `*SECRET*`, `*KEY*`, `*PASSWORD*`) is allowed but logged at warn level.
 `env.set` wins over `env.pass`; neither can override `HOME`.
+
+`USER` and `LOGNAME` are also **computed** (0.2.2): both are set to the user
+name of the generated `/etc/passwd` and `/etc/group` stubs, which is the name
+`getpwuid_r(geteuid())` returns on the host (NSS applies), looked up once at
+session start by the supervisor — never read from the host `$USER`, so a
+scrubbed launch environment (`env -i`, Wakil) gives the same result. It is
+used only if it is 1–32 characters of `[A-Za-z0-9_.-]` and does not start with
+`-`; if the lookup fails or the name is unusable the name is `user`, and
+`hisn run -v` prints why. Unlike `HOME`, a policy that lists them in `env.pass` / `env.set` is not a
+load error (0.2.1 policies keep loading); the computed value simply wins. An
+`exec` request naming either is refused like one naming `HOME`. Disclosure:
+under a scrubbed launch environment 0.2.1 showed the placeholder `user`; 0.2.2
+shows the host login name (the same name `id -un` prints for that user), in
+`/etc/passwd`, `/etc/group` and the two variables. No other field of the host
+passwd entry (home, shell, GECOS) is copied. The lookup runs in the supervisor
+before the sandbox is created; descriptors NSS may leave open do not reach the
+sandbox (init closes every descriptor but its channel, `init.rs`), but it may
+block on a slow user-database backend, which 0.2.1 never queried.
 
 ## 9. Control socket, session dir, and what must never be mounted
 
@@ -709,7 +728,7 @@ the number of fds; unknown JSON keys are errors (as for every op).
 Final environment = the session's base environment (what init gave the main
 command: allowlist + `env.pass` + `env.set` + computed `HOME`/cache vars) with
 the request's `env` applied on top. A request key is **accepted only if it is
-in `env.pass`** and is not a computed name (`HOME`, `XDG_*`, `CARGO_HOME`,
+in `env.pass`** and is not a computed name (`HOME`, `USER`, `LOGNAME`, `XDG_*`, `CARGO_HOME`,
 `GOMODCACHE`, `GOCACHE`, `npm_config_cache`, `PIP_CACHE_DIR`). Any other key
 rejects the **whole request** (`E_BAD_REQUEST`, message lists the keys, never
 the values); nothing is dropped silently. Names must be non-empty, without `=`

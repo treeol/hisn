@@ -1282,6 +1282,22 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e, Invalid::RejectedEnvKeys(vec!["HOME".into()]));
+        // USER/LOGNAME are computed too, even when listed in env.pass.
+        let mut r = rules();
+        r.env_pass.extend(["USER".into(), "LOGNAME".into()]);
+        let e = validate(
+            argv(&["x"]),
+            None,
+            env(&[("USER", "root"), ("LOGNAME", "root")]),
+            false,
+            3,
+            &r,
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            Invalid::RejectedEnvKeys(vec!["LOGNAME".into(), "USER".into()])
+        );
         let mut r = rules();
         r.env_pass.push("CARGO_HOME".into());
         assert!(

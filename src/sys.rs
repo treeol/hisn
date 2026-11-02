@@ -279,6 +279,53 @@ pub fn mnt_id(dirfd: RawFd, path: &CStr, flags: c_int) -> io::Result<u64> {
     Ok(st.stx_mnt_id)
 }
 
+/// Login name of `uid` from the host's user database (`getpwuid_r`, so NSS
+/// applies). `Ok(None)`: no such user. The caller validates the name before
+/// using it anywhere (it ends up in a generated `/etc/passwd`).
+pub fn passwd_name(uid: u32) -> io::Result<Option<String>> {
+    const MAX_BUF: usize = 1 << 20;
+    // SAFETY: sysconf has no preconditions; -1 means "no limit known".
+    let hint = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut buf = vec![0u8; usize::try_from(hint).unwrap_or(0).clamp(1024, 16384)];
+    loop {
+        // SAFETY: an all-zero `passwd` (null pointers, zero ints) is a valid
+        // value; getpwuid_r overwrites it before we read it.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `pwd`, `buf` and `result` are live for the call and `buf`
+        // is described by its true length.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < MAX_BUF {
+            buf.resize((buf.len() * 2).min(MAX_BUF), 0);
+            continue;
+        }
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        if result.is_null() {
+            return Ok(None);
+        }
+        if pwd.pw_name.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: on success `pw_name` points at a NUL-terminated string
+        // inside `buf`, which outlives this borrow (copied out immediately).
+        let name = unsafe { CStr::from_ptr(pwd.pw_name) };
+        return name
+            .to_str()
+            .map(|n| Some(n.to_owned()))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "user name is not UTF-8"));
+    }
+}
+
 /// Inode of `/proc/<pid>/ns/<name>` — identifies the namespace.
 pub fn ns_inode(pid: i32, name: &str) -> io::Result<u64> {
     use std::os::unix::fs::MetadataExt;

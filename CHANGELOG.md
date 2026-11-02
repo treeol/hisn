@@ -7,6 +7,32 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2]
+
+### Fixed
+- **User name inside the sandbox.** 0.2.1 took the name for `/etc/passwd` and
+  `/etc/group` from `$USER`, which a scrubbed launch environment (Wakil,
+  `env -i`) does not have, so `id -un` and `echo $USER` showed `user`. The name
+  now comes from `getpwuid_r(geteuid())` (fallback `user` only if the lookup
+  fails or the name is unusable; `hisn run -v` logs why).
+
+### Changed
+- `USER` and `LOGNAME` are set in the sandbox environment, computed from that
+  name, like `HOME`: never copied from the host environment, and `env.pass`,
+  `env.set` and `exec` requests cannot override them (an `exec` request naming
+  them is refused as a computed name). POLICY-SPEC and DESIGN §8 updated.
+  A 0.2.1 policy yields the same mount plan. Differences: the two new
+  variables; the content of the generated `/etc/passwd` / `/etc/group` (host
+  login name instead of the placeholder `user` under a scrubbed launch
+  environment); a policy that set `USER`/`LOGNAME` now loses to the computed
+  value. Session start now queries the host user database once
+  (`getpwuid_r`), which can be slow with an unreachable network backend.
+
+### Tests
+- Leak test L1c (`id -un`, `$USER`, `$LOGNAME`, `getent passwd` show the host
+  user, also for a session started under `env -i`); unit tests for the lookup
+  and fallback, stub generation and the computed names.
+
 ## [0.2.1]
 
 ### Added

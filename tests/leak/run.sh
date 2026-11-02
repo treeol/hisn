@@ -480,6 +480,65 @@ if HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/
       printf '%s' "$out"
     }
 
+    # ---- L1c: the user name inside the sandbox is the host user's (0.2.2)
+    # `id -un`, $USER, $LOGNAME and getent all show the name the host's user
+    # database gives this uid -- also when the session was started from an
+    # `env -i` environment that has no USER at all.
+    HOST_UN=$(id -un 2>/dev/null)
+    L1C_ID=$(command -v id); L1C_SH=$(command -v sh); L1C_GETENT=$(command -v getent)
+    l1c_probe() { # l1c_probe SESSION LABEL
+      local sess=$1 label=$2 got
+      got=$(timeout 30 "$HISN" exec --session "$sess" -- "$L1C_ID" -un </dev/null 2>&1)
+      eq "L1c $label id -un is the host user" "$got" "$HOST_UN"
+      got=$(timeout 30 "$HISN" exec --session "$sess" -- "$L1C_SH" -c 'printf %s "$USER"' </dev/null 2>&1)
+      eq "L1c $label \$USER is the host user" "$got" "$HOST_UN"
+      got=$(timeout 30 "$HISN" exec --session "$sess" -- "$L1C_SH" -c 'printf %s "$LOGNAME"' </dev/null 2>&1)
+      eq "L1c $label \$LOGNAME is the host user" "$got" "$HOST_UN"
+      if [ -n "$L1C_GETENT" ]; then
+        # The whole generated record, not just the name: host home, shell and
+        # GECOS must not appear.
+        got=$(timeout 30 "$HISN" exec --session "$sess" -- "$L1C_GETENT" passwd "$(id -u)" </dev/null 2>&1)
+        eq "L1c $label getent passwd is the generated record" "$got" "$HOST_UN:x:$(id -u):$(id -g):$HOST_UN:/run/hisn/home:/bin/sh"
+      else
+        skip "L1c $label getent" "getent not installed on this host"
+      fi
+    }
+    # l1c_env_session TAG LABEL ENVVARS... : start a detached session under
+    # `env -i` plus ENVVARS, probe it, kill it.
+    l1c_env_session() {
+      local tag=$1 label=$2 pid ready=0 i
+      shift 2
+      local xdg=()
+      [ -n "${XDG_RUNTIME_DIR:-}" ] && xdg=("XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
+      local cx; cx=$(new_cwd "l1c$tag")
+      write_policy "$WORK/L1c-$tag.toml" "$cx"
+      env -i "${xdg[@]}" "$@" "$HISN" run --policy "$WORK/L1c-$tag.toml" --session-id "l1c$tag-$$" --detach \
+        </dev/null >"$WORK/l1c$tag.out" 2>"$WORK/l1c$tag.err" & pid=$!
+      SESSIONS+=("$pid")
+      for i in $(seq 1 150); do
+        "$HISN" ls --json 2>/dev/null | grep -q "l1c$tag-$$" && { ready=1; break; }
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      if [ "$ready" = 1 ]; then
+        l1c_probe "l1c$tag-$$" "$label"
+        timeout 30 "$HISN" kill --session "l1c$tag-$$" </dev/null >/dev/null 2>&1
+      else
+        fail "L1c $label session start" "did not start: $(head -c 300 "$WORK/l1c$tag.err")"
+      fi
+      kill "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+    }
+    if ! printf '%s' "$HOST_UN" | grep -Eq '^[A-Za-z0-9_.][A-Za-z0-9_.-]{0,31}$'; then
+      skip "L1c user name" "host user name [$HOST_UN] is outside the portable set; the sandbox uses the fallback"
+    else
+      l1c_probe "xdet-$$" "(suite environment)"
+      # No USER/LOGNAME reach hisn at all.
+      l1c_env_session a "(env -i, no USER)"
+      # A false USER/LOGNAME at launch must not be believed.
+      l1c_env_session b "(env -i, USER=notme LOGNAME=notme)" USER=notme LOGNAME=notme
+    fi
+
     # ---- L15: every L1/L3/L4/L5/L9/L10 probe passes identically via exec
     for p in /home /root /tankz /var /etc/shadow /etc/ssh "$HOME/.ssh" "$HOME/.aws"; do
       got=$(exq stat "$p")

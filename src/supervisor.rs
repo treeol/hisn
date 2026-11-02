@@ -696,17 +696,53 @@ impl Handler for Ctl {
 
 // --------------------------------------------------------------------- run
 
-fn getids() -> (u32, u32, String) {
+/// Longest user name accepted for the sandbox stubs (`useradd` limit).
+const MAX_USERNAME: usize = 32;
+
+/// Fallback when the host user cannot be named.
+const FALLBACK_USERNAME: &str = "user";
+
+/// May `n` be written into the generated `/etc/passwd` and `/etc/group`
+/// and exported as `USER`/`LOGNAME`? Conservative on purpose: no `:`,
+/// newline, whitespace or `/`, so a hostile NSS entry cannot add a line or a
+/// field to the stubs.
+fn valid_username(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= MAX_USERNAME
+        && !n.starts_with('-')
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Turn a user-database lookup into the sandbox user name. The second value
+/// is why the fallback was used (logged at `-v`). Pure: unit-tested.
+fn pick_username(lookup: io::Result<Option<String>>) -> (String, Option<String>) {
+    let why = match lookup {
+        Ok(Some(n)) if valid_username(&n) => return (n, None),
+        Ok(Some(n)) => format!(
+            "host user name is not usable in /etc/passwd ({} bytes, unsupported characters or length)",
+            n.len()
+        ),
+        Ok(None) => "no passwd entry for the host uid".to_owned(),
+        Err(e) => format!("getpwuid_r failed: {e}"),
+    };
+    (FALLBACK_USERNAME.to_owned(), Some(why))
+}
+
+/// Host uid, gid and the user name shown inside the sandbox. The name comes
+/// from the user database (`getpwuid_r` on the effective uid), never from
+/// `$USER`: a scrubbed launch environment (Wakil, `env -i`) has none.
+fn getids(verbose: u8) -> (u32, u32, String) {
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
-    let name = std::env::var("USER")
-        .ok()
-        .filter(|u| {
-            !u.is_empty()
-                && u.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        })
-        .unwrap_or_else(|| "user".into());
+    let euid = rustix::process::geteuid().as_raw();
+    let (name, why) = pick_username(sys::passwd_name(euid));
+    if verbose > 0 {
+        match why {
+            Some(w) => eprintln!("hisn: username: using {name:?}: {w}"),
+            None => eprintln!("hisn: username: {name:?} (getpwuid_r uid {euid})"),
+        }
+    }
     (uid, gid, name)
 }
 
@@ -816,7 +852,7 @@ pub fn open_fd_count() -> io::Result<usize> {
 
 /// Exit code of `hisn run`.
 pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32> {
-    let (uid, gid, username) = getids();
+    let (uid, gid, username) = getids(verbose);
     let prep = prepare(&args, uid)?;
     let policy = prep.policy;
     if !args.grants.iter().all(|g| !g.is_empty()) {
@@ -872,6 +908,7 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         prep.roots,
         uid,
         gid,
+        &facts.username,
         allow_host_abstract,
         verbose,
     );
@@ -889,6 +926,7 @@ fn run_session(
     roots: Vec<PathBuf>,
     uid: u32,
     gid: u32,
+    username: &str,
     allow_host_abstract: bool,
     verbose: u8,
 ) -> Result<i32> {
@@ -927,6 +965,7 @@ fn run_session(
     let scrub = senv::scrub(
         &policy,
         host_env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        username,
         visible,
     );
     for n in &scrub.secretish_passed {
@@ -1374,6 +1413,53 @@ pub fn client_request(session_id: &str, req: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn username_comes_from_the_lookup_and_falls_back_with_a_reason() {
+        let (n, why) = pick_username(Ok(Some("alice".into())));
+        assert_eq!((n.as_str(), why), ("alice", None));
+        for bad in [
+            "",
+            "a:b",
+            "a\nroot:x:0:0::/:/bin/sh",
+            "a b",
+            "a/b",
+            "-x",
+            &"x".repeat(MAX_USERNAME + 1),
+        ] {
+            let (n, why) = pick_username(Ok(Some(bad.into())));
+            assert_eq!(n, "user", "{bad:?}");
+            assert!(why.is_some(), "{bad:?}");
+        }
+        let (n, why) = pick_username(Ok(None));
+        assert_eq!(n, "user");
+        assert!(why.unwrap().contains("no passwd entry"));
+        let (n, why) = pick_username(Err(io::Error::from_raw_os_error(libc::EIO)));
+        assert_eq!(n, "user");
+        assert!(why.unwrap().contains("getpwuid_r failed"));
+        assert!(valid_username(&"x".repeat(MAX_USERNAME)) && valid_username("a.b_c-d9"));
+    }
+
+    #[test]
+    fn passwd_name_of_the_current_uid_matches_id_un() {
+        // `id -un` is the reference; skip quietly where it is unavailable or
+        // the uid has no passwd entry (some CI containers).
+        let Ok(out) = std::process::Command::new("id").arg("-un").output() else {
+            return;
+        };
+        if !out.status.success() {
+            return;
+        }
+        let want = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+        let euid = rustix::process::geteuid().as_raw();
+        assert_eq!(
+            sys::passwd_name(euid).unwrap().as_deref(),
+            Some(want.as_str())
+        );
+        // An absent uid is Ok(None) (some NSS backends report an error
+        // instead); either way it is never a name.
+        assert!(!matches!(sys::passwd_name(4_000_000_123), Ok(Some(_))));
+    }
+
     use super::*;
     use crate::policy::Home;
 

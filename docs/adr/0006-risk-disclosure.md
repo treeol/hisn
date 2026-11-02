@@ -30,12 +30,13 @@ By the feature, not the author:
 - `[[forward]]` of the Docker socket (or a recognized rootless-podman
   socket) → `root-equivalent` (always; the Docker daemon is root).
 - `[[forward]]` of the D-Bus system or session bus → `host-exec` (always).
-- `[[forward]]` / `[[host_services]]` of **any other socket** → `host-exec`
-  by default (round-1 BLOCKING: hisn cannot know what protocol an arbitrary
+- `[[forward]]` / `[[host_services]]` of **an unrecognised socket** → **load
+  error** (round-2 BLOCKING: hisn cannot know what protocol an arbitrary
   inode speaks; a forwarded socket is as powerful as its server, so an
-  unknown socket defaults to the strongest non-root label and requires
-  `risk_ack`). The profile may **downgrade** the label only for a recognized
-  socket path pattern; an unrecognized socket cannot be labelled `none` or
+  unknown socket is rejected unless the profile sets `risk` explicitly —
+  minimum `host-exec`, documenting that the author asserts the server is
+  not root). The profile may **downgrade** the label only for a recognised
+  socket path pattern; an unrecognised socket cannot be labelled `none` or
   `data` without an explicit `[forward] risk = "data"` that hisn accepts
   against a known pattern.
 - `[[host_services]]` → `data` (it starts a host process; the exposure is

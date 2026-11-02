@@ -567,10 +567,18 @@ that can do a powerful thing on the host."
   - allowlists **key fingerprints** (the profile lists
     `[ssh] allow_keys = ["SHA256:…"]`); other keys in the host agent are
     invisible.
-  - is **sign-only**: `SSH_AGENTC.SSH_AGENTC_SIGN_REQUEST` is allowed; all
-    other agent operations (`SSH_AGENTC_ADD_IDENTITY`, `REMOVE_*`,
-    `LOCK`/`UNLOCK`, `LIST_IDS`) are denied. The sandbox cannot add or remove
-    keys or lock the agent.
+  - **is sign-only with filtered identity listing** (round-2 BLOCKING):
+    `SSH_AGENTC.SSH_AGENTC_SIGN_REQUEST` is allowed;
+    `SSH_AGENTC.SSH_AGENTC_REQUEST_IDENTITIES` (`LIST_IDS`) is **also**
+    allowed — but the proxy **filters the reply** to only `allow_keys`
+    fingerprints, so non-allowlisted keys are **invisible** (that is how
+    invisibility is enforced, not by denying the op outright — a denied
+    `LIST_IDS` proves nothing about what keys the agent holds);
+    `SSH_AGENTC_ADD_IDENTITY`, `REMOVE_*`, `LOCK`/`UNLOCK` are denied;
+    `SSH_AGENTC_EXTENSION` is allowed only for
+    `session-bind@openssh.com` and `query` (required for `ssh-add -h`
+    constrained keys to sign via the per-session agent). The sandbox cannot
+    add or remove keys or lock the agent.
   - **restricts the auth target — but not by parsing the signed blob.** The
     signed blob in the ssh-agent protocol is the SSH protocol's session data,
     not a directly authenticated destination hostname; and git SSH signing
@@ -584,6 +592,13 @@ that can do a powerful thing on the host."
     restriction, where needed, is enforced by using a **per-session agent
     with destination-constrained keys** (`ssh-add -h`, below) — the
     constraint is enforced by the agent, not the proxy's parser.
+    **Constrained keys cannot do `ssh-keygen -Y sign`** (round-2 BLOCKING):
+    `ssh-keygen -Y sign` does not go through the agent at all — it calls the
+    key directly — so git commit signing via SSHSIG with a constrained key
+    needs a separate **unconstrained** key in `allow_keys` for signing, or
+    the proxy's `SIGN_REQUEST` path with an unconstrained key. A constrained
+    key is for ssh login / `git push` over ssh, not for `git commit -S` with
+    an SSH signing key.
   - **per-signature audit**: every sign request logs (fingerprint, timestamp)
     to `<session>/ssh-proxy.jsonl`. Never the blob.
   Risk label: `signing`. `risk_ack = "signing"` required.
@@ -593,13 +608,15 @@ that can do a powerful thing on the host."
     printed at every start. Not the default.
 
 **Per-session agent with destination-constrained keys (`ssh-add -h`):**
-OpenSSH 9.6+ `ssh-add -h` loads a key that is constrained to specific
-destinations. The profile can ask hisn to `ssh-add -h` a dedicated key into a
-fresh per-session agent that the proxy then forwards. This is the
-**enforceable** host-restriction mechanism (round-1 BLOCKING: the constraint
-is enforced by the agent, not by the proxy parsing the signed blob). T1
-supports it (`[ssh] per_session_agent = true`); the proxy forwards to the
-per-session agent, not the host one.
+OpenSSH **8.9+** `ssh-add -h` loads a key that is constrained to specific
+destinations (round-2 BLOCKING: destination constraints exist since OpenSSH
+8.9, not 9.6; the ssh client inside the sandbox must be >= 8.9 for the
+constraint to be enforced). The profile can ask hisn to `ssh-add -h` a
+dedicated key into a fresh per-session agent that the proxy then forwards.
+This is the **enforceable** host-restriction mechanism (round-1 BLOCKING: the
+constraint is enforced by the agent, not by the proxy parsing the signed
+blob). T1 supports it (`[ssh] per_session_agent = true`); the proxy forwards
+to the per-session agent, not the host one.
 
 **FIDO `sk-` keys:** a FIDO key (`sk-ssh-ed25519@…`) may require a physical
 touch for each signature. The proxy can require `[ssh] require_fido = true`,
@@ -637,16 +654,17 @@ label** from a closed set:
 A capability's label is **fixed by the feature**, not chosen by the profile
 author: `docker = "socket"` is always `root-equivalent`; `nested_userns = true`
 is always `kernel-surface`; a `[[forward]]` of an ssh agent is always
-`signing`; a `[[forward]]` of the Docker socket (or a recognized rootless-
+`signing`; a `[[forward]]` of the Docker socket (or a recognised rootless-
 podman socket) is always `root-equivalent`; a `[[forward]]` of the D-Bus
-system or session bus is always `host-exec`; **a `[[forward]]` of any other
-socket defaults to `host-exec`** (round-1 BLOCKING: hisn cannot know what
+system or session bus is always `host-exec`; **a `[[forward]]` of an
+unrecognised socket is a load error** (round-2 BLOCKING: hisn cannot know what
 protocol an arbitrary inode speaks; a forwarded socket is as powerful as its
-server, so an unknown socket defaults to the strongest non-root label and
-requires `risk_ack`). The author declares the *capability*; hisn computes the
-*label*; an unknown socket cannot be labelled `none` or `data` without an
-explicit `[forward] risk = "data"` that hisn accepts against a known path
-pattern.
+server, so an unknown socket is rejected unless the profile sets `risk`
+explicitly — minimum `host-exec`, documenting that the author asserts the
+server is not root — or matches a known path pattern that hisn recognises).
+The author declares the *capability*; hisn computes the *label*; an unknown
+socket cannot be labelled `none` or `data` without an explicit
+`[forward] risk = "data"` that hisn accepts against a known path pattern.
 
 ### Behaviour
 
@@ -711,9 +729,16 @@ the declared binds, no other sockets, no extra mounts in `inspect`).
   → `EROFS`; `~/.ssh` is absent.
 - **L27** (ssh-proxy): a sign request with an allowlisted key succeeds; a
   sign request with a non-allowlisted key is denied;
-  `SSH_AGENTC.LIST_IDS`/`ADD_IDENTITY`/`REMOVE_*` are denied; a
-  non-allowlisted key is invisible to `LIST_IDS` (which itself is denied, so
-  the test confirms the op is denied, not that the list is empty).
+  `SSH_AGENTC.LIST_IDS` is allowed but the reply is **filtered** to
+  `allow_keys` (a non-allowlisted key is invisible, not just "op denied");
+  `ADD_IDENTITY`/`REMOVE_*`/`LOCK`/`UNLOCK` are denied;
+  `EXTENSION` is allowed only for `session-bind@openssh.com` and `query`,
+  denied for others (round-2 BLOCKING). The test **must drive a real ssh
+  client against a real sshd** (not only raw agent messages): `ssh
+  user@localhost true` with an allowlisted key succeeds; the same with a
+  non-allowlisted key fails with `Permission denied (publickey)`;
+  `ssh-add -l` inside the sandbox shows only `allow_keys` (round-2
+  BLOCKING: raw agent messages do not prove the ssh client path works).
 - **L28** (docker-proxy): `docker run --privileged hello-world` is denied by
   the proxy (403); `docker run hello-world` (unprivileged, image present)
   succeeds; `docker exec` is denied; `docker pull` is denied (default
@@ -730,14 +755,15 @@ the declared binds, no other sockets, no extra mounts in `inspect`).
   printed `RISK: docker=socket is root-equivalent`; the profile has the
   matching `risk_ack`; the test then cleans up the container.
 - **L30** (toolchains): `rustc --version` inside the sandbox is the rustup
-  one; `which cargo` is under the persistent home; `touch $CARGO_HOME/..` →
-  `EROFS` (the home is a bind, ro above the home root).
+  one; `which cargo` is under the persistent home; the home is a ro bind
+  (attempted write to the home root → `EROFS`).
 - **L31** (kvr): the service socket is connectable from a second exec; the
   service dies with the session; `inspect` shows the service socket and
   nothing else.
-- **L32** (wakil): the Wakil profile (T0 ssh, no docker, no forward) yields
-  `RISK: none`; `hisn profile explain wakil` lists no widening capabilities;
-  `inspect` equals the 0.2 plan.
+- **L32** (wakil): the Wakil profile (T0 ssh, no docker, no forward,
+  `session.shm = true` for `tests/leak`) yields `RISK: none`; `hisn profile
+  explain wakil` lists no widening capabilities; `inspect` equals the 0.2
+  plan plus `/dev/shm`.
 
 **Invariant touched:** the recipes are the proof that "secure by accident"
 holds — each one either widens the boundary in a declared, labelled way or
@@ -762,9 +788,10 @@ not at all. **OCI:** the profiles are annotation-only; the inner policies map.
 - **Session discovery by name/cwd:** `hisn ls --json` gains `cwd` (the
   resolved session cwd) and `name` (a new `--name` flag on `run`, stored in
   the session dir). `hisn attach --name foo` and `hisn attach --cwd
-  /path/to/repo` resolve to a session by name or by cwd match. This lets a
-  second agent find "the session already running in this repo" without
-  guessing the session id.
+  /path/to/repo` resolve to a session by name or by cwd match. If `--name`
+  matches multiple sessions, `attach` errors (`E_AMBIGUOUS`) rather than
+  picking one. This lets a second agent find "the session already running in
+  this repo" without guessing the session id.
 
 **In 0.4 (deferred):**
 
@@ -800,9 +827,9 @@ profiles and services in 0.3 rely on them.
 | 1 | `/dev/shm` tmpfs | mount `/dev/shm` (tmpfs, `size=…`, `mode=1777`) inside `/dev`; `session.shm = true` to enable, default off (some programs need it; default off keeps the 0.2 `/dev`) | L33 |
 | 2 | `/tmp` size configurable | `session.tmp_size = <MiB>` (default 1024); `mounts.rs` `TMP_SIZE` becomes a policy value | — (L8 covers it) |
 | 3 | passwd stub with host username | `mounts.rs::passwd_stub` already uses `HostFacts.username`; ensure `/etc/passwd` and `/etc/group` in the sandbox have the real username (`getids()` already reads `USER`) | — (L1 covers it) |
-| 4 | init argv scrub | init's `argv[0]` is set to something opaque (not the session id leak); `prctl(PR_SET_NAME, …)` for the process title; the session id is not in argv | L34 |
+| 4 | init argv scrub | init's `argv[0]` is overwritten in memory to something opaque (not the session id leak); `PR_SET_NAME` alone does **not** change `/proc/1/cmdline` (it sets the process title only), so the `argv` memory itself must be overwritten. The session id is not in argv | L34 |
 | 5 | stale-dir cleanup on kill/run | `session::ensure_root` and `supervisor` cleanup: on `run`/`kill`, remove session dirs that are not live (`is_live` already exists); bounded | — |
-| 6 | R5 ancestry retry | `supervisor::authorize_peer` retries the `/proc/<pid>/status` read on EINTR/ETXTBSY; bounded (3×, 50 ms) | — (P16 covers it) |
+| 6 | R5 ancestry retry | `supervisor::authorize_peer` retries the `/proc/<pid>/status` read on `ENOENT`/`ESRCH`/`EINTR`/`ETXTBSY` on any ancestor during the walk (the observed failure is `ENOENT`/`ESRCH` when an ancestor vanishes mid-walk); bounded (3×, 50 ms); refuse only if the peer itself is gone or the chain cannot be established after retries | — (P16 covers it) |
 | 7 | `--ready-fd` | `hisn run --ready-fd <fd>`: after the sandbox is ready, write one byte to the fd before returning; for programmatic readiness (Wakil) | — |
 | 8 | opaque exec ids for `signal` | the `pid` returned by `exec` and accepted by `signal` is already the in-sandbox pid; 0.2.1 adds an opaque `exec_id` (monotonic per session) and `signal` accepts it too, so a recycled pid cannot be signalled by a stale client | L35 |
 | 9 | `hisn ls/inspect --json` schema frozen | the `--json` output gets a `schema` version field (`"hisn-ls/v1"`, `"hisn-inspect/v1"`); fields are documented and additive; 0.3 services add to it | — |
@@ -822,7 +849,7 @@ the acceptance criterion.
 | docker T2 (§4) | root on the host (the docker daemon) | — (it is root-equivalent by design) | 1, 3 | L29 |
 | docker T3 (§4, 0.4) | provoke the kernel's userns code paths | escape the sandbox's Landlock/caps (nested userns is a child); reach host paths not granted | 2 (seccomp change) | L38 (0.4) |
 | ssh T0 (§4b) | a git identity (name/email) | sign anything; push from inside | 4 | L25/L26 |
-| ssh T1 (§4b) | produce signatures with allowlisted keys | use non-allowlisted keys; add/remove keys; lock the agent | 1, 3, 4 | L27 |
+| ssh T1 (§4b) | produce signatures with allowlisted keys | use non-allowlisted keys (invisible in filtered `LIST_IDS`); add/remove keys; lock the agent | 1, 3, 4 | L27 |
 | ssh T2 (§4b) | use any host agent key for anything | — (root-equivalent for the agent) | 1, 3 | — (covered by L29's ack check) |
 | risk labels (§5) | nothing (display) | — | 5 | — (no leak test; load error is unit-tested) |
 | recipes (§6) | per recipe | per recipe | per recipe | L25–L32 |
@@ -837,7 +864,8 @@ the acceptance criterion.
   `exec_id` works.
 - **L36** (forward): the sandbox can `connect` to `expose`; `unlink expose` →
   `EROFS` (ro mount); `ls /run/user` → absent; the host path is not
-  resolvable.
+  resolvable. `EBUSY` on `connect` is accepted (the socket may be briefly
+  busy during start).
 - **L37** (host_service): the service starts, its socket is at `expose`; on
   session end the host process is gone (`kill -0` fails) and the socket is
   gone.
@@ -872,35 +900,49 @@ Dependency graph (edges = "needs first"):
 ```
 0.2.1 patches (§8)
  ├─ shm, tmp_size, passwd, argv scrub, stale-dir, R5 retry, ready-fd, exec_id, --json schema
- └─> profiles (§1)        [needs --json schema frozen, needs ready-fd for services]
-      ├─> in-sandbox services (§2)   [needs profiles + ready-fd]
-      ├─> forward / host_services (§3) [needs profiles]
-      │    └─> docker T1 (§4)          [needs host_services; new crate]
+ └─> 0.3a:
+      ├─ profiles (§1)        [needs --json schema frozen, needs ready-fd for services]
+      ├─ risk labels (§5)     [needs profiles]
+      ├─ forward / host_services (§3) [needs profiles]
       │    └─> docker T2 (§4)          [needs forward + risk labels]
       │    └─> ssh T1 (§4b)            [needs host_services; new crate]
-      ├─> risk labels (§5)             [needs profiles]
-      └─> multi-agent discovery (§7)   [needs profiles + --name]
-           └─> recipes (§6)            [needs everything above]
-                └─> threat model / leak tests (§9) [needs recipes]
+      ├─ in-sandbox services (§2)   [needs profiles + ready-fd]
+      └─> 0.3b:
+           ├─ multi-agent discovery (§7) [needs profiles + --name]
+           │    └─> recipes (§6)          [needs everything above]
+           │         └─> threat model / leak tests (§9) [needs recipes]
+docker T1 (§4)  ──> 0.4 (new crate, trusted-source mount, by-construction lifetime)
 docker T3 (§4)  ──> 0.4 (seccomp change, subuid, nested leak run)
 leases / per-client (§7) ──> 0.4
 ```
 
 ### Order and estimates (single maintainer, Wakil-built; in sessions)
 
+**0.3a** (ships first — the core boundary and the deploy case):
+
 | step | what | est. | ships |
 |---|---|---|---|
 | 1 | 0.2.1 patches (§8, all nine) | 2 sessions | 0.2.1 |
-| 2 | profiles (§1): envelope, `--profile`, search path, `profile explain`, `profile list` | 1.5 | 0.3 |
-| 3 | risk labels (§5): label table, `--quiet-risk`, `risk_ack` enforcement, `host-exec` | 1 | 0.3 |
-| 4 | forward / host_services (§3): `open_tree` socket forward, lifecycle, `host-exec` risk_ack, L36/L37 | 2 | 0.3 |
-| 5 | in-sandbox services (§2): exec-chain start, readiness, stop, `ls --json`, L31 | 2 | 0.3 |
-| 6 | docker T2 (§4): raw forward + risk_ack check, L29 | 0.5 | 0.3 |
-| 7 | ssh T1 (§4b): `hisn-agent-proxy` crate, sign-only, allow_keys, per-session agent, audit, L27 | 3 | 0.3 |
-| 8 | multi-agent discovery (§7): `--name`, `attach`, cwd lookup, L39 | 1.5 | 0.3 |
-| 9 | recipes (§6): profiles + L25/L26/L30/L32 | 2 | 0.3 |
-| 10 | threat model leak tests (§9): L33–L37 | 2 | 0.3 |
+| 2 | profiles (§1): envelope, `--profile`, search path, `profile explain`, `profile list` | 1.5 | 0.3a |
+| 3 | risk labels (§5): label table, `--quiet-risk`, `risk_ack` enforcement, `host-exec` | 1 | 0.3a |
+| 4 | forward / host_services (§3): `open_tree` socket forward, lifecycle, `host-exec` risk_ack, L36/L37 | 2 | 0.3a |
+| 5 | in-sandbox services (§2): exec-chain start, readiness, stop, `ls --json`, L31 | 2 | 0.3a |
+| 6 | docker T2 (§4): raw forward + risk_ack check, L29 | 0.5 | 0.3a |
+| 7 | ssh T1 (§4b): `hisn-agent-proxy` crate, sign-only, allow_keys, filtered `LIST_IDS`, per-session agent, audit, L27 | 3 | 0.3a |
+| | **0.3a total** | **~12 sessions** | |
+
+**0.3b** (ships second — multi-agent and the proof layer):
+
+| step | what | est. | ships |
+|---|---|---|---|
+| 8 | multi-agent discovery (§7): `--name`, `attach`, cwd lookup, L39 | 1.5 | 0.3b |
+| 9 | recipes (§6): profiles + L25/L26/L30/L32 | 2 | 0.3b |
+| 10 | threat model leak tests (§9): L33–L37 | 2 | 0.3b |
+| | **0.3b total** | **~5.5 sessions** | |
 | | **0.3 total** | **~17.5 sessions** | |
+
+| step | what | est. | ships |
+|---|---|---|---|
 | 11 | docker T1 (§4): `hisn-docker-proxy` crate, per-session inventory, bind-source mechanism, container lifetime, L28 | 6 | 0.4 |
 | 12 | docker T3 (§4) + subuid + nested leak L38 | 4 | 0.4 |
 | 13 | leases + per-client identity (§7) + `hisn request` (§11) | 5 | 0.4 |
@@ -927,6 +969,42 @@ additions beyond L33/L34/L35 (which can ship with 0.2.1 or 0.3).
 Non-blocking findings from the Mashūra rounds and items explicitly scoped to
 0.4 or deferred. Blocking findings are folded into §1–§9; they are not
 repeated here.
+
+### External review — COMPLETED (2026-11-02)
+
+An external review of the full `docs/PLAN-0.3.md` was completed outside Wakil
+on 2026-11-02. Three BLOCKING findings (B1–B3) were folded into §4b/§5/§8
+and the ADRs above:
+
+- **B1** (§4b/ADR 0005): SSH T1 must allow `REQUEST_IDENTITIES` and filter the
+  reply to `allow_keys`; deny `ADD`/`REMOVE`/`LOCK`/`UNLOCK`; allow `EXTENSION`
+  only for `session-bind@openssh.com` and `query`; constrained keys cannot do
+  `ssh-keygen -Y sign`; destination constraints since OpenSSH 8.9 (not 9.6);
+  L27 must drive a real ssh client against a real sshd. → folded into §4b and
+  ADR 0005.
+- **B2** (§5/ADR 0006): an unrecognised `[[forward]]` socket is a **load
+  error**, not a default `host-exec`; the profile must set `risk` explicitly
+  (minimum `host-exec`, documenting that the author asserts the server is not
+  root). → folded into §5 and ADR 0006.
+- **B3** (§8 patch 6): R5 retry must cover `ENOENT`/`ESRCH` on any ancestor
+  during the walk (the observed failure), bounded 3×/50 ms; refuse only if the
+  peer itself is gone or the chain cannot be established after retries. →
+  folded into §8 patch 6.
+
+Non-blocking findings from the external review (recorded here, applied to
+the relevant sections):
+
+- Patch 4 (`init argv scrub`): must overwrite argv memory;
+  `PR_SET_NAME` does not change `/proc/1/cmdline` (L34 reads `cmdline`).
+  Folded into §8 patch 4.
+- L36: accept `EBUSY` on `connect` (the socket may be briefly busy during
+  start). Folded into L36.
+- L30: drop the `$CARGO_HOME/..` assertion (`/run` is writable, so the
+  parent-of-home EROFS test is not a valid assertion). Folded into L30.
+- `attach --name` ambiguous match → `E_AMBIGUOUS` error. Folded into §7.
+- Wakil profile sets `session.shm = true`. Folded into L32.
+- §10: split into 0.3a (steps 1–7) and 0.3b (8–10); 0.3a ships first. Folded
+  into §10.
 
 ### Scoped to 0.4 (with reason)
 

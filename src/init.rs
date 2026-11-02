@@ -38,11 +38,11 @@ const PR_CAPBSET_DROP: i32 = 24;
 const PR_SET_SECUREBITS: i32 = 28;
 const PR_CAP_AMBIENT: i32 = 47;
 const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
-const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
+const SIOCSIFFLAGS: u64 = 0x8914;
 const IFF_UP: i16 = 0x1;
-const TIOCSPTLCK_REQ: libc::c_ulong = 0x4004_5431;
-const TIOCGPTN_REQ: libc::c_ulong = 0x8004_5430;
-const TIOCSCTTY_REQ: libc::c_ulong = 0x540E;
+const TIOCSPTLCK_REQ: u64 = 0x4004_5431;
+const TIOCGPTN_REQ: u64 = 0x8004_5430;
+const TIOCSCTTY_REQ: u64 = 0x540E;
 
 pub const EXIT_CANNOT_EXEC: i32 = 126;
 pub const EXIT_NOT_FOUND: i32 = 127;
@@ -284,7 +284,7 @@ fn exec_command(
     unsafe {
         libc::setsid();
         if let Some(s) = &slave {
-            libc::ioctl(s.as_raw_fd(), TIOCSCTTY_REQ, 0);
+            libc::ioctl(s.as_raw_fd(), TIOCSCTTY_REQ as _, 0);
             for fd in 0..3 {
                 libc::dup2(s.as_raw_fd(), fd);
             }
@@ -393,7 +393,7 @@ fn loopback_up() -> io::Result<()> {
             *d = *b as libc::c_char;
         }
         req.ifr_ifru.ifru_flags = IFF_UP;
-        let r = libc::ioctl(s, SIOCSIFFLAGS, &req);
+        let r = libc::ioctl(s, SIOCSIFFLAGS as _, &req);
         let e = io::Error::last_os_error();
         libc::close(s);
         if r != 0 { Err(e) } else { Ok(()) }
@@ -413,11 +413,11 @@ fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
         }
         let master = OwnedFd::from_raw_fd(m);
         let unlock: libc::c_int = 0;
-        if libc::ioctl(m, TIOCSPTLCK_REQ, &unlock) != 0 {
+        if libc::ioctl(m, TIOCSPTLCK_REQ as _, &unlock) != 0 {
             return Err(io::Error::last_os_error());
         }
         let mut n: libc::c_uint = 0;
-        if libc::ioctl(m, TIOCGPTN_REQ, &mut n) != 0 {
+        if libc::ioctl(m, TIOCGPTN_REQ as _, &mut n) != 0 {
             return Err(io::Error::last_os_error());
         }
         let path = CString::new(format!("/dev/pts/{n}")).expect("no NUL");

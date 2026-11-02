@@ -123,6 +123,12 @@ impl SessionDir {
     pub fn remove(&self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+
+    /// Read the resolved policy TOML from the session dir, if present.
+    /// Returns `None` if the file does not exist (e.g. a stale or 0.2.0 dir).
+    pub fn read_resolved_policy(&self) -> Option<String> {
+        fs::read_to_string(self.path.join("policy.resolved.toml")).ok()
+    }
 }
 
 /// Resolve `--session ID` to its directory under any candidate root.

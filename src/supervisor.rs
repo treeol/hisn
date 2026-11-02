@@ -516,6 +516,7 @@ impl Shared {
     fn inspect(&self) -> Value {
         match fs::read_to_string(format!("/proc/{}/mountinfo", self.init_pid)) {
             Ok(mi) => ok(json!({
+                "schema": "hisn-inspect/v1",
                 "mountinfo": mi,
                 "policy": self.resolved_toml,
                 // The supervisor's own descriptor count: the leak suite (L19)

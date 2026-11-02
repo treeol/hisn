@@ -174,22 +174,44 @@ fn ls(session_id: Option<&str>, json_out: bool) -> Result<ExitCode> {
             let uid = rustix::process::getuid().as_raw();
             let roots =
                 session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
-            let rows: Vec<(String, bool)> = session::list_sessions(&roots)
+            let rows: Vec<(String, PathBuf, bool)> = session::list_sessions(&roots)
                 .into_iter()
-                .map(|(n, p)| (n, session::is_live(&p)))
+                .map(|(n, p)| (n.clone(), p.clone(), session::is_live(&p)))
                 .collect();
             if json_out {
-                let v: Vec<Value> = rows
+                let sessions: Vec<Value> = rows
                     .iter()
-                    .map(|(n, l)| json!({"id": n, "live": l}))
+                    .map(|(n, p, live)| {
+                        let policy = read_session_policy(p);
+                        json!({
+                            "id": n,
+                            "state": if *live { "live" } else { "stale" },
+                            "cwd": policy.as_ref().map(|p| p["cwd"].clone()).unwrap_or(Value::Null),
+                            "hostname": policy.as_ref().map(|p| p["hostname"].clone()).unwrap_or(Value::Null),
+                            "network": policy.as_ref().map(|p| p["network"].clone()).unwrap_or(Value::Null),
+                            "pid": Value::Null,
+                            "started": Value::Null,
+                            "execs": [],
+                        })
+                    })
                     .collect();
-                println!("{}", Value::Array(v));
+                println!("{}", json!({"schema": "hisn-ls/v1", "sessions": sessions}));
             } else {
-                for (n, live) in rows {
+                for (n, _p, live) in rows {
                     println!("{n}\t{}", if live { "live" } else { "stale" });
                 }
             }
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Read `policy.resolved.toml` from a session dir and parse it as TOML into a
+/// JSON `Value` for the `ls --json` output.
+fn read_session_policy(path: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(path.join("policy.resolved.toml")).ok()?;
+    let toml_val: toml::Value = toml::from_str(&text).ok()?;
+    // Convert the TOML table to a serde_json::Value (toml::Value -> JSON).
+    let json_str = serde_json::to_string(&toml_val).ok()?;
+    serde_json::from_str(&json_str).ok()
 }

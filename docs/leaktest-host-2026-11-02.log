@@ -1,16 +1,17 @@
 # hisn leaktest host log
-commit:  5ea2fc20766d200c65d30da2caa5940374c6727a
+commit:  81b07059dfaed0f0e28842608b766b44d46fcc87
 tree:    clean
-date:    2026-11-02T10:23:04Z
+date:    2026-11-02T21:59:51Z
 host:    rubin
 kernel:  7.2.13-200.fc44.x86_64
-hisn:    hisn 0.2.1
+hisn:    hisn 0.2.2
 ---
 make[1]: Verzeichnis „/home/valon/Coding/hisn“ wird betreten
 cargo build --release
     Finished `release` profile [optimized] target(s) in 0.03s
 cargo build --release --example leakprobe
-    Finished `release` profile [optimized] target(s) in 0.03s
+   Compiling hisn v0.2.2 (/home/valon/Coding/hisn)
+    Finished `release` profile [optimized] target(s) in 0.70s
 bash tests/leak/run.sh ./target/release/hisn
 PASS  L1 stat /home -> ENOENT
 PASS  L1 open /home -> ENOENT
@@ -37,8 +38,8 @@ PASS  L2 /proc/1/root/etc/shadow unreachable (EACCES)
 PASS  L2 /proc/self/root is the sandbox root
 PASS  L2 init is pid 1
 PASS  L2 only 2 pids visible
-PASS  L2 host hisn pid 2005244 invisible
-PASS  L2 host shell pid 2005220 invisible
+PASS  L2 host hisn pid 3486874 invisible
+PASS  L2 host shell pid 3486850 invisible
 PASS  L3 mount -> EPERM
 PASS  L3 umount -> EPERM
 PASS  L3 unshare_mnt -> EPERM
@@ -128,6 +129,18 @@ PASS  L14 runtime-dir bind alias under cwd is rejected (R1b)
 PASS  L14b runtime-dir bind alias offered as a grant source is refused
 WEAK  L14 R5 -- the control-socket pid-namespace check (R5) is covered by unit tests only; no end-to-end test can place the socket inside the sandbox without a test hook
 PASS  L14c 200 rapid hisn ls invocations: 0 refusals
+PASS  L1c (suite environment) id -un is the host user
+PASS  L1c (suite environment) $USER is the host user
+PASS  L1c (suite environment) $LOGNAME is the host user
+PASS  L1c (suite environment) getent passwd is the generated record
+PASS  L1c (env -i, no USER) id -un is the host user
+PASS  L1c (env -i, no USER) $USER is the host user
+PASS  L1c (env -i, no USER) $LOGNAME is the host user
+PASS  L1c (env -i, no USER) getent passwd is the generated record
+PASS  L1c (env -i, USER=notme LOGNAME=notme) id -un is the host user
+PASS  L1c (env -i, USER=notme LOGNAME=notme) $USER is the host user
+PASS  L1c (env -i, USER=notme LOGNAME=notme) $LOGNAME is the host user
+PASS  L1c (env -i, USER=notme LOGNAME=notme) getent passwd is the generated record
 PASS  L15 exec stat /home -> ENOENT
 PASS  L15 exec stat /root -> ENOENT
 PASS  L15 exec stat /tankz -> ENOENT
@@ -160,7 +173,7 @@ PASS  L15 exec /tmp writable
 PASS  L15 exec symlink escape -> not readable (ENOENT)
 PASS  L15 exec /dev contents
 PASS  L15 exec /sys absent
-PASS  L17 exec'd process chain is P -> W -> init (88 -> 87 -> 1)
+PASS  L17 exec'd process chain is P -> W -> init (100 -> 99 -> 1)
 PASS  L17 exec'd process is in the sandbox pid ns (init=1 visible)
 PASS  L17 only 3 pids visible via exec
 PASS  L18 env key not in env.pass rejected (exit 125)
@@ -193,6 +206,8 @@ PASS  L17 exec'd sleeper died with the session (hisn exec rc=125)
 PASS  L17 detached session dir removed
 PASS  L17b --prune removes a stale session dir
 PASS  L17b dir without supervisor.pid is not pruned
+PASS  L17b symlink in a stale dir is not followed by --prune (canary kept, stale dir removed)
+PASS  L17b run over a stale dir: --session-id succeeds; old supervisor.pid and dir content are gone
 PASS  L33 /dev/shm is present when shm=true
 PASS  L33 file in /dev/shm is visible across execs
 PASS  L33 /dev/shm is a private tmpfs
@@ -200,5 +215,5 @@ PASS  L33 /dev/shm is absent by default (shm=false)
 PASS  L34 /proc/1/cmdline is exactly hisn-init (NUL padding only after it)
 PASS  L35 exec into detached session returns program stdout
 
-RESULT: 184 passed, 0 failed, 1 skipped, 1 weak
+RESULT: 198 passed, 0 failed, 1 skipped, 1 weak
 make[1]: Verzeichnis „/home/valon/Coding/hisn“ wird verlassen

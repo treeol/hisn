@@ -277,7 +277,7 @@ To check a downloaded binary, run `sha256sum -c SHA256SUMS`, then
 ## Status
 
 hisn 0.2.2 is maintained by one person. The leak suite was last recorded on a
-Fedora x86_64 host at commit `a478d5d`: **186 passed, 0 failed, 1 skipped
+Fedora x86_64 host at commit `81b0705`: **198 passed, 0 failed, 1 skipped
 (L12, needs write access to `/etc`), 1 weak (L14, the R5 peer check is covered
 by unit tests only)** ([log](docs/leaktest-host-2026-11-02.log)). CI runs the
 suite on Ubuntu 22.04 and 24.04 (x86_64) and builds a release only after it

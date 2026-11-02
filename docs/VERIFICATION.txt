@@ -57,16 +57,35 @@ is approximately **180** (L1–L24 = 175 + L14c = 1 + L17b = ~3 + L33 = ~3
 + L34 = 1 + L35 = 1). The actual total depends on host-specific skips
 (L12 needs /etc write; L23/L24 need Landlock ABI 6).
 
-Three bugs were found and fixed after the first host run (a1d238b)
-showed L34 FAIL (argv scrub ran after PR_SET_DUMPABLE=0, so
-/proc/self/mem was EACCES), L35 FAIL (--detach + command are mutually
-exclusive; the test now starts a detached session directly), and all
-manifest IDs L1–L35 reported "no line" (the sed regex matched `^L…`
-not `PASS  L…`). All three are fixed; the suite awaits a fresh host run.
+Two host runs of the 0.2.1 suite have been seen so far, both with failures:
+
+* a1d238b: 182 passed, 31 failed. L34 FAIL, L35 FAIL (--detach + command are
+  mutually exclusive), and 29 manifest FAILs.
+* 5543e7e: 183 passed, 30 failed. L35 now PASSes. **L34 still FAILs and the
+  manifest check still reports every id as missing**; the fixes in 5543e7e
+  for those two were wrong.
+
+Causes found afterwards (fixed in the commit after 5543e7e, unverified on a
+host):
+
+* L34: `scrub_argv` writes `/proc/self/mem`. 5543e7e moved it before
+  `PR_SET_DUMPABLE=0`, but it still ran after `landlock::apply`, and Landlock
+  has no write rule for `/proc`, so the open failed with EACCES and the scrub
+  silently did nothing. It now runs before Landlock. Unit tests:
+  `landlock::tests::proc_self_mem_is_not_writable_after_apply` (the ordering
+  constraint, real kernel) and `init::tests::scrub_argv_overwrites_cmdline`
+  (the scrub changes `/proc/self/cmdline`, not only comm). The L34 assertion
+  also accepted only a trailing space; it now ignores NUL padding (shown as
+  spaces) and fails on any other content.
+* Manifest: `run.sh` records ids in `OUTPUT_LOG` as the bare test name
+  (`L1 stat ...`), without the `PASS  ` prefix, so the regex that expects the
+  prefix matched nothing. The regex now matches the bare name; checked
+  against every name in the host log.
 
 | check | commit | where | result | log file |
 |-------|--------|-------|--------|----------|
-| `make leaktest` (L1-L35) | — | not run with the fixes | not run | — |
+| `make leaktest` (L1-L35) | after 5543e7e | — | not run | — |
+| `make leaktest` (L1-L35) | 5543e7e | host (rubin, Fedora 7.2.13-200.fc44.x86_64) | 183 passed, 30 failed (L34, 29 manifest), 1 skipped, 1 weak; summary and failing lines pasted by the maintainer, no log file kept | — |
 | `make leaktest` (L1-L35) | a1d238b (pre-fix) | host (rubin, Fedora 7.2.13-200.fc44.x86_64) | 182 passed, 31 failed (L34, L35, 29 manifest), 1 skipped, 1 weak | `docs/leaktest-host-2026-11-02.log` |
 | `hisn ls` 200x rapid (L14c) | — | not run | not run | — |
 | `x86_64-unknown-linux-musl` build + leak | — | not run | not run (stdlib not in build sandbox) | — |

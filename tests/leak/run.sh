@@ -913,17 +913,16 @@ if start_session l34-$$ "$L34_CWD" "$L34_POL"; then
   got=$(timeout 30 "$HISN" exec --session l34-$$ -- "$L34_CWD/leakprobe" cmdline </dev/null 2>&1)
   # The cmdline should start with "hisn-init" and have no non-NUL bytes after it
   case "$got" in
-    "OK hisn-init "*)
-      # Check that the only non-empty segment is "hisn-init"
-      rest=${got#OK hisn-init }
-      if [ -z "$rest" ] || [ "$rest" = " " ]; then
-        pass "L34 /proc/1/cmdline starts with hisn-init, no session info"
+    "OK hisn-init"*)
+      # NUL padding up to the original argv length shows as spaces: only the
+      # content matters. Anything but spaces after "hisn-init" is a leak.
+      rest=${got#OK hisn-init}
+      rest=${rest//[[:space:]]/}
+      if [ -z "$rest" ]; then
+        pass "L34 /proc/1/cmdline is exactly hisn-init (NUL padding only after it)"
       else
         fail "L34 argv scrub" "extra content after hisn-init: [$rest]"
       fi
-      ;;
-    "OK hisn-init")
-      pass "L34 /proc/1/cmdline is exactly hisn-init"
       ;;
     *) fail "L34 argv scrub" "got [$got] want [OK hisn-init ...]" ;;
   esac
@@ -976,7 +975,7 @@ fi
 # the test was silently dropped from the suite — FAIL.
 MANIFEST="$HERE/MANIFEST"
 if [ -f "$MANIFEST" ]; then
-  EMITTED=$(printf '%s\n' "$OUTPUT_LOG" | sed -n 's/^[A-Z]*  \(L[0-9]*[a-z]*\).*/\1/p' | sort -u)
+  EMITTED=$(printf '%s\n' "$OUTPUT_LOG" | sed -n 's/^\(L[0-9][0-9]*[a-z]*\)\([^0-9a-z].*\)\{0,1\}$/\1/p' | sort -u)
   MISSING=""
   while IFS= read -r id; do
     [ -z "$id" ] && continue

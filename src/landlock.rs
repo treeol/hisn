@@ -244,6 +244,52 @@ mod tests {
         assert!(plan.scope_abstract);
     }
 
+    /// Ordering constraint for init's argv scrub (init.rs): once the ruleset is
+    /// applied, `/proc` is outside the write set, so opening `/proc/self/mem`
+    /// read-write fails with EACCES. The scrub must therefore run BEFORE
+    /// `apply`. Needs Landlock only (no userns).
+    #[test]
+    fn proc_self_mem_is_not_writable_after_apply() {
+        let allowed = tempfile::tempdir().unwrap();
+        let pl = plan(&pol(Network::None), &[allowed.path().to_path_buf()]);
+        // SAFETY: fork in a test; the child only uses std fs calls and `_exit`s.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                let before = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/proc/self/mem")
+                    .is_ok();
+                let code = match apply(&pl, false) {
+                    Err(_) => 20,
+                    Ok((false, _)) => 21,
+                    Ok(_) => {
+                        let after = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open("/proc/self/mem");
+                        match (before, after) {
+                            (true, Err(e)) if e.raw_os_error() == Some(libc::EACCES) => 0,
+                            (false, _) => 23,
+                            _ => 22,
+                        }
+                    }
+                };
+                libc::_exit(code);
+            }
+            let mut st = 0;
+            libc::waitpid(pid, &mut st, 0);
+            assert!(libc::WIFEXITED(st));
+            let c = libc::WEXITSTATUS(st);
+            assert_eq!(
+                c, 0,
+                "child code (20=apply failed, 21=not enforced, 22=still writable after apply, 23=not writable even before)"
+            );
+        }
+    }
+
     /// Real kernel check in a forked child: write inside an allowed dir works,
     /// write outside fails with EACCES, reading outside still works. Needs
     /// Landlock only (no userns), so it runs in restricted containers too.

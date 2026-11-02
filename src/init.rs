@@ -118,6 +118,15 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     )
     .context("opening the sandbox root")?;
 
+    // Scrub argv BEFORE Landlock and PR_SET_DUMPABLE=0. The scrub writes
+    // /proc/self/mem: Landlock (step 10) has no write rule for /proc, so after
+    // `landlock::apply` the open fails with EACCES, and a non-dumpable process
+    // cannot open it either. Done late, the write silently fails and the
+    // session id, policy path and session dir stay visible in
+    // /proc/1/cmdline (L34; unit test
+    // `landlock::tests::proc_self_mem_is_not_writable_after_apply`).
+    scrub_argv("hisn-init");
+
     // Pty (must exist before seccomp/landlock; /dev is the sandbox's own).
     let pty = if cfg.use_pty {
         Some(open_pty().context("allocating pty")?)
@@ -134,14 +143,6 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     drop_all_caps().context("dropping capabilities")?;
     // 12. Seccomp (installs on init; the command inherits it).
     seccomp::install(&cfg.seccomp)?;
-
-    // Scrub argv BEFORE PR_SET_DUMPABLE=0: the /proc/self/mem write in
-    // scrub_argv requires the process to be dumpable (ptrace_may_access
-    // must succeed for self-access to /proc/self/mem). After
-    // PR_SET_DUMPABLE=0, /proc/self/mem becomes EACCES and the scrub
-    // silently fails — leaving the session id, policy path, and session
-    // dir visible in /proc/1/cmdline inside the sandbox.
-    scrub_argv("hisn-init");
 
     sys::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0).context("PR_SET_DUMPABLE")?;
     verify_hardening().context("post-setup verification")?;
@@ -756,6 +757,40 @@ mod tests {
             libc::waitpid(pid, &mut st, 0);
             assert_eq!(decode_status(st), 0);
         }
+    }
+
+    /// The scrub must change `/proc/self/cmdline` itself (PR_SET_NAME only
+    /// changes comm): content starts with the replacement and only NUL
+    /// padding follows. Regression test for L34 (a scrub that silently failed
+    /// shipped twice because only comm was tested).
+    #[test]
+    fn scrub_argv_overwrites_cmdline() {
+        // SAFETY: fork in a test; the child only uses std fs calls and `_exit`s.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let before = std::fs::read("/proc/self/cmdline").unwrap_or_default();
+            scrub_argv("hisn-init");
+            let after = std::fs::read("/proc/self/cmdline").unwrap_or_default();
+            let code = if before.len() < 10 || before.starts_with(b"hisn-init\0") {
+                3 // cmdline too short to be a meaningful test
+            } else if after.len() == before.len()
+                && after.starts_with(b"hisn-init")
+                && after[b"hisn-init".len()..].iter().all(|&b| b == 0)
+            {
+                0
+            } else {
+                1
+            };
+            // SAFETY: _exit never returns.
+            unsafe { libc::_exit(code) }
+        }
+        let mut st = 0;
+        unsafe { libc::waitpid(pid, &mut st, 0) };
+        assert_eq!(
+            decode_status(st),
+            0,
+            "cmdline not scrubbed (1=content wrong, 3=test cmdline too short)"
+        );
     }
 
     #[test]

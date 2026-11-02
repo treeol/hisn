@@ -775,7 +775,7 @@ pub fn pidfd_alive(pidfd: RawFd) -> bool {
     unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd, 0, 0usize, 0) == 0 }
 }
 
-/// Starttime (field 22 of `/proc/<pid>/stat`, the 21st after the `)`)
+/// Starttime (field 22 of `/proc/<pid>/stat`, the 20th field after the `)`)
 /// — identifies a specific process instance across pid reuse.
 pub fn stat_starttime(pid: i32) -> io::Result<u64> {
     let body = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
@@ -784,8 +784,10 @@ pub fn stat_starttime(pid: i32) -> io::Result<u64> {
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no ')' in stat"))?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After the ')' split, field 3 (state) is at index 0, so field 22
+    // (starttime) is at index 19.
     fields
-        .get(20)
+        .get(19)
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no starttime field"))
 }

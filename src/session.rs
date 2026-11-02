@@ -118,7 +118,7 @@ impl SessionDir {
     /// Write `supervisor.pid` with the pid and starttime so stale-detection
     /// can confirm the supervisor is the same process (not a reused pid).
     pub fn write_supervisor_pid(&self, pid: i32) -> io::Result<()> {
-        let starttime = sys::stat_starttime(pid).unwrap_or(0);
+        let starttime = sys::stat_starttime(pid)?;
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -276,18 +276,18 @@ pub fn is_stale(path: &Path) -> bool {
         None => return false, // malformed → not stale
     };
     let pid: i32 = match pid_str.parse() {
-        Ok(p) => p,
-        Err(_) => return false,
+        Ok(p) if p > 0 => p, // only positive pids are valid supervisor ids
+        _ => return false,   // non-positive or unparseable → not stale
     };
     let recorded_start: u64 = match start_str.parse() {
-        Ok(s) => s,
-        Err(_) => return false,
+        Ok(s) if s > 0 => s, // starttime must be positive
+        _ => return false,
     };
     // pid not alive → stale; alive with mismatched starttime → stale.
     match sys::kill(pid, 0) {
         Ok(()) => match sys::stat_starttime(pid) {
             Ok(st) => st != recorded_start,
-            Err(_) => true, // cannot read stat — assume gone
+            Err(_) => false, // cannot read stat — alive but unknown → not stale
         },
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => true,
         Err(_) => false, // EPERM etc → alive, not stale
@@ -531,11 +531,13 @@ mod tests {
     fn supervisor_pid_is_written_once_privately() {
         let d = tempfile::tempdir().unwrap();
         let s = SessionDir::create(&d.path().join("h"), uid(), "p").unwrap();
-        s.write_supervisor_pid(12345).unwrap();
+        // Use our own pid so stat_starttime succeeds.
+        let my_pid = std::process::id() as i32;
+        s.write_supervisor_pid(my_pid).unwrap();
         let text = fs::read_to_string(s.pid_path()).unwrap();
-        assert!(text.trim().starts_with("12345 "));
+        assert!(text.trim().starts_with(&format!("{my_pid} ")));
         // Second write fails (create_new).
-        assert!(s.write_supervisor_pid(99999).is_err());
+        assert!(s.write_supervisor_pid(my_pid).is_err());
         assert_eq!(fs::metadata(s.pid_path()).unwrap().mode() & 0o777, 0o600);
     }
 
@@ -565,17 +567,18 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().join("hisn");
         let s = SessionDir::create(&root, uid(), "stale3").unwrap();
-        // Fork a child that exits immediately, then write its pid with its
-        // real starttime. The socket won't exist (ECONNREFUSED) and the pid
-        // is dead (ESRCH) → stale.
+        // Fork a child that sleeps briefly, write its pid + starttime while
+        // it's alive, then wait for it. The socket won't exist
+        // (ECONNREFUSED) and the pid is dead (ESRCH) → stale.
         let pid = unsafe { libc::fork() };
         if pid == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
             std::process::exit(0);
         }
+        let starttime = sys::stat_starttime(pid).expect("child starttime while alive");
+        fs::write(s.pid_path(), format!("{pid} {starttime}")).unwrap();
         let mut st = 0;
         unsafe { libc::waitpid(pid, &mut st, 0) };
-        let starttime = sys::stat_starttime(pid).unwrap_or(0);
-        fs::write(s.pid_path(), format!("{pid} {starttime}")).unwrap();
         assert!(is_stale(&s.path));
     }
 

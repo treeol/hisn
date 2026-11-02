@@ -593,8 +593,9 @@ fn scrub_argv(replacement: &str) {
         None => return,
     };
     let fields: Vec<&str> = rest.split_whitespace().collect();
-    // startstack is field 27 (0-indexed) after ')'.
-    let startstack: u64 = match fields.get(27).and_then(|s| s.parse().ok()) {
+    // startstack is field 28 (1-indexed in the man page), which is index 25
+    // after the ')' split (0-indexed; field 3 'state' is index 0).
+    let startstack: u64 = match fields.get(25).and_then(|s| s.parse().ok()) {
         Some(v) => v,
         None => return,
     };

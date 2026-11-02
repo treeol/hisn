@@ -127,8 +127,12 @@ struct Shared {
     next_exec_id: std::sync::atomic::AtomicU64,
     /// Map of exec_id → (pid, status fd handle) for live execs.
     execs: Mutex<std::collections::BTreeMap<u64, (i32, OwnedFd)>>,
-    /// Pids that have been recycled (reused by a later exec). A `signal` by
-    /// such a pid is rejected — the client must use `exec_id`.
+    /// All pids ever used by any exec in this session. Used to detect pid
+    /// reuse: if a new exec gets a pid that was used by a previous exec
+    /// (even a finished one), `signal` by that pid is rejected.
+    used_pids: Mutex<std::collections::BTreeSet<i32>>,
+    /// Pids that have been reused by a later exec. A `signal` by such a
+    /// pid is rejected — the client must use `exec_id`.
     recycled_pids: Mutex<std::collections::BTreeSet<i32>>,
 }
 
@@ -479,22 +483,17 @@ impl Shared {
         let registered = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3)
             .ok()
             .map(|h| {
-                // If this pid was used by a previous exec, mark it recycled.
-                let mut recycled = self.recycled_pids.lock().expect("recycled");
-                if self.live.lock().expect("live").contains_key(&sp.pid)
-                    || self
-                        .execs
-                        .lock()
-                        .expect("execs")
-                        .values()
-                        .any(|(p, _)| *p == sp.pid)
+                // Check if this pid was used by a previous exec (even a
+                // finished one). If so, mark it as recycled so `signal`
+                // by pid is rejected for the new exec.
                 {
-                    recycled.insert(sp.pid);
+                    let mut used = self.used_pids.lock().expect("used_pids");
+                    if used.contains(&sp.pid) {
+                        self.recycled_pids.lock().expect("recycled").insert(sp.pid);
+                    }
+                    used.insert(sp.pid);
                 }
                 self.live.lock().expect("live").insert(sp.pid, h);
-                // Track exec_id → (pid, dup of status fd) for signal by exec_id.
-                // The dup is needed because `live` owns the primary copy and
-                // `signal` by exec_id needs its own handle.
                 if let Ok(dup) = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3) {
                     self.execs
                         .lock()
@@ -1078,6 +1077,7 @@ fn run_session(
         live: Mutex::new(Default::default()),
         next_exec_id: std::sync::atomic::AtomicU64::new(1),
         execs: Mutex::new(Default::default()),
+        used_pids: Mutex::new(Default::default()),
         recycled_pids: Mutex::new(Default::default()),
     });
     // The only way to start `network = "host"` without abstract-socket

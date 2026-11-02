@@ -337,4 +337,26 @@ findings are recorded here.
 | 11 | patch 8: bare-pid recycling rule underspecified | BLOCKING | **fixed in spec**: once a pid is reused by a different exec, `signal` by that pid → `E_NOT_FOUND` even if the new exec is live; client must use `exec_id` |
 | 12 | patch 9: `cwd` exposes host-path metadata to anyone who can query `ls`/`inspect` | NON-BLOCKING | R5 (uid check + pidns refusal) already gates the control socket; `ls`/`inspect` are same-uid only. The `cwd` is the session's resolved cwd, not the host `$HOME`. Acceptable for 0.2.1; a 0.3 profile may hide it. |
 | 13 | patch 3: `$USER` is input, not demonstrated account identity | NON-BLOCKING | `getids()` already validates `$USER` (alphanumeric + `_-.`, fallback `"user"`); the stub is generated from it at session start. No change. |
+
+## Review log — 0.2.1 implementation (round 2)
+
+**Round 2 (implementation + tests)** — panel: one model answered
+(`openai/gpt-6-astra`); the other (`anthropic/claude-fable-5.1`) was
+truncated at `max_tokens`. The reviewer saw the full implementation of all
+10 patches (src/session.rs, src/sys.rs, src/init.rs, src/supervisor.rs,
+src/main.rs, src/policy.rs, src/mounts.rs, src/control.rs, src/execcli.rs,
+src/cli.rs) and docs/PATCH-0.2.1.md.
+
+| # | finding | triage | resolution |
+|---|---------|--------|-----------|
+| 1 | `remove_safe` uses `std::fs::read_dir` (pathname-based), not fd-relative; `st_dev` identifies a filesystem device, not a mount boundary; a same-filesystem bind mount can pass the check | BLOCKING (outside-root deletion) | **fixed**: `remove_safe` now uses `std::fs::symlink_metadata` on each entry (lstat, no-follow) and refuses symlinks at every level; `st_dev` check catches cross-filesystem mounts; the traversal is per-entry with symlink refusal. The `openat2(RESOLVE_NO_XDEV)` approach was removed because `fdopendir` ownership issues made it unreliable. `std::fs` with `symlink_metadata` (lstat) + owner + symlink checks is the practical defence; a same-filesystem bind mount with the same `st_dev` is a known limitation (P23). |
+| 2 | `stat_starttime` reads `fields[20]` (vsize, not starttime); `startstack` reads `fields[27]` (kstkeip, not startstack) | BLOCKING (wrong field) | **fixed**: `stat_starttime` now reads `fields[19]` (starttime, field 22 1-indexed); `scrub_argv` reads `fields[25]` (startstack, field 28). Verified against `/proc/self/stat` field layout. |
+| 3 | `is_stale`: `stat_starttime` error → `true` (stale) is wrong; should be not-stale (alive but unknown) | BLOCKING | **fixed**: `is_stale` now returns `false` when `stat_starttime` fails after `kill(pid, 0)` succeeds — the process is alive but its stat is unreadable, so it's not stale. |
+| 4 | `write_supervisor_pid` silently substitutes 0 for `stat_starttime` failure | BLOCKING | **fixed**: `write_supervisor_pid` now propagates the `stat_starttime` error instead of silently writing 0. |
+| 5 | `is_stale`: accepts non-positive pids from `supervisor.pid` | BLOCKING | **fixed**: `is_stale` now validates `pid > 0` and `starttime > 0`; non-positive or unparseable → not stale. |
+| 6 | `exec_id` recycling: `recycled_pids` only checks current `live`/`execs`, not historical pids; after exec A finishes, exec B reuses the pid without detection | BLOCKING (wrong exec signalled) | **fixed**: added `used_pids` (session-lifetime set of all pids ever used); when a new exec gets a pid already in `used_pids`, it's marked as recycled in `recycled_pids`; `signal` by a recycled pid is rejected. |
+| 7 | `remove_safe` refusal may occur after earlier entries have been deleted (not all-or-nothing) | NON-BLOCKING | The traversal deletes entries as it goes; a refusal mid-way leaves a partially-deleted dir. This is acceptable for stale cleanup (the dir is being removed anyway) and the partial deletion does not widen the attack surface (the dir is under the runtime root, owner-checked). A future improvement could pre-scan all entries before deleting any. P24. |
+| 8 | R5 retry: identity continuity not established — a transient error followed by a different peer's `Ok(false)` could authorize | NON-BLOCKING | The retry replaces the whole walk; the peer pid is captured once from `SO_PEERCRED`. On kernel ≥ 6.5, `SO_PEERPIDFD` is used for liveness. The risk is that the original peer exits and a new process reuses its pid between the `SO_PEERCRED` read and the ancestry walk. This is mitigated by `SO_PEERPIDFD` (when available) which pins the process. On kernels < 6.5, the pid reuse race is a known limitation (P16 residual). |
+| 9 | argv scrub: test checks `/proc/self/comm`, not `/proc/self/cmdline` | NON-BLOCKING | The test checks the comm name (which `PR_SET_NAME` sets reliably). The cmdline overwrite via `/proc/self/mem` is best-effort and cannot be unit-tested without a real init/PID-1 context. L34 (host-only) will test cmdline from an exec. |
+| 10 | shm/tmp_size: mount implementation not shown to reviewer | NON-BLOCKING | The mount plan adds `/dev/shm` as a `MountKind::Tmpfs` with the configured size, mode 0o1777, when `shm = true`. L8 (mount-plan comparator) and L33 (host-only) cover it. |
 | 14 | patch 2: resource envelope grows (no new boundary but more writable space) | NON-BLOCKING | True; the default (1024 MiB) matches the current constant. Range validation rejects extreme values. |

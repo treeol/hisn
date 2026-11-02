@@ -1,8 +1,8 @@
-<p align="center">
-  <img src="assets/logo.png" alt="hisn logo" width="160">
-</p>
-
 # hisn
+
+<p align="center">
+  <img src="assets/logo.png" alt="hisn logo" width="256">
+</p>
 
 [![CI](https://github.com/treeol/hisn/actions/workflows/ci.yml/badge.svg)](https://github.com/treeol/hisn/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/treeol/hisn)](https://github.com/treeol/hisn/releases)

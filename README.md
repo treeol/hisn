@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="hisn logo" width="160">
+</p>
+
 # hisn
 
 [![CI](https://github.com/treeol/hisn/actions/workflows/ci.yml/badge.svg)](https://github.com/treeol/hisn/actions/workflows/ci.yml)

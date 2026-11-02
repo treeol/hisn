@@ -74,6 +74,10 @@ pub struct RunArgs {
     /// session lives until `hisn kill` / SIGTERM. Use `hisn exec` to run things in it.
     #[arg(long)]
     pub detach: bool,
+    /// After the session is ready, write "ready\n" to this fd and close it.
+    /// For programmatic readiness (Wakil); works with and without --detach.
+    #[arg(long, value_name = "FD")]
+    pub ready_fd: Option<i32>,
     /// Command and arguments (required unless `--detach`).
     #[arg(last = true, value_name = "CMD")]
     pub command: Vec<String>,

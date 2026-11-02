@@ -1018,6 +1018,19 @@ fn run_session(
     sys::send_with_fd(sup_end.as_raw_fd(), &[MSG_START], None)?;
     thread::spawn(move || control::serve(listener, handler));
 
+    // --ready-fd: write "ready\n" to the caller's fd after the session is
+    // live (START sent, initial grants applied, control thread started).
+    // On start failure the early `bail!` paths above return before reaching
+    // here, so nothing is written and the exit status carries it.
+    if let Some(fd) = args.ready_fd {
+        // SAFETY: the fd is the caller's; we write to it and do not close it
+        // (the caller owns the lifecycle). Using a borrowed fd, not owned.
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        let _ = std::io::Write::write_all(&mut &f, b"ready\n");
+        let _ = f.into_raw_fd(); // do not close; caller owns it
+    }
+
     // ---- 7. relay + wait
     let code = relay_and_wait(pid, master, tty);
 
@@ -1447,6 +1460,7 @@ mod tests {
             allow_host_abstract_sockets: false,
             grants: vec!["/x:rw".into(), "/y".into()],
             detach: false,
+            ready_fd: None,
             command: vec!["true".into()],
         };
         let p = prepare(&args, 1000).unwrap();

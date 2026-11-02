@@ -25,8 +25,10 @@ All notable changes to hisn are recorded here. The format follows
   `hostname`, `network` are included in `ls --json`.
 - **`hisn ls --prune`**: remove stale session directories (no live
   supervisor). Stale = control socket refuses AND supervisor pid is gone or
-  has a different starttime. Removal is symlink-safe, mount-safe
-  (`st_dev` check), owner-checked, and confined to the runtime root.
+  has a different starttime. Removal is fd-relative (`openat2` with
+  `NO_SYMLINKS|NO_XDEV|BENEATH`), so a planted symlink is unlinked and never
+  followed and a planted bind mount is never entered; it is owner-checked and
+  confined to the one session directory.
 - **Stale session cleanup on `hisn run --session-id X`**: if the dir is
   stale, remove it and proceed; if live, `E_EXISTS` stands.
 - **Stale session cleanup on `hisn kill --session X`**: if stale, remove the

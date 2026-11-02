@@ -2,6 +2,8 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -306,52 +308,96 @@ fn socket_refuses(path: &Path) -> bool {
     }
 }
 
-/// Remove a session directory **safely**: only inside the runtime root,
-/// symlink-safe, mount-safe, owner-checked. Uses `unlinkat` per entry (not
-/// `remove_dir_all`) so the traversal is fd-relative and flag-bounded.
-/// Refuses if any entry is not owned by `uid` or is a symlink. Returns
-/// `Ok(())` on success, `Err(reason)` on refusal.
+/// Remove a session directory **safely**: only the given directory, owner-
+/// checked, never following a symlink and never crossing a mount boundary.
+///
+/// The traversal is fd-relative: every directory is opened with
+/// `openat2(RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV |
+/// RESOLVE_BENEATH)` relative to its parent's fd, so a symlink swapped in
+/// after a check cannot redirect it, and a bind mount planted inside (same
+/// device or not) makes the open fail with `EXDEV` instead of being entered.
+/// A **symlink entry is unlinked, not followed and not refused**: `unlinkat`
+/// never dereferences its final component, so removing the link cannot touch
+/// its target. An entry not owned by `uid`, or a mount boundary, is refused
+/// (`Err`), possibly after earlier entries were already removed (P24).
 pub fn remove_safe(path: &Path, uid: u32) -> Result<(), String> {
-    // Verify the path is a real directory owned by uid.
-    let dir_meta = fs::symlink_metadata(path).map_err(|e| format!("stat session dir: {e}"))?;
-    if !dir_meta.file_type().is_dir() {
-        return Err("session dir is not a directory".into());
-    }
-    if dir_meta.uid() != uid {
+    let name = path
+        .file_name()
+        .ok_or_else(|| "session path has no final component".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "session path has no parent".to_owned())?;
+    let parent_fd = File::open(parent).map_err(|e| format!("open {parent:?}: {e}"))?;
+    // The session dir itself must be a real directory (not a symlink to one).
+    let top = open_child_dir(parent_fd.as_raw_fd(), name)
+        .map_err(|e| format!("open session dir {path:?}: {e}"))?;
+    let st = rustix::fs::fstat(&top).map_err(|e| format!("fstat session dir: {e}"))?;
+    if st.st_uid != uid {
         return Err(format!("session dir not owned by uid {uid}"));
     }
-    // Walk the tree with std::fs, checking ownership and refusing symlinks
-    // at every level. We already verified the root path; the checks prevent
-    // a same-uid attacker from planting symlinks or bind mounts that
-    // redirect the removal.
-    remove_tree_std(path, uid, dir_meta.dev())?;
-    // Remove the now-empty session dir.
-    fs::remove_dir(path).map_err(|e| format!("remove session dir: {e}"))
+    remove_contents(&top, uid, 0)?;
+    drop(top);
+    let c = sys::cstr(Path::new(name)).map_err(|e| e.to_string())?;
+    rustix::fs::unlinkat(&parent_fd, c.as_c_str(), rustix::fs::AtFlags::REMOVEDIR)
+        .map_err(|e| format!("remove session dir: {e}"))
 }
 
-fn remove_tree_std(path: &Path, uid: u32, parent_dev: u64) -> Result<(), String> {
-    for entry in fs::read_dir(path).map_err(|e| format!("read_dir {path:?}: {e}"))? {
-        let entry = entry.map_err(|e| format!("read entry {path:?}: {e}"))?;
-        let entry_path = entry.path();
-        let meta =
-            fs::symlink_metadata(&entry_path).map_err(|e| format!("stat {entry_path:?}: {e}"))?;
-        // Check ownership.
-        if meta.uid() != uid {
-            return Err(format!("{entry_path:?}: not owned by uid {uid}"));
+const REMOVE_MAX_DEPTH: usize = 64;
+
+fn open_child_dir(dirfd: RawFd, name: &std::ffi::OsStr) -> io::Result<OwnedFd> {
+    let c = sys::cstr(Path::new(name))?;
+    sys::openat2(
+        dirfd,
+        &c,
+        (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+        0,
+        sys::RESOLVE_NO_SYMLINKS
+            | sys::RESOLVE_NO_MAGICLINKS
+            | sys::RESOLVE_NO_XDEV
+            | sys::RESOLVE_BENEATH,
+    )
+}
+
+fn remove_contents(dir: &OwnedFd, uid: u32, depth: usize) -> Result<(), String> {
+    use rustix::fs::{AtFlags, FileType, statat, unlinkat};
+    if depth > REMOVE_MAX_DEPTH {
+        return Err("directory tree too deep".into());
+    }
+    // Collect the names first: unlinking while iterating a Dir is unspecified.
+    let mut names = Vec::new();
+    let rd = rustix::fs::Dir::read_from(dir).map_err(|e| format!("read_dir: {e}"))?;
+    for ent in rd {
+        let ent = ent.map_err(|e| format!("read entry: {e}"))?;
+        let n = ent.file_name();
+        if n.to_bytes() == b"." || n.to_bytes() == b".." {
+            continue;
         }
-        // Check not a symlink.
-        if meta.file_type().is_symlink() {
-            return Err(format!("{entry_path:?}: is a symlink"));
+        names.push(n.to_owned());
+    }
+    for n in names {
+        let os = std::ffi::OsStr::from_bytes(n.to_bytes());
+        let st = statat(dir, n.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| format!("stat {os:?}: {e}"))?;
+        if st.st_uid != uid {
+            return Err(format!("{os:?}: not owned by uid {uid}"));
         }
-        // Check not on a different mount (bind mount crossing).
-        if meta.dev() != parent_dev {
-            return Err(format!("{entry_path:?}: crosses a mount boundary"));
-        }
-        if meta.is_dir() {
-            remove_tree_std(&entry_path, uid, meta.dev())?;
-            fs::remove_dir(&entry_path).map_err(|e| format!("remove_dir {entry_path:?}: {e}"))?;
+        if FileType::from_raw_mode(st.st_mode) == FileType::Directory {
+            let child = open_child_dir(dir.as_raw_fd(), os)
+                .map_err(|e| format!("open {os:?} (symlink or mount boundary?): {e}"))?;
+            // The opened object must be the one we stat'ed (no swap in between).
+            let cst = rustix::fs::fstat(&child).map_err(|e| format!("fstat {os:?}: {e}"))?;
+            if cst.st_ino != st.st_ino || cst.st_dev != st.st_dev {
+                return Err(format!("{os:?}: changed during removal"));
+            }
+            remove_contents(&child, uid, depth + 1)?;
+            drop(child);
+            unlinkat(dir, n.as_c_str(), AtFlags::REMOVEDIR)
+                .map_err(|e| format!("remove_dir {os:?}: {e}"))?;
         } else {
-            fs::remove_file(&entry_path).map_err(|e| format!("remove_file {entry_path:?}: {e}"))?;
+            // Regular file, socket, fifo, or a symlink: unlink the entry
+            // itself. unlinkat does not dereference the final component.
+            unlinkat(dir, n.as_c_str(), AtFlags::empty())
+                .map_err(|e| format!("unlink {os:?}: {e}"))?;
         }
     }
     Ok(())
@@ -595,18 +641,34 @@ mod tests {
     }
 
     #[test]
-    fn remove_safe_refuses_symlink_inside() {
+    fn remove_safe_unlinks_symlinks_without_following_them() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().join("hisn");
         let s = SessionDir::create(&root, uid(), "rm2").unwrap();
         let target = d.path().join("outside");
         fs::create_dir(&target).unwrap();
+        fs::write(target.join("canary"), b"keep").unwrap();
+        // top-level dir link, file link, dangling link, and one nested.
         std::os::unix::fs::symlink(&target, s.path.join("link")).unwrap();
-        let result = remove_safe(&s.path, uid());
-        assert!(result.is_err());
-        let msg = result.unwrap_err();
-        assert!(msg.contains("symlink"), "msg was: {msg}");
-        assert!(s.path.exists(), "dir should still exist after refusal");
+        std::os::unix::fs::symlink(target.join("canary"), s.path.join("flink")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent-hisn", s.path.join("dangling")).unwrap();
+        fs::create_dir(s.path.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&target, s.path.join("sub/link")).unwrap();
+        remove_safe(&s.path, uid()).unwrap();
+        assert!(!s.path.exists(), "stale dir must be gone");
+        assert_eq!(fs::read(target.join("canary")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn remove_safe_refuses_a_symlinked_session_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("canary"), b"keep").unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(remove_safe(&link, uid()).is_err());
+        assert!(real.join("canary").exists());
     }
 
     #[test]

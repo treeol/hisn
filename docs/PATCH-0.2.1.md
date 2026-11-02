@@ -150,7 +150,10 @@ RESOLVE_BENEATH | RESOLVE_NO_XDEV)` + `unlinkat(fd, name, AT_REMOVEDIR)`.
 who `mount --bind $HOME <stale-dir>/x` cannot redirect the recursive
 removal to `$HOME` (the bind is a mount, not a symlink; `RESOLVE_NO_SYMLINKS`
 alone does not stop it). Refuse if any entry inside the dir is not owned by
-the uid or is a symlink. `unlinkat` (not `remove_dir_all`) is used so the
+the uid. A symlink entry is **unlinked, not followed and not refused**
+(`unlinkat` never dereferences its final component, so a link to `$HOME` is
+removed and `$HOME` is untouched; refusing would leave the stale dir behind,
+which host run L17b caught). `unlinkat` (not `remove_dir_all`) is used so the
 traversal is fd-relative and flag-bounded, not path-based.
 
 The `supervisor.pid` file is treated as a **hint**, never the sole liveness

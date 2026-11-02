@@ -56,7 +56,7 @@ pub fn build_request(args: &ExecArgs) -> Result<Value> {
 /// One parsed response line from the supervisor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
-    Started(i32),
+    Started(i32, Option<String>),
     Exit(Finish),
     Error { code: String, message: String },
 }
@@ -74,7 +74,9 @@ pub fn parse_reply(line: &str) -> Option<Reply> {
         return Some(Reply::Exit(Finish::Signal(n)));
     }
     if v["ok"] == true {
-        return Some(Reply::Started(v["pid"].as_i64()? as i32));
+        let pid = v["pid"].as_i64()? as i32;
+        let exec_id = v["exec_id"].as_str().map(|s| s.to_owned());
+        return Some(Reply::Started(pid, exec_id));
     }
     Some(Reply::Error {
         code: v["error"].as_str().unwrap_or("E_INTERNAL").to_owned(),
@@ -214,6 +216,7 @@ fn relay(conn: &UnixStream, session: &str, master: Option<OwnedFd>) -> Result<Fi
     let mut lines = Lines::default();
     let mut buf = vec![0u8; 16384];
     let mut pid: Option<i32> = None;
+    let mut exec_id: Option<String> = None;
     let mut queued: Vec<i32> = Vec::new();
     let mut finish: Option<Finish> = None;
     let mut master_open = master.is_some();
@@ -230,9 +233,17 @@ fn relay(conn: &UnixStream, session: &str, master: Option<OwnedFd>) -> Result<Fi
                 _ => {}
             }
         }
-        if let Some(p) = pid {
+        if let Some(eid) = &exec_id {
             for s in queued.drain(..) {
                 // A second connection: this one is busy delivering the exit line.
+                let _ = control::request(
+                    &supervisor::socket_for(session)?,
+                    &json!({"op":"signal","exec_id":eid,"signal":control::signal_name(s)}),
+                );
+            }
+        } else if let Some(p) = pid {
+            for s in queued.drain(..) {
+                // Deprecated 0.2 path: signal by pid.
                 let _ = control::request(
                     &supervisor::socket_for(session)?,
                     &json!({"op":"signal","pid":p,"signal":control::signal_name(s)}),
@@ -272,7 +283,10 @@ fn relay(conn: &UnixStream, session: &str, master: Option<OwnedFd>) -> Result<Fi
                 lines.push(&buf[..n]);
                 while let Some(l) = lines.pop_line() {
                     match parse_reply(&l) {
-                        Some(Reply::Started(p)) => pid = Some(p),
+                        Some(Reply::Started(p, eid)) => {
+                            pid = Some(p);
+                            exec_id = eid;
+                        }
                         Some(Reply::Exit(f)) => finish = Some(f),
                         Some(Reply::Error { code, message }) => {
                             eprintln!("hisn: exec: {code}: {message}");
@@ -382,7 +396,7 @@ mod tests {
     fn replies_parse() {
         assert_eq!(
             parse_reply(r#"{"ok":true,"pid":9}"#),
-            Some(Reply::Started(9))
+            Some(Reply::Started(9, None))
         );
         assert_eq!(
             parse_reply(r#"{"exit":{"code":3}}"#),

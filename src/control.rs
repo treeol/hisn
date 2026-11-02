@@ -93,9 +93,13 @@ pub enum Request {
         #[serde(default)]
         tty: bool,
     },
-    /// Signal a live exec'd program (by its in-sandbox pid, as returned by `exec`).
+    /// Signal a live exec'd program (by `exec_id` preferred, or by
+    /// in-sandbox pid for 0.2 clients — deprecated).
     Signal {
-        pid: i32,
+        #[serde(default)]
+        exec_id: Option<String>,
+        #[serde(default)]
+        pid: Option<i32>,
         #[serde(default = "term")]
         signal: String,
     },
@@ -467,7 +471,6 @@ mod tests {
             r#"{"op":"exec"}"#,
             r#"{"op":"exec","argv":"id"}"#,
             r#"{"op":"exec","argv":["id"],"tty":"yes"}"#,
-            r#"{"op":"signal"}"#,
             r#"{"op":"signal","pid":"1"}"#,
             r#"{"op":"grant"}"#,
             r#"{"op":"grant","path":"/a","mode":"rwx"}"#,
@@ -682,7 +685,8 @@ mod tests {
         assert_eq!(
             parse_request(r#"{"op":"signal","pid":7}"#).unwrap(),
             Request::Signal {
-                pid: 7,
+                exec_id: None,
+                pid: Some(7),
                 signal: "TERM".into()
             }
         );

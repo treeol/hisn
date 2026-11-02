@@ -123,6 +123,13 @@ struct Shared {
     /// Live exec'd programs: in-sandbox pid → a handle on their status socket
     /// (only used to deliver `signal`).
     live: Mutex<std::collections::BTreeMap<i32, OwnedFd>>,
+    /// Monotonic exec_id counter (never reused within a session).
+    next_exec_id: std::sync::atomic::AtomicU64,
+    /// Map of exec_id → (pid, status fd handle) for live execs.
+    execs: Mutex<std::collections::BTreeMap<u64, (i32, OwnedFd)>>,
+    /// Pids that have been recycled (reused by a later exec). A `signal` by
+    /// such a pid is rejected — the client must use `exec_id`.
+    recycled_pids: Mutex<std::collections::BTreeSet<i32>>,
 }
 
 impl Shared {
@@ -466,14 +473,42 @@ impl Shared {
             Err(exec::SpawnError::Internal(m)) => return fail(control::E_INTERNAL, m),
         };
         // Register for `signal` before the client learns the pid.
+        let exec_id = self
+            .next_exec_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let registered = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3)
             .ok()
             .map(|h| {
+                // If this pid was used by a previous exec, mark it recycled.
+                let mut recycled = self.recycled_pids.lock().expect("recycled");
+                if self.live.lock().expect("live").contains_key(&sp.pid)
+                    || self
+                        .execs
+                        .lock()
+                        .expect("execs")
+                        .values()
+                        .any(|(p, _)| *p == sp.pid)
+                {
+                    recycled.insert(sp.pid);
+                }
                 self.live.lock().expect("live").insert(sp.pid, h);
+                // Track exec_id → (pid, dup of status fd) for signal by exec_id.
+                // The dup is needed because `live` owns the primary copy and
+                // `signal` by exec_id needs its own handle.
+                if let Ok(dup) = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3) {
+                    self.execs
+                        .lock()
+                        .expect("execs")
+                        .insert(exec_id, (sp.pid, dup));
+                }
                 sp.pid
             });
         let mut w = conn;
-        let started = writeln!(w, "{}", ok(json!({ "pid": sp.pid })));
+        let started = writeln!(
+            w,
+            "{}",
+            ok(json!({ "pid": sp.pid, "exec_id": format!("e-{exec_id}") }))
+        );
         let outcome = if started.is_ok() {
             exec::drive(&sp.status, sp.pending, conn.as_raw_fd(), exec::CANCEL_GRACE)
         } else {
@@ -483,6 +518,7 @@ impl Shared {
         if let Some(pid) = registered {
             self.live.lock().expect("live").remove(&pid);
         }
+        self.execs.lock().expect("execs").remove(&exec_id);
         let (res, line) = match outcome {
             exec::Outcome::Exited(exec::Exit::Code(c)) => ("ok", json!({ "exit": { "code": c } })),
             exec::Outcome::Exited(exec::Exit::Signal(n)) => (
@@ -496,10 +532,42 @@ impl Shared {
     }
 
     /// `signal`: deliver to a live exec'd program of *this* session only.
-    fn do_signal(&self, pid: i32, signal: &str) -> Value {
+    /// Accepts `exec_id` (preferred) or `pid` (deprecated for 0.2 clients).
+    fn do_signal(&self, exec_id: Option<String>, pid: Option<i32>, signal: &str) -> Value {
         let Some(sig) = control::parse_signal(signal) else {
             return err(control::E_BAD_REQUEST, format!("unknown signal {signal:?}"));
         };
+        // Prefer exec_id; fall back to pid for 0.2 clients.
+        if let Some(eid) = exec_id {
+            let eid_num = eid.strip_prefix("e-").and_then(|n| n.parse::<u64>().ok());
+            let Some(eid_num) = eid_num else {
+                return err(control::E_BAD_REQUEST, format!("invalid exec_id {eid:?}"));
+            };
+            let execs = self.execs.lock().expect("execs");
+            let Some((_, h)) = execs.get(&eid_num) else {
+                return err(
+                    control::E_NOT_FOUND,
+                    format!("no running exec with exec_id {eid}"),
+                );
+            };
+            return match sys::send_all(h.as_raw_fd(), exec::format_kill(sig).as_bytes()) {
+                Ok(()) => ok(json!({})),
+                Err(e) => err(control::E_INTERNAL, e.to_string()),
+            };
+        }
+        // Deprecated pid path: reject if the pid has been recycled.
+        let Some(pid) = pid else {
+            return err(
+                control::E_BAD_REQUEST,
+                "signal requires exec_id or pid".to_owned(),
+            );
+        };
+        if self.recycled_pids.lock().expect("recycled").contains(&pid) {
+            return err(
+                control::E_NOT_FOUND,
+                format!("pid {pid} has been recycled; use exec_id"),
+            );
+        }
         let live = self.live.lock().expect("live");
         let Some(h) = live.get(&pid) else {
             return err(
@@ -591,7 +659,11 @@ impl Handler for Ctl {
                 peer,
                 peer_pid,
             ),
-            Request::Signal { pid, signal } => self.sh.do_signal(pid, &signal),
+            Request::Signal {
+                exec_id,
+                pid,
+                signal,
+            } => self.sh.do_signal(exec_id, pid, &signal),
             Request::Grant {
                 path,
                 mode,
@@ -985,6 +1057,9 @@ fn run_session(
         exec_rules,
         spawn_gate: RwLock::new(()),
         live: Mutex::new(Default::default()),
+        next_exec_id: std::sync::atomic::AtomicU64::new(1),
+        execs: Mutex::new(Default::default()),
+        recycled_pids: Mutex::new(Default::default()),
     });
     // The only way to start `network = "host"` without abstract-socket
     // scoping is the explicit flag; it is audited (DESIGN §7, B1).

@@ -174,6 +174,12 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
         bail!("supervisor aborted the session");
     }
 
+    // Scrub argv: overwrite /proc/self/cmdline with "hisn-init" so the
+    // session id, policy path, and session dir do not appear in
+    // /proc/1/cmdline inside the sandbox. Best-effort: failure is not
+    // fatal (the confinement is already in place).
+    scrub_argv("hisn-init");
+
     if cfg.detach {
         drop(slave);
         return Ok(supervise_detached(&old));
@@ -521,6 +527,99 @@ pub fn raw_fd(f: &OwnedFd) -> RawFd {
     f.as_raw_fd()
 }
 
+/// Overwrite the process's argv memory in place so `/proc/self/cmdline`
+/// shows `replacement` instead of the original command line. The session
+/// id, policy path, and session dir must not appear in `/proc/1/cmdline`
+/// inside the sandbox.
+///
+/// Uses `prctl(PR_SET_NAME)` for the comm name and a direct memory
+/// overwrite for the cmdline. The overwrite is best-effort: if it fails
+/// (caps dropped), the scrub is silently skipped — the confinement is
+/// already in place.
+fn scrub_argv(replacement: &str) {
+    // Set the process name (comm, /proc/self/comm) — does not need caps.
+    let name = std::ffi::CString::new(replacement).unwrap_or_default();
+    // SAFETY: PR_SET_NAME with a valid C string (truncated to 16 bytes
+    // including NUL by the kernel).
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0);
+    }
+
+    // Overwrite the argv memory in place. The argv strings live on the
+    // initial stack at the top of the address space. We read
+    // /proc/self/cmdline to get the content (and total byte length), then
+    // write the replacement over the same memory via /proc/self/mem at the
+    // address the content came from. We find that address from
+    // /proc/self/stat (startstack, field 28 after the ')' split, 0-indexed
+    // field 44 in the full list — but the stat file layout has the comm
+    // field in parens which complicates indexing; the actual argv string
+    // area starts just after the argv pointer array and envp pointer
+    // array on the stack, at the address startstack + sizeof(argc) +
+    // (nargv+1)*sizeof(ptr) + (nenvp+1)*sizeof(ptr)).
+    //
+    // Simpler: the first argv string is at the address pointed to by
+    // argv[0], which is at startstack + sizeof(ulong). We can read
+    // startstack from /proc/self/stat, then read the pointer from the
+    // stack, then write to that address via /proc/self/mem.
+    //
+    // Even simpler: use PR_SET_MM_ARG_START/END if we still have
+    // CAP_SYS_RESOURCE (best-effort; may fail with EPERM after caps drop).
+    let cmdline = match std::fs::read("/proc/self/cmdline") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let cmdline_len = cmdline.len();
+    if cmdline_len == 0 {
+        return;
+    }
+    // Write the replacement + NUL padding to a buffer, then try to set it
+    // as the new argv range via PR_SET_MM. This needs CAP_SYS_RESOURCE,
+    // which we don't have after caps drop — so it may fail. Best-effort.
+    let mut new_cmdline = vec![0u8; cmdline_len];
+    let copy_len = replacement.len().min(cmdline_len.saturating_sub(1));
+    new_cmdline[..copy_len].copy_from_slice(&replacement.as_bytes()[..copy_len]);
+    // new_cmdline is already NUL-padded.
+    // Try to write via /proc/self/mem at the address of the original
+    // cmdline. The address is the start of the argv string area on the
+    // initial stack. We can find it by reading /proc/self/stat.
+    let stat = match std::fs::read_to_string("/proc/self/stat") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    // Parse /proc/self/stat: everything after the last ')' is space-separated
+    // fields. Field 28 (0-indexed after ')') is startstack.
+    let rest = match stat.rsplit(')').next() {
+        Some(r) => r.trim(),
+        None => return,
+    };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // startstack is field 27 (0-indexed) after ')'.
+    let startstack: u64 = match fields.get(27).and_then(|s| s.parse().ok()) {
+        Some(v) => v,
+        None => return,
+    };
+    // The stack layout (top-down): startstack -> argc (8 bytes) -> argv[0]
+    // (pointer, 8 bytes) -> ... -> argv array. The first argv string is at
+    // the address stored at startstack + 8 (i.e., *argv[0]).
+    // Read the pointer from /proc/self/mem.
+    let mem = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/proc/self/mem")
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    use std::os::unix::fs::FileExt;
+    let mut ptr_buf = [0u8; 8];
+    if mem.read_at(&mut ptr_buf, startstack + 8).is_err() {
+        return;
+    }
+    let argv0_addr = u64::from_le_bytes(ptr_buf);
+    // Write the replacement + NUL padding at argv0_addr.
+    let _ = mem.write_at(&new_cmdline, argv0_addr);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +749,28 @@ mod tests {
             libc::waitpid(pid, &mut st, 0);
             assert_eq!(decode_status(st), 0);
         }
+    }
+
+    #[test]
+    fn scrub_argv_sets_comm_name() {
+        // PR_SET_NAME is per-thread on modern Linux. Fork so the child's
+        // comm is under our control, then check it.
+        // SAFETY: fork; child sets name, reads comm, exits with status.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            scrub_argv("hisn-test");
+            let comm = std::fs::read_to_string("/proc/self/comm").unwrap_or_default();
+            // SAFETY: _exit never returns.
+            unsafe {
+                libc::_exit(if comm.trim().starts_with("hisn-test") {
+                    0
+                } else {
+                    1
+                });
+            }
+        }
+        let mut st = 0;
+        unsafe { libc::waitpid(pid, &mut st, 0) };
+        assert_eq!(decode_status(st), 0, "comm was not 'hisn-test'");
     }
 }

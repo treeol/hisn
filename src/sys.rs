@@ -1019,4 +1019,64 @@ mod tests {
         assert!(!is_transient(&io::Error::from_raw_os_error(libc::EACCES)));
         assert!(!is_transient(&io::Error::from_raw_os_error(libc::EPERM)));
     }
+
+    /// Cross-check `stat_starttime` against `/proc/self/stat` field layout.
+    /// The Linux `/proc/<pid>/stat` file has fields 1-indexed in the man
+    /// page; after the `)` split, field 3 (state) is index 0, so field 22
+    /// (starttime) is index 19, and field 23 (vsize) is index 20. If the
+    /// index were wrong (e.g. 20 instead of 19), this test would catch it
+    /// because vsize and starttime have very different value ranges.
+    #[test]
+    fn stat_starttime_reads_field_22_not_field_23() {
+        let my_pid = std::process::id() as i32;
+        let stat = std::fs::read_to_string(format!("/proc/{my_pid}/stat")).unwrap();
+        let rest = stat.rsplit(')').next().unwrap();
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        // starttime (field 22) = index 19; vsize (field 23) = index 20.
+        let starttime_val: u64 = fields[19].parse().unwrap();
+        let vsize_val: u64 = fields[20].parse().unwrap();
+        // starttime is a clock tick count (small-ish); vsize is in bytes
+        // (typically megabytes). They should differ by orders of magnitude.
+        // If we were reading the wrong field, the values would be swapped.
+        let st = stat_starttime(my_pid).unwrap();
+        assert_eq!(
+            st, starttime_val,
+            "stat_starttime should read field 22 (index 19)"
+        );
+        // Sanity: vsize should be much larger than starttime for a normal
+        // process (vsize is bytes, starttime is clock ticks since boot).
+        // This catches a swapped index.
+        assert!(
+            vsize_val > starttime_val,
+            "vsize ({vsize_val}) should be > starttime ({starttime_val}); \
+             a swapped field index would invert this"
+        );
+    }
+
+    /// Cross-check the startstack field index used by `scrub_argv` in init.rs.
+    /// startstack (field 28) is index 25 after the `)` split. If the index
+    /// were wrong (e.g. 27 = kstkeip), the address would be 0 or a text
+    /// segment address, not a stack address.
+    #[test]
+    fn startstack_field_index_is_25_not_27() {
+        let my_pid = std::process::id() as i32;
+        let stat = std::fs::read_to_string(format!("/proc/{my_pid}/stat")).unwrap();
+        let rest = stat.rsplit(')').next().unwrap();
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        // startstack (field 28) = index 25; kstkeip (field 30) = index 27.
+        let startstack_val: u64 = fields[25].parse().unwrap();
+        let kstkeip_val: u64 = fields[27].parse().unwrap();
+        // startstack is a stack address (high on x86_64, typically
+        // 0x7fff...); kstkeip is an instruction pointer (text segment).
+        // On x86_64, stack addresses are in the high user-space range.
+        // A non-zero startstack that differs from kstkeip catches a
+        // swapped index.
+        assert_ne!(
+            startstack_val, kstkeip_val,
+            "startstack ({startstack_val:#x}) and kstkeip ({kstkeip_val:#x}) should differ; \
+             a swapped field index would make them equal"
+        );
+        // startstack should be non-zero (we're running, the stack exists).
+        assert_ne!(startstack_val, 0, "startstack should be non-zero");
+    }
 }

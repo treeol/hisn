@@ -1,0 +1,36 @@
+# hisn leak suite — manifest of expected test ids.
+#
+# run.sh FAILS at the end if any listed id produced no line (PASS/FAIL/SKIP/WEAK).
+# This catches a test that was silently dropped from the suite.
+#
+# Format: one id per line, comments and blank lines ignored.
+L1
+L2
+L3
+L4
+L5
+L6
+L7
+L8
+L9
+L10
+L11
+L12
+L13
+L14
+L14b
+L14c
+L15
+L16
+L17
+L17b
+L18
+L19
+L20
+L21
+L22
+L23
+L24
+L33
+L34
+L35

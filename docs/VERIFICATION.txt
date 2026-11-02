@@ -49,12 +49,23 @@ so.  The log file column points at the `docs/leaktest-host-*.log` produced by
 | `make leaktest` (L1-L23) | 19af325 (log header: tree clean) | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 173 passed, 0 failed, 1 skipped, 1 weak | `docs/leaktest-host-2026-11-01.log` |
 | `make leaktest` (L1-L20) | e3bcd31 [inferred — confirm] | host (Fedora 7.2.13, x86_64, ABI 10) | 167 passed, 0 failed, 1 skipped, 1 weak | — (summary line only; `make leaktest-log` did not exist yet) |
 
-### 0.2.1 — not run on host yet
+### 0.2.1 — not run on host yet (with the new tests wired in)
+
+The 0.2.1 leak suite adds L14c, L17b, L33, L34, L35 to the existing
+L1–L24. The expected total on a host that runs all tests (no skips)
+is approximately **180** (L1–L24 = 175 + L14c = 1 + L17b = ~3 + L33 = ~3
++ L34 = 1 + L35 = 1). The actual total depends on host-specific skips
+(L12 needs /etc write; L23/L24 need Landlock ABI 6).
+
+A host run at commit a1d238b (before the new tests were wired in) reported
+175 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5) — identical to
+0.2.0, because L14c/L17b/L33/L34/L35 produced no lines. The new tests are
+now wired into run.sh and the MANIFEST enforces coverage.
 
 | check | commit | where | result | log file |
 |-------|--------|-------|--------|----------|
-| `make leaktest` (L1-L24, L33-L35) | — | not run | not run | — |
-| `hisn ls --prune` (L17b) | — | not run | not run | — |
+| `make leaktest` (L1-L35) | — | not run with new tests | not run | — |
+| `make leaktest` (L1-L24) | a1d238b | host (rubin, Fedora 7.2.13-200.fc44.x86_64) | 175 passed, 0 failed, 1 skipped, 1 weak | `docs/leaktest-host-2026-11-02.log` |
 | `hisn ls` 200x rapid (L14c) | — | not run | not run | — |
 | `x86_64-unknown-linux-musl` build + leak | — | not run | not run (stdlib not in build sandbox) | — |
 

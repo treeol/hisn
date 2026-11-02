@@ -490,6 +490,24 @@ fn cmd_fds() -> String {
     )
 }
 
+/// Read /proc/1/cmdline (L34: argv scrub). Returns the raw bytes as a
+/// space-separated display string; the caller checks it starts with
+/// "hisn-init" and has no non-NUL bytes after it.
+fn cmd_cmdline() -> String {
+    match fs::read("/proc/1/cmdline") {
+        Ok(bytes) => {
+            // Replace NUL separators with spaces for display; the content
+            // assertion checks that after the first NUL everything is NUL.
+            let display: Vec<String> = bytes
+                .split(|&b| b == 0)
+                .map(|seg| String::from_utf8_lossy(seg).into_owned())
+                .collect();
+            format!("OK {}", display.join(" "))
+        }
+        Err(e) => err_str(&e),
+    }
+}
+
 /// Send SIGTERM to `pid` (L21: exec B kills exec A's sleeper by PID).
 fn cmd_kill_pid(pid: &str) -> String {
     let Ok(p) = pid.parse::<i32>() else {
@@ -610,6 +628,7 @@ fn dispatch(a: &[String]) -> String {
         "kill-pid" => cmd_kill_pid(arg(1)),
         "abs-sock-bind" => cmd_abs_sock_bind(arg(1)),
         "abs-sock-connect" => cmd_abs_sock_connect(arg(1)),
+        "cmdline" => cmd_cmdline(),
         other => format!("UNKNOWN_COMMAND {other}"),
     }
 }

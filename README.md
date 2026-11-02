@@ -1,14 +1,14 @@
 # hisn
 
-<p align="center">
-  <img src="assets/logo.png" alt="hisn logo" width="256">
-</p>
+**A rootless, daemonless, single-binary sandbox for AI coding agents on Linux.**
 
 [![CI](https://github.com/treeol/hisn/actions/workflows/ci.yml/badge.svg)](https://github.com/treeol/hisn/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/treeol/hisn)](https://github.com/treeol/hisn/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**A rootless, daemonless, single-binary sandbox for AI coding agents on Linux.**
+<p align="center">
+  <img src="assets/logo.png" alt="hisn logo" width="256">
+</p>
 
 hisn runs a command in a private view of your machine. The command sees its
 working directory at the *same path* as on the host, a read-only toolchain, and

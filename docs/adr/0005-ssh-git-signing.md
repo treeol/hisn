@@ -49,12 +49,18 @@ inside. It:
   with destination-constrained keys** (`ssh-add -h`, below) — the
   constraint is enforced by the agent, not the proxy's parser.
   **Constrained keys cannot do `ssh-keygen -Y sign`** (round-2 BLOCKING):
-  `ssh-keygen -Y sign` does not go through the agent at all — it calls the
-  key directly — so git commit signing via SSHSIG with a constrained key
-  needs a separate **unconstrained** key in `allow_keys` for signing, or
-  the proxy's `SIGN_REQUEST` path with an unconstrained key. A constrained
-  key is for ssh login / `git push` over ssh, not for `git commit -S` with
-  an SSH signing key.
+  `ssh-keygen -Y sign -f <key.pub>` **does** use the agent — it resolves the
+  public key to a private key in the agent and asks the agent to sign. The
+  failure is not "the agent is not called"; it is that a
+  destination-constrained key (loaded with `ssh-add -h`) is constrained to
+  sign only within a session-bound SSH connection to the declared
+  destination, so the agent **refuses to sign** a `git commit -S` SSHSIG
+  blob (it is not an SSH connection to the constrained destination). Git
+  commit signing via SSHSIG therefore needs a separate **unconstrained**
+  key in `allow_keys` for the `SIGN_REQUEST` path, or an unconstrained key
+  loaded into the per-session agent without `-h`. A constrained key is for
+  ssh login / `git push` over ssh, not for `git commit -S` with an SSH
+  signing key.
 - **per-signature audit**: every sign request logs (fingerprint, timestamp)
   to `<session>/ssh-proxy.jsonl`. Never the blob.
 - **commit-signing restriction (0.4, not claimed in 0.3):** a future

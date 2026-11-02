@@ -216,9 +216,11 @@ sandbox root, **read-only as a mount**. From inside the sandbox the socket is
 just a unix socket file at `expose`; the sandbox can `connect(2)` to it. What
 it **cannot** do:
 
-- **unlink** it — the mount is ro (`MOUNT_ATTR_RDONLY`), and the parent
-  directory is the sandbox root tmpfs owned by the mapped uid but the socket
-  inode is not writable (unlink targets the inode, which is the ro mount).
+- **unlink** it — the mount is ro (`MOUNT_ATTR_RDONLY`), so `unlink` of
+  `expose` fails with `EROFS` (or `EBUSY` if the socket inode is momentarily
+  busy). `connect(2)` on the forwarded socket **must succeed** — read-only
+  mounts do not block socket inodes; the ro mount prevents `unlink`/`rename`,
+  not `connect`.
 - **re-bind** it — the sandbox has no `CAP_SYS_ADMIN` and seccomp denies
   `mount`/`umount` (the mount syscall), so it cannot create a new mount at
   that path. (`bind(2)` the socket syscall is not denied; the sandbox can
@@ -593,12 +595,18 @@ that can do a powerful thing on the host."
     with destination-constrained keys** (`ssh-add -h`, below) — the
     constraint is enforced by the agent, not the proxy's parser.
     **Constrained keys cannot do `ssh-keygen -Y sign`** (round-2 BLOCKING):
-    `ssh-keygen -Y sign` does not go through the agent at all — it calls the
-    key directly — so git commit signing via SSHSIG with a constrained key
-    needs a separate **unconstrained** key in `allow_keys` for signing, or
-    the proxy's `SIGN_REQUEST` path with an unconstrained key. A constrained
-    key is for ssh login / `git push` over ssh, not for `git commit -S` with
-    an SSH signing key.
+    `ssh-keygen -Y sign -f <key.pub>` **does** use the agent — it resolves the
+    public key to a private key in the agent and asks the agent to sign. The
+    failure is not "the agent is not called"; it is that a
+    destination-constrained key (loaded with `ssh-add -h`) is constrained to
+    sign only within a session-bound SSH connection to the declared
+    destination, so the agent **refuses to sign** a `git commit -S` SSHSIG
+    blob (it is not an SSH connection to the constrained destination). Git
+    commit signing via SSHSIG therefore needs a separate **unconstrained**
+    key in `allow_keys` for the `SIGN_REQUEST` path, or an unconstrained key
+    loaded into the per-session agent without `-h`. A constrained key is for
+    ssh login / `git push` over ssh, not for `git commit -S` with an SSH
+    signing key.
   - **per-signature audit**: every sign request logs (fingerprint, timestamp)
     to `<session>/ssh-proxy.jsonl`. Never the blob.
   Risk label: `signing`. `risk_ack = "signing"` required.
@@ -862,10 +870,10 @@ the acceptance criterion.
 - **L34**: init's `argv` does not contain the session id (read `/proc/1/cmdline`).
 - **L35**: `signal` with a stale/recycled `exec_id` → `E_NOT_FOUND`; a live
   `exec_id` works.
-- **L36** (forward): the sandbox can `connect` to `expose`; `unlink expose` →
-  `EROFS` (ro mount); `ls /run/user` → absent; the host path is not
-  resolvable. `EBUSY` on `connect` is accepted (the socket may be briefly
-  busy during start).
+- **L36** (forward): the sandbox can `connect` to `expose` (must succeed —
+  ro mounts do not block socket inodes); `unlink expose` → `EROFS` or
+  `EBUSY` (the mount is ro); `ls /run/user` → absent; the host path is not
+  resolvable.
 - **L37** (host_service): the service starts, its socket is at `expose`; on
   session end the host process is gone (`kill -0` fails) and the socket is
   gone.
@@ -905,12 +913,12 @@ Dependency graph (edges = "needs first"):
       ├─ risk labels (§5)     [needs profiles]
       ├─ forward / host_services (§3) [needs profiles]
       │    └─> docker T2 (§4)          [needs forward + risk labels]
-      │    └─> ssh T1 (§4b)            [needs host_services; new crate]
       ├─ in-sandbox services (§2)   [needs profiles + ready-fd]
+      ├─ multi-agent discovery (§7) [needs profiles + --name; cheap, ships in 0.3a]
       └─> 0.3b:
-           ├─ multi-agent discovery (§7) [needs profiles + --name]
-           │    └─> recipes (§6)          [needs everything above]
-           │         └─> threat model / leak tests (§9) [needs recipes]
+           ├─ ssh T1 (§4b)            [needs host_services; new crate; own review cycle after B1]
+           ├─ recipes (§6)            [needs everything above, incl. ssh T1]
+           │    └─> threat model / leak tests (§9) [needs recipes]
 docker T1 (§4)  ──> 0.4 (new crate, trusted-source mount, by-construction lifetime)
 docker T3 (§4)  ──> 0.4 (seccomp change, subuid, nested leak run)
 leases / per-client (§7) ──> 0.4
@@ -918,7 +926,8 @@ leases / per-client (§7) ──> 0.4
 
 ### Order and estimates (single maintainer, Wakil-built; in sessions)
 
-**0.3a** (ships first — the core boundary and the deploy case):
+**0.3a** (ships first — the core boundary, the deploy case, and cheap
+discovery):
 
 | step | what | est. | ships |
 |---|---|---|---|
@@ -928,17 +937,18 @@ leases / per-client (§7) ──> 0.4
 | 4 | forward / host_services (§3): `open_tree` socket forward, lifecycle, `host-exec` risk_ack, L36/L37 | 2 | 0.3a |
 | 5 | in-sandbox services (§2): exec-chain start, readiness, stop, `ls --json`, L31 | 2 | 0.3a |
 | 6 | docker T2 (§4): raw forward + risk_ack check, L29 | 0.5 | 0.3a |
-| 7 | ssh T1 (§4b): `hisn-agent-proxy` crate, sign-only, allow_keys, filtered `LIST_IDS`, per-session agent, audit, L27 | 3 | 0.3a |
-| | **0.3a total** | **~12 sessions** | |
+| 8 | multi-agent discovery (§7): `--name`, `attach`, cwd lookup, L39 | 1.5 | 0.3a |
+| | **0.3a total** | **~10.5 sessions** | |
 
-**0.3b** (ships second — multi-agent and the proof layer):
+**0.3b** (ships second — ssh T1 gets its own review cycle after B1, then
+recipes and the threat-model proof layer):
 
 | step | what | est. | ships |
 |---|---|---|---|
-| 8 | multi-agent discovery (§7): `--name`, `attach`, cwd lookup, L39 | 1.5 | 0.3b |
+| 7 | ssh T1 (§4b): `hisn-agent-proxy` crate, sign-only, allow_keys, filtered `LIST_IDS`, per-session agent, audit, L27 | 3 | 0.3b |
 | 9 | recipes (§6): profiles + L25/L26/L30/L32 | 2 | 0.3b |
 | 10 | threat model leak tests (§9): L33–L37 | 2 | 0.3b |
-| | **0.3b total** | **~5.5 sessions** | |
+| | **0.3b total** | **~7 sessions** | |
 | | **0.3 total** | **~17.5 sessions** | |
 
 | step | what | est. | ships |
@@ -997,14 +1007,17 @@ the relevant sections):
 - Patch 4 (`init argv scrub`): must overwrite argv memory;
   `PR_SET_NAME` does not change `/proc/1/cmdline` (L34 reads `cmdline`).
   Folded into §8 patch 4.
-- L36: accept `EBUSY` on `connect` (the socket may be briefly busy during
-  start). Folded into L36.
+- L36: `EBUSY`/`EROFS` applies to `unlink <expose>` (the ro mount blocks
+  unlink/rename, not `connect`); `connect` on the forwarded socket must
+  succeed. Folded into L36 and §3.
 - L30: drop the `$CARGO_HOME/..` assertion (`/run` is writable, so the
   parent-of-home EROFS test is not a valid assertion). Folded into L30.
 - `attach --name` ambiguous match → `E_AMBIGUOUS` error. Folded into §7.
 - Wakil profile sets `session.shm = true`. Folded into L32.
-- §10: split into 0.3a (steps 1–7) and 0.3b (8–10); 0.3a ships first. Folded
-  into §10.
+- §10: split into 0.3a (steps 1–6 and 8 — core boundary, deploy case, cheap
+  discovery; ~10.5 sessions) and 0.3b (steps 7, 9, 10 — ssh T1 gets its own
+  review cycle after B1, then recipes and the threat-model proof layer; ~7
+  sessions); 0.3a ships first. Folded into §10.
 
 ### Scoped to 0.4 (with reason)
 

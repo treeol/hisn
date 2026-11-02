@@ -109,6 +109,17 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             print_response(&r)
         }
         Command::Kill(a) => {
+            let uid = rustix::process::getuid().as_raw();
+            let roots =
+                session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
+            let dir = session::find_session(&roots, &a.session)?;
+            if session::is_stale(&dir) {
+                session::remove_safe(&dir, uid).map_err(|e| {
+                    anyhow::Error::msg(format!("cannot remove stale session {}: {e}", a.session))
+                })?;
+                eprintln!("session {} was stale; removed", a.session);
+                return Ok(ExitCode::SUCCESS);
+            }
             let r =
                 supervisor::client_request(&a.session, &json!({"op":"kill","signal":a.signal}))?;
             print_response(&r)
@@ -125,7 +136,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Command::Ls(a) => ls(a.session.as_deref(), a.json),
+        Command::Ls(a) => ls(a.session.as_deref(), a.json, a.prune),
     }
 }
 
@@ -153,7 +164,9 @@ fn print_response(r: &Value) -> Result<ExitCode> {
     })
 }
 
-fn ls(session_id: Option<&str>, json_out: bool) -> Result<ExitCode> {
+fn ls(session_id: Option<&str>, json_out: bool, prune: bool) -> Result<ExitCode> {
+    let uid = rustix::process::getuid().as_raw();
+    let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     match session_id {
         Some(id) => {
             let r = supervisor::client_request(id, &json!({"op":"list"}))?;
@@ -171,10 +184,29 @@ fn ls(session_id: Option<&str>, json_out: bool) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         None => {
-            let uid = rustix::process::getuid().as_raw();
-            let roots =
-                session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
-            let rows: Vec<(String, PathBuf, bool)> = session::list_sessions(&roots)
+            let sessions = session::list_sessions(&roots);
+            if prune {
+                for (n, p) in &sessions {
+                    // Check twice 300 ms apart to avoid racing a live session
+                    // mid-shutdown.
+                    if session::is_stale(p) {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        if session::is_stale(p) {
+                            match session::remove_safe(p, uid) {
+                                Ok(()) => eprintln!("{n} stale; removed"),
+                                Err(e) => {
+                                    tracing::warn!("prune {n}: removal refused: {e}");
+                                    eprintln!("{n} stale; removal refused: {e}");
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::info!("prune: {n} not stale; skipped");
+                    }
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            let rows: Vec<(String, PathBuf, bool)> = sessions
                 .into_iter()
                 .map(|(n, p)| (n.clone(), p.clone(), session::is_live(&p)))
                 .collect();

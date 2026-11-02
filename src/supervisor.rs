@@ -849,6 +849,20 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         None => session::random_id()?,
     };
     let root = session::pick_root(&prep.roots);
+    // Handle a stale session dir for the same id: remove it and proceed.
+    // A live dir is still an error (E_EXISTS).
+    let dir_path = root.join(&id);
+    if dir_path.is_dir() {
+        if session::is_stale(&dir_path) {
+            if let Err(e) = session::remove_safe(&dir_path, uid) {
+                tracing::warn!("stale session {id}: removal refused: {e}");
+                bail!("session {id} exists and cannot be removed: {e}");
+            }
+            tracing::info!("stale session {id}: removed");
+        } else {
+            bail!("session {id} already exists");
+        }
+    }
     let sdir = SessionDir::create(&root, uid, &id)?;
     let result = run_session(
         &args,
@@ -881,6 +895,11 @@ fn run_session(
 ) -> Result<i32> {
     sdir.write_resolved_policy(&policy.to_toml())?;
     let audit = Audit::open(&sdir.audit_path())?;
+    // Write supervisor.pid for stale-detection. Written after the dir is
+    // created and before unshare — a crash here leaves a dir without the
+    // pid file, which is_stale treats as "not stale" (fail safe).
+    sdir.write_supervisor_pid(std::process::id() as i32)
+        .context("writing supervisor.pid")?;
     // A detached session has no command, hence no terminal to relay.
     let tty = !args.detach && sys::isatty(0);
     let root_dir = sdir.path.join("root");

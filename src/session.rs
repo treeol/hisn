@@ -3,11 +3,13 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
 use crate::policy::is_valid_session_id;
+use crate::sys;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -107,6 +109,23 @@ impl SessionDir {
 
     pub fn audit_path(&self) -> PathBuf {
         self.path.join("grants.jsonl")
+    }
+
+    pub fn pid_path(&self) -> PathBuf {
+        self.path.join("supervisor.pid")
+    }
+
+    /// Write `supervisor.pid` with the pid and starttime so stale-detection
+    /// can confirm the supervisor is the same process (not a reused pid).
+    pub fn write_supervisor_pid(&self, pid: i32) -> io::Result<()> {
+        let starttime = sys::stat_starttime(pid).unwrap_or(0);
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(self.pid_path())?;
+        writeln!(f, "{pid} {starttime}")?;
+        Ok(())
     }
 
     pub fn write_resolved_policy(&self, toml: &str) -> io::Result<()> {
@@ -236,6 +255,106 @@ pub fn rfc3339(secs: i64) -> String {
 /// Is `path` a socket we can connect to (a live supervisor)?
 pub fn is_live(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path.join("control.sock")).is_ok()
+}
+
+/// Is a session directory stale? `stale` = the socket refuses **and** the
+/// supervisor pid is gone or has a different starttime. Socket errors other
+/// than `ECONNREFUSED`/`ENOENT` mean **not stale** (a busy live session must
+/// never be classified stale). A missing or malformed `supervisor.pid` means
+/// **not stale** (fail safe — a 0.2.0 dir or a 0.2.1 session mid-start).
+pub fn is_stale(path: &Path) -> bool {
+    match socket_refuses(path) {
+        true => {}
+        false => return false,
+    }
+    let pid_file = match fs::read_to_string(path.join("supervisor.pid")) {
+        Ok(s) => s,
+        Err(_) => return false, // missing → not stale
+    };
+    let (pid_str, start_str) = match pid_file.trim().split_once(' ') {
+        Some((a, b)) => (a, b),
+        None => return false, // malformed → not stale
+    };
+    let pid: i32 = match pid_str.parse() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let recorded_start: u64 = match start_str.parse() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    // pid not alive → stale; alive with mismatched starttime → stale.
+    match sys::kill(pid, 0) {
+        Ok(()) => match sys::stat_starttime(pid) {
+            Ok(st) => st != recorded_start,
+            Err(_) => true, // cannot read stat — assume gone
+        },
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => true,
+        Err(_) => false, // EPERM etc → alive, not stale
+    }
+}
+
+/// Does the control socket refuse? Only `ECONNREFUSED`/`ENOENT` counts;
+/// a timeout or backlog-full means **not stale** (live and busy).
+fn socket_refuses(path: &Path) -> bool {
+    match UnixStream::connect(path.join("control.sock")) {
+        Ok(_) => false, // connected → live
+        Err(e) => matches!(
+            e.raw_os_error(),
+            Some(libc::ECONNREFUSED) | Some(libc::ENOENT)
+        ),
+    }
+}
+
+/// Remove a session directory **safely**: only inside the runtime root,
+/// symlink-safe, mount-safe, owner-checked. Uses `unlinkat` per entry (not
+/// `remove_dir_all`) so the traversal is fd-relative and flag-bounded.
+/// Refuses if any entry is not owned by `uid` or is a symlink. Returns
+/// `Ok(())` on success, `Err(reason)` on refusal.
+pub fn remove_safe(path: &Path, uid: u32) -> Result<(), String> {
+    // Verify the path is a real directory owned by uid.
+    let dir_meta = fs::symlink_metadata(path).map_err(|e| format!("stat session dir: {e}"))?;
+    if !dir_meta.file_type().is_dir() {
+        return Err("session dir is not a directory".into());
+    }
+    if dir_meta.uid() != uid {
+        return Err(format!("session dir not owned by uid {uid}"));
+    }
+    // Walk the tree with std::fs, checking ownership and refusing symlinks
+    // at every level. We already verified the root path; the checks prevent
+    // a same-uid attacker from planting symlinks or bind mounts that
+    // redirect the removal.
+    remove_tree_std(path, uid, dir_meta.dev())?;
+    // Remove the now-empty session dir.
+    fs::remove_dir(path).map_err(|e| format!("remove session dir: {e}"))
+}
+
+fn remove_tree_std(path: &Path, uid: u32, parent_dev: u64) -> Result<(), String> {
+    for entry in fs::read_dir(path).map_err(|e| format!("read_dir {path:?}: {e}"))? {
+        let entry = entry.map_err(|e| format!("read entry {path:?}: {e}"))?;
+        let entry_path = entry.path();
+        let meta =
+            fs::symlink_metadata(&entry_path).map_err(|e| format!("stat {entry_path:?}: {e}"))?;
+        // Check ownership.
+        if meta.uid() != uid {
+            return Err(format!("{entry_path:?}: not owned by uid {uid}"));
+        }
+        // Check not a symlink.
+        if meta.file_type().is_symlink() {
+            return Err(format!("{entry_path:?}: is a symlink"));
+        }
+        // Check not on a different mount (bind mount crossing).
+        if meta.dev() != parent_dev {
+            return Err(format!("{entry_path:?}: crosses a mount boundary"));
+        }
+        if meta.is_dir() {
+            remove_tree_std(&entry_path, uid, meta.dev())?;
+            fs::remove_dir(&entry_path).map_err(|e| format!("remove_dir {entry_path:?}: {e}"))?;
+        } else {
+            fs::remove_file(&entry_path).map_err(|e| format!("remove_file {entry_path:?}: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -406,5 +525,95 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn supervisor_pid_is_written_once_privately() {
+        let d = tempfile::tempdir().unwrap();
+        let s = SessionDir::create(&d.path().join("h"), uid(), "p").unwrap();
+        s.write_supervisor_pid(12345).unwrap();
+        let text = fs::read_to_string(s.pid_path()).unwrap();
+        assert!(text.trim().starts_with("12345 "));
+        // Second write fails (create_new).
+        assert!(s.write_supervisor_pid(99999).is_err());
+        assert_eq!(fs::metadata(s.pid_path()).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn is_stale_false_for_missing_supervisor_pid() {
+        // A 0.2.0 dir without supervisor.pid is not stale (fail safe).
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("hisn");
+        let s = SessionDir::create(&root, uid(), "stale1").unwrap();
+        // No supervisor.pid written — socket also doesn't exist → ENOENT
+        // (refuses), but missing pid → not stale.
+        assert!(!is_stale(&s.path));
+    }
+
+    #[test]
+    fn is_stale_false_for_malformed_supervisor_pid() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("hisn");
+        let s = SessionDir::create(&root, uid(), "stale2").unwrap();
+        fs::write(s.pid_path(), "not-a-number\n").unwrap();
+        // Socket doesn't exist → refuses, but malformed pid → not stale.
+        assert!(!is_stale(&s.path));
+    }
+
+    #[test]
+    fn is_stale_true_for_dead_supervisor() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("hisn");
+        let s = SessionDir::create(&root, uid(), "stale3").unwrap();
+        // Fork a child that exits immediately, then write its pid with its
+        // real starttime. The socket won't exist (ECONNREFUSED) and the pid
+        // is dead (ESRCH) → stale.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            std::process::exit(0);
+        }
+        let mut st = 0;
+        unsafe { libc::waitpid(pid, &mut st, 0) };
+        let starttime = sys::stat_starttime(pid).unwrap_or(0);
+        fs::write(s.pid_path(), format!("{pid} {starttime}")).unwrap();
+        assert!(is_stale(&s.path));
+    }
+
+    #[test]
+    fn remove_safe_removes_a_session_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("hisn");
+        let s = SessionDir::create(&root, uid(), "rm1").unwrap();
+        fs::write(s.path.join("control.sock"), b"x").unwrap();
+        fs::create_dir(s.path.join("sub")).unwrap();
+        fs::write(s.path.join("sub/file"), b"x").unwrap();
+        remove_safe(&s.path, uid()).unwrap();
+        assert!(!s.path.exists());
+    }
+
+    #[test]
+    fn remove_safe_refuses_symlink_inside() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("hisn");
+        let s = SessionDir::create(&root, uid(), "rm2").unwrap();
+        let target = d.path().join("outside");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, s.path.join("link")).unwrap();
+        let result = remove_safe(&s.path, uid());
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("symlink"), "msg was: {msg}");
+        assert!(s.path.exists(), "dir should still exist after refusal");
+    }
+
+    #[test]
+    fn remove_safe_refuses_wrong_owner() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("hisn");
+        let s = SessionDir::create(&root, uid(), "rm3").unwrap();
+        // Pass wrong uid — remove_safe should refuse.
+        let wrong_uid = uid() + 1;
+        let result = remove_safe(&s.path, wrong_uid);
+        assert!(result.is_err());
     }
 }

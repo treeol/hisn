@@ -166,6 +166,9 @@ pub struct LsArgs {
     /// Print JSON instead of text.
     #[arg(long)]
     pub json: bool,
+    /// Remove stale session directories (no live supervisor).
+    #[arg(long)]
+    pub prune: bool,
 }
 
 #[derive(Debug, Args)]

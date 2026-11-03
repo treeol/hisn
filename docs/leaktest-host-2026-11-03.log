@@ -1,0 +1,237 @@
+# hisn leaktest host log
+commit:  809da1185ae6244448143178d97122c02964b3d6
+tree:    clean
+date:    2026-11-03T22:48:12Z
+host:    rubin
+kernel:  7.2.15-200.fc44.x86_64
+hisn:    hisn 0.3.0
+---
+make[1]: Verzeichnis „/home/valon/Coding/hisn“ wird betreten
+cargo build --release
+    Finished `release` profile [optimized] target(s) in 0.03s
+cargo build --release --example leakprobe
+    Finished `release` profile [optimized] target(s) in 0.03s
+bash tests/leak/run.sh ./target/release/hisn
+PASS  L1 stat /home -> ENOENT
+PASS  L1 open /home -> ENOENT
+PASS  L1 stat /root -> ENOENT
+PASS  L1 open /root -> ENOENT
+PASS  L1 stat /tankz -> ENOENT
+PASS  L1 open /tankz -> ENOENT
+PASS  L1 stat /var -> ENOENT
+PASS  L1 open /var -> ENOENT
+PASS  L1 stat /etc/shadow -> ENOENT
+PASS  L1 open /etc/shadow -> ENOENT
+PASS  L1 stat /etc/ssh -> ENOENT
+PASS  L1 open /etc/ssh -> ENOENT
+PASS  L1 stat /home/valon/.ssh -> ENOENT
+PASS  L1 open /home/valon/.ssh -> ENOENT
+PASS  L1 stat /home/valon/.aws -> ENOENT
+PASS  L1 open /home/valon/.aws -> ENOENT
+PASS  L1 /etc listing has no shadow
+PASS  L1 /etc listing has no gshadow
+PASS  L1 /etc listing has no sudoers
+PASS  L1 /etc listing has no ssh
+PASS  L2 /proc/1/root denied (non-dumpable init, DESIGN D6)
+PASS  L2 /proc/1/root/etc/shadow unreachable (EACCES)
+PASS  L2 /proc/self/root is the sandbox root
+PASS  L2 init is pid 1
+PASS  L2 only 2 pids visible
+PASS  L2 host hisn pid 3587400 invisible
+PASS  L2 host shell pid 3587376 invisible
+PASS  L3 mount -> EPERM
+PASS  L3 umount -> EPERM
+PASS  L3 unshare_mnt -> EPERM
+PASS  L3 unshare_user -> EPERM
+PASS  L3 setns -> EPERM
+PASS  L3 ptrace -> EPERM
+PASS  L3 chroot -> EPERM
+PASS  L3 pivot_root -> EPERM
+PASS  L3 open_tree -> EPERM
+PASS  L3 bpf -> EPERM
+PASS  L3 io_uring_setup -> EPERM
+PASS  L3 clone_newuser -> EPERM
+PASS  L3 tiocsti -> EPERM
+PASS  L3 clone3 -> ENOSYS
+PASS  L3 'unshare -m true' failed as required (OK exit=1)
+PASS  L3 'nsenter -t 1 -m true' failed as required (OK exit=1)
+PASS  L3 CapInh empty
+PASS  L3 CapPrm empty
+PASS  L3 CapEff empty
+PASS  L3 CapBnd empty
+PASS  L3 CapAmb empty
+PASS  L3 no_new_privs
+PASS  L3 seccomp filter active
+PASS  L4 host secret value absent
+PASS  L4 AWS secret absent
+PASS  L4 SSH_AUTH_SOCK absent
+PASS  L4 HISN_LEAK_SECRET name absent
+PASS  L4 env.pass var present
+PASS  L4 HOME forced
+PASS  L5 write in cwd
+PASS  L5 write visible on host
+PASS  L5 /usr write -> EROFS
+PASS  L5 /etc write -> EROFS
+PASS  L5 /tmp writable
+PASS  L5 home writable
+PASS  L5 cwd identical path
+PASS  L5 sandbox /tmp is private
+PASS  L7 loopback works
+PASS  L7 1.1.1.1 -> ENETUNREACH
+PASS  L7 10.255.255.1 -> ENETUNREACH
+PASS  L9 l_shadow not readable (ENOENT)
+PASS  L9 l_outside not readable (ENOENT)
+PASS  L9 l_rel not readable (ENOENT)
+PASS  L9 l_proc not readable (EACCES)
+PASS  L9 outside secret content never read
+PASS  L10 /dev contents
+PASS  L10 /sys absent
+PASS  L12 sandbox /etc only holds start-time, non-masked entries
+PASS  L8 L8 ok: 326 mounts, all accounted for, modes match
+PASS  L6 initial ro grant readable
+PASS  L6 ro grant write -> EROFS
+PASS  L6 ro grant: nothing written on host
+PASS  L6 rw grant accepted
+PASS  L6 rw grant writable
+PASS  L6 rw write visible on host
+PASS  L6 rw outside grantable prefix refused
+PASS  L6 runtime dir cannot be granted (R1)
+PASS  L6 / cannot be granted (R2)
+PASS  L8 with live grants: L8 ok: 327 mounts, all accounted for, modes match
+PASS  L6 grant mounts invisible in the host mount table
+PASS  L13 queue an fd
+PASS  L6 revoke rw accepted
+PASS  L13 soft revoke reports guarantee=lookup, never 'hard'
+PASS  L6 revoked rw path -> ENOENT
+PASS  L6 revoked rw file -> ENOENT
+INFO  L13 soft revoke: recv-write through the queued fd says: OK wrote-through-queued-fd  (documented residual of soft revoke, see DESIGN D14)
+PASS  L6 revoke ro accepted
+PASS  L6 revoked ro path -> ENOENT
+PASS  L6 double revoke -> E_NOT_GRANTED
+PASS  L6 session end: no grant mountpoint in the host mount table
+PASS  L6 session end: session dir removed
+PASS  L6 host mount table identical before/after the session
+PASS  L11 B's grant visible in B
+PASS  L11 A cannot see B's grant
+PASS  L11 A cannot see B's cwd
+PASS  L11 A sees only its own cwd (+ the empty grantable prefix dir) under the shared parent
+PASS  L11 A cannot see the runtime dir
+PASS  L11 A cannot see B's session dir
+PASS  L11 B cannot see A's session dir
+PASS  L11 host sees session A
+PASS  L11 host sees session B
+PASS  L11 A's grant list has no B grant
+PASS  L13 hard revoke reports guarantee=hard
+PASS  L13 queued fd unusable after hard revoke (no write landed)
+SKIP  L12 host-creates-secret-after-start -- needs write access to /etc (not available unprivileged); the allowlist substitute above ran instead
+PASS  L14 runtime-dir bind alias under cwd is rejected (R1b)
+PASS  L14b runtime-dir bind alias offered as a grant source is refused
+WEAK  L14 R5 -- the control-socket pid-namespace check (R5) is covered by unit tests only; no end-to-end test can place the socket inside the sandbox without a test hook
+PASS  L14c 200 rapid hisn ls invocations: 0 refusals
+PASS  L1c (suite environment) id -un is the host user
+PASS  L1c (suite environment) $USER is the host user
+PASS  L1c (suite environment) $LOGNAME is the host user
+PASS  L1c (suite environment) getent passwd is the generated record
+PASS  L1c (env -i, no USER) id -un is the host user
+PASS  L1c (env -i, no USER) $USER is the host user
+PASS  L1c (env -i, no USER) $LOGNAME is the host user
+PASS  L1c (env -i, no USER) getent passwd is the generated record
+PASS  L1c (env -i, USER=notme LOGNAME=notme) id -un is the host user
+PASS  L1c (env -i, USER=notme LOGNAME=notme) $USER is the host user
+PASS  L1c (env -i, USER=notme LOGNAME=notme) $LOGNAME is the host user
+PASS  L1c (env -i, USER=notme LOGNAME=notme) getent passwd is the generated record
+PASS  L15 exec stat /home -> ENOENT
+PASS  L15 exec stat /root -> ENOENT
+PASS  L15 exec stat /tankz -> ENOENT
+PASS  L15 exec stat /var -> ENOENT
+PASS  L15 exec stat /etc/shadow -> ENOENT
+PASS  L15 exec stat /etc/ssh -> ENOENT
+PASS  L15 exec stat /home/valon/.ssh -> ENOENT
+PASS  L15 exec stat /home/valon/.aws -> ENOENT
+PASS  L15 exec mount -> EPERM
+PASS  L15 exec unshare_mnt -> EPERM
+PASS  L15 exec unshare_user -> EPERM
+PASS  L15 exec setns -> EPERM
+PASS  L15 exec ptrace -> EPERM
+PASS  L15 exec chroot -> EPERM
+PASS  L15 exec pivot_root -> EPERM
+PASS  L15 exec open_tree -> EPERM
+PASS  L15 exec bpf -> EPERM
+PASS  L15 exec io_uring_setup -> EPERM
+PASS  L15 exec clone_newuser -> EPERM
+PASS  L15 exec tiocsti -> EPERM
+PASS  L15 exec clone3 -> ENOSYS
+PASS  L15 exec env: host secret absent
+PASS  L15 exec env: AWS secret absent
+PASS  L15 exec env: passed var present
+PASS  L15 exec env: HOME forced
+PASS  L15 exec write in cwd
+PASS  L15 exec write visible on host
+PASS  L15 exec /usr write -> EROFS
+PASS  L15 exec /tmp writable
+PASS  L15 exec symlink escape -> not readable (ENOENT)
+PASS  L15 exec /dev contents
+PASS  L15 exec /sys absent
+PASS  L17 exec'd process chain is P -> W -> init (100 -> 99 -> 1)
+PASS  L17 exec'd process is in the sandbox pid ns (init=1 visible)
+PASS  L17 only 3 pids visible via exec
+PASS  L18 env key not in env.pass rejected (exit 125)
+PASS  L18 passed key present in the exec environment
+PASS  L18 computed name (HOME) rejected
+PASS  L16 grant before exec accepted
+PASS  L16 grant made before exec is visible in it
+PASS  L16 rw grant during a running exec accepted
+PASS  L16 grant during a running exec is visible to a later one
+PASS  L16 revoke of a live grant accepted
+PASS  L16 mid-exec revoke: the running exec cannot re-read the grant (rc=rc=1)
+PASS  L16 revoked path -> ENOENT for a later exec
+PASS  L16 an unrevoked grant stays visible to a later exec
+PASS  L16 second revoke -> ENOENT for a later exec
+PASS  L19 50 sequential execs all succeed
+PASS  L19 10 concurrent execs all succeed
+PASS  L19 supervisor fd count back to baseline (10 -> 10 after 60 execs)
+PASS  L19 no zombie in the sandbox after 60 execs
+PASS  L20 --tty exec: isatty=1, initial size 80x24, resize to 100x30 reached the program (RESULT first=[FIRST isatty=1 size=80x24] resized=[RESIZED size=100x30])
+PASS  L20 terminal without --tty refused (exit 125)
+PASS  L21 exec B kills exec A's process by PID (OK killed)
+PASS  L21 exec B cannot stat /home
+PASS  L21 exec B cannot stat /root
+PASS  L21 exec B cannot stat /etc/shadow
+PASS  L22 exec B connects to exec A's abstract unix socket (OK connected)
+PASS  L23 scoped signal: cross-exec kill fails with EPERM
+PASS  L24 network=host (default policy): exec cannot connect to a host abstract socket
+PASS  L24 network=host (explicit policy): exec cannot connect to a host abstract socket
+PASS  L17 exec'd sleeper died with the session (hisn exec rc=125)
+PASS  L17 detached session dir removed
+PASS  L17b --prune removes a stale session dir
+PASS  L17b dir without supervisor.pid is not pruned
+PASS  L17b symlink in a stale dir is not followed by --prune (canary kept, stale dir removed)
+PASS  L17b run over a stale dir: --session-id succeeds; old supervisor.pid and dir content are gone
+PASS  L33 /dev/shm is present when shm=true
+PASS  L33 file in /dev/shm is visible across execs
+PASS  L33 /dev/shm is a private tmpfs
+PASS  L33 /dev/shm is absent by default (shm=false)
+PASS  L34 /proc/1/cmdline is exactly hisn-init (NUL padding only after it)
+PASS  L35 exec into detached session returns program stdout
+PASS  L25 profile base == 0.2.2 plan: L8 ok: 326 mounts, all accounted for, modes match
+PASS  L26 profile under cwd → E_PROFILE_UNTRUSTED
+PASS  L36 forward: connect to expose works (OK connected)
+PASS  L36 forward: unlink expose → EBUSY
+PASS  L36 forward: host path absent inside
+PASS  L36 forward: other socket in same dir invisible
+PASS  L37 host_service: socket at expose (OK socket)
+PASS  L37 host_service: connect works (OK connected)
+PASS  L37 host_service: host process gone after session end
+PASS  L29 docker-socket: RISK line printed on start
+PASS  L29 docker-socket: docker ps works inside (OK exit=0)
+PASS  L29 docker-socket: missing risk_ack → load error
+PASS  L31 service: socket appears at cwd path
+PASS  L31 service: connectable from a second exec (OK connected)
+OK
+PASS  L31 service: inspect shows no extra mounts for the service
+PASS  L31 service: dies with the session
+PASS  L41 service readiness timeout → session fails closed (exit 125)
+PASS  L41 readiness timeout: nothing left running (session dir gone)
+
+RESULT: 216 passed, 0 failed, 1 skipped, 1 weak
+make[1]: Verzeichnis „/home/valon/Coding/hisn“ wird verlassen

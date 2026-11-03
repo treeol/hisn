@@ -7,6 +7,19 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1]
+
+### Fixed
+- L17 signal race (7b162c7, 809da11): the control thread left `SIGCHLD`,
+  `SIGTERM`, `SIGINT`, `SIGHUP` and `SIGWINCH` unblocked, so the kernel could
+  deliver them to it and the main thread's `sigsuspend` was never woken (a
+  detached supervisor hung after its init exited; seen on ubuntu-22.04 CI).
+  The control thread now blocks them. 7b162c7 also made the L29 test and
+  `profiles/docker-socket.toml` use `network = "none"` (host mode needs
+  Landlock ABI >= 6, absent on ubuntu-22.04).
+- Verification rows for CI and the host run: see `docs/VERIFICATION.txt`.
+  The 0.3.0 tag points at afdccd0 and does not contain these fixes.
+
 ## [0.3.0]
 
 ### Added

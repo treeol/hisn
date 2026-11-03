@@ -1,6 +1,6 @@
 # Verification record
 
-hisn version : 0.3.0
+hisn version : 0.3.1
 
 This file records what was actually run, where, and with what result.  No
 entry is "inferred": anything not backed by a log file or by a run in this
@@ -12,7 +12,7 @@ commit it ran on.
 
 Linux 7.2.13-200.fc44.x86_64, uid 1000.  User namespaces are available here
 (allow_userns), so leak tests run in the sandbox.  The host does a final
-`make leaktest-log` before the 0.3.0 tag.
+`make leaktest-log` before the tag (done for 0.3.1, see "0.3.1 runs").
 
 | check | commit | where | result | log file |
 |-------|--------|-------|--------|----------|
@@ -133,3 +133,15 @@ boundary). A WARN line is logged by init when it fails. Hostname isolation
 (UTS ns separation) is only verifiable on the host — in the build sandbox
 `sethostname` fails but the session still starts; on the host it succeeds and
 the hostname inside the sandbox is `hisn`.
+
+### 0.3.1 runs
+
+0.3.0 (tag at afdccd0) predates the L29 and L17 fixes (7b162c7, 809da11).
+
+| check | commit | where | result | log file |
+|-------|--------|-------|--------|----------|
+| `make leaktest-log` (L1-L41) | 809da11 (log header: tree clean) | host (rubin, Fedora 7.2.15-200.fc44.x86_64) | **216 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5)** | `docs/leaktest-host-2026-11-03.log` |
+| CI, all jobs (check; leaktest ubuntu-22.04 and ubuntu-24.04) | 809da11 | GitHub Actions, 2026-11-03 | all jobs green (reported by the maintainer; run URL not recorded) | — |
+| `x86_64-unknown-linux-musl` build + leak | -- | -- | not run: no workflow builds or tests musl (only a comment in `release.yml`) | -- |
+| aarch64 leak; other kernels/distros | -- | -- | not run | -- |
+| the L17 race fix itself | 809da11 | -- | cause is an inference from the CI process table (supervisor in `sigsuspend`, init a zombie); a race, so green runs are supporting evidence, not proof | -- |

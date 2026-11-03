@@ -277,10 +277,10 @@ To check a downloaded binary, run `sha256sum -c SHA256SUMS`, then
 
 ## Status
 
-hisn 0.3.0 is maintained by one person. The leak suite was last run in the
-build sandbox (allow_userns) at commit `1c74aad`: **214 passed, 0 failed, 1
-skipped (L12, needs write access to `/etc`), 4 weak (L1, L14 R5, L20, L37)**.
-The user does a final `make leaktest-log` on the host before the 0.3.0 tag.
+hisn 0.3.1 is maintained by one person. The leak suite was last recorded on a
+Fedora x86_64 host at commit `809da11`: **216 passed, 0 failed, 1 skipped
+(L12, needs write access to `/etc`), 1 weak (L14 R5)**
+([log](docs/leaktest-host-2026-11-03.log)).
 CI runs the suite on Ubuntu 22.04 and 24.04 (x86_64) and builds a release only
 after it passes. aarch64 is cross-checked by clippy and has not been
 leak-tested. [docs/VERIFICATION.txt](docs/VERIFICATION.txt) lists what was run,

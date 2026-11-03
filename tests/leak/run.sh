@@ -1362,7 +1362,7 @@ version = "hisn-profile/v1"
 [policy]
 version = "hisn-policy/v1"
 session.cwd = "$L29_CWD"
-session.network = "host"
+session.network = "none"
 env.pass = ["DOCKER_HOST"]
 env.set = { DOCKER_HOST = "unix:///run/docker.sock" }
 [[forward]]
@@ -1412,7 +1412,7 @@ version = "hisn-profile/v1"
 [policy]
 version = "hisn-policy/v1"
 session.cwd = "$L29_CWD"
-session.network = "host"
+session.network = "none"
 [[forward]]
 name = "docker"
 socket = "/var/run/docker.sock"

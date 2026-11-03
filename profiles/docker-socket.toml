@@ -1,12 +1,12 @@
 version = "hisn-profile/v1"
 
 # Docker T2: raw socket forward, root-equivalent.
-# network = "host" is for compose services that need host networking;
-# the daemon socket itself is reachable via a mount under network = "none".
+# The daemon socket is a mount, so network = "none" is enough to reach it.
+# (network = "host" would additionally need Landlock ABI >= 6.)
 [policy]
 version = "hisn-policy/v1"
 session.cwd = "."
-session.network = "host"
+session.network = "none"
 mounts.grantable_rw = ["/srv/out"]
 
 [[forward]]

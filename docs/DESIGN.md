@@ -1193,3 +1193,140 @@ covers the **authority** the socket grants (signing, root-equivalent,
 host-exec), not the confidentiality of the host path name. Leak test L36
 records this as a WEAK check (the host path is visible through `getpeername`
 but the sandbox cannot reach the host path as a file).
+
+## 18. Docker T2 — raw socket forward (v0.3, ADR 0004)
+
+**0.3 ships T2 only.** T1 (`tier = "proxy"`) and T3 (`nested_userns = true`)
+are designed in ADR 0004 but rejected in 0.3 with `E_NOT_SUPPORTED` (round-1/2
+BLOCKING: T1's bind-source TOCTOU, container-lifetime-by-construction, and
+shared-bridge isolation are not achievable by a host-side proxy alone in
+0.3; T3 needs subuid handling and a seccomp profile change).
+
+### Decision
+
+`[docker] tier = "socket"` is a `[[forward]]` of the Docker daemon socket
+(`/var/run/docker.sock` or the host's docker socket). The sandbox can do
+anything the Docker daemon can: create a privileged container, mount host
+paths, start a container that mounts `docker.sock` again. This is
+**root-equivalent**.
+
+T2 is:
+- never the default (DO NOT ALTER #4);
+- never silent — `hisn run` prints `RISK: root-equivalent — docker:socket`
+  on start, every start, to **stderr** (like all hisn diagnostics, §11),
+  unless `--quiet-risk`;
+- only loadable from a profile that contains `risk_ack = "root-equivalent"`
+  in its `[docker]` block; a profile with `tier = "socket"` and no
+  matching `risk_ack` is a **load error** (`E_RISK_ACK_REQUIRED`).
+
+### What the sandbox can and cannot do
+
+- **Can:** `docker ps`, `docker run`, `docker compose` — anything the daemon
+  accepts. The daemon runs as root; a container it starts is not a child of
+  the sandbox's PID namespace and does not inherit the sandbox's seccomp,
+  Landlock, or rlimits.
+- **Cannot** outlive the session: the **socket** dies with the session (it
+  is a mount in the sandbox mntns); the **containers** the daemon started
+  do **not** die with the session — they are daemon-owned, not sandbox-owned.
+  This is why T2 is `root-equivalent` and `risk_ack` is required: the
+  sandbox can start containers that outlive the session.
+
+### What T2 makes advisory (round-1 BLOCKING)
+
+A container started via the forwarded docker socket can mount host paths
+(e.g. `docker run -v /run/user/$UID:/x`), and its processes descend from
+`dockerd`, not from sandbox init. This means:
+
+- **R5** (§9) accepts the container's processes by design (they do not
+  descend from sandbox init), so a container can name and drive
+  `control.sock` — self-granting `/` rw, revoking other sessions' grants.
+- **Masks** (§4.2) and **revoke guarantees** (§10) are void for paths the
+  container can reach via bind mounts.
+- **L11** (session isolation) is void if a container mounts the runtime
+  root.
+
+This is the fundamental reason T2 is `root-equivalent` and `risk_ack` is
+required: the sandbox can start a container that defeats every isolation
+guarantee of the session. The profile author who sets `risk_ack =
+"root-equivalent"` acknowledges this. T1 (0.4) closes these gaps by
+filtering container creation; T2 does not.
+
+### Rejected tiers
+
+- `[docker] tier = "proxy"` → `E_NOT_SUPPORTED` (0.4). T1 is a host-side
+  filtering proxy; the proxy is a separate untrusted-code boundary. It is
+  designed in ADR 0004 but the review found gaps a proxy cannot close in
+  0.3 (bind-source TOCTOU, container lifetime, shared-bridge isolation, build
+  authority).
+- `nested_userns = true` → `E_NOT_SUPPORTED` (0.4). T3 allows
+  `unshare(CLONE_NEWUSER)` inside the sandbox for rootless podman/buildah;
+  it needs a seccomp profile change (removing `CLONE_NEWUSER` from the deny
+  mask) and subuid handling. Risk label: `kernel-surface`.
+
+### Profile table and interaction with `[[forward]]`
+
+```toml
+[docker]
+tier = "socket"
+risk_ack = "root-equivalent"
+```
+
+In 0.3, `[docker] tier = "socket"` adds the **risk label** and
+`risk_ack` enforcement but does **not** auto-create the forward. The
+profile author must also write a `[[forward]]` entry for the docker socket:
+
+```toml
+[[forward]]
+name = "docker"
+socket = "/var/run/docker.sock"
+expose = "/run/docker.sock"
+risk = "root-equivalent"
+risk_ack = "root-equivalent"
+```
+
+A `[docker]` block without a matching `[[forward]]` is valid (the risk
+label is computed and the `risk_ack` is checked) but has no effect — no
+socket is forwarded. A `[[forward]]` of the docker socket without a
+`[docker]` block is also valid (the `[[forward]]` risk_ack covers the
+forward); the `[docker]` block is for the `tier` declaration and future
+0.4 features. A future 0.4 may add `[docker] socket = "/path"` to
+auto-create the forward.
+
+### Networking
+
+A unix socket forward (§17) works cross-network-namespace: the socket is
+reached by inode via a mount, not by network. `network = "none"` is
+sufficient for `docker ps` and `docker run`. The shipped
+`profiles/docker-socket.toml` uses `network = "host"` because the deploy
+use case (smaragd) needs host networking for compose services, not for
+reaching the daemon socket. A profile that only needs `docker run` (no
+container networking) may use `network = "none"`.
+
+### Shipped profiles
+
+- `profiles/docker-socket.toml` — T2 with `risk_ack = "root-equivalent"`,
+  `network = "host"` (for compose services), and a `[[forward]]` of
+  `/var/run/docker.sock`.
+- `profiles/deploy-smaragd-example.toml` — a deploy example: `network =
+  "host"`, `cwd` rw, `mounts.grantable_rw` for deploy outputs, docker
+  socket T2 with `risk_ack`.
+
+### Leak test
+
+L29 (host-only): requires a running Docker daemon. Asserts: (1) the RISK
+line `RISK: root-equivalent — docker:socket` is printed on start; (2)
+`docker ps` works inside the sandbox; (3) a profile with `docker =
+"socket"` and no `risk_ack` is a load error (`E_RISK_ACK_REQUIRED`).
+
+### OCI mapping
+
+Annotation only (`org.hisn.docker.tier = "socket"`). The forwarded socket is
+a `[[forward]]` mount (§17); if emitted in v2, it is a `mounts[]` bind of one
+inode with `options: ["ro","nosuid"]` (matching §17's `MOUNT_ATTR_RDONLY |
+MOUNT_ATTR_NOSUID`).
+
+**Invariant touched:** 1 (T2 adds the docker socket, a single ro mount of one
+inode). 2 (seccomp unchanged; the socket is host-side). 3 (the **socket**
+dies with the session; the containers the daemon started do not — this is
+why T2 is root-equivalent and acked; T2 also makes R5/mask/revoke advisory
+for the session, as documented above). 5 (annotation only).

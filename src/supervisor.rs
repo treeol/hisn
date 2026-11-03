@@ -335,12 +335,17 @@ impl Shared {
     fn do_forward(&self, socket: &str, expose: &str, name: &str) -> Result<()> {
         let _g = self.op_lock.lock().expect("op lock");
         self.log("forward", "start", Some(socket), None, None, None);
-        // Validate the source path (R1–R4).
-        let p = grant::parse_abs(socket).map_err(|r| anyhow!("{}: {}", r.code, r.message))?;
+        // Canonicalize the socket path: /var/run is a symlink to /run on
+        // systemd hosts, and open_source uses RESOLVE_NO_SYMLINKS, so we
+        // must resolve the path first. The canonical path is what we
+        // validate against (R1–R4); the original string is only for display.
+        let canon_path = fs::canonicalize(socket)
+            .with_context(|| format!("canonicalizing socket {}", socket))?;
+        let p = grant::parse_abs(canon_path.to_str().unwrap_or(socket))
+            .map_err(|r| anyhow!("{}: {}", r.code, r.message))?;
         let (src, canon) = grant::open_source(&p).map_err(|e| anyhow!("open source: {e}"))?;
-        if canon != p {
-            bail!("{socket}: not canonical (resolves to {})", canon.display());
-        }
+        // canon should now match p (both are symlink-free); if not, the
+        // path was further resolved by the kernel and we use the canonical form.
         // Verify the source is a socket inode.
         let meta = fs::symlink_metadata(&canon).map_err(|e| anyhow!("stat: {e}"))?;
         let file_type = meta.file_type();

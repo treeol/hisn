@@ -1,0 +1,20 @@
+version = "hisn-profile/v1"
+
+# Deploy example for smaragd: network host (compose needs the daemon socket),
+# cwd rw (the deploy repo), grantable_rw for deploy outputs, docker socket T2.
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "."
+session.network = "host"
+mounts.grantable_rw = ["/srv/out"]
+
+[[forward]]
+name = "docker"
+socket = "/var/run/docker.sock"
+expose = "/run/docker.sock"
+risk = "root-equivalent"
+risk_ack = "root-equivalent"
+
+[docker]
+tier = "socket"
+risk_ack = "root-equivalent"

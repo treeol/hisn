@@ -1327,6 +1327,92 @@ else
   fail "L37 host_service" "session did not start: $(head -c 300 "$L37_LOG")"
 fi
 
+# ================================================ L29: docker-socket profile (0.3a)
+# A docker-socket profile forwards /var/run/docker.sock inside with
+# risk_ack = "root-equivalent". The RISK line is printed on start; `docker ps`
+# works inside; a profile with docker=socket but no risk_ack is a load error.
+# This test requires a running Docker daemon on the host; skip if not.
+if ! command -v docker >/dev/null 2>&1; then
+  skip "L29 docker-socket" "docker not installed on this host"
+elif ! docker info >/dev/null 2>&1; then
+  skip "L29 docker-socket" "docker daemon not running on this host"
+else
+  L29_CWD=$(new_cwd l29)
+  L29_PROFILE="$WORK/L29-profile.toml"
+  cat >"$L29_PROFILE" <<L29EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L29_CWD"
+session.network = "host"
+env.pass = ["DOCKER_HOST"]
+env.set = { DOCKER_HOST = "unix:///run/docker.sock" }
+[[forward]]
+name = "docker"
+socket = "/var/run/docker.sock"
+expose = "/run/docker.sock"
+risk = "root-equivalent"
+risk_ack = "root-equivalent"
+[docker]
+tier = "socket"
+risk_ack = "root-equivalent"
+L29EOF
+  L29_LOG="$WORK/l29.log"
+  HISN_LEAK_SECRET=topsecret HISN_LEAK_PASSED=visible-ok HISN_PROFILES="$ROOT/profiles" \
+    "$HISN" run --profile "$L29_PROFILE" --session-id l29-$$ \
+    -- "$L29_CWD/leakprobe" loop "$L29_CWD/ctl" \
+    </dev/null >"$L29_LOG.out" 2>"$L29_LOG" &
+  L29_PID=$!
+  SESSIONS+=("$L29_PID")
+  l29_ready=0
+  for i in $(seq 1 150); do
+    [ -e "$L29_CWD/ctl/ready" ] && { l29_ready=1; break; }
+    kill -0 "$L29_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [ "$l29_ready" = 1 ]; then
+    # 1. RISK line was printed on start (check the log)
+    if grep -q 'RISK: root-equivalent' "$L29_LOG"; then
+      pass "L29 docker-socket: RISK line printed on start"
+    else
+      fail "L29 RISK line" "not found in log: $(head -c 300 "$L29_LOG")"
+    fi
+    # 2. docker ps works inside the sandbox
+    got=$(q "$L29_CWD" exec docker ps)
+    case "$got" in
+      OK*exit=0*) pass "L29 docker-socket: docker ps works inside ($got)" ;;
+      *) fail "L29 docker ps" "got [$got] want OK exit=0" ;;
+    esac
+    end_session "$L29_CWD" "$L29_PID"
+  else
+    fail "L29 docker-socket" "session did not start: $(head -c 300 "$L29_LOG")"
+  fi
+  # 3. missing risk_ack → load error
+  L29B_PROFILE="$WORK/L29b-profile.toml"
+  cat >"$L29B_PROFILE" <<L29BEOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L29_CWD"
+session.network = "host"
+[[forward]]
+name = "docker"
+socket = "/var/run/docker.sock"
+expose = "/run/docker.sock"
+risk = "root-equivalent"
+risk_ack = "root-equivalent"
+[docker]
+tier = "socket"
+L29BEOF
+  "$HISN" run --profile "$L29B_PROFILE" --session-id l29b-$$ --detach </dev/null >"$WORK/l29b.out" 2>"$WORK/l29b.err"
+  L29B_RC=$?
+  if [ $L29B_RC -eq 125 ] && grep -q "E_RISK_ACK_REQUIRED" "$WORK/l29b.err"; then
+    pass "L29 docker-socket: missing risk_ack → load error"
+  else
+    fail "L29 missing risk_ack" "rc=$L29B_RC err=$(head -c 300 "$WORK/l29b.err")"
+  fi
+fi
+
 # ----------------------------------------------------------------- manifest
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.

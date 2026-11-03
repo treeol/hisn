@@ -40,6 +40,9 @@ pub struct Profile {
     /// Start a host-side process and forward its socket (0.3 §17).
     #[serde(default, rename = "host_services")]
     pub host_services: Vec<HostService>,
+    /// Docker access tier (0.3 §18: T2 socket only).
+    #[serde(default)]
+    pub docker: Option<Docker>,
 }
 
 impl Profile {
@@ -62,8 +65,8 @@ impl Profile {
         Ok(p)
     }
 
-    /// Validate the 0.3 surface tables: `[[forward]]` and `[[host_services]]`.
-    /// Enforces risk_ack matching (§16) and path sanity.
+    /// Validate the 0.3 surface tables: `[[forward]]`, `[[host_services]]`,
+    /// and `[docker]`. Enforces risk_ack matching (§16–§18) and path sanity.
     fn validate_surface(&self) -> Result<()> {
         for f in &self.forwards {
             if f.name.is_empty() {
@@ -157,6 +160,25 @@ impl Profile {
                 _ => {}
             }
         }
+        // [docker] tier validation (§18).
+        if let Some(d) = &self.docker {
+            let tier = docker_tier(d)?;
+            if tier == "socket" {
+                let label = RiskLabel::RootEquivalent;
+                match &d.risk_ack {
+                    None => bail!(
+                        "E_RISK_ACK_REQUIRED: [docker] tier = \"socket\" requires risk_ack = \"{}\"",
+                        label.kebab()
+                    ),
+                    Some(ack) if ack != label.kebab() => bail!(
+                        "E_RISK_ACK_MISMATCH: [docker] risk_ack = {:?} but the computed label is {:?}",
+                        ack,
+                        label.kebab()
+                    ),
+                    _ => {}
+                }
+            }
+        }
         Ok(())
     }
 
@@ -228,7 +250,37 @@ pub struct HostService {
     pub risk_ack: Option<String>,
 }
 
-/// Readiness specification for `[[host_services]]`.
+/// Docker access tier (0.3 §18, ADR 0004). Only `socket` (T2) is available
+/// in 0.3; `proxy` (T1) and `nested_userns` (T3) are rejected with
+/// `E_NOT_SUPPORTED`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Docker {
+    /// `"socket"` (T2 — raw forward, root-equivalent). `"proxy"` (T1) is
+    /// rejected with `E_NOT_SUPPORTED` in 0.3.
+    pub tier: String,
+    /// Required: must match the computed risk label (`root-equivalent` for
+    /// `socket`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_ack: Option<String>,
+    // Note: `nested_userns = true` (T3) is a top-level profile key, not
+    // inside `[docker]`. It is rejected with `E_NOT_SUPPORTED` in 0.3.
+    // We do not parse it here — it would be a deny_unknown_fields violation.
+}
+
+/// The docker tier (only `socket` is available in 0.3).
+pub fn docker_tier(docker: &Docker) -> Result<&'static str> {
+    match docker.tier.as_str() {
+        "socket" => Ok("socket"),
+        "proxy" => bail!(
+            "E_NOT_SUPPORTED: [docker] tier = \"proxy\" is not available in 0.3 (T1 ships in 0.4)"
+        ),
+        other => bail!(
+            "E_NOT_SUPPORTED: [docker] tier = {:?} is not a valid tier (0.3: \"socket\" only)",
+            other
+        ),
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadinessSpec {
@@ -425,9 +477,9 @@ pub struct RiskEntry {
 }
 
 /// Compute the risk labels for a profile's capabilities (DESIGN §16).
-/// Detects `[[forward]]` and `[[host_services]]` capabilities and assigns
-/// labels per §16/§17. Unknown sockets without explicit `risk` are a load
-/// error (E_RISK_ACK_REQUIRED).
+/// Detects `[[forward]]`, `[[host_services]]`, and `[docker]` capabilities
+/// and assigns labels per §16/§17/§18. Unknown sockets without explicit
+/// `risk` are a load error (E_RISK_ACK_REQUIRED).
 pub fn compute_risks(profile: &Profile) -> Vec<RiskEntry> {
     let mut entries = Vec::new();
     for f in &profile.forwards {
@@ -451,6 +503,15 @@ pub fn compute_risks(profile: &Profile) -> Vec<RiskEntry> {
             capability: format!("host_service:{}", h.name),
             label,
         });
+    }
+    // [docker] tier (§18): socket → root-equivalent.
+    if let Some(d) = &profile.docker {
+        if d.tier == "socket" {
+            entries.push(RiskEntry {
+                capability: "docker:socket".into(),
+                label: RiskLabel::RootEquivalent,
+            });
+        }
     }
     entries
 }
@@ -572,6 +633,7 @@ pub fn explain(spec: Option<&str>) -> Result<Value> {
             policy: Policy::default(),
             forwards: Vec::new(),
             host_services: Vec::new(),
+            docker: None,
         },
     };
     let risks = compute_risks(&profile);
@@ -1091,5 +1153,128 @@ version = "hisn-policy/v1"
             forward_label("/run/custom.sock", Some("host-exec")),
             RiskLabel::HostExec
         );
+    }
+
+    #[test]
+    fn docker_socket_tier_computes_root_equivalent() {
+        let p = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[forward]]
+name = "docker"
+socket = "/var/run/docker.sock"
+expose = "/run/docker.sock"
+risk = "root-equivalent"
+risk_ack = "root-equivalent"
+[docker]
+tier = "socket"
+risk_ack = "root-equivalent"
+"#,
+        )
+        .unwrap();
+        let risks = compute_risks(&p);
+        // Two entries: the forward (root-equivalent) and docker:socket (root-equivalent).
+        assert_eq!(risks.len(), 2);
+        assert_eq!(risks[1].label, RiskLabel::RootEquivalent);
+        assert_eq!(risks[1].capability, "docker:socket");
+    }
+
+    #[test]
+    fn docker_socket_without_risk_ack_rejected() {
+        let result = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[forward]]
+name = "docker"
+socket = "/var/run/docker.sock"
+expose = "/run/docker.sock"
+risk = "root-equivalent"
+risk_ack = "root-equivalent"
+[docker]
+tier = "socket"
+"#,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("E_RISK_ACK_REQUIRED"), "{msg}");
+    }
+
+    #[test]
+    fn docker_socket_with_mismatched_risk_ack_rejected() {
+        let result = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[forward]]
+name = "docker"
+socket = "/var/run/docker.sock"
+expose = "/run/docker.sock"
+risk = "root-equivalent"
+risk_ack = "root-equivalent"
+[docker]
+tier = "socket"
+risk_ack = "data"
+"#,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("E_RISK_ACK_MISMATCH"), "{msg}");
+    }
+
+    #[test]
+    fn docker_proxy_tier_rejected_with_e_not_supported() {
+        let result = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[docker]
+tier = "proxy"
+risk_ack = "none"
+"#,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("E_NOT_SUPPORTED"), "{msg}");
+    }
+
+    #[test]
+    fn docker_unknown_tier_rejected() {
+        let result = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[docker]
+tier = "bogus"
+risk_ack = "none"
+"#,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("E_NOT_SUPPORTED"), "{msg}");
+    }
+
+    #[test]
+    fn profile_with_docker_but_no_surface_still_has_risk() {
+        let p = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[docker]
+tier = "socket"
+risk_ack = "root-equivalent"
+"#,
+        )
+        .unwrap();
+        let risks = compute_risks(&p);
+        assert_eq!(risks.len(), 1);
+        assert_eq!(risks[0].label, RiskLabel::RootEquivalent);
     }
 }

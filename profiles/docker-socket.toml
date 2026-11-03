@@ -1,0 +1,21 @@
+version = "hisn-profile/v1"
+
+# Docker T2: raw socket forward, root-equivalent.
+# network = "host" is for compose services that need host networking;
+# the daemon socket itself is reachable via a mount under network = "none".
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "."
+session.network = "host"
+mounts.grantable_rw = ["/srv/out"]
+
+[[forward]]
+name = "docker"
+socket = "/var/run/docker.sock"
+expose = "/run/docker.sock"
+risk = "root-equivalent"
+risk_ack = "root-equivalent"
+
+[docker]
+tier = "socket"
+risk_ack = "root-equivalent"

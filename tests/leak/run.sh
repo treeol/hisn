@@ -1126,9 +1126,10 @@ network = "none"
 L25EOF
 # Start a session with --profile base (the built-in 0.2 sandbox), NOT --policy.
 # Use --cwd to override the profile's cwd to L25_CWD (the same as write_policy).
+# HISN_PROFILES points at the repo's profiles/ so `--profile base` resolves.
 L25_LOG="$WORK/l25.log"
 HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
-  HISN_LEAK_PASSED=visible-ok \
+  HISN_LEAK_PASSED=visible-ok HISN_PROFILES="$ROOT/profiles" \
   "$HISN" run --profile base --cwd "$L25_CWD" --session-id l25-$$ --grant "$WORK/g_ro:ro" \
   -- "$L25_CWD/leakprobe" loop "$L25_CWD/ctl" \
   </dev/null >"$L25_LOG.out" 2>"$L25_LOG" &
@@ -1156,6 +1157,27 @@ if [ "$l25_ready" = 1 ]; then
   end_session "$L25_CWD" "$L25_PID"
 else
   fail "L25 profile base == 0.2.2 plan" "session did not start: $(head -c 300 "$L25_LOG")"
+fi
+
+# ================================================ L26: profile under cwd → E_PROFILE_UNTRUSTED (0.3a)
+# A profile file located under the session cwd cannot satisfy risk_ack —
+# the sandbox can write it and self-ack its own risk. Start a session with
+# --profile pointing at a file under the session cwd; it must fail with
+# E_PROFILE_UNTRUSTED.
+L26_CWD=$(new_cwd l26)
+L26_PROFILE="$L26_CWD/evil-profile.toml"
+cat >"$L26_PROFILE" <<L26EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "."
+L26EOF
+"$HISN" run --profile "$L26_PROFILE" --session-id l26-$$ --detach </dev/null >"$WORK/l26.out" 2>"$WORK/l26.err"
+L26_RC=$?
+if [ $L26_RC -eq 125 ] && grep -q "E_PROFILE_UNTRUSTED" "$WORK/l26.err"; then
+  pass "L26 profile under cwd → E_PROFILE_UNTRUSTED"
+else
+  fail "L26 profile under cwd" "rc=$L26_RC err=$(head -c 300 "$WORK/l26.err")"
 fi
 
 # ----------------------------------------------------------------- manifest

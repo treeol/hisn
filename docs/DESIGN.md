@@ -946,3 +946,91 @@ plan is derived from it exactly as today (no change to `mounts::plan`).
 **Invariant touched:** 5 (the envelope tables have no OCI runtime-spec
 representation; they are annotation only). 1, 2, 3, 4 untouched (same
 resolution, same mount plan, same grants, same env scrub).
+
+## 16. Risk labels (v0.3, ADR 0006)
+
+Every profile capability that widens the boundary carries a **fixed risk label**
+from a closed set. The label is **computed by hisn from the capability**, not
+chosen by the profile author: the author declares the *capability*; hisn emits
+the *label*. A missing or mismatched `risk_ack` for a `root-equivalent`,
+`signing`, or `host-exec` capability is a load error.
+
+### Label set
+
+| label | meaning |
+|---|---|
+| `none` | no widening; the 0.2 sandbox |
+| `data` | the sandbox can read or write host data beyond cwd (a bind, a forwarded data socket) |
+| `signing` | the sandbox can produce a cryptographic signature valid on the host (ssh agent, git signing) |
+| `host-exec` | the sandbox can run arbitrary commands on the host as the user (a forwarded D-Bus/systemd socket, a shell server, another hisn control socket) — user-equivalent |
+| `root-equivalent` | the sandbox can become root on the host (raw docker socket) |
+| `kernel-surface` | the sandbox can provoke kernel code paths out of scope of the 0.2 threat model (nested userns) |
+
+### How a label is assigned (by the feature, not the author)
+
+- `[docker] tier = "socket"` → `root-equivalent` (always; the 0.3 tier).
+- `[docker] tier = "proxy"` → `E_NOT_SUPPORTED` (0.4; T1 is not available).
+- `nested_userns = true` → `kernel-surface` (always; **rejected in 0.3**).
+- `[[forward]]` of an ssh agent → `signing` (always).
+- `[[forward]]` of the Docker socket (or a recognized rootless-podman socket)
+  → `root-equivalent` (always).
+- `[[forward]]` of the D-Bus system or session bus → `host-exec` (always).
+- `[[forward]]` / `[[host_services]]` of **an unrecognised socket** → **load
+  error** (`E_RISK_ACK_REQUIRED`) unless the profile sets `risk` explicitly
+  (minimum `host-exec`, documenting that the author asserts the server is not
+  root). The profile may **downgrade** the label only for a recognised socket
+  path pattern; an unrecognised socket cannot be labelled `none` or `data` without
+  an explicit `[[forward]] risk = "data"` that hisn accepts.
+- `[[host_services]]` → `host-exec` for the execution itself (a profile's
+  arbitrary host-side `exec` is user-equivalent execution), plus the socket's
+  label (`data`/`signing`/`root-equivalent` as above). The `risk_ack` covers
+  both.
+
+### Behaviour
+
+- `hisn run` prints the effective risk labels on start, one line each:
+  `RISK: <label> — <capability>`, unless `--quiet-risk` is passed. A profile
+  with no widening capabilities prints `RISK: none` (with `--verbose` only).
+- `hisn profile explain <name>` prints each capability and its label with
+  one sentence of explanation.
+- A profile with a `root-equivalent`, `signing`, or `host-exec` capability
+  **must** contain the matching `risk_ack`:
+  ```toml
+  [docker]
+  tier = "socket"
+  risk_ack = "root-equivalent"   # must match the computed label
+  ```
+  Missing → `E_RISK_ACK_REQUIRED`; mismatched → `E_RISK_ACK_MISMATCH`.
+- The risk list is recorded in the session dir (`risk.json`) and in `inspect
+  --json` (the `risk` field).
+
+### Secure by default
+
+A profile with no `[[services]]`, `[[host_services]]`, `[[forward]]`, `[docker]`,
+`[ssh]`, `nested_userns`, and the inner `[policy]` at its defaults yields
+exactly the 0.2 sandbox — same mount plan, same seccomp, same Landlock, same
+env. The profile layer is a strict superset of capabilities, never a relaxation.
+(DO NOT ALTER #3.)
+
+### What the risk labels do not change
+
+- The labels add no capability; they disclose the ones the profile already
+  declares. A missing `risk_ack` is a load error, so a profile cannot silently
+  enable a root-equivalent or signing capability.
+- The labels cover **0.3 surface capabilities** (`[[forward]]`, `[docker]`,
+  `[[host_services]]`, `[[services]]`, `nested_userns`). Inner-policy widenings
+  (`mounts.rw`, `network = "host"`, `--allow-host-abstract-sockets`) are not
+  labelled by the 0.3 risk system — they are the existing 0.2 surface, already
+  subject to their own enforcement (Landlock write set, abstract-socket
+  scope). `RISK: none` means "no 0.3 surface widening", not "no widening at
+  all"; a profile with `mounts.rw = ["/home/u"]` still widens the 0.2 boundary
+  (a `data` exposure) but does so through the existing inner-policy mechanism.
+- `risk.json` and `inspect --json` are start-time snapshots — they reflect the
+  profile as loaded. Dynamic grants made after start are not reflected in
+  `risk.json` (they are in `grants.jsonl`).
+- The mount plan, seccomp, Landlock, caps, env scrub are unchanged — the
+  labels are display + load-time enforcement, not a runtime boundary.
+
+**Invariant touched:** 5 (the labels are annotation only). 6 (the leak suite
+tests the isolation; the labels are display + load-time enforcement). 1, 2, 3, 4
+untouched.

@@ -22,6 +22,9 @@ pub const E_PROFILE_POLICY: &str = "E_PROFILE_POLICY";
 pub const E_PROFILE_NOT_PROFILE: &str = "E_PROFILE_NOT_PROFILE";
 pub const E_PROFILE_UNTRUSTED: &str = "E_PROFILE_UNTRUSTED";
 pub const E_PROFILE_NOTFOUND: &str = "E_PROFILE_NOTFOUND";
+pub const E_RISK_ACK_REQUIRED: &str = "E_RISK_ACK_REQUIRED";
+pub const E_RISK_ACK_MISMATCH: &str = "E_RISK_ACK_MISMATCH";
+pub const E_NOT_SUPPORTED: &str = "E_NOT_SUPPORTED";
 
 /// A profile as written in a `.toml` file: the envelope around a `Policy`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,11 +155,11 @@ pub fn check_profile_trust(
     match source {
         ProfileSource::Path => {
             let canon = std::fs::canonicalize(profile_path)
-                .unwrap_or_else(|_| profile_path.to_path_buf());
+                .with_context(|| format!("canonicalizing profile path {}", profile_path.display()))?;
             // Check against the process cwd (independent of the profile's
             // own [policy]).
             let proc_cwd_canon = std::fs::canonicalize(&proc_cwd)
-                .unwrap_or_else(|_| proc_cwd.clone());
+                .with_context(|| format!("canonicalizing process cwd {}", proc_cwd.display()))?;
             if canon.starts_with(&proc_cwd_canon) {
                 bail!(
                     "E_PROFILE_UNTRUSTED: profile {} lies under the process cwd {}",
@@ -166,7 +169,7 @@ pub fn check_profile_trust(
             }
             // Also check against the session cwd (from the inner [policy]).
             let cwd_canon = std::fs::canonicalize(session_cwd)
-                .unwrap_or_else(|_| session_cwd.to_path_buf());
+                .with_context(|| format!("canonicalizing session cwd {}", session_cwd.display()))?;
             if canon.starts_with(&cwd_canon) {
                 bail!(
                     "E_PROFILE_UNTRUSTED: profile {} lies under the session cwd {}",
@@ -175,7 +178,8 @@ pub fn check_profile_trust(
                 );
             }
             for g in rw_grants {
-                let g_canon = std::fs::canonicalize(g).unwrap_or_else(|_| g.to_path_buf());
+                let g_canon = std::fs::canonicalize(g)
+                    .with_context(|| format!("canonicalizing rw grant {}", g.display()))?;
                 if canon.starts_with(&g_canon) {
                     bail!(
                         "E_PROFILE_UNTRUSTED: profile {} lies under a rw grant {}",
@@ -190,7 +194,90 @@ pub fn check_profile_trust(
     }
 }
 
-/// The built-in profile names (shipped in `profiles/` next to the binary).
+/// A risk label from the closed set (ADR 0006, PLAN §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RiskLabel {
+    None,
+    Data,
+    Signing,
+    HostExec,
+    RootEquivalent,
+    KernelSurface,
+}
+
+impl RiskLabel {
+    /// The label requires a matching `risk_ack` (DESIGN §16).
+    pub fn requires_ack(self) -> bool {
+        matches!(self, Self::RootEquivalent | Self::Signing | Self::HostExec)
+    }
+
+    /// One-sentence explanation (for `hisn profile explain`).
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::None => "no widening; the 0.2 sandbox",
+            Self::Data => "the sandbox can read or write host data beyond cwd",
+            Self::Signing => "the sandbox can produce a cryptographic signature valid on the host",
+            Self::HostExec => {
+                "the sandbox can run arbitrary commands on the host as the user"
+            }
+            Self::RootEquivalent => "the sandbox can become root on the host",
+            Self::KernelSurface => {
+                "the sandbox can provoke kernel code paths out of scope of the 0.2 threat model"
+            }
+        }
+    }
+}
+
+/// A capability and its computed risk label (for display and audit).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskEntry {
+    pub capability: String,
+    pub label: RiskLabel,
+}
+
+/// Compute the risk labels for a profile's capabilities (DESIGN §16).
+/// In 0.3a Feature 1 (no 0.3 surface), the risk is always `none`.
+/// Later features (docker, forward, host_services, ssh) will add capability
+/// detection here.
+pub fn compute_risks(_profile: &Profile) -> Vec<RiskEntry> {
+    // Feature 1: no 0.3 surface yet.
+    Vec::new()
+}
+
+/// The highest risk label from a list (for the RISK line and risk.json).
+pub fn highest_risk(entries: &[RiskEntry]) -> RiskLabel {
+    entries
+        .iter()
+        .map(|e| e.label)
+        .max()
+        .unwrap_or(RiskLabel::None)
+}
+
+/// Format the RISK lines for `hisn run` output (one per widening capability).
+/// Format: `RISK: <label> — <capability>` (DESIGN §16).
+pub fn format_risk_lines(entries: &[RiskEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| e.label != RiskLabel::None)
+        .map(|e| format!("RISK: {} — {}", e.label.kebab(), e.capability))
+        .collect()
+}
+
+impl RiskLabel {
+    /// The kebab-case string for display and serialization.
+    pub fn kebab(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Data => "data",
+            Self::Signing => "signing",
+            Self::HostExec => "host-exec",
+            Self::RootEquivalent => "root-equivalent",
+            Self::KernelSurface => "kernel-surface",
+        }
+    }
+}
+
 pub const BUILTIN_PROFILES: &[&str] = &["base", "wakil"];
 
 /// Print the profile search path and built-in names (for `hisn profile list`).
@@ -210,9 +297,7 @@ pub fn list() -> Result<Value> {
 }
 
 /// Explain a profile: parse it and print the capabilities and their risk
-/// labels (for `hisn profile explain`). In 0.3a (Feature 1 only), profiles
-/// have no 0.3 surface yet, so the explanation is just "no widening
-/// capabilities" or the risk labels from later features.
+/// labels (for `hisn profile explain`).
 pub fn explain(spec: Option<&str>) -> Result<Value> {
     let profile = match spec {
         Some(s) => {
@@ -224,13 +309,22 @@ pub fn explain(spec: Option<&str>) -> Result<Value> {
             policy: Policy::default(),
         },
     };
-    // In Feature 1 (profiles only, no 0.3 surface), there are no widening
-    // capabilities yet. The risk label is "none".
+    let risks = compute_risks(&profile);
+    let highest = highest_risk(&risks);
+    let caps: Vec<Value> = risks
+        .iter()
+        .map(|r| {
+            json!({
+                "capability": r.capability,
+                "label": r.label.kebab(),
+            })
+        })
+        .collect();
     Ok(json!({
         "schema": "hisn-profile-explain/v1",
         "version": profile.version,
-        "capabilities": [],
-        "risk": "none",
+        "capabilities": caps,
+        "risk": highest.kebab(),
     }))
 }
 
@@ -351,16 +445,15 @@ version = "hisn-policy/v2"
         } else {
             // If $HISN_PROFILES doesn't have base.toml, try the binary's
             // profiles/ directory — which may or may not exist.
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(parent) = exe.parent() {
-                    let candidate = parent.join("profiles").join("base.toml");
-                    if candidate.exists() {
-                        let (p, source) =
-                            resolve_profile_path("base").unwrap_or((candidate, ProfileSource::Builtin));
-                        assert!(p.exists());
-                        assert_eq!(source, ProfileSource::Builtin);
-                        return;
-                    }
+            if let Ok(exe) = std::env::current_exe()
+                && let Some(parent) = exe.parent()
+            {
+                let candidate = parent.join("profiles").join("base.toml");
+                if candidate.exists() {
+                    let (p, source) =
+                        resolve_profile_path("base").unwrap_or((candidate, ProfileSource::Builtin));
+                    assert!(p.exists());
+                    assert_eq!(source, ProfileSource::Builtin);
                 }
             }
             // Neither path found — skip (the test environment doesn't have
@@ -520,5 +613,53 @@ version = "hisn-policy/v2"
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("E_PROFILE_UNTRUSTED"), "{msg}");
+    }
+
+    #[test]
+    fn risk_label_kebab_and_format_risk_lines() {
+        assert_eq!(RiskLabel::None.kebab(), "none");
+        assert_eq!(RiskLabel::Data.kebab(), "data");
+        assert_eq!(RiskLabel::Signing.kebab(), "signing");
+        assert_eq!(RiskLabel::HostExec.kebab(), "host-exec");
+        assert_eq!(RiskLabel::RootEquivalent.kebab(), "root-equivalent");
+        assert_eq!(RiskLabel::KernelSurface.kebab(), "kernel-surface");
+
+        let entries = vec![
+            RiskEntry {
+                capability: "docker-socket".into(),
+                label: RiskLabel::RootEquivalent,
+            },
+            RiskEntry {
+                capability: "ssh-agent".into(),
+                label: RiskLabel::Signing,
+            },
+        ];
+        let lines = format_risk_lines(&entries);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "RISK: root-equivalent — docker-socket");
+        assert_eq!(lines[1], "RISK: signing — ssh-agent");
+
+        // None entries are filtered out.
+        let none_entries = vec![RiskEntry {
+            capability: "base".into(),
+            label: RiskLabel::None,
+        }];
+        assert!(format_risk_lines(&none_entries).is_empty());
+    }
+
+    #[test]
+    fn highest_risk_orders_labels() {
+        let entries = vec![
+            RiskEntry {
+                capability: "data".into(),
+                label: RiskLabel::Data,
+            },
+            RiskEntry {
+                capability: "docker".into(),
+                label: RiskLabel::RootEquivalent,
+            },
+        ];
+        assert_eq!(highest_risk(&entries), RiskLabel::RootEquivalent);
+        assert_eq!(highest_risk(&[]), RiskLabel::None);
     }
 }

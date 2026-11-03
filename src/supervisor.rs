@@ -108,6 +108,8 @@ struct Shared {
     init_pid: i32,
     sandbox_pidns: u64,
     resolved_toml: String,
+    /// Risk labels for this session (DESIGN §16), for `inspect --json`.
+    risk: Vec<profile::RiskEntry>,
     rules: Rules,
     table: Mutex<GrantTable>,
     held: Mutex<std::collections::BTreeMap<PathBuf, Held>>,
@@ -587,6 +589,10 @@ impl Shared {
                 "schema": "hisn-inspect/v1",
                 "mountinfo": mi,
                 "policy": self.resolved_toml,
+                "risk": self.risk.iter().map(|e| json!({
+                    "capability": e.capability,
+                    "label": e.label.kebab(),
+                })).collect::<Vec<_>>(),
                 // The supervisor's own descriptor count: the leak suite (L19)
                 // cannot read /proc/<supervisor>/fd (non-dumpable after the
                 // userns change), so the supervisor reports it itself.
@@ -878,27 +884,61 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
     }
 
     // Profile trust check: a profile loaded from a file path (--profile
-    // /path/to/profile.toml) that lies under the session cwd or a rw grant
-    // cannot satisfy risk_ack (E_PROFILE_UNTRUSTED) — the sandbox can write
-    // it and self-ack its own risk. Built-in and $HISN_PROFILES profiles are
-    // trusted (they are not under the session's writable set).
+    // /path/to/profile.toml) that lies under the session cwd, a rw grant,
+    // mounts.rw, or a persistent home cannot satisfy risk_ack
+    // (E_PROFILE_UNTRUSTED) — the sandbox can write it and self-ack its own
+    // risk. Built-in and $HISN_PROFILES profiles are trusted (they are not
+    // under the session's writable set).
     if let Some(ref spec) = args.profile
         && spec.contains('/')
     {
         let (path, _source) = profile::resolve_profile_path(spec)?;
-        let rw_paths: Vec<&Path> = prep
+        let mut rw_paths: Vec<PathBuf> = prep
             .grants
             .iter()
             .filter(|(_, m)| *m == Mode::Rw)
-            .map(|(p, _)| Path::new(p))
+            .map(|(p, _)| PathBuf::from(p))
             .collect();
+        // Also check against mounts.rw and persistent home from the inner
+        // policy — the profile's own [policy] can declare these.
+        rw_paths.extend(policy.rw.iter().cloned());
+        if let crate::policy::Home::Path(ref p) = policy.home {
+            rw_paths.push(p.clone());
+        }
+        let rw_refs: Vec<&Path> = rw_paths.iter().map(|p| p.as_path()).collect();
         profile::check_profile_trust(
             &path,
             profile::ProfileSource::Path,
             &policy.cwd,
-            &rw_paths,
+            &rw_refs,
         )
         .map_err(anyhow::Error::msg)?;
+    }
+
+    // Compute risk labels from the profile's capabilities (DESIGN §16).
+    // In 0.3a Feature 1 (no 0.3 surface), the risk is always `none`.
+    let risk_entries = if args.profile.is_some() {
+        let prof = match &args.profile {
+            Some(spec) => {
+                let (path, _) = profile::resolve_profile_path(spec)?;
+                ProfileDoc::load(&path)?
+            }
+            None => unreachable!("profile is Some"),
+        };
+        profile::compute_risks(&prof)
+    } else {
+        Vec::new()
+    };
+
+    // Print RISK lines on start (one per widening capability), unless --quiet-risk.
+    if !args.quiet_risk {
+        let lines = profile::format_risk_lines(&risk_entries);
+        for line in &lines {
+            eprintln!("{line}");
+        }
+        if lines.is_empty() && verbose > 0 {
+            eprintln!("RISK: none");
+        }
     }
 
     // Preflight: fail early with a readable report instead of an EPERM.
@@ -953,6 +993,7 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         &facts.username,
         allow_host_abstract,
         verbose,
+        &risk_entries,
     );
     sdir.remove();
     result
@@ -971,8 +1012,18 @@ fn run_session(
     username: &str,
     allow_host_abstract: bool,
     verbose: u8,
+    risk_entries: &[profile::RiskEntry],
 ) -> Result<i32> {
     sdir.write_resolved_policy(&policy.to_toml())?;
+    // Write risk.json (the risk labels for this session, DESIGN §16).
+    let risk_json = serde_json::to_string_pretty(&serde_json::json!({
+        "labels": risk_entries.iter().map(|e| serde_json::json!({
+            "capability": e.capability,
+            "label": e.label.kebab(),
+        })).collect::<Vec<_>>(),
+    }))?;
+    fs::write(sdir.path.join("risk.json"), risk_json)
+        .context("writing risk.json")?;
     let audit = Audit::open(&sdir.audit_path())?;
     // Write supervisor.pid for stale-detection. Written after the dir is
     // created and before unshare — a crash here leaves a dir without the
@@ -1146,6 +1197,7 @@ fn run_session(
         init_pid: pid,
         sandbox_pidns,
         resolved_toml: policy.to_toml(),
+        risk: risk_entries.to_vec(),
         rules,
         table: Mutex::new(GrantTable::default()),
         held: Mutex::new(Default::default()),

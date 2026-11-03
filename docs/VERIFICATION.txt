@@ -27,6 +27,32 @@ namespace-dependent code path is "not run" — see the table below.
 | `cargo fmt/clippy (x86_64 + aarch64)/test`, CI | c4acf20 | GitHub Actions ubuntu-latest | passed | same run, job `check` |
 | `make leaktest` (L1-L24, incl. L24 B1 host-mode abstract scope; D25 root check exercised end-to-end by L15-L24) | 34947f4 | host (maintainer host, Fedora 7.2.13-200.fc44.x86_64) | 175 passed, 0 failed, 1 skipped (L12), 1 weak (L14 R5) | `docs/leaktest-host-2026-11-01.log` |
 
+### 0.3a Feature 2 (risk labels)
+
+| check | commit | where | result | log file |
+|-------|--------|-------|--------|----------|
+| `cargo fmt --check` | this commit | sandbox | clean | — |
+| `cargo clippy --all-targets -- -D warnings` (x86_64) | this commit | sandbox | clean | — |
+| `cargo test` (unit tests) | this commit | sandbox | 219 passed, 0 failed | — |
+| `python3 tests/leak/test_l8.py` | this commit | sandbox | 12 passed | — |
+| `make leaktest` (L1-L35 incl. L25, L26) | this commit | sandbox (allow_userns) | 199 passed, 0 failed, 1 skipped (L12), 3 weak | — |
+
+The 3 weak tests (by ID with reason):
+- **L1** (1 weak): `/tankz` does not exist on this host, so ENOENT proves little.
+- **L14 R5** (1 weak): the control-socket pid-namespace check (R5) is covered by
+  unit tests only; no end-to-end test can place the socket inside the sandbox
+  without a test hook (P16).
+- **L20** (1 weak): `run.sh` stdin is not a tty; rerun with a terminal for the
+  `--tty` terminal-refusal check.
+
+**Note on hostname isolation:** the `sethostname` call in `init.rs` is
+best-effort (some containers block it via seccomp even in a new UTS ns). The
+hostname is cosmetic (the UTS ns is already unshared; it is not a security
+boundary). A WARN line is logged by init when it fails. Hostname isolation
+(UTS ns separation) is only verifiable on the host — in the build sandbox
+`sethostname` fails but the session still starts; on the host it succeeds and
+the hostname inside the sandbox is `hisn`.
+
 ## Not verified in the build sandbox
 
 rootfs::execute, init (pivot_root, caps, post-setup verification), grant helper

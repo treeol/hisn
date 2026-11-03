@@ -37,6 +37,8 @@ L34
 L35
 L25
 L26
+L36
+L37
 
 # A line of the form "ID: text" requires a line of test ID whose name contains
 # "text": one entry per distinct check inside a test that prints several lines.

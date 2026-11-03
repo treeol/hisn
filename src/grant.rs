@@ -13,8 +13,8 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::{Component, Path, PathBuf};
 
 use crate::control::{E_EXISTS, E_NOT_GRANTABLE, E_NOT_GRANTED, E_PATH_FORBIDDEN, Mode};
 use crate::policy::lexical_normalize;
@@ -295,10 +295,14 @@ pub fn prepare_tree(src: &OwnedFd, mode: Mode, recursive: bool) -> io::Result<Ow
 }
 
 /// Commands the helper process understands. Wire format (one line on the
-/// helper's stdin): `grant <target-path>` or `revoke`.
+/// helper's stdin): `grant <target-path>`, `forward <target-path>`, or
+/// `revoke <target-path>`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HelperCmd {
     Grant(PathBuf),
+    /// Like `Grant` but the target is created as a file (for socket inodes),
+    /// not a directory.
+    Forward(PathBuf),
     /// Detach the passed mount-root fd; then remove the directories the
     /// grant of this path created.
     Revoke(PathBuf),
@@ -312,6 +316,7 @@ pub fn parse_helper_cmd(line: &str) -> Option<HelperCmd> {
     }
     match verb {
         "grant" => Some(HelperCmd::Grant(PathBuf::from(p))),
+        "forward" => Some(HelperCmd::Forward(PathBuf::from(p))),
         "revoke" => Some(HelperCmd::Revoke(PathBuf::from(p))),
         _ => None,
     }
@@ -374,6 +379,12 @@ fn helper_loop(sock: &OwnedFd, mntns: &OwnedFd) -> io::Result<()> {
                     (id, Some(handle))
                 })
             }
+            (Some(HelperCmd::Forward(target)), Some(tree)) => {
+                do_forward_helper(&root, &target, tree).map(|(id, handle, made)| {
+                    created.insert(target, made);
+                    (id, Some(handle))
+                })
+            }
             (Some(HelperCmd::Revoke(target)), Some(mnt)) => do_revoke(&mnt).map(|()| {
                 if let Some(made) = created.remove(&target) {
                     crate::rootfs::remove_created(root.as_raw_fd(), &made);
@@ -397,6 +408,135 @@ fn helper_loop(sock: &OwnedFd, mntns: &OwnedFd) -> io::Result<()> {
 }
 
 type Granted = (u64, OwnedFd, Vec<PathBuf>);
+
+/// Like [`do_grant`] but creates a **file** at the target (for socket
+/// inodes). `move_mount` of a socket onto a directory fails with EINVAL;
+/// onto a file it succeeds.
+fn do_forward_helper(root: &OwnedFd, target: &Path, tree: OwnedFd) -> io::Result<Granted> {
+    let rel = sys::rel_to_root(target);
+    // Ensure the parent directory exists (tracked), then create the file.
+    let parent_rel = rel.parent().unwrap_or(Path::new(""));
+    let (_parent_dir, dir_made) = if parent_rel.as_os_str().is_empty() {
+        (root.try_clone()?, Vec::new())
+    } else {
+        crate::rootfs::ensure_dir_tracked(root.as_raw_fd(), parent_rel)?
+    };
+    let file_name = rel
+        .file_name()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let c = sys::cstr(Path::new(file_name))?;
+    let parent_fd = parent_dir_fd(root, parent_rel)?;
+    let parent_raw = parent_fd.as_raw_fd();
+    // Create the file if it doesn't exist (O_CREAT | O_EXCL | O_NOFOLLOW).
+    let mut made = dir_made;
+    // SAFETY: faccessat with a valid dirfd.
+    let file_path_existed = unsafe {
+        let r = libc::faccessat(parent_raw, c.as_ptr(), libc::F_OK, 0);
+        r == 0
+    };
+    if !file_path_existed {
+        // SAFETY: valid dirfd + C string; O_EXCL|O_NOFOLLOW make creation atomic.
+        let fd = unsafe {
+            libc::openat(
+                parent_raw,
+                c.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_WRONLY,
+                0o644,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Close the fd — we just needed the file to exist as a mountpoint.
+        // SAFETY: valid fd.
+        unsafe { libc::close(fd) };
+        made.push(rel.to_path_buf());
+    }
+    // Now open the file as O_PATH for move_mount.
+    // SAFETY: openat with O_PATH on the file we just created.
+    let target_raw =
+        unsafe { libc::openat(parent_raw, c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if target_raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: we own this fd.
+    let target_fd: OwnedFd = unsafe { std::os::fd::OwnedFd::from_raw_fd(target_raw) };
+    let attach = sys::move_mount(
+        tree.as_raw_fd(),
+        c"",
+        target_fd.as_raw_fd(),
+        c"",
+        sys::MOVE_MOUNT_F_EMPTY_PATH | sys::MOVE_MOUNT_T_EMPTY_PATH,
+    );
+    if let Err(e) = attach {
+        crate::rootfs::remove_created(root.as_raw_fd(), &made);
+        return Err(e);
+    }
+    match sys::mnt_id(tree.as_raw_fd(), c"", libc::AT_EMPTY_PATH) {
+        Ok(id) => Ok((id, tree, made)),
+        Err(e) => {
+            let _ = do_revoke(&tree);
+            crate::rootfs::remove_created(root.as_raw_fd(), &made);
+            Err(e)
+        }
+    }
+}
+
+/// Open the parent directory of `rel` as a real directory fd (not O_PATH),
+/// for `do_forward_helper` (which needs to create a file via `openat`).
+fn parent_dir_fd(root: &OwnedFd, parent_rel: &Path) -> io::Result<OwnedFd> {
+    if parent_rel.as_os_str().is_empty() {
+        // Open the root as a real directory fd (not O_PATH).
+        return sys::openat2(
+            root.as_raw_fd(),
+            c".",
+            (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+            0,
+            0,
+        );
+    }
+    // Walk from the root, creating directories as needed.
+    let mut cur = sys::openat2(
+        root.as_raw_fd(),
+        c".",
+        (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        0,
+        0,
+    )?;
+    for comp in parent_rel.components() {
+        if let Component::Normal(name) = comp {
+            let c = sys::cstr(Path::new(name))?;
+            // Try to open the directory; create it if it doesn't exist.
+            match sys::openat2(
+                cur.as_raw_fd(),
+                &c,
+                (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+                0,
+                sys::RESOLVE_BENEATH | sys::RESOLVE_NO_SYMLINKS | sys::RESOLVE_NO_MAGICLINKS,
+            ) {
+                Ok(fd) => cur = fd,
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                    // Create the directory.
+                    // SAFETY: valid dirfd + C string.
+                    if unsafe { libc::mkdirat(cur.as_raw_fd(), c.as_ptr(), 0o755) } != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    cur = sys::openat2(
+                        cur.as_raw_fd(),
+                        &c,
+                        (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+                        0,
+                        sys::RESOLVE_BENEATH
+                            | sys::RESOLVE_NO_SYMLINKS
+                            | sys::RESOLVE_NO_MAGICLINKS,
+                    )?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(cur)
+}
 
 /// Attach `tree` at `target`. The mount handle returned for later revoke is
 /// the `open_tree` descriptor itself: it keeps referring to *that* mount after
@@ -466,6 +606,17 @@ impl HelperClient {
     /// mount-root fd and its mount id.
     pub fn grant(&self, target: &Path, tree: &OwnedFd) -> io::Result<(OwnedFd, u64)> {
         let (reply, fd) = self.call(&format!("grant {}", target.display()), tree.as_raw_fd())?;
+        let id = parse_helper_reply(&reply)?;
+        Ok((
+            fd.ok_or_else(|| io::Error::other("helper returned no mount fd"))?,
+            id,
+        ))
+    }
+
+    /// Like `grant` but the target is a file (for socket inodes). Uses
+    /// `forward` instead of `grant` so the helper creates a file mountpoint.
+    pub fn forward(&self, target: &Path, tree: &OwnedFd) -> io::Result<(OwnedFd, u64)> {
+        let (reply, fd) = self.call(&format!("forward {}", target.display()), tree.as_raw_fd())?;
         let id = parse_helper_reply(&reply)?;
         Ok((
             fd.ok_or_else(|| io::Error::other("helper returned no mount fd"))?,
@@ -716,6 +867,10 @@ mod tests {
         assert_eq!(
             parse_helper_cmd("grant /a/b\n"),
             Some(HelperCmd::Grant("/a/b".into()))
+        );
+        assert_eq!(
+            parse_helper_cmd("forward /a/b\n"),
+            Some(HelperCmd::Forward("/a/b".into()))
         );
         for bad in [
             "grant a/b",

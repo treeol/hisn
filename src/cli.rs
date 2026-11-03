@@ -100,19 +100,17 @@ impl RunArgs {
     /// `--profile` and `--policy` are mutually exclusive.
     pub fn check_command(&self) -> Result<(), String> {
         match (self.detach, self.command.is_empty()) {
-            (true, false) => {
-                return Err(
-                    "--detach starts a session without a command; run commands in it with `hisn exec`"
-                        .to_string(),
-                )
-            }
-            (false, true) => {
-                return Err("a command is required (or use --detach)".to_string())
-            }
+            (true, false) => return Err(
+                "--detach starts a session without a command; run commands in it with `hisn exec`"
+                    .to_string(),
+            ),
+            (false, true) => return Err("a command is required (or use --detach)".to_string()),
             _ => {}
         }
         if self.profile.is_some() && self.policy.is_some() {
-            return Err("E_PROFILE_POLICY: --profile and --policy are mutually exclusive".to_string());
+            return Err(
+                "E_PROFILE_POLICY: --profile and --policy are mutually exclusive".to_string(),
+            );
         }
         Ok(())
     }

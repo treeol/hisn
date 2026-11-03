@@ -220,3 +220,36 @@ boundary). A WARN line is logged by init when it fails. Hostname isolation
 (UTS ns separation) is only verifiable on the host — in the build sandbox
 `sethostname` fails but the session still starts; on the host it succeeds and
 the hostname inside the sandbox is `hisn`.
+
+### 0.3a Feature 3 (socket forwarding) — sandbox (allow_userns)
+
+The 0.3a socket-forwarding feature adds `[[forward]]` and `[[host_services]]`
+profile tables, the `do_forward` supervisor method (using the grant helper with
+a `forward` helper command for file mountpoints), risk-label computation for
+forwarded sockets, host-service lifecycle (start, readiness, stop), and L36/L37
+leak tests.
+
+| check | commit | where | result | log file |
+|-------|--------|-------|--------|----------|
+| `cargo fmt --check` | this commit | sandbox | clean | — |
+| `cargo clippy --all-targets -- -D warnings` (x86_64) | this commit | sandbox | clean | — |
+| `cargo test` (unit tests) | this commit | sandbox | 230 passed, 0 failed | — |
+| `python3 tests/leak/test_l8.py` | this commit | sandbox | 12 passed | — |
+| `make leaktest` (L1-L37 incl. L25, L26, L36, L37) | this commit | sandbox (allow_userns) | 205 passed, 0 failed, 1 skipped (L12), 4 weak | — |
+
+The 4 weak tests (by ID with reason):
+- **L1** (1 weak): `/tankz` does not exist on this host, so ENOENT proves little.
+- **L14 R5** (1 weak): the control-socket pid-namespace check (R5) is covered by
+  unit tests only (P16).
+- **L20** (1 weak): `run.sh` stdin is not a tty; rerun with a terminal for the
+  `--tty` terminal-refusal check.
+- **L37** (1 weak): the host-service socket file may linger after session end
+  (the host process was signaled but may not have exited yet when the check
+  runs). The process IS killed (TERM + grace + KILL); the socket file cleanup is
+  best-effort.
+
+**Known information leak (round-1 review):** `getpeername(2)` on a connected
+`AF_UNIX` socket returns the peer's bound `sun_path` (the host path of the
+forwarded socket). This is visible to the sandbox through the socket API, not
+through the filesystem. The risk label covers the **authority** the socket
+grants, not the confidentiality of the host path name.

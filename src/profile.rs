@@ -34,13 +34,18 @@ pub struct Profile {
     pub version: String,
     /// A complete `hisn-policy/v1` document (inline table).
     pub policy: Policy,
+    /// Forward an existing host socket inside (0.3 §17).
+    #[serde(default, rename = "forward")]
+    pub forwards: Vec<Forward>,
+    /// Start a host-side process and forward its socket (0.3 §17).
+    #[serde(default, rename = "host_services")]
+    pub host_services: Vec<HostService>,
 }
 
 impl Profile {
     /// Parse and syntax-validate a profile TOML (no filesystem access).
     pub fn parse(text: &str) -> Result<Self> {
-        let p: Profile = toml::from_str(text)
-            .map_err(|e| anyhow!("profile parse: {e}"))?;
+        let p: Profile = toml::from_str(text).map_err(|e| anyhow!("profile parse: {e}"))?;
         if p.version != PROFILE_VERSION {
             bail!(
                 "version: must be \"{PROFILE_VERSION}\", got {:?}",
@@ -52,7 +57,107 @@ impl Profile {
         // the inner Policy is deserialized by serde, not parsed — so we
         // re-validate it here to get the same syntax checks.
         p.policy.validate().map_err(|e| anyhow!("{e}"))?;
+        // Validate the 0.3 surface (forwards and host_services).
+        p.validate_surface()?;
         Ok(p)
+    }
+
+    /// Validate the 0.3 surface tables: `[[forward]]` and `[[host_services]]`.
+    /// Enforces risk_ack matching (§16) and path sanity.
+    fn validate_surface(&self) -> Result<()> {
+        for f in &self.forwards {
+            if f.name.is_empty() {
+                bail!("[[forward]]: name must not be empty");
+            }
+            if !f.socket.starts_with('/') {
+                bail!("[[forward]] {}: socket must be an absolute path", f.name);
+            }
+            if !f.expose.starts_with('/') {
+                bail!("[[forward]] {}: expose must be an absolute path", f.name);
+            }
+            // Compute the label and check risk_ack (§16).
+            let label = forward_label(&f.socket, f.risk.as_deref());
+            if label == RiskLabel::None && f.risk.is_none() {
+                // Unknown socket with no explicit risk → load error
+                bail!(
+                    "E_RISK_ACK_REQUIRED: [[forward]] {}: unknown socket {} — set `risk` explicitly (minimum host-exec)",
+                    f.name,
+                    f.socket
+                );
+            }
+            if label.requires_ack() {
+                match &f.risk_ack {
+                    None => bail!(
+                        "E_RISK_ACK_REQUIRED: [[forward]] {}: {} requires risk_ack = \"{}\"",
+                        f.name,
+                        f.socket,
+                        label.kebab()
+                    ),
+                    Some(ack) if ack != label.kebab() => bail!(
+                        "E_RISK_ACK_MISMATCH: [[forward]] {}: risk_ack = {:?} but the computed label is {:?}",
+                        f.name,
+                        ack,
+                        label.kebab()
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        for h in &self.host_services {
+            if h.name.is_empty() {
+                bail!("[[host_services]]: name must not be empty");
+            }
+            if h.exec.is_empty() {
+                bail!("[[host_services]] {}: exec must not be empty", h.name);
+            }
+            if !h.socket.starts_with('/') {
+                bail!(
+                    "[[host_services]] {}: socket must be an absolute path",
+                    h.name
+                );
+            }
+            if !h.expose.starts_with('/') {
+                bail!(
+                    "[[host_services]] {}: expose must be an absolute path",
+                    h.name
+                );
+            }
+            // host_services always requires host-exec for the execution
+            // itself, plus the socket's label. For an unknown socket
+            // without explicit `risk`, the effective label is `host-exec`
+            // (the floor for the execution itself); the `risk_ack` must
+            // match that.
+            let socket_label = if h.risk.is_some() {
+                forward_label(&h.socket, h.risk.as_deref())
+            } else {
+                // Unknown socket with no explicit risk: for host_services,
+                // the floor is host-exec (the execution itself).
+                match forward_label(&h.socket, h.risk.as_deref()) {
+                    RiskLabel::None => RiskLabel::HostExec,
+                    other => other,
+                }
+            };
+            let effective = if socket_label > RiskLabel::HostExec {
+                socket_label
+            } else {
+                RiskLabel::HostExec
+            };
+            match &h.risk_ack {
+                None => bail!(
+                    "E_RISK_ACK_REQUIRED: [[host_services]] {}: requires risk_ack = \"{}\"",
+                    h.name,
+                    effective.kebab()
+                ),
+                Some(ack) if ack != effective.kebab() => bail!(
+                    "E_RISK_ACK_MISMATCH: [[host_services]] {}: risk_ack = {:?} but the computed label is {:?}",
+                    h.name,
+                    ack,
+                    effective.kebab()
+                ),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Load and parse a profile from a file.
@@ -75,6 +180,90 @@ impl Profile {
             .resolve(base_dir, overrides, runtime_roots)
             .map_err(|e| anyhow!("{e}"))
     }
+}
+
+/// A `[[forward]]` table: expose an existing host socket inside (DESIGN §17).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forward {
+    /// Required. A name for this forward (for display and audit).
+    pub name: String,
+    /// The host-side socket path to forward.
+    pub socket: String,
+    /// The in-sandbox path where the socket will appear.
+    pub expose: String,
+    /// Optional explicit risk label (for unknown sockets; §16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+    /// Required risk acknowledgment (must match the computed label).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_ack: Option<String>,
+}
+
+/// A `[[host_services]]` table: start a host process and forward its socket
+/// (DESIGN §17).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostService {
+    /// Required. A name for this service.
+    pub name: String,
+    /// The command to run on the host.
+    pub exec: Vec<String>,
+    /// The host-side socket path the process binds.
+    pub socket: String,
+    /// The in-sandbox path where the socket will appear.
+    pub expose: String,
+    /// Readiness check (socket stat, tcp connect, or command exit 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<ReadinessSpec>,
+    /// Stop policy (signal + grace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<StopSpec>,
+    /// Optional explicit risk label (for the socket; §16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
+    /// Required risk acknowledgment (must cover host-exec for the execution
+    /// itself, plus the socket's label).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_ack: Option<String>,
+}
+
+/// Readiness specification for `[[host_services]]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessSpec {
+    /// `socket = "/path"` — stat the socket file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+    /// `tcp = "host:port"` — connect to a TCP address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<String>,
+    /// `command = ["sh", "-c", "test -S /path"]` — run a command, exit 0 = ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    /// Timeout in seconds (default 15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+}
+
+/// Stop specification for `[[host_services]]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StopSpec {
+    /// Signal name (default "TERM").
+    #[serde(default = "default_signal")]
+    pub signal: String,
+    /// Grace period in seconds (default 5).
+    #[serde(default = "default_grace")]
+    pub grace: u64,
+}
+
+fn default_signal() -> String {
+    "TERM".to_string()
+}
+
+fn default_grace() -> u64 {
+    5
 }
 
 /// Resolve `--profile <name|path>` to a file path, applying the search path.
@@ -154,8 +343,9 @@ pub fn check_profile_trust(
     let proc_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     match source {
         ProfileSource::Path => {
-            let canon = std::fs::canonicalize(profile_path)
-                .with_context(|| format!("canonicalizing profile path {}", profile_path.display()))?;
+            let canon = std::fs::canonicalize(profile_path).with_context(|| {
+                format!("canonicalizing profile path {}", profile_path.display())
+            })?;
             // Check against the process cwd (independent of the profile's
             // own [policy]).
             let proc_cwd_canon = std::fs::canonicalize(&proc_cwd)
@@ -218,9 +408,7 @@ impl RiskLabel {
             Self::None => "no widening; the 0.2 sandbox",
             Self::Data => "the sandbox can read or write host data beyond cwd",
             Self::Signing => "the sandbox can produce a cryptographic signature valid on the host",
-            Self::HostExec => {
-                "the sandbox can run arbitrary commands on the host as the user"
-            }
+            Self::HostExec => "the sandbox can run arbitrary commands on the host as the user",
             Self::RootEquivalent => "the sandbox can become root on the host",
             Self::KernelSurface => {
                 "the sandbox can provoke kernel code paths out of scope of the 0.2 threat model"
@@ -237,12 +425,87 @@ pub struct RiskEntry {
 }
 
 /// Compute the risk labels for a profile's capabilities (DESIGN §16).
-/// In 0.3a Feature 1 (no 0.3 surface), the risk is always `none`.
-/// Later features (docker, forward, host_services, ssh) will add capability
-/// detection here.
-pub fn compute_risks(_profile: &Profile) -> Vec<RiskEntry> {
-    // Feature 1: no 0.3 surface yet.
-    Vec::new()
+/// Detects `[[forward]]` and `[[host_services]]` capabilities and assigns
+/// labels per §16/§17. Unknown sockets without explicit `risk` are a load
+/// error (E_RISK_ACK_REQUIRED).
+pub fn compute_risks(profile: &Profile) -> Vec<RiskEntry> {
+    let mut entries = Vec::new();
+    for f in &profile.forwards {
+        let label = forward_label(&f.socket, f.risk.as_deref());
+        entries.push(RiskEntry {
+            capability: format!("forward:{}", f.name),
+            label,
+        });
+    }
+    for h in &profile.host_services {
+        // host_services always adds host-exec for the execution itself.
+        // For an unknown socket without explicit risk, the floor is
+        // host-exec (the execution itself).
+        let socket_label = forward_label(&h.socket, h.risk.as_deref());
+        let label = match socket_label {
+            RiskLabel::None => RiskLabel::HostExec,
+            other if other > RiskLabel::HostExec => other,
+            _ => RiskLabel::HostExec,
+        };
+        entries.push(RiskEntry {
+            capability: format!("host_service:{}", h.name),
+            label,
+        });
+    }
+    entries
+}
+
+/// Compute the risk label for a `[[forward]]` socket.
+/// Known patterns: ssh-agent → signing, docker.sock → root-equivalent,
+/// D-Bus → host-exec. Unknown → load error unless the profile sets `risk`
+/// explicitly (minimum host-exec).
+fn forward_label(socket: &str, explicit: Option<&str>) -> RiskLabel {
+    // Known patterns (path-based, not name-based — a docker socket at a
+    // non-standard path is still root-equivalent if it matches the pattern).
+    if is_ssh_agent_socket(socket) {
+        return RiskLabel::Signing;
+    }
+    if is_docker_socket(socket) {
+        return RiskLabel::RootEquivalent;
+    }
+    if is_dbus_socket(socket) {
+        return RiskLabel::HostExec;
+    }
+    // Unknown socket: the profile must set `risk` explicitly (minimum
+    // host-exec). If no `risk` is set, this is a load error — return a
+    // sentinel that the caller checks.
+    match explicit {
+        Some("data") => RiskLabel::Data,
+        Some("signing") => RiskLabel::Signing,
+        Some("host-exec") => RiskLabel::HostExec,
+        Some("root-equivalent") => RiskLabel::RootEquivalent,
+        Some("kernel-surface") => RiskLabel::KernelSurface,
+        _ => RiskLabel::None, // caller must check and reject
+    }
+}
+
+/// Recognised ssh-agent socket paths.
+fn is_ssh_agent_socket(p: &str) -> bool {
+    p.contains("ssh-agent")
+        || p.ends_with("/ssh/agent.sock")
+        || p.ends_with("/ssh-agent.sock")
+        || p.contains("ssh-agent.sock")
+}
+
+/// Recognised Docker daemon socket paths.
+fn is_docker_socket(p: &str) -> bool {
+    p.ends_with("/docker.sock")
+        || p == "/var/run/docker.sock"
+        || p.contains("docker.sock")
+        || p.contains("podman.sock")
+}
+
+/// Recognised D-Bus socket paths.
+fn is_dbus_socket(p: &str) -> bool {
+    p.contains("dbus")
+        || p == "/run/dbus/system_bus_socket"
+        || p.contains("system_bus_socket")
+        || p.contains("session_bus_socket")
 }
 
 /// The highest risk label from a list (for the RISK line and risk.json).
@@ -307,6 +570,8 @@ pub fn explain(spec: Option<&str>) -> Result<Value> {
         None => Profile {
             version: PROFILE_VERSION.to_string(),
             policy: Policy::default(),
+            forwards: Vec::new(),
+            host_services: Vec::new(),
         },
     };
     let risks = compute_risks(&profile);
@@ -344,10 +609,8 @@ pub fn validate(path: Option<&Path>) -> Result<ResolvedPolicy> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let uid = rustix::process::getuid().as_raw();
-    let roots = crate::session::runtime_roots(
-        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
-        uid,
-    );
+    let roots =
+        crate::session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     let resolved = profile.resolve(base, &Overrides::default(), &roots)?;
     Ok(resolved)
 }
@@ -394,38 +657,44 @@ mounts.grantable_rw = ["/srv/out"]
 
     #[test]
     fn wrong_version_rejected() {
-        assert!(Profile::parse(
-            r#"
+        assert!(
+            Profile::parse(
+                r#"
 version = "hisn-profile/v2"
 [policy]
 version = "hisn-policy/v1"
 "#,
-        )
-        .is_err());
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn missing_version_rejected() {
-        assert!(Profile::parse(
-            r#"
+        assert!(
+            Profile::parse(
+                r#"
 [policy]
 version = "hisn-policy/v1"
 "#,
-        )
-        .is_err());
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn inner_policy_validated() {
         // Bad inner policy version → error
-        assert!(Profile::parse(
-            r#"
+        assert!(
+            Profile::parse(
+                r#"
 version = "hisn-profile/v1"
 [policy]
 version = "hisn-policy/v2"
 "#,
-        )
-        .is_err());
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -436,7 +705,9 @@ version = "hisn-policy/v2"
         let here = std::env::current_dir().unwrap();
         let profiles_dir = here.join("profiles");
         // SAFETY: tests are single-threaded.
-        unsafe { std::env::set_var("HISN_PROFILES", &profiles_dir); }
+        unsafe {
+            std::env::set_var("HISN_PROFILES", &profiles_dir);
+        }
         let result = resolve_profile_path("base");
         // Don't clean up $HISN_PROFILES — other tests may need it too.
         if let Ok((p, _)) = &result {
@@ -483,12 +754,7 @@ version = "hisn-policy/v2"
         fs::create_dir(&cwd).unwrap();
         let profile = cwd.join("profile.toml");
         fs::write(&profile, "version = \"hisn-profile/v1\"\n").unwrap();
-        let result = check_profile_trust(
-            &profile,
-            ProfileSource::Path,
-            &cwd,
-            &[],
-        );
+        let result = check_profile_trust(&profile, ProfileSource::Path, &cwd, &[]);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("E_PROFILE_UNTRUSTED"), "{msg}");
@@ -501,12 +767,7 @@ version = "hisn-policy/v2"
         fs::create_dir(&cwd).unwrap();
         let profile = d.path().join("profile.toml");
         fs::write(&profile, "version = \"hisn-profile/v1\"\n").unwrap();
-        let result = check_profile_trust(
-            &profile,
-            ProfileSource::Path,
-            &cwd,
-            &[],
-        );
+        let result = check_profile_trust(&profile, ProfileSource::Path, &cwd, &[]);
         assert!(result.is_ok(), "{}", result.unwrap_err());
     }
 
@@ -519,12 +780,7 @@ version = "hisn-policy/v2"
         fs::create_dir(&grant).unwrap();
         let profile = grant.join("profile.toml");
         fs::write(&profile, "version = \"hisn-profile/v1\"\n").unwrap();
-        let result = check_profile_trust(
-            &profile,
-            ProfileSource::Path,
-            &cwd,
-            &[grant.as_path()],
-        );
+        let result = check_profile_trust(&profile, ProfileSource::Path, &cwd, &[grant.as_path()]);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("E_PROFILE_UNTRUSTED"), "{msg}");
@@ -537,20 +793,8 @@ version = "hisn-policy/v2"
         fs::create_dir(&cwd).unwrap();
         let profile = cwd.join("profile.toml");
         fs::write(&profile, "version = \"hisn-profile/v1\"\n").unwrap();
-        assert!(check_profile_trust(
-            &profile,
-            ProfileSource::Builtin,
-            &cwd,
-            &[],
-        )
-        .is_ok());
-        assert!(check_profile_trust(
-            &profile,
-            ProfileSource::Env,
-            &cwd,
-            &[],
-        )
-        .is_ok());
+        assert!(check_profile_trust(&profile, ProfileSource::Builtin, &cwd, &[],).is_ok());
+        assert!(check_profile_trust(&profile, ProfileSource::Env, &cwd, &[],).is_ok());
     }
 
     #[test]
@@ -568,7 +812,9 @@ version = "hisn-policy/v2"
         // Save and unset $HISN_PROFILES
         let saved = std::env::var("HISN_PROFILES").ok();
         // SAFETY: tests are single-threaded; no other thread reads this env var.
-        unsafe { std::env::remove_var("HISN_PROFILES"); }
+        unsafe {
+            std::env::remove_var("HISN_PROFILES");
+        }
         // cd to the dir that has ./profiles/evil.toml
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&cwd).unwrap();
@@ -577,7 +823,9 @@ version = "hisn-policy/v2"
         std::env::set_current_dir(prev).unwrap();
         if let Some(v) = saved {
             // SAFETY: tests are single-threaded.
-            unsafe { std::env::set_var("HISN_PROFILES", v); }
+            unsafe {
+                std::env::set_var("HISN_PROFILES", v);
+            }
         }
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -604,12 +852,7 @@ version = "hisn-policy/v2"
         .unwrap();
         // The session cwd from the policy is /elsewhere, but the profile
         // is under proc_cwd — so it must be rejected.
-        let result = check_profile_trust(
-            &profile,
-            ProfileSource::Path,
-            &proc_cwd,
-            &[],
-        );
+        let result = check_profile_trust(&profile, ProfileSource::Path, &proc_cwd, &[]);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("E_PROFILE_UNTRUSTED"), "{msg}");
@@ -661,5 +904,192 @@ version = "hisn-policy/v2"
         ];
         assert_eq!(highest_risk(&entries), RiskLabel::RootEquivalent);
         assert_eq!(highest_risk(&[]), RiskLabel::None);
+    }
+
+    #[test]
+    fn forward_parses_and_computes_signing() {
+        let p = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[forward]]
+name = "ssh-agent"
+socket = "/run/user/1000/ssh-agent.sock"
+expose = "/run/ssh/agent.sock"
+risk = "signing"
+risk_ack = "signing"
+"#,
+        )
+        .unwrap();
+        assert_eq!(p.forwards.len(), 1);
+        assert_eq!(p.forwards[0].name, "ssh-agent");
+        let risks = compute_risks(&p);
+        assert_eq!(risks.len(), 1);
+        assert_eq!(risks[0].label, RiskLabel::Signing);
+    }
+
+    #[test]
+    fn forward_docker_socket_computes_root_equivalent() {
+        let p = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[forward]]
+name = "docker"
+socket = "/var/run/docker.sock"
+expose = "/run/docker.sock"
+risk = "root-equivalent"
+risk_ack = "root-equivalent"
+"#,
+        )
+        .unwrap();
+        let risks = compute_risks(&p);
+        assert_eq!(risks[0].label, RiskLabel::RootEquivalent);
+    }
+
+    #[test]
+    fn forward_unknown_socket_without_risk_rejected() {
+        let result = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[forward]]
+name = "unknown"
+socket = "/run/user/1000/custom.sock"
+expose = "/run/custom.sock"
+"#,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("E_RISK_ACK_REQUIRED"), "{msg}");
+    }
+
+    #[test]
+    fn forward_unknown_socket_with_risk_and_ack_accepted() {
+        let p = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[forward]]
+name = "custom"
+socket = "/run/user/1000/custom.sock"
+expose = "/run/custom.sock"
+risk = "host-exec"
+risk_ack = "host-exec"
+"#,
+        )
+        .unwrap();
+        let risks = compute_risks(&p);
+        assert_eq!(risks[0].label, RiskLabel::HostExec);
+    }
+
+    #[test]
+    fn forward_risk_ack_mismatch_rejected() {
+        let result = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[forward]]
+name = "ssh-agent"
+socket = "/run/user/1000/ssh-agent.sock"
+expose = "/run/ssh/agent.sock"
+risk = "signing"
+risk_ack = "data"
+"#,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("E_RISK_ACK_MISMATCH"), "{msg}");
+    }
+
+    #[test]
+    fn host_service_parses_and_requires_host_exec_ack() {
+        let p = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[host_services]]
+name = "kvr-host"
+exec = ["kvr-server"]
+socket = "/run/user/1000/kvr/abc.sock"
+expose = "/run/kvr/kvr.sock"
+ready = { socket = "/run/user/1000/kvr/abc.sock" }
+stop = { signal = "TERM", grace = 5 }
+risk_ack = "host-exec"
+"#,
+        )
+        .unwrap();
+        assert_eq!(p.host_services.len(), 1);
+        let risks = compute_risks(&p);
+        assert_eq!(risks[0].label, RiskLabel::HostExec);
+    }
+
+    #[test]
+    fn host_service_without_risk_ack_rejected() {
+        let result = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[host_services]]
+name = "kvr-host"
+exec = ["kvr-server"]
+socket = "/run/user/1000/kvr/abc.sock"
+expose = "/run/kvr/kvr.sock"
+"#,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("E_RISK_ACK_REQUIRED"), "{msg}");
+    }
+
+    #[test]
+    fn profile_with_no_surface_yields_no_risks() {
+        let p = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+"#,
+        )
+        .unwrap();
+        assert!(compute_risks(&p).is_empty());
+    }
+
+    #[test]
+    fn forward_label_recognizes_known_patterns() {
+        assert_eq!(
+            forward_label("/run/user/1000/ssh-agent.sock", None),
+            RiskLabel::Signing
+        );
+        assert_eq!(
+            forward_label("/var/run/docker.sock", None),
+            RiskLabel::RootEquivalent
+        );
+        assert_eq!(
+            forward_label("/run/dbus/system_bus_socket", None),
+            RiskLabel::HostExec
+        );
+        assert_eq!(
+            forward_label("/run/user/1000/podman.sock", None),
+            RiskLabel::RootEquivalent
+        );
+        // Unknown without explicit risk → None (caller must reject)
+        assert_eq!(forward_label("/run/custom.sock", None), RiskLabel::None);
+        // Unknown with explicit risk → accepted
+        assert_eq!(
+            forward_label("/run/custom.sock", Some("data")),
+            RiskLabel::Data
+        );
+        assert_eq!(
+            forward_label("/run/custom.sock", Some("host-exec")),
+            RiskLabel::HostExec
+        );
     }
 }

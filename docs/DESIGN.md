@@ -1034,3 +1034,162 @@ env. The profile layer is a strict superset of capabilities, never a relaxation.
 **Invariant touched:** 5 (the labels are annotation only). 6 (the leak suite
 tests the isolation; the labels are display + load-time enforcement). 1, 2, 3, 4
 untouched.
+
+## 17. Socket forwarding (v0.3, ADR 0003)
+
+Two profile tables expose a **host-side unix socket** inside the sandbox at a
+declared path, as a **read-only mount of one socket inode**:
+
+- `[[forward]]` — expose an **existing** host socket (ssh agent, Docker
+  daemon). The supervisor prepares a detached tree with `open_tree(OPEN_TREE_CLONE)`
+  and sends it to the **grant helper** (§10), which attaches it at `expose`
+  inside the sandbox mount namespace via `move_mount`, with
+  `MOUNT_ATTR_RDONLY`. The helper is the same single-threaded fork from §10/D17:
+  it is forked before any thread, stays in userns S, joins only the sandbox
+  mntns, and uses fd-anchored, symlink-free path walks (R4). The forward is
+  tracked in the **grant table** so `inspect`, `list`, and revoke see it.
+- `[[host_services]]` — start a host-side process **in the supervisor's
+  userns S** (not the sandbox userns U), wait for its socket, then forward it
+  as above. Stop = signal + grace then KILL at session end.
+
+```toml
+[[forward]]
+name      = "ssh-agent"
+socket    = "/run/user/1000/ssh-agent.sock"   # existing host socket
+expose    = "/run/ssh/agent.sock"             # in-sandbox path
+risk      = "signing"
+risk_ack  = "signing"
+
+[[host_services]]
+name      = "kvr-host"
+exec      = ["kvr-server", "--addr", "/run/user/1000/kvr/abc.sock"]
+socket    = "/run/user/1000/kvr/abc.sock"     # host path the process binds
+expose    = "/run/kvr/kvr.sock"               # in-sandbox path
+ready     = { socket = "/run/user/1000/kvr/abc.sock" }
+stop      = { signal = "TERM", grace = 5 }
+risk_ack  = "host-exec"
+```
+
+### What the sandbox can and cannot do with a forwarded socket
+
+- **Can:** `connect(2)` to `expose`; speak the service's protocol over the
+  stream. A read-only mount does **not** make socket requests read-only: the
+  service may read/write host files, launch processes, or return descriptors
+  via `SCM_RIGHTS` — the risk is bounded by the **protocol**, disclosed by
+  the risk label, not by the mount flag.
+- **Cannot unlink it:** the mount is ro (`MOUNT_ATTR_RDONLY`); the parent
+  directory is the sandbox root tmpfs (owned by the mapped uid), but the
+  socket inode is not writable. `unlink` → `EBUSY` (a mounted inode).
+- **Cannot re-bind it:** the sandbox has no `CAP_SYS_ADMIN` and seccomp denies
+  `mount`/`umount`, so it cannot create a new mount at that path. `bind(2)`
+  the socket syscall is not denied; the sandbox can create its own unix
+  sockets, but it cannot move the forwarded inode.
+- **Cannot see the host path as a mount name:** `expose` is the only mount
+  name; `socket` does not exist in the sandbox's mount namespace. However,
+  `getpeername(2)` on a connected `AF_UNIX` socket returns the peer's bound
+  `sun_path` (the host path); this is a **known information leak** — the
+  host path is visible through the socket API, not through the filesystem.
+  The risk label covers the **authority** the socket grants, not the
+  confidentiality of the host path name. Leak test L36 records this.
+- **Cannot see other host sockets as mount names:** only the one inode is
+  mounted, not the host's `/run`. Other sockets in the same host directory
+  are not mounted and do not exist as path names. (A service can relay access
+  to other sockets through its protocol — that is protocol-level, not
+  mount-level, and is covered by the risk label.)
+
+### Source path rules (R1–R4 + R1b + R3)
+
+The `socket` path (the host-side source) satisfies the same path rules as a
+grant source: R1 (not the runtime dir), R2 (not `/`, `/proc`, `/sys`, `/dev`),
+R4 (opened with `openat2(O_PATH, RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`),
+and R1b (mountinfo alias scan). The `expose` path is an absolute in-sandbox
+path; it must not be `/`, `/proc`, `/sys`, `/dev`, or inside the runtime dir.
+R3 applies: `expose` may not overlap a mask or a static mount (same check as a
+grant target). The source must be a **socket** (`statx` → `S_IFSOCK`); a
+non-socket inode is a load error (`E_NOT_SOCKET`).
+
+### Mechanism (grant helper, not threaded supervisor)
+
+The forward is performed **through the grant helper** (§10), not by the
+threaded supervisor directly. The supervisor:
+1. `open_tree(OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)` the socket inode (no
+   `AT_RECURSIVE` — a socket is a single inode);
+2. `mount_setattr(tree, MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID, AT_EMPTY_PATH)`
+   on the detached tree;
+3. sends `grant <expose>` + the tree fd to the helper over the socketpair;
+4. the helper `setns(mntns)`, walks to the target dirfd with
+   `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`, `move_mount`s the tree;
+5. the helper returns the mount-root fd + mount id; the supervisor stores
+   the forward in the **grant table** (as a `Grant` with `mode = Ro`,
+   `recursive = false`) so `inspect`, `list`, and revoke see it.
+
+This reuses the exact same mechanism as a ro grant, ensuring:
+- the threaded supervisor never forks (D17);
+- the helper's fd-anchored path walk has no TOCTOU (R4);
+- the mount is tracked and revokable like any grant.
+
+### `[[host_services]]` lifecycle
+
+1. The supervisor forks the host process **before any thread** (like the
+   grant helper, D17), in the supervisor's userns S. The process runs with
+   the user's host credentials (not in the sandbox userns U), the host `PATH`
+   (not the sandbox's), and optional `cwd`. Never setuid, never extra caps.
+2. **Readiness:** the supervisor polls `ready` (socket stat, tcp connect, or
+   command exit 0) with a timeout (default 15 s; `ready.timeout` per service).
+   On timeout the session fails to start (fail closed) — the service is
+   killed and the session exits `125`. Readiness must complete **before**
+   `START` is sent to init.
+3. **Forward:** once ready, the socket is forwarded as `[[forward]]` above.
+4. **Stop:** on session end (init exit, `hisn kill`), the supervisor sends
+   `stop.signal` to the host process's process group, waits `stop.grace`,
+   then `SIGKILL`. The host process is a direct child of the supervisor
+   (not in the sandbox pidns); `kill(-pgid)` targets its group. If the
+   supervisor is `SIGKILL`ed, the host process is orphaned — it runs with
+   `PR_SET_PDEATHSIG=SIGKILL` so it dies with the supervisor.
+5. **`risk_ack = "host-exec"`** is required for the execution itself (a
+   profile's arbitrary host-side `exec` is user-equivalent execution),
+   independently of the socket's label. If the socket also has a
+   `signing` or `root-equivalent` label, the `risk_ack` must match the
+   **highest** label (§16).
+
+### Audit
+
+Every `[[forward]]` and every `[[host_services]]` start/stop is appended to
+`grants.jsonl` (op = `"forward"` or `"host_service"`, path = `socket` (the
+host source, not `expose` — the audit records what host object was exposed),
+expose = `expose` (the in-sandbox path), stage =
+`"start"`/`"stop"`/`"result"`).
+
+### `inspect --json` and L8
+
+Forwards appear as **additional mounts** in `inspect --json` (the mount
+table includes the forwarded socket at `expose`). They are **not in
+`mounts::plan`** (the plan is the inner policy's mount list); L8 compares
+`inspect` against `plan + initial grants`, so forwards are treated like
+initial grants — the L8 comparator must account for them.
+
+### What this feature does not change
+
+- The mount plan for the inner `[policy]` is unchanged; the forwarded socket
+  is an additional mount made by the supervisor after the initial plan.
+- The seccomp filter, Landlock ruleset, capability drop, and env scrub are
+  unchanged.
+- The control socket, grant/revoke, and exec mechanics are unchanged (the
+  forward reuses the grant helper and the grant table).
+
+**Invariant touched:** 1 (the exposed socket is a single ro mount inside the
+empty-tmpfs root; the host path is absent as a mount name). 2 (seccomp still
+denies mount/unlink from inside; the mount is made by the supervisor via the
+grant helper). 3 (the forward lives as long as the session; on session end
+the host-side process is stopped and the mount dies with the mnt ns). 5
+(annotation only; the mount is a bind of one inode if emitted in v2).
+
+### Known information leak (round-1 review)
+
+`getpeername(2)` on a connected `AF_UNIX` socket returns the peer's bound
+`sun_path` — the host path of the forwarded socket. This is visible to the
+sandbox through the socket API, not through the filesystem. The risk label
+covers the **authority** the socket grants (signing, root-equivalent,
+host-exec), not the confidentiality of the host path name. Leak test L36
+records this as a WEAK check (the host path is visible through `getpeername`
+but the sandbox cannot reach the host path as a file).

@@ -23,6 +23,7 @@ fn errno_name(e: i32) -> String {
         libc::EACCES => "EACCES".into(),
         libc::EPERM => "EPERM".into(),
         libc::EROFS => "EROFS".into(),
+        libc::EBUSY => "EBUSY".into(),
         libc::ENETUNREACH => "ENETUNREACH".into(),
         libc::ELOOP => "ELOOP".into(),
         libc::ENOSYS => "ENOSYS".into(),
@@ -47,12 +48,15 @@ fn last_errno() -> String {
 
 fn kind(md: &fs::Metadata) -> &'static str {
     let t = md.file_type();
+    use std::os::unix::fs::FileTypeExt;
     if t.is_dir() {
         "dir"
     } else if t.is_symlink() {
         "symlink"
     } else if t.is_file() {
         "file"
+    } else if t.is_socket() {
+        "socket"
     } else {
         "other"
     }
@@ -223,6 +227,24 @@ fn cmd_connect(host: &str, port: &str) -> String {
     };
     match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
         Ok(_) => "OK".into(),
+        Err(e) => err_str(&e),
+    }
+}
+
+/// Connect to a unix socket at `path` (L36: forward connect test).
+fn cmd_connect_unix(path: &str) -> String {
+    use std::os::unix::net::UnixStream;
+    match UnixStream::connect(path) {
+        Ok(_) => "OK connected".into(),
+        Err(e) => err_str(&e),
+    }
+}
+
+/// Unlink a file at `path` (L36: forward unlink test — should fail with
+/// EBUSY or EROFS on a ro-mounted socket).
+fn cmd_unlink(path: &str) -> String {
+    match fs::remove_file(path) {
+        Ok(()) => "OK unlinked".into(),
         Err(e) => err_str(&e),
     }
 }
@@ -620,6 +642,8 @@ fn dispatch(a: &[String]) -> String {
         "caps" => cmd_caps(),
         "syscall" => cmd_syscall(arg(1)),
         "connect" => cmd_connect(arg(1), arg(2)),
+        "connect-unix" => cmd_connect_unix(arg(1)),
+        "unlink" => cmd_unlink(arg(1)),
         "loopback" => cmd_loopback(),
         "exec" if a.len() > 1 => cmd_exec(&a[1..]),
         "hold-queued" => cmd_hold_queued(arg(1)),

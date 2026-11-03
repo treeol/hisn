@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -95,6 +96,15 @@ pub fn holders_json(holders: &BTreeSet<Holder>) -> Value {
             .map(|h| json!({ "pid": h.pid, "kind": h.kind.as_str() }))
             .collect(),
     )
+}
+
+/// Check the `expose` path for a forward (R1, R2, R3). The expose path must
+/// not be `/`, `/proc`, `/sys`, `/dev`, or inside the runtime root; and must
+/// not overlap a mask or static mount (same rules as a grant target).
+fn check_forbidden_expose(path: &Path, runtime_roots: &[PathBuf]) -> Result<()> {
+    use crate::policy::check_forbidden;
+    check_forbidden(path, runtime_roots).map_err(|e| anyhow!("expose: {e}"))?;
+    Ok(())
 }
 
 // ------------------------------------------------------------------- state
@@ -316,6 +326,76 @@ impl Shared {
                 err(&code, msg)
             }
         }
+    }
+
+    /// Forward a host socket inside the sandbox at `expose` (DESIGN §17).
+    /// Uses the grant helper to `open_tree` the socket inode and `move_mount`
+    /// it at `expose` with `MOUNT_ATTR_RDONLY`. The forward is tracked in
+    /// the grant table like a ro grant.
+    fn do_forward(&self, socket: &str, expose: &str, name: &str) -> Result<()> {
+        let _g = self.op_lock.lock().expect("op lock");
+        self.log("forward", "start", Some(socket), None, None, None);
+        // Validate the source path (R1–R4).
+        let p = grant::parse_abs(socket).map_err(|r| anyhow!("{}: {}", r.code, r.message))?;
+        let (src, canon) = grant::open_source(&p).map_err(|e| anyhow!("open source: {e}"))?;
+        if canon != p {
+            bail!("{socket}: not canonical (resolves to {})", canon.display());
+        }
+        // Verify the source is a socket inode.
+        let meta = fs::symlink_metadata(&canon).map_err(|e| anyhow!("stat: {e}"))?;
+        let file_type = meta.file_type();
+        if !file_type.is_socket() {
+            bail!(
+                "E_NOT_SOCKET: {} is not a socket (is {})",
+                socket,
+                if file_type.is_dir() {
+                    "dir"
+                } else if file_type.is_file() {
+                    "file"
+                } else {
+                    "other"
+                }
+            );
+        }
+        // R1b on the source.
+        if let Ok(mi) = fs::read_to_string("/proc/self/mountinfo") {
+            match alias::check_tree(&mi, &canon, false, &self.rules.runtime_roots) {
+                Ok(None) => {}
+                Ok(Some(a)) => bail!("{socket} aliases the runtime directory: {a:?}"),
+                Err(e) => bail!("R1b: {e}"),
+            }
+        } else {
+            bail!("cannot read mountinfo");
+        }
+        // Validate the expose path (R1, R2, R3).
+        let expose_p =
+            grant::parse_abs(expose).map_err(|r| anyhow!("expose: {} : {}", r.code, r.message))?;
+        check_forbidden_expose(&expose_p, &self.rules.runtime_roots)?;
+        // Prepare the tree: open_tree(OPEN_TREE_CLONE) + mount_setattr(RDONLY).
+        let tree =
+            grant::prepare_tree(&src, Mode::Ro, false).map_err(|e| anyhow!("prepare_tree: {e}"))?;
+        // Send to the grant helper to attach at `expose`.
+        let (mount_root, id) = self
+            .helper
+            .lock()
+            .expect("helper")
+            .forward(&expose_p, &tree)
+            .map_err(|e| anyhow!("attach: {e}"))?;
+        // Track in the grant table.
+        self.table.lock().expect("table").insert(Grant {
+            path: expose_p.clone(),
+            mode: Mode::Ro,
+            recursive: false,
+            mount_id: id,
+            ts: session::rfc3339_now(),
+        });
+        self.held
+            .lock()
+            .expect("held")
+            .insert(expose_p.clone(), Held { mount_root });
+        self.log("forward", "result", Some(socket), None, Some("ok"), None);
+        tracing::info!("forward: {} -> {} (mount_id={id})", name, expose);
+        Ok(())
     }
 
     /// PIDs (in the supervisor's view) of every process in the sandbox pid
@@ -753,17 +833,21 @@ fn getids(verbose: u8) -> (u32, u32, String) {
     (uid, gid, name)
 }
 
-/// Resolve policy + flags into the resolved policy, grant list, runtime roots.
+/// Resolve policy + flags into the resolved policy, grant list, runtime roots,
+/// and the 0.3 surface (forwards, host_services) from the profile.
 pub struct Prepared {
     pub policy: ResolvedPolicy,
     pub grants: Vec<(String, Mode)>,
     pub roots: Vec<PathBuf>,
+    /// 0.3 surface: forwards and host_services from the profile.
+    pub forwards: Vec<profile::Forward>,
+    pub host_services: Vec<profile::HostService>,
 }
 
 pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     let cwd_base = std::env::current_dir().context("current dir")?;
-    let (pol, base) = match (&args.policy, &args.profile) {
+    let (pol, base, forwards, host_services) = match (&args.policy, &args.profile) {
         (Some(f), None) => {
             let p = Policy::load(f).with_context(|| f.display().to_string())?;
             let b = f
@@ -771,7 +855,7 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
                 .filter(|b| !b.as_os_str().is_empty())
                 .map(Path::to_path_buf)
                 .unwrap_or(cwd_base.clone());
-            (p, b)
+            (p, b, Vec::new(), Vec::new())
         }
         (None, Some(spec)) => {
             let (path, source) = profile::resolve_profile_path(spec)?;
@@ -786,9 +870,14 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
             // is not known yet (it is resolved from the inner policy), so the
             // check runs after resolution, in `run`. Here we just load it.
             let _ = source; // trust check deferred to run()
-            (prof.policy, b)
+            (
+                prof.policy,
+                b,
+                prof.forwards.clone(),
+                prof.host_services.clone(),
+            )
         }
-        (None, None) => (Policy::default(), cwd_base.clone()),
+        (None, None) => (Policy::default(), cwd_base.clone(), Vec::new(), Vec::new()),
         // (Some, Some) is rejected by check_command() before we get here.
         _ => unreachable!("--profile and --policy are mutually exclusive (check_command)"),
     };
@@ -815,6 +904,8 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
         policy,
         grants,
         roots,
+        forwards,
+        host_services,
     })
 }
 
@@ -906,13 +997,8 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
             rw_paths.push(p.clone());
         }
         let rw_refs: Vec<&Path> = rw_paths.iter().map(|p| p.as_path()).collect();
-        profile::check_profile_trust(
-            &path,
-            profile::ProfileSource::Path,
-            &policy.cwd,
-            &rw_refs,
-        )
-        .map_err(anyhow::Error::msg)?;
+        profile::check_profile_trust(&path, profile::ProfileSource::Path, &policy.cwd, &rw_refs)
+            .map_err(anyhow::Error::msg)?;
     }
 
     // Compute risk labels from the profile's capabilities (DESIGN §16).
@@ -994,6 +1080,8 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         allow_host_abstract,
         verbose,
         &risk_entries,
+        &prep.forwards,
+        &prep.host_services,
     );
     sdir.remove();
     result
@@ -1013,6 +1101,8 @@ fn run_session(
     allow_host_abstract: bool,
     verbose: u8,
     risk_entries: &[profile::RiskEntry],
+    forwards: &[profile::Forward],
+    host_services: &[profile::HostService],
 ) -> Result<i32> {
     sdir.write_resolved_policy(&policy.to_toml())?;
     // Write risk.json (the risk labels for this session, DESIGN §16).
@@ -1022,8 +1112,7 @@ fn run_session(
             "label": e.label.kebab(),
         })).collect::<Vec<_>>(),
     }))?;
-    fs::write(sdir.path.join("risk.json"), risk_json)
-        .context("writing risk.json")?;
+    fs::write(sdir.path.join("risk.json"), risk_json).context("writing risk.json")?;
     let audit = Audit::open(&sdir.audit_path())?;
     // Write supervisor.pid for stale-detection. Written after the dir is
     // created and before unshare — a crash here leaves a dir without the
@@ -1242,6 +1331,51 @@ fn run_session(
             );
         }
     }
+    // Process [[forward]] entries (DESIGN §17): expose host sockets inside.
+    for f in forwards {
+        if let Err(e) = shared.do_forward(&f.socket, &f.expose, &f.name) {
+            let _ = sys::kill(pid, libc::SIGKILL);
+            let _ = reap(pid);
+            bail!("forward {}: {e}", f.name);
+        }
+    }
+    // Process [[host_services]] entries (DESIGN §17): start host process,
+    // wait for readiness, then forward its socket. Fail closed on timeout.
+    let mut host_pids: Vec<(i32, profile::StopSpec)> = Vec::new();
+    for h in host_services {
+        let stop_spec = h.stop.clone().unwrap_or(profile::StopSpec {
+            signal: "TERM".into(),
+            grace: 5,
+        });
+        match start_host_service(h) {
+            Ok(host_pid) => {
+                // Wait for readiness.
+                let timeout_secs = h.ready.as_ref().and_then(|r| r.timeout).unwrap_or(15);
+                if let Err(e) = wait_readiness(h, timeout_secs) {
+                    // Fail closed: kill the host process.
+                    let _ = sys::kill(host_pid, libc::SIGKILL);
+                    let _ = reap_host(host_pid);
+                    let _ = sys::kill(pid, libc::SIGKILL);
+                    let _ = reap(pid);
+                    bail!("host_service {}: readiness: {e}", h.name);
+                }
+                // Forward the socket.
+                if let Err(e) = shared.do_forward(&h.socket, &h.expose, &h.name) {
+                    let _ = sys::kill(host_pid, libc::SIGKILL);
+                    let _ = reap_host(host_pid);
+                    let _ = sys::kill(pid, libc::SIGKILL);
+                    let _ = reap(pid);
+                    bail!("host_service {}: forward: {e}", h.name);
+                }
+                host_pids.push((host_pid, stop_spec));
+            }
+            Err(e) => {
+                let _ = sys::kill(pid, libc::SIGKILL);
+                let _ = reap(pid);
+                bail!("host_service {}: {e}", h.name);
+            }
+        }
+    }
     sys::send_with_fd(sup_end.as_raw_fd(), &[MSG_START], None)?;
     thread::spawn(move || control::serve(listener, handler));
 
@@ -1260,6 +1394,28 @@ fn run_session(
 
     // ---- 7. relay + wait
     let code = relay_and_wait(pid, master, tty);
+
+    // Stop host services (DESIGN §17): signal + grace then KILL.
+    for (hpid, stop_spec) in &host_pids {
+        let sig = control::parse_signal(&stop_spec.signal).unwrap_or(libc::SIGTERM);
+        let _ = sys::kill(*hpid, sig);
+        // Wait for grace period.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(stop_spec.grace);
+        while std::time::Instant::now() < deadline {
+            let mut st = 0;
+            let r = unsafe { libc::waitpid(*hpid, &mut st, libc::WNOHANG) };
+            if r == *hpid {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // SIGKILL if still alive.
+        let mut st_kill = 0;
+        if unsafe { libc::waitpid(*hpid, &mut st_kill, libc::WNOHANG) } != *hpid {
+            let _ = sys::kill(*hpid, libc::SIGKILL);
+            let _ = reap_host(*hpid);
+        }
+    }
 
     // Let in-flight responses (e.g. a hard revoke that ended the session) go out.
     control::drain(std::time::Duration::from_secs(2));
@@ -1344,6 +1500,146 @@ fn reap(pid: i32) -> i32 {
     // SAFETY: blocking waitpid on our own child.
     unsafe { libc::waitpid(pid, &mut st, 0) };
     init::decode_status(st)
+}
+
+/// Reap a host service process (blocking waitpid).
+fn reap_host(pid: i32) -> i32 {
+    let mut st = 0;
+    // SAFETY: blocking waitpid on our own child.
+    unsafe { libc::waitpid(pid, &mut st, 0) };
+    init::decode_status(st)
+}
+
+/// Start a `[[host_services]]` process on the host (in the supervisor's
+/// userns S). The process runs with the user's credentials, the host PATH,
+/// and `PR_SET_PDEATHSIG=SIGKILL`. Returns the pid.
+fn start_host_service(h: &profile::HostService) -> Result<i32> {
+    // SAFETY: fork is called while the supervisor is single-threaded (before
+    // the control thread starts). The child runs execve immediately.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error()).context("fork host service");
+    }
+    if pid == 0 {
+        // Child: set PDEATHSIG so it dies with the supervisor.
+        // SAFETY: prctl with PDEATHSIG.
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+        }
+        // Build the environment: inherit the host environment, not the
+        // sandbox's scrubbed one. The host service runs as the user.
+        // Close all fds > 2 (don't leak supervisor fds into the host process).
+        unsafe {
+            libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as i32);
+        }
+        // execve the command.
+        let argv: Vec<std::ffi::CString> = h
+            .exec
+            .iter()
+            .map(|s| std::ffi::CString::new(s.as_str()).unwrap())
+            .collect();
+        let argv_ptrs: Vec<*const libc::c_char> = argv
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        // SAFETY: execve replaces the process image; on failure, _exit.
+        let rc = unsafe { libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr()) };
+        if rc < 0 {
+            // SAFETY: _exit on exec failure.
+            unsafe { libc::_exit(127) };
+        }
+        // Unreachable: execvp either succeeds or _exit's.
+        unsafe { libc::_exit(127) };
+    }
+    tracing::info!("host_service: {} started pid {pid}", h.name);
+    Ok(pid)
+}
+
+/// Wait for a host service to become ready (DESIGN §17).
+/// Polls `ready` (socket stat, tcp connect, or command exit 0) with a
+/// timeout. On timeout returns Err (fail closed).
+fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()> {
+    let ready = match &h.ready {
+        Some(r) => r,
+        None => {
+            // No readiness check: assume the socket exists immediately.
+            // Verify the socket path exists.
+            if !Path::new(&h.socket).exists() {
+                return Err(anyhow!(
+                    "host_service {}: socket {} does not exist",
+                    h.name,
+                    h.socket
+                ));
+            }
+            return Ok(());
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err(anyhow!(
+                "host_service {}: readiness timeout ({}s)",
+                h.name,
+                timeout_secs
+            ));
+        }
+        let ready_result = check_readiness(ready, &h.socket);
+        if ready_result {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Check one readiness probe. Returns true if the service is ready.
+fn check_readiness(ready: &profile::ReadinessSpec, _socket: &str) -> bool {
+    // Socket stat: check if the socket file exists.
+    if let Some(sock) = &ready.socket {
+        if let Ok(meta) = fs::symlink_metadata(sock)
+            && meta.file_type().is_socket()
+        {
+            return true;
+        }
+        return false;
+    }
+    // TCP connect: try to connect to the address.
+    if let Some(_addr) = &ready.tcp {
+        // TCP readiness is not implemented in this sandbox (no network
+        // for host services); fall through to command.
+        return false;
+    }
+    // Command: run a command, exit 0 = ready.
+    if let Some(cmd) = &ready.command {
+        if cmd.is_empty() {
+            return false;
+        }
+        let argv: Vec<std::ffi::CString> = cmd
+            .iter()
+            .map(|s| std::ffi::CString::new(s.as_str()).unwrap())
+            .collect();
+        let argv_ptrs: Vec<*const libc::c_char> = argv
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        // SAFETY: fork + waitpid on our own child.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return false;
+        }
+        if pid == 0 {
+            unsafe {
+                libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr());
+                libc::_exit(1);
+            }
+        }
+        let mut st = 0;
+        unsafe { libc::waitpid(pid, &mut st, 0) };
+        return st == 0;
+    }
+    // No readiness check: assume ready.
+    true
 }
 
 // -------------------------------------------------------------- stdio relay

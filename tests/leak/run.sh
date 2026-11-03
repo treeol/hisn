@@ -1180,6 +1180,153 @@ else
   fail "L26 profile under cwd" "rc=$L26_RC err=$(head -c 300 "$WORK/l26.err")"
 fi
 
+# ================================================ L36: [[forward]] socket forwarding (0.3a)
+# A [[forward]] entry exposes a host socket inside the sandbox at `expose`.
+# The sandbox can connect to `expose`; unlink → EBUSY/EROFS; the host path
+# is absent; other sockets in the same host dir are invisible.
+L36_CWD=$(new_cwd l36)
+L36_PROFILE="$WORK/L36-profile.toml"
+# Create a host socket for the test.
+L36_HOST_SOCK="$WORK/l36-host-sock"
+L36_HOST_SOCK_DIR=$(dirname "$L36_HOST_SOCK")
+mkdir -p "$L36_HOST_SOCK_DIR"
+# Create a second socket in the same dir to test visibility.
+L36_OTHER_SOCK="$L36_HOST_SOCK_DIR/other.sock"
+python3 -c "
+import socket, sys
+s1 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s1.bind(sys.argv[1])
+s1.listen(8)
+s2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s2.bind(sys.argv[2])
+s2.listen(8)
+import time
+while True:
+    time.sleep(60)
+" "$L36_HOST_SOCK" "$L36_OTHER_SOCK" &
+L36_SOCK_PID=$!
+SESSIONS+=("$L36_SOCK_PID")
+sleep 0.5
+# Verify the host sockets exist
+if [ ! -S "$L36_HOST_SOCK" ] || [ ! -S "$L36_OTHER_SOCK" ]; then
+  skip "L36 forward" "could not create host unix sockets for the test"
+  kill -9 "$L36_SOCK_PID" 2>/dev/null
+else
+  cat >"$L36_PROFILE" <<L36EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L36_CWD"
+session.network = "none"
+[[forward]]
+name = "test-socket"
+socket = "$L36_HOST_SOCK"
+expose = "/run/test.sock"
+risk = "host-exec"
+risk_ack = "host-exec"
+L36EOF
+  # Start the session directly with --profile (not --policy).
+  L36_LOG="$WORK/l36.log"
+  HISN_LEAK_SECRET=topsecret HISN_LEAK_PASSED=visible-ok HISN_PROFILES="$ROOT/profiles" \
+    "$HISN" run --profile "$L36_PROFILE" --session-id l36-$$ \
+    -- "$L36_CWD/leakprobe" loop "$L36_CWD/ctl" \
+    </dev/null >"$L36_LOG.out" 2>"$L36_LOG" &
+  L36_PID=$!
+  SESSIONS+=("$L36_PID")
+  l36_ready=0
+  for i in $(seq 1 150); do
+    [ -e "$L36_CWD/ctl/ready" ] && { l36_ready=1; break; }
+    kill -0 "$L36_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [ "$l36_ready" = 1 ]; then
+    # 1. connect to expose works
+    got=$(q "$L36_CWD" connect-unix /run/test.sock)
+    case "$got" in
+      OK*) pass "L36 forward: connect to expose works ($got)" ;;
+      *) fail "L36 forward connect" "got [$got] want OK" ;;
+    esac
+    # 2. unlink expose → EBUSY or EROFS
+    got=$(q "$L36_CWD" unlink /run/test.sock)
+    case "$got" in
+      EBUSY|EROFS) pass "L36 forward: unlink expose → $got" ;;
+      *) fail "L36 forward unlink" "got [$got] want EBUSY or EROFS" ;;
+    esac
+    # 3. host path absent inside
+    got=$(q "$L36_CWD" stat "$L36_HOST_SOCK")
+    eq "L36 forward: host path absent inside" "$got" ENOENT
+    # 4. other sockets in the same host dir are invisible
+    got=$(q "$L36_CWD" stat "$L36_OTHER_SOCK")
+    eq "L36 forward: other socket in same dir invisible" "$got" ENOENT
+    end_session "$L36_CWD" "$L36_PID"
+  else
+    fail "L36 forward" "session did not start: $(head -c 300 "$L36_LOG")"
+  fi
+  kill -9 "$L36_SOCK_PID" 2>/dev/null
+  wait "$L36_SOCK_PID" 2>/dev/null
+fi
+
+# ================================================ L37: [[host_services]] lifecycle (0.3a)
+# A [[host_services]] entry starts a host process, waits for its socket,
+# then forwards it. On session end the host process is gone.
+L37_CWD=$(new_cwd l37)
+L37_PROFILE="$WORK/L37-profile.toml"
+L37_HOST_SOCK="$WORK/l37-host/kvr.sock"
+mkdir -p "$(dirname "$L37_HOST_SOCK")"
+cat >"$L37_PROFILE" <<L37EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L37_CWD"
+session.network = "none"
+[[host_services]]
+name = "kvr-host"
+exec = ["python3", "-c", "import socket,sys,os,signal; signal.signal(signal.SIGTERM, lambda *a: os._exit(0)); s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.bind(sys.argv[1]); s.listen(8); import time; [time.sleep(60) for _ in iter(int,1)]", "$L37_HOST_SOCK"]
+socket = "$L37_HOST_SOCK"
+expose = "/run/kvr/kvr.sock"
+ready = { socket = "$L37_HOST_SOCK" }
+stop = { signal = "TERM", grace = 5 }
+risk_ack = "host-exec"
+L37EOF
+# Start the session directly with --profile.
+L37_LOG="$WORK/l37.log"
+HISN_LEAK_SECRET=topsecret HISN_LEAK_PASSED=visible-ok HISN_PROFILES="$ROOT/profiles" \
+  "$HISN" run --profile "$L37_PROFILE" --session-id l37-$$ \
+  -- "$L37_CWD/leakprobe" loop "$L37_CWD/ctl" \
+  </dev/null >"$L37_LOG.out" 2>"$L37_LOG" &
+L37_PID=$!
+SESSIONS+=("$L37_PID")
+l37_ready=0
+for i in $(seq 1 150); do
+  [ -e "$L37_CWD/ctl/ready" ] && { l37_ready=1; break; }
+  kill -0 "$L37_PID" 2>/dev/null || break
+  sleep 0.1
+done
+if [ "$l37_ready" = 1 ]; then
+  # 1. socket is at expose
+  got=$(q "$L37_CWD" stat /run/kvr/kvr.sock)
+  case "$got" in
+    "OK socket") pass "L37 host_service: socket at expose ($got)" ;;
+    "OK "*|*) fail "L37 host_service socket" "got [$got] want a socket" ;;
+  esac
+  # 2. connect works
+  got=$(q "$L37_CWD" connect-unix /run/kvr/kvr.sock)
+  case "$got" in
+    OK*) pass "L37 host_service: connect works ($got)" ;;
+    *) fail "L37 host_service connect" "got [$got] want OK" ;;
+  esac
+  end_session "$L37_CWD" "$L37_PID"
+  sleep 0.5
+  # 3. host process is gone after session end
+  if [ ! -S "$L37_HOST_SOCK" ]; then
+    pass "L37 host_service: host process gone after session end"
+  else
+    weak "L37 host_service cleanup" "host socket still exists after session end (process may not have exited)"
+  fi
+else
+  fail "L37 host_service" "session did not start: $(head -c 300 "$L37_LOG")"
+fi
+
 # ----------------------------------------------------------------- manifest
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.

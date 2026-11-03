@@ -1471,7 +1471,21 @@ fn run_session(
         }
     }
     sys::send_with_fd(sup_end.as_raw_fd(), &[MSG_START], None)?;
-    thread::spawn(move || control::serve(listener, handler));
+    thread::spawn(move || {
+        // Process-directed signals (SIGCHLD, SIGTERM, ...) must be handled by
+        // the main thread, which waits for them in `sigsuspend`. A thread that
+        // leaves them unblocked can be picked by the kernel as the recipient:
+        // the handler then runs here and the main thread is never woken.
+        // Threads spawned by `serve` inherit this mask.
+        let _ = sig::block(&[
+            libc::SIGTERM,
+            libc::SIGINT,
+            libc::SIGHUP,
+            libc::SIGWINCH,
+            libc::SIGCHLD,
+        ]);
+        control::serve(listener, handler)
+    });
 
     // --ready-fd: write "ready\n" to the caller's fd after the session is
     // live (START sent, initial grants applied, control thread started).

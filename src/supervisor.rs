@@ -158,6 +158,8 @@ struct ServiceState {
     socket: Option<String>,
     state: &'static str, // "starting" | "ready" | "exited"
     exit: Option<i32>,
+    /// The status socket to the service's monitor `W`, used to detect exit.
+    status: OwnedFd,
 }
 
 impl Shared {
@@ -680,21 +682,41 @@ impl Shared {
     }
 
     fn inspect(&self) -> Value {
-        let services = self
-            .services
-            .lock()
-            .expect("services")
-            .values()
-            .map(|s| {
-                json!({
-                    "name": s.name,
-                    "pid": s.pid,
-                    "socket": s.socket,
-                    "state": s.state,
-                    "exit": s.exit,
+        let services = {
+            let mut svcs = self.services.lock().expect("services");
+            // Update service states: check if each service is still alive
+            // (P26). A service whose status socket is closed or whose pid
+            // is gone has exited.
+            for s in svcs.values_mut() {
+                if s.state == "ready" {
+                    // Check if the service process is still alive via the
+                    // status socket. If the socket is closed (POLLHUP), the
+                    // monitor is gone, so the service has exited.
+                    let alive = s.status.as_raw_fd();
+                    let mut pollfds = [libc::pollfd {
+                        fd: alive,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }];
+                    // SAFETY: poll on our own fd, non-blocking.
+                    let r = unsafe { libc::poll(&mut pollfds[0], 1, 0) };
+                    if r > 0 && (pollfds[0].revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
+                        s.state = "exited";
+                    }
+                }
+            }
+            svcs.values()
+                .map(|s| {
+                    json!({
+                        "name": s.name,
+                        "pid": s.pid,
+                        "socket": s.socket,
+                        "state": s.state,
+                        "exit": s.exit,
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        };
         match fs::read_to_string(format!("/proc/{}/mountinfo", self.init_pid)) {
             Ok(mi) => ok(json!({
                 "schema": "hisn-inspect/v1",
@@ -1468,18 +1490,26 @@ fn run_session(
     let code = relay_and_wait(pid, master, tty);
 
     // Stop host services (DESIGN §17): signal + grace then KILL.
+    // Check if the process is already gone before sleeping the full grace (P27).
     for (hpid, stop_spec) in &host_pids {
         let sig = control::parse_signal(&stop_spec.signal).unwrap_or(libc::SIGTERM);
         let _ = sys::kill(*hpid, sig);
-        // Wait for grace period.
+        // Wait for grace period, but only while the process is alive.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(stop_spec.grace);
         while std::time::Instant::now() < deadline {
             let mut st = 0;
+            // SAFETY: non-blocking waitpid on our own child.
             let r = unsafe { libc::waitpid(*hpid, &mut st, libc::WNOHANG) };
             if r == *hpid {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            if r == 0 {
+                // Still running; wait a bit and re-check.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            } else {
+                // waitpid error (e.g. ECHILD) — the process is gone.
+                break;
+            }
         }
         // SIGKILL if still alive.
         let mut st_kill = 0;
@@ -1490,15 +1520,32 @@ fn run_session(
     }
     // Stop in-sandbox services (DESIGN §19): best-effort signal + grace.
     // If init has already exited, the kernel has killed everything in the pid
-    // ns; the stop is moot but harmless.
+    // ns; the stop is moot but harmless. Check if the service is still alive
+    // before sleeping the full grace period (P27).
     for handle in &service_handles {
         let sig = control::parse_signal(&handle.stop.signal).unwrap_or(libc::SIGTERM);
         // The service's pid is in the sandbox pid ns; signal it via the status
         // socket (same as exec signal).
         let _ = sys::send_all(handle.status.as_raw_fd(), exec::format_kill(sig).as_bytes());
+        // Wait for grace period, but only while the service is still alive.
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(handle.stop.grace);
         while std::time::Instant::now() < deadline {
+            // Check if the status socket is still open (service still running).
+            // If the service has already exited, skip the remaining grace.
+            // Use a non-blocking read: if the socket is closed, the service
+            // monitor is gone.
+            let mut pollfds = [libc::pollfd {
+                fd: handle.status.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            // SAFETY: poll on our own fd, non-blocking.
+            let r = unsafe { libc::poll(&mut pollfds[0], 1, 0) };
+            if r > 0 && (pollfds[0].revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
+                // Service monitor is gone; skip the remaining grace.
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         // SIGKILL via the status socket.
@@ -1659,6 +1706,10 @@ fn start_in_sandbox_service(
     // Register the service in the shared state for ls --json.
     {
         let mut svcs = shared.services.lock().expect("services");
+        // The status socket is dup'd for the ServiceState so inspect() can
+        // poll it for liveness (P26).
+        let status_dup = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3)
+            .map_err(|e| anyhow!("service {}: dup status fd: {e}", s.name))?;
         svcs.insert(
             s.name.clone(),
             ServiceState {
@@ -1667,6 +1718,7 @@ fn start_in_sandbox_service(
                 socket: s.socket.clone(),
                 state: "ready",
                 exit: None,
+                status: status_dup,
             },
         );
     }
@@ -1685,7 +1737,10 @@ fn start_in_sandbox_service(
 }
 
 /// Wait for an in-sandbox service to become ready (DESIGN §19).
-/// Polls `ready` with a timeout. On timeout returns Err (fail closed).
+/// Polls `ready.socket` (stat from the supervisor) with a timeout. On
+/// timeout returns Err (fail closed). Only `socket` stat is available for
+/// in-sandbox services in 0.3 (P25: `command` would run on the host with the
+/// user's credentials; `tcp` is not available for in-sandbox services).
 fn wait_service_readiness(s: &profile::Service, timeout_secs: u64) -> Result<()> {
     let ready = match &s.ready {
         Some(r) => r,
@@ -1706,36 +1761,14 @@ fn wait_service_readiness(s: &profile::Service, timeout_secs: u64) -> Result<()>
         // ready.socket: stat the path from the supervisor (userns S). This
         // works for paths under cwd (a rw bind visible from S) and under
         // mounts.ro/rw. It does not work for paths on the sandbox's private
-        // tmpfs (/tmp, /run, $HOME); for those, use ready.command.
+        // tmpfs (/tmp, /run, $HOME); the service must declare its socket
+        // under cwd for readiness to be checkable.
         if let Some(sock) = &ready.socket
             && let Ok(meta) = fs::symlink_metadata(sock)
             && meta.file_type().is_socket()
         {
             return Ok(());
         }
-        // ready.command: run through the exec helper chain (inside the
-        // sandbox). This is the readiness check for sockets on private tmpfs.
-        if let Some(cmd) = &ready.command
-            && !cmd.is_empty()
-        {
-            // The readiness command runs as a plain child process outside the
-            // sandbox (it only checks existence of a file, which is a stat).
-            // This is safe because the command runs as the user, not the
-            // sandbox.
-            let result = std::process::Command::new(&cmd[0])
-                .args(&cmd[1..])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            if let Ok(status) = result
-                && status.success()
-            {
-                return Ok(());
-            }
-        }
-        // ready.tcp is not available for in-sandbox services in 0.3 (validated
-        // in validate_surface).
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }

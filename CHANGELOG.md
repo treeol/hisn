@@ -7,6 +7,71 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0]
+
+### Added
+- **Profiles** (`hisn-profile/v1`): an envelope around `hisn-policy/v1` that
+  layers orchestration surface (services, forwards, host_services, docker tier,
+  risk labels) on top of the isolation contract. `hisn run --profile <name|path>`
+  resolves the profile by name (`$HISN_PROFILES/<name>.toml`, then built-in
+  `profiles/<name>.toml` next to the binary) or path. `--profile` and `--policy`
+  are mutually exclusive. Built-in profiles: `base` (the 0..2 sandbox),
+  `wakil` (0.2 sandbox + `grantable_rw`). `hisn profile list|explain|validate`.
+  A profile under the session cwd or a rw grant cannot satisfy `risk_ack`
+  (`E_PROFILE_UNTRUSTED`); `./<name>.toml` is not in the search path
+  (`E_PROFILE_NOTFOUND` with `$HISN_PROFILES` unset).
+  A profile with no new tables yields the 0.2 mount plan (L25).
+- **Risk labels**: every profile capability that widens the boundary carries a
+  fixed label (`none`, `data`, `signing`, `host-exec`, `root-equivalent`,
+  `kernel-surface`), computed by hisn from the capability. `hisn run` prints
+  `RISK: <label> — <capability>` per widening capability at start unless
+  `--quiet-risk`. `root-equivalent`, `signing`, `host-exec` require a matching
+  `risk_ack` (`E_RISK_ACK_REQUIRED` / `E_RISK_ACK_MISMATCH`). An unknown
+  `[[forward]]` socket without explicit `risk` is a load error. Labels are
+  recorded in `risk.json` in the session dir and in `inspect --json`.
+- **Socket forwarding** (`[[forward]]`): expose an existing host unix socket
+  inside at `expose` via `open_tree(OPEN_TREE_CLONE)` + `move_mount`, read-only.
+  `connect` works; `unlink` → `EROFS`/`EBUSY`; the host path is absent inside.
+- **Host-side services** (`[[host_services]]`): hisn starts a host-side process
+  as the user (no extra privilege), waits for readiness (socket/tcp/command,
+  timeout default 15 s, fail closed), then forwards its socket. Stop = signal +
+  grace + KILL at session end. Requires `risk_ack = "host-exec"`.
+- **Docker T2** (`[docker] tier = "socket"`): raw `[[forward]]` of the Docker
+  daemon socket with label `root-equivalent` and required `risk_ack =
+  "root-equivalent"`. `tier = "proxy"` and `nested_userns = true` are rejected
+  with `E_NOT_SUPPORTED` (0.4). Shipped: `profiles/docker-socket.toml`,
+  `profiles/deploy-smaragd-example.toml`. The socket dies with the session;
+  containers the daemon started do not.
+- **In-sandbox services** (`[[services]]`): start a long-lived process inside
+  the sandbox through the exec helper chain (same confinement as the main
+  command), before START. Readiness: socket stat (for paths under cwd) with
+  timeout (default 15 s, fail closed). Stop: best-effort signal + grace + KILL
+  (checks if the service is still alive before sleeping). `restart = "none"`
+  only. `ls --json` and `inspect --json` gain a `services` array (state is
+  evidence-based: `"ready"` after readiness, `"exited"` when the status socket
+  closes). Shipped: `profiles/kvr-example.toml`. `hisn profile explain` prints
+  a socket-hijack warning for each `[[services]]` entry with a `socket` field.
+
+### Changed
+- `sethostname` in init is now best-effort (some containers block it via seccomp
+  even in a new UTS ns; the hostname is cosmetic, not a security boundary).
+  A WARN line is logged when it fails.
+
+### Removed (0.3.0 scope)
+- `ready.command` and `ready.tcp` are not in the `[[services]]` schema
+  (`ServiceReadinessSpec` uses `deny_unknown_fields`). `ready.command` would
+  run on the host with the user's credentials while the risk label says `none`
+  (P25); re-adding it through the exec helper chain is 0.3b work. `ready.tcp`
+  is not available for in-sandbox services in 0.3 (use `ready.socket`).
+
+### Tests
+- L25 (profile base == 0.2 plan), L26 (profile under cwd → E_PROFILE_UNTRUSTED),
+  L29 (docker-socket: RISK line, docker ps, missing risk_ack → load error),
+  L31 (in-sandbox service: connectable, dies with session, no extra mounts),
+  L36 (forward: connect, unlink EROFS/EBUSY, host path absent, other sockets
+  invisible), L37 (host_service: socket at expose, connect works, host process
+  gone after session end), L41 (service readiness timeout → fail closed).
+
 ## [0.2.2]
 
 ### Fixed

@@ -41,6 +41,7 @@ they are absent: `ENOENT`.
 hisn check                                              # does this host qualify?
 hisn run -- make test                                   # cwd rw, toolchain ro, nothing else
 hisn run --policy hisn.toml --grant ~/data:ro -- ./job  # with a policy and a read-only grant
+hisn run --profile base -- make test                    # with a profile (built-in: base, wakil)
 ```
 
 `hisn run` passes stdio through unchanged and allocates a pty inside the sandbox
@@ -276,19 +277,18 @@ To check a downloaded binary, run `sha256sum -c SHA256SUMS`, then
 
 ## Status
 
-hisn 0.2.2 is maintained by one person. The leak suite was last recorded on a
-Fedora x86_64 host at commit `81b0705`: **198 passed, 0 failed, 1 skipped
-(L12, needs write access to `/etc`), 1 weak (L14, the R5 peer check is covered
-by unit tests only)** ([log](docs/leaktest-host-2026-11-02.log)). CI runs the
-suite on Ubuntu 22.04 and 24.04 (x86_64) and builds a release only after it
-passes. aarch64 is cross-checked by clippy and has not been leak-tested.
-[docs/VERIFICATION.txt](docs/VERIFICATION.txt) lists what was run, where, and
-with which log; anything without a log is recorded as "not run".
+hisn 0.3.0 is maintained by one person. The leak suite was last run in the
+build sandbox (allow_userns) at commit `1c74aad`: **214 passed, 0 failed, 1
+skipped (L12, needs write access to `/etc`), 4 weak (L1, L14 R5, L20, L37)**.
+The user does a final `make leaktest-log` on the host before the 0.3.0 tag.
+CI runs the suite on Ubuntu 22.04 and 24.04 (x86_64) and builds a release only
+after it passes. aarch64 is cross-checked by clippy and has not been
+leak-tested. [docs/VERIFICATION.txt](docs/VERIFICATION.txt) lists what was run,
+where, and with which log; anything without a log is recorded as "not run".
 
-**Next:** a 0.3 plan (profiles, in-sandbox and host-side services, a filtering
-Docker proxy, risk labels) is written up in
-[docs/PLAN-0.3.md](docs/PLAN-0.3.md). It is a plan, not a commitment, and none
-of it is implemented.
+**Next:** 0.3b (ssh T1, recipes, threat-model leak tests) and 0.4 (Docker T1/T3,
+leases, egress proxy) are planned in
+[docs/PLAN-0.3.md](docs/PLAN-0.3.md).
 
 ## Documentation
 

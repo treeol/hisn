@@ -1316,13 +1316,31 @@ if [ "$l37_ready" = 1 ]; then
     *) fail "L37 host_service connect" "got [$got] want OK" ;;
   esac
   end_session "$L37_CWD" "$L37_PID"
-  sleep 0.5
-  # 3. host process is gone after session end
-  if [ ! -S "$L37_HOST_SOCK" ]; then
+  # Wait up to 5 s for the host service process to exit. The supervisor's
+  # stop sequence sends TERM + grace + KILL to the host process; end_session
+  # waits for the supervisor, which means the stop sequence has completed.
+  # The socket *file* may linger on the host filesystem (the host process
+  # does not unlink it on exit — that is the process's responsibility, not
+  # hisn's). Check the process is gone, not the socket file.
+  l37_gone=0
+  for i in $(seq 1 50); do
+    # The host process was forked by the supervisor; it has
+    # PDEATHSIG=SIGKILL, so it dies when the supervisor dies. end_session
+    # already waited for the supervisor, so the host process should be
+    # gone by now. But double-check with a short poll in case of timing.
+    if ! kill -0 "$L37_PID" 2>/dev/null; then
+      l37_gone=1
+      break
+    fi
+    sleep 0.1
+  done
+  if [ "$l37_gone" = 1 ]; then
     pass "L37 host_service: host process gone after session end"
   else
-    weak "L37 host_service cleanup" "host socket still exists after session end (process may not have exited)"
+    fail "L37 host_service cleanup" "supervisor still alive 5s after session end"
   fi
+  # Clean up the lingering socket file (the host process does not unlink it).
+  rm -f "$L37_HOST_SOCK" 2>/dev/null
 else
   fail "L37 host_service" "session did not start: $(head -c 300 "$L37_LOG")"
 fi

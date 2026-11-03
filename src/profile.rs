@@ -95,15 +95,11 @@ impl Profile {
                     );
                 }
             }
-            // ready.tcp is not available for in-sandbox services in 0.3.
-            if let Some(r) = &s.ready
-                && r.tcp.is_some()
-            {
-                bail!(
-                    "E_NOT_SUPPORTED: [[services]] {}: ready.tcp is not available for in-sandbox services in 0.3 (use ready.command instead)",
-                    s.name
-                );
-            }
+            // ready for [[services]] only supports `socket` (stat from
+            // supervisor). `command` and `tcp` are not in
+            // `ServiceReadinessSpec` — `deny_unknown_fields` rejects them at
+            // parse time with a clear error naming the unknown field. No
+            // additional validation needed here.
         }
         for f in &self.forwards {
             if f.name.is_empty() {
@@ -253,15 +249,36 @@ pub struct Service {
     /// Optional: the path the service listens on (for display and `ls --json`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<String>,
-    /// Readiness check (socket stat from supervisor, or command via exec chain).
+    /// Readiness check: socket stat from the supervisor (for paths under
+    /// cwd or mounts). `ready.command` is not available for `[[services]]` in
+    /// 0.3 — it would run on the host with the user's credentials (P25).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ready: Option<ReadinessSpec>,
+    pub ready: Option<ServiceReadinessSpec>,
     /// Stop policy (signal + grace).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<StopSpec>,
     /// Restart policy (only "none" in 0.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<String>,
+}
+
+/// Readiness spec for `[[services]]`: only `socket` stat (from the
+/// supervisor) and `timeout` are available. `command` and `tcp` are not —
+/// `command` would run on the host with the user's credentials (P25), and
+/// `tcp` is not available for in-sandbox services in 0.3 (use `socket`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceReadinessSpec {
+    /// `socket = "/path"` — stat the socket file from the supervisor.
+    /// Works for paths under cwd (a rw bind visible from S) or under
+    /// mounts.ro/mounts.rw. For paths on the sandbox's private tmpfs (/tmp,
+    /// /run, $HOME), the supervisor cannot stat them; declare the socket
+    /// under cwd instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+    /// Timeout in seconds (default 15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
 }
 
 /// A `[[forward]]` table: expose an existing host socket inside (DESIGN §17).
@@ -689,7 +706,9 @@ pub fn list() -> Result<Value> {
 }
 
 /// Explain a profile: parse it and print the capabilities and their risk
-/// labels (for `hisn profile explain`).
+/// labels (for `hisn profile explain`). Includes `notes` for each
+/// `[[services]]` entry warning that the service socket is replaceable by
+/// the sandboxed command (socket hijack, P29).
 pub fn explain(spec: Option<&str>) -> Result<Value> {
     let profile = match spec {
         Some(s) => {
@@ -716,11 +735,29 @@ pub fn explain(spec: Option<&str>) -> Result<Value> {
             })
         })
         .collect();
+    // Notes for [[services]]: the service socket is on a writable path
+    // (cwd or a grant) that the main command can also write. A hostile
+    // command can kill the service, unlink its socket, and bind a
+    // replacement — a host-side client connecting to the socket path would
+    // then reach the attacker's process (P29).
+    let notes: Vec<String> = profile
+        .services
+        .iter()
+        .filter_map(|s| {
+            s.socket.as_ref().map(|sock| {
+                format!(
+                    "service {}: socket {} is replaceable by the sandboxed command; the client must authenticate the service",
+                    s.name, sock
+                )
+            })
+        })
+        .collect();
     Ok(json!({
         "schema": "hisn-profile-explain/v1",
         "version": profile.version,
         "capabilities": caps,
         "risk": highest.kebab(),
+        "notes": notes,
     }))
 }
 
@@ -1430,6 +1467,9 @@ restart = "on-failure"
 
     #[test]
     fn services_ready_tcp_rejected() {
+        // ready.tcp is not in ServiceReadinessSpec — deny_unknown_fields
+        // rejects it at parse time (P25: command and tcp are not available
+        // for in-sandbox services in 0.3).
         let result = Profile::parse(
             r#"
 version = "hisn-profile/v1"
@@ -1442,7 +1482,36 @@ ready = { tcp = "127.0.0.1:8080" }
 "#,
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("E_NOT_SUPPORTED"));
+        let msg = result.unwrap_err().to_string();
+        // deny_unknown_fields produces a serde parse error mentioning "tcp".
+        assert!(
+            msg.contains("tcp") || msg.contains("unknown field"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn services_ready_command_rejected() {
+        // ready.command is not in ServiceReadinessSpec — deny_unknown_fields
+        // rejects it at parse time (P25: command would run on the host with
+        // the user's credentials).
+        let result = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[services]]
+name = "kvr"
+exec = ["sleep", "1"]
+ready = { command = ["test", "-S", "/run/kvr.sock"] }
+"#,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("command") || msg.contains("unknown field"),
+            "{msg}"
+        );
     }
 
     #[test]

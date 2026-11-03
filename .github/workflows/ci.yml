@@ -150,13 +150,14 @@ jobs:
           if [ "$failed" -ne 0 ]; then
             echo "::error::$failed leak checks failed"; grep '^FAIL  ' "$log" || true; exit 1
           fi
-          # The host run that qualified 0.2.0 had 175 passes; allow for SKIPs on
-          # kernels without Landlock ABI 6, but not for a hollow run.
+          # The host run that qualified 0.2.0 had 175 passes; 0.3.0 has 214+.
+          # Allow for SKIPs on kernels without Landlock ABI 6, but not for a
+          # hollow run.
           if [ "$passed" -lt 150 ]; then
             echo "::error::only $passed checks passed; expected at least 150"; exit 1
           fi
           # Every test group L1-L22 must have at least one PASS. L23/L24 may
-          # SKIP on Landlock ABI < 6.
+          # SKIP on Landlock ABI < 6. L29 may SKIP if Docker is not available.
           missing=""
           for n in $(seq 1 22); do
             grep -Eq "^PASS  L${n} " "$log" || missing="$missing L$n"

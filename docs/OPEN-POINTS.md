@@ -360,3 +360,38 @@ src/cli.rs) and docs/PATCH-0.2.1.md.
 | 9 | argv scrub: test checks `/proc/self/comm`, not `/proc/self/cmdline` | NON-BLOCKING | The test checks the comm name (which `PR_SET_NAME` sets reliably). The cmdline overwrite via `/proc/self/mem` is best-effort and cannot be unit-tested without a real init/PID-1 context. L34 (host-only) will test cmdline from an exec. |
 | 10 | shm/tmp_size: mount implementation not shown to reviewer | NON-BLOCKING | The mount plan adds `/dev/shm` as a `MountKind::Tmpfs` with the configured size, mode 0o1777, when `shm = true`. L8 (mount-plan comparator) and L33 (host-only) cover it. |
 | 14 | patch 2: resource envelope grows (no new boundary but more writable space) | NON-BLOCKING | True; the default (1024 MiB) matches the current constant. Range validation rejects extreme values. |
+
+## 0.3a open points
+
+* **P25 — `ready.command` for `[[services]]` is 0.3b work.** A profile field
+  that runs an arbitrary command on the host with the user's credentials while
+  the risk label says `none` cannot ship. For 0.3.0 `ready.command` is removed
+  from the `[[services]]` schema entirely (`ServiceReadinessSpec` uses
+  `deny_unknown_fields`, so it is rejected at parse time with a clear error
+  naming `ready.socket` as the supported form). Re-adding it through the exec
+  helper chain (so the readiness command runs inside the sandbox, not on the
+  host) is 0.3b work.
+
+* **P26 — `ls --json` service state is now truthful.** The `state` field
+  reports `"ready"` after the readiness check passed and `"exited"` once the
+  status socket closes (checked in `inspect()`). The schema stays frozen (same
+  field, same values); the values are now evidence-based, not constant.
+
+* **P27 — service stop never sleeps the full grace when the service is
+  already gone.** The stop sequence checks `waitpid(WNOHANG)` (for host
+  services) or `poll(POLLHUP)` on the status socket (for in-sandbox services)
+  before sleeping `stop.grace`, so a session exit with a configured service
+  takes < 1 s after the main command returns if the service has already exited.
+
+* **P28 — `{cwd}` templating in profile paths** (mentioned in DESIGN §19) is
+  not implemented; profiles must use absolute paths or paths relative to the
+  policy file's directory.
+
+* **P29 — service socket hijack.** A `[[services]]` socket on a writable
+  path (cwd or a grant) is replaceable by the main command: a hostile process
+  can kill the service, unlink its socket, and bind a replacement. A host-side
+  client (Wakil) connecting to the socket path would then reach the
+  attacker's process. `hisn profile explain` prints a note for each
+  `[[services]]` entry with a `socket` field warning about this. A 0.3b fix:
+  give services a Landlock ruleset distinct from execs so the socket directory
+  is not writable by the main command.

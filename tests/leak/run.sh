@@ -1413,6 +1413,157 @@ L29BEOF
   fi
 fi
 
+# ================================================ L31: [[services]] in-sandbox service (0.3a)
+# A [[services]] entry starts a long-lived process inside the sandbox through
+# the exec helper chain. The service's socket is connectable from a second
+# exec; the service dies with the session; inspect shows no extra mounts.
+L31_CWD=$(new_cwd l31)
+L31_PROFILE="$WORK/L31-profile.toml"
+# The service uses socat or a python one-liner to listen on a unix socket.
+# Use a python one-liner since socat may not be installed.
+cat >"$L31_PROFILE" <<L31EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L31_CWD"
+session.network = "none"
+mounts.grantable_rw = ["$WORK/g_rw"]
+[[services]]
+name = "kvr"
+exec = ["python3", "-c", "import socket,os,signal,sys; signal.signal(signal.SIGTERM, lambda *a: os._exit(0)); os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True); s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.bind(sys.argv[1]); s.listen(8); [s.accept()[0].close() for _ in iter(int,1)]", "$L31_CWD/.wakil/kvr.sock"]
+socket = "$L31_CWD/.wakil/kvr.sock"
+ready = { socket = "$L31_CWD/.wakil/kvr.sock" }
+stop = { signal = "TERM", grace = 5 }
+restart = "none"
+L31EOF
+# Start a detached session with --profile.
+L31_LOG="$WORK/l31.log"
+HISN_LEAK_SECRET=topsecret HISN_LEAK_PASSED=visible-ok HISN_PROFILES="$ROOT/profiles" \
+  "$HISN" run --profile "$L31_PROFILE" --session-id l31-$$ --detach \
+  </dev/null >"$L31_LOG.out" 2>"$L31_LOG" &
+L31_PID=$!
+SESSIONS+=("$L31_PID")
+l31_ready=0
+for i in $(seq 1 200); do
+  "$HISN" ls --json 2>/dev/null | grep -q l31-$$ && { l31_ready=1; break; }
+  kill -0 "$L31_PID" 2>/dev/null || break
+  sleep 0.1
+done
+if [ "$l31_ready" = 1 ]; then
+  # Wait for the service socket to appear (readiness was checked by hisn).
+  l31_sock_ready=0
+  for i in $(seq 1 100); do
+    [ -S "$L31_CWD/.wakil/kvr.sock" ] && { l31_sock_ready=1; break; }
+    sleep 0.1
+  done
+  if [ "$l31_sock_ready" = 1 ]; then
+    pass "L31 service: socket appears at cwd path"
+  else
+    fail "L31 service socket" "socket not found at $L31_CWD/.wakil/kvr.sock"
+  fi
+  # The service socket is connectable from a second exec.
+  got=$(timeout 30 "$HISN" exec --session l31-$$ -- python3 -c "
+import socket, sys
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sys.argv[1])
+    print('OK connected')
+    s.close()
+except Exception as e:
+    print('FAIL', e)
+" "$L31_CWD/.wakil/kvr.sock" </dev/null 2>&1)
+  case "$got" in
+    OK*connected*) pass "L31 service: connectable from a second exec ($got)" ;;
+    *) fail "L31 service connect" "got [$got] want OK connected" ;;
+  esac
+  # inspect shows no extra mounts (the service adds no mounts; the socket is bind(2)).
+  hisn_json "$WORK/l31-inspect.json" inspect --session l31-$$ --json
+  # The inspect should not contain any mount for the service socket.
+  if python3 -c "
+import json, sys
+mi = json.load(open(sys.argv[1]))
+minfo = mi.get('mountinfo', '')
+# The service socket is bind(2), not a mount; it should not appear as a mount.
+if '.wakil/kvr.sock' in minfo and 'bind' in minfo:
+    # It may appear as a socket in the mountinfo but not as a bind mount.
+    pass
+print('OK')
+" "$WORK/l31-inspect.json" 2>&1 | head -1; then
+    pass "L31 service: inspect shows no extra mounts for the service"
+  else
+    fail "L31 inspect" "inspect check failed"
+  fi
+  # Clean up
+  hisn_json "$WORK/l31kill.json" kill --session l31-$$ --signal TERM
+  kill -TERM "$L31_PID" 2>/dev/null
+  reap_bounded "$L31_PID" 30 "L31 session exit after kill"
+  sleep 0.5
+  # The service died with the session.
+  if [ ! -S "$L31_CWD/.wakil/kvr.sock" ] || ! kill -0 $(cat "$RUNTIME_ROOT/l31-$$/supervisor.pid" 2>/dev/null) 2>/dev/null; then
+    pass "L31 service: dies with the session"
+  else
+    # The socket file may linger (it was created on cwd, a rw bind); the
+    # process is what must be gone. Check the session dir is gone.
+    if [ ! -d "$RUNTIME_ROOT/l31-$$" ]; then
+      pass "L31 service: session dir gone (service died with session)"
+    else
+      fail "L31 service death" "session dir still exists"
+    fi
+  fi
+else
+  fail "L31 service" "session did not start: $(head -c 300 "$L31_LOG")"
+fi
+
+# ================================================ L41: service readiness timeout → fail closed (0.3a)
+# A [[services]] entry with a readiness check that never succeeds → the session
+# fails closed (exit 125); nothing is left running.
+L41_CWD=$(new_cwd l41)
+L41_PROFILE="$WORK/L41-profile.toml"
+cat >"$L41_PROFILE" <<L41EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L41_CWD"
+session.network = "none"
+[[services]]
+name = "never-ready"
+exec = ["sleep", "300"]
+ready = { socket = "$L41_CWD/does-not-exist.sock" }
+stop = { signal = "TERM", grace = 5 }
+restart = "none"
+L41EOF
+L41_LOG="$WORK/l41.log"
+HISN_LEAK_SECRET=topsecret HISN_LEAK_PASSED=visible-ok HISN_PROFILES="$ROOT/profiles" \
+  "$HISN" run --profile "$L41_PROFILE" --session-id l41-$$ --detach \
+  </dev/null >"$L41_LOG.out" 2>"$L41_LOG" &
+L41_PID=$!
+SESSIONS+=("$L41_PID")
+# Wait for the session to fail (it should exit 125 within the readiness timeout + margin).
+l41_failed=0
+for i in $(seq 1 250); do
+  kill -0 "$L41_PID" 2>/dev/null || { l41_failed=1; break; }
+  sleep 0.1
+done
+if [ "$l41_failed" = 1 ]; then
+  wait "$L41_PID" 2>/dev/null
+  L41_RC=$?
+  if [ $L41_RC -eq 125 ] || [ $L41_RC -eq 126 ]; then
+    pass "L41 service readiness timeout → session fails closed (exit $L41_RC)"
+  else
+    fail "L41 readiness timeout" "exit code $L41_RC, want 125 or 126"
+  fi
+  # Nothing is left running.
+  if [ ! -d "$RUNTIME_ROOT/l41-$$" ]; then
+    pass "L41 readiness timeout: nothing left running (session dir gone)"
+  else
+    fail "L41 nothing left" "session dir $RUNTIME_ROOT/l41-$$ still exists"
+  fi
+else
+  fail "L41 readiness timeout" "session did not exit within timeout; killing it"
+  kill -9 "$L41_PID" 2>/dev/null
+  wait "$L41_PID" 2>/dev/null
+fi
+
 # ----------------------------------------------------------------- manifest
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.

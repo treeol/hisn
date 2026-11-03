@@ -88,3 +88,25 @@ OPEN-POINTS.)
 * revoke, assert path → `ENOENT`;
 * session end → no `hisn` process, no session dir, no residual mounts in the
   host `/proc/self/mountinfo` diff.
+
+## 5. In-sandbox services (`[[services]]`, 0.3)
+
+Wakil may declare a `[[services]]` entry in its profile to start a long-lived
+process inside the sandbox (e.g. `kvr-server` for staging). The service:
+
+- is started by hisn through the exec helper chain, with the **same confinement**
+  as the main command (same seccomp, Landlock, caps, env);
+- runs as a sibling of the main command in the sandbox pid namespace;
+- binds its socket at a path inside the sandbox (e.g. `{cwd}/.wakil/kvr.sock`);
+- dies with the session (it is in the pid ns; when init exits the kernel kills
+  everything in it);
+- has no client connection; its stdio is `/dev/null`.
+
+Wakil's host-side client connects to the socket at the **identical path** (path
+parity: cwd is a rw bind of the host directory at the same path). A stale
+socket file at that path after session end is cleaned up by Wakil (not by hisn);
+the session dir cleanup does not remove files created inside cwd by the
+sandbox.
+
+The `kvr-example` profile (`profiles/kvr-example.toml`) ships as a reference.
+`hisn ls --json` gains a `services` array: `[{name, pid, socket, state, exit}]`.

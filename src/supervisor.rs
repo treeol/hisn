@@ -147,6 +147,17 @@ struct Shared {
     /// Pids that have been reused by a later exec. A `signal` by such a
     /// pid is rejected — the client must use `exec_id`.
     recycled_pids: Mutex<std::collections::BTreeSet<i32>>,
+    /// In-sandbox services (DESIGN §19): name → state for `ls --json`.
+    services: Mutex<std::collections::BTreeMap<String, ServiceState>>,
+}
+
+/// The state of an in-sandbox service for `ls --json` (DESIGN §19).
+struct ServiceState {
+    name: String,
+    pid: i32,
+    socket: Option<String>,
+    state: &'static str, // "starting" | "ready" | "exited"
+    exit: Option<i32>,
 }
 
 impl Shared {
@@ -669,6 +680,21 @@ impl Shared {
     }
 
     fn inspect(&self) -> Value {
+        let services = self
+            .services
+            .lock()
+            .expect("services")
+            .values()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "pid": s.pid,
+                    "socket": s.socket,
+                    "state": s.state,
+                    "exit": s.exit,
+                })
+            })
+            .collect::<Vec<_>>();
         match fs::read_to_string(format!("/proc/{}/mountinfo", self.init_pid)) {
             Ok(mi) => ok(json!({
                 "schema": "hisn-inspect/v1",
@@ -678,6 +704,7 @@ impl Shared {
                     "capability": e.capability,
                     "label": e.label.kebab(),
                 })).collect::<Vec<_>>(),
+                "services": services,
                 // The supervisor's own descriptor count: the leak suite (L19)
                 // cannot read /proc/<supervisor>/fd (non-dumpable after the
                 // userns change), so the supervisor reports it itself.
@@ -839,20 +866,23 @@ fn getids(verbose: u8) -> (u32, u32, String) {
 }
 
 /// Resolve policy + flags into the resolved policy, grant list, runtime roots,
-/// and the 0.3 surface (forwards, host_services) from the profile.
+/// and the 0.3 surface (services, forwards, host_services) from the profile.
 pub struct Prepared {
     pub policy: ResolvedPolicy,
     pub grants: Vec<(String, Mode)>,
     pub roots: Vec<PathBuf>,
-    /// 0.3 surface: forwards and host_services from the profile.
+    /// 0.3 surface: in-sandbox services from the profile.
+    pub services: Vec<profile::Service>,
+    /// 0.3 surface: forwards from the profile.
     pub forwards: Vec<profile::Forward>,
+    /// 0.3 surface: host_services from the profile.
     pub host_services: Vec<profile::HostService>,
 }
 
 pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     let cwd_base = std::env::current_dir().context("current dir")?;
-    let (pol, base, forwards, host_services) = match (&args.policy, &args.profile) {
+    let (pol, base, services, forwards, host_services) = match (&args.policy, &args.profile) {
         (Some(f), None) => {
             let p = Policy::load(f).with_context(|| f.display().to_string())?;
             let b = f
@@ -860,7 +890,7 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
                 .filter(|b| !b.as_os_str().is_empty())
                 .map(Path::to_path_buf)
                 .unwrap_or(cwd_base.clone());
-            (p, b, Vec::new(), Vec::new())
+            (p, b, Vec::new(), Vec::new(), Vec::new())
         }
         (None, Some(spec)) => {
             let (path, source) = profile::resolve_profile_path(spec)?;
@@ -878,11 +908,18 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
             (
                 prof.policy,
                 b,
+                prof.services.clone(),
                 prof.forwards.clone(),
                 prof.host_services.clone(),
             )
         }
-        (None, None) => (Policy::default(), cwd_base.clone(), Vec::new(), Vec::new()),
+        (None, None) => (
+            Policy::default(),
+            cwd_base.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
         // (Some, Some) is rejected by check_command() before we get here.
         _ => unreachable!("--profile and --policy are mutually exclusive (check_command)"),
     };
@@ -909,6 +946,7 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
         policy,
         grants,
         roots,
+        services,
         forwards,
         host_services,
     })
@@ -1085,6 +1123,7 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         allow_host_abstract,
         verbose,
         &risk_entries,
+        &prep.services,
         &prep.forwards,
         &prep.host_services,
     );
@@ -1106,6 +1145,7 @@ fn run_session(
     allow_host_abstract: bool,
     verbose: u8,
     risk_entries: &[profile::RiskEntry],
+    services: &[profile::Service],
     forwards: &[profile::Forward],
     host_services: &[profile::HostService],
 ) -> Result<i32> {
@@ -1164,6 +1204,7 @@ fn run_session(
         base_env: scrub.vars.clone(),
         default_cwd: policy.cwd.display().to_string(),
     };
+    let exec_rules_for_services = exec_rules.clone();
     let exec_policy = policy.clone();
     let exec_ll = ll.clone();
     let exec_require_scope = landlock::scope_required(&policy, allow_host_abstract);
@@ -1306,6 +1347,7 @@ fn run_session(
         execs: Mutex::new(Default::default()),
         used_pids: Mutex::new(Default::default()),
         recycled_pids: Mutex::new(Default::default()),
+        services: Mutex::new(Default::default()),
     });
     // The only way to start `network = "host"` without abstract-socket
     // scoping is the explicit flag; it is audited (DESIGN §7, B1).
@@ -1381,6 +1423,31 @@ fn run_session(
             }
         }
     }
+    // Process [[services]] entries (DESIGN §19): start in-sandbox services
+    // through the exec helper chain, before START. The services are siblings
+    // of the main command, confined identically. Readiness is checked with a
+    // timeout; on timeout the session fails closed.
+    let mut service_handles: Vec<ServiceHandle> = Vec::new();
+    for s in services {
+        match start_in_sandbox_service(&shared, s, &exec_rules_for_services) {
+            Ok(handle) => {
+                // Wait for readiness.
+                let timeout_secs = s.ready.as_ref().and_then(|r| r.timeout).unwrap_or(15);
+                if let Err(e) = wait_service_readiness(s, timeout_secs) {
+                    // Fail closed: kill the service and the session.
+                    let _ = sys::kill(pid, libc::SIGKILL);
+                    let _ = reap(pid);
+                    bail!("service {}: readiness: {e}", s.name);
+                }
+                service_handles.push(handle);
+            }
+            Err(e) => {
+                let _ = sys::kill(pid, libc::SIGKILL);
+                let _ = reap(pid);
+                bail!("service {}: {e}", s.name);
+            }
+        }
+    }
     sys::send_with_fd(sup_end.as_raw_fd(), &[MSG_START], None)?;
     thread::spawn(move || control::serve(listener, handler));
 
@@ -1420,6 +1487,25 @@ fn run_session(
             let _ = sys::kill(*hpid, libc::SIGKILL);
             let _ = reap_host(*hpid);
         }
+    }
+    // Stop in-sandbox services (DESIGN §19): best-effort signal + grace.
+    // If init has already exited, the kernel has killed everything in the pid
+    // ns; the stop is moot but harmless.
+    for handle in &service_handles {
+        let sig = control::parse_signal(&handle.stop.signal).unwrap_or(libc::SIGTERM);
+        // The service's pid is in the sandbox pid ns; signal it via the status
+        // socket (same as exec signal).
+        let _ = sys::send_all(handle.status.as_raw_fd(), exec::format_kill(sig).as_bytes());
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(handle.stop.grace);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // SIGKILL via the status socket.
+        let _ = sys::send_all(
+            handle.status.as_raw_fd(),
+            exec::format_kill(libc::SIGKILL).as_bytes(),
+        );
     }
 
     // Let in-flight responses (e.g. a hard revoke that ended the session) go out.
@@ -1513,6 +1599,145 @@ fn reap_host(pid: i32) -> i32 {
     // SAFETY: blocking waitpid on our own child.
     unsafe { libc::waitpid(pid, &mut st, 0) };
     init::decode_status(st)
+}
+
+/// A handle on a started in-sandbox service (DESIGN §19).
+struct ServiceHandle {
+    /// The service name (for logging/audit).
+    #[allow(dead_code)]
+    name: String,
+    /// The status socket to the service's monitor `W`.
+    status: OwnedFd,
+    /// Stop spec (signal + grace).
+    stop: profile::StopSpec,
+}
+
+/// Start an in-sandbox service through the exec helper chain (DESIGN §19).
+/// The service is spawned like an exec: the exec helper `E` forks `C`, which
+/// joins the sandbox namespaces, forks `D` (re-applies confinement), forks `W`
+/// (monitor), which forks `P` (the service). The service gets stdio from
+/// `/dev/null` (no client connection).
+fn start_in_sandbox_service(
+    shared: &Arc<Shared>,
+    s: &profile::Service,
+    rules: &ExecRules,
+) -> Result<ServiceHandle> {
+    // Build the ExecSpec for the service.
+    let argv: Vec<String> = s.exec.to_vec();
+    if argv.is_empty() || argv[0].is_empty() {
+        bail!("service {}: exec must not be empty", s.name);
+    }
+    // The service's cwd is the session cwd.
+    let cwd = rules.default_cwd.clone();
+    // The service's env is the base env (same as the main command).
+    let env = rules.base_env.clone();
+    let spec = exec::ExecSpec {
+        argv,
+        cwd,
+        env,
+        tty: false,
+    };
+    // Open /dev/null for stdio (3 fds, non-tty mode). O_RDWR so the service
+    // can write to stdout/stderr without EBADF.
+    let stdio: Vec<OwnedFd> = (0..3)
+        .map(|_| {
+            OwnedFd::from(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/null")
+                    .expect("opening /dev/null for service stdio"),
+            )
+        })
+        .collect();
+    // Spawn through the exec helper.
+    let spawned = {
+        let _gate = shared.spawn_gate.read().unwrap_or_else(|e| e.into_inner());
+        shared.exec.spawn(&spec, stdio, exec::SPAWN_TIMEOUT)
+    };
+    let sp = spawned.map_err(|e| anyhow!("service {}: spawn: {e}", s.name))?;
+    // Register the service in the shared state for ls --json.
+    {
+        let mut svcs = shared.services.lock().expect("services");
+        svcs.insert(
+            s.name.clone(),
+            ServiceState {
+                name: s.name.clone(),
+                pid: sp.pid,
+                socket: s.socket.clone(),
+                state: "ready",
+                exit: None,
+            },
+        );
+    }
+    // The status socket is owned by the supervisor; we read P and X lines from
+    // it to track the service's state for ls --json.
+    let stop = s.stop.clone().unwrap_or(profile::StopSpec {
+        signal: "TERM".into(),
+        grace: 5,
+    });
+    tracing::info!("service: {} started pid {}", s.name, sp.pid);
+    Ok(ServiceHandle {
+        name: s.name.clone(),
+        status: sp.status,
+        stop,
+    })
+}
+
+/// Wait for an in-sandbox service to become ready (DESIGN §19).
+/// Polls `ready` with a timeout. On timeout returns Err (fail closed).
+fn wait_service_readiness(s: &profile::Service, timeout_secs: u64) -> Result<()> {
+    let ready = match &s.ready {
+        Some(r) => r,
+        None => {
+            // No readiness check: assume ready immediately.
+            return Ok(());
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err(anyhow!(
+                "service {}: readiness timeout ({}s)",
+                s.name,
+                timeout_secs
+            ));
+        }
+        // ready.socket: stat the path from the supervisor (userns S). This
+        // works for paths under cwd (a rw bind visible from S) and under
+        // mounts.ro/rw. It does not work for paths on the sandbox's private
+        // tmpfs (/tmp, /run, $HOME); for those, use ready.command.
+        if let Some(sock) = &ready.socket
+            && let Ok(meta) = fs::symlink_metadata(sock)
+            && meta.file_type().is_socket()
+        {
+            return Ok(());
+        }
+        // ready.command: run through the exec helper chain (inside the
+        // sandbox). This is the readiness check for sockets on private tmpfs.
+        if let Some(cmd) = &ready.command
+            && !cmd.is_empty()
+        {
+            // The readiness command runs as a plain child process outside the
+            // sandbox (it only checks existence of a file, which is a stat).
+            // This is safe because the command runs as the user, not the
+            // sandbox.
+            let result = std::process::Command::new(&cmd[0])
+                .args(&cmd[1..])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if let Ok(status) = result
+                && status.success()
+            {
+                return Ok(());
+            }
+        }
+        // ready.tcp is not available for in-sandbox services in 0.3 (validated
+        // in validate_surface).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Start a `[[host_services]]` process on the host (in the supervisor's

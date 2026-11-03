@@ -288,3 +288,32 @@ R5/mask/revoke guarantees advisory for the session — a container started via
 the forwarded socket can mount host paths and its processes descend from
 `dockerd`, not sandbox init. This is documented in DESIGN §18 and is the
 fundamental reason T2 is `root-equivalent` and `risk_ack` is required.
+
+### 0.3a Feature 5 (in-sandbox services) — sandbox (allow_userns)
+
+The 0.3a in-sandbox-services feature adds `[[services]]` to the profile
+envelope, the `start_in_sandbox_service` supervisor method (spawns a service
+through the exec helper chain with stdio to `/dev/null`), service readiness
+checks (socket stat from supervisor or command via plain child), best-effort
+stop (signal + grace + KILL before session teardown), `ls --json` and
+`inspect --json` `services` array, `profiles/kvr-example.toml`, and L31/L41
+leak tests.
+
+| check | commit | where | result | log file |
+|-------|--------|-------|--------|----------|
+| `cargo fmt --check` | this commit | sandbox | clean | — |
+| `cargo clippy --all-targets -- -D warnings` (x86_64) | this commit | sandbox | clean | — |
+| `cargo test` (unit tests) | this commit | sandbox | 242 passed, 0 failed | — |
+| `python3 tests/leak/test_l8.py` (L8 comparator self-tests) | this commit | sandbox | 12 passed | — |
+| `make leaktest` (L1-L37 incl. L25, L26, L29, L31, L36, L37, L41) | this commit | sandbox (allow_userns) | 214 passed, 0 failed, 1 skipped (L12), 4 weak | — |
+
+The 4 weak tests (by ID with reason):
+- **L1** (1 weak): `/tankz` does not exist on this host, so ENOENT proves little.
+- **L14 R5** (1 weak): the control-socket pid-namespace check (R5) is covered by
+  unit tests only (P16).
+- **L20** (1 weak): `run.sh` stdin is not a tty; rerun with a terminal for the
+  `--tty` terminal-refusal check.
+- **L37** (1 weak): the host-service socket file may linger after session end
+  (the host process was signaled but may not have exited yet when the check
+  runs). The process IS killed (TERM + grace + KILL); the socket file cleanup is
+  best-effort.

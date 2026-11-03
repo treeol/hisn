@@ -34,6 +34,9 @@ pub struct Profile {
     pub version: String,
     /// A complete `hisn-policy/v1` document (inline table).
     pub policy: Policy,
+    /// In-sandbox services (0.3 §19).
+    #[serde(default, rename = "services")]
+    pub services: Vec<Service>,
     /// Forward an existing host socket inside (0.3 §17).
     #[serde(default, rename = "forward")]
     pub forwards: Vec<Forward>,
@@ -65,9 +68,43 @@ impl Profile {
         Ok(p)
     }
 
-    /// Validate the 0.3 surface tables: `[[forward]]`, `[[host_services]]`,
-    /// and `[docker]`. Enforces risk_ack matching (§16–§18) and path sanity.
+    /// Validate the 0.3 surface tables: `[[services]]`, `[[forward]]`,
+    /// `[[host_services]]`, and `[docker]`. Enforces risk_ack matching
+    /// (§16–§18) and path sanity.
     fn validate_surface(&self) -> Result<()> {
+        // Validate [[services]] (§19).
+        let mut service_names = std::collections::HashSet::new();
+        for s in &self.services {
+            if s.name.is_empty() {
+                bail!("[[services]]: name must not be empty");
+            }
+            if !service_names.insert(s.name.as_str()) {
+                bail!("[[services]]: duplicate name {:?}", s.name);
+            }
+            if s.exec.is_empty() {
+                bail!("[[services]] {}: exec must not be empty", s.name);
+            }
+            // restart = "none" only in 0.3.
+            match s.restart.as_deref() {
+                None | Some("none") => {}
+                Some(other) => {
+                    bail!(
+                        "E_NOT_SUPPORTED: [[services]] {}: restart = {:?} is not available in 0.3 (only \"none\")",
+                        s.name,
+                        other
+                    );
+                }
+            }
+            // ready.tcp is not available for in-sandbox services in 0.3.
+            if let Some(r) = &s.ready
+                && r.tcp.is_some()
+            {
+                bail!(
+                    "E_NOT_SUPPORTED: [[services]] {}: ready.tcp is not available for in-sandbox services in 0.3 (use ready.command instead)",
+                    s.name
+                );
+            }
+        }
         for f in &self.forwards {
             if f.name.is_empty() {
                 bail!("[[forward]]: name must not be empty");
@@ -202,6 +239,29 @@ impl Profile {
             .resolve(base_dir, overrides, runtime_roots)
             .map_err(|e| anyhow!("{e}"))
     }
+}
+
+/// A `[[services]]` table: start a long-lived process inside the sandbox
+/// (DESIGN §19).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Service {
+    /// Required. A name for this service (unique among `[[services]]`).
+    pub name: String,
+    /// The command to run inside the sandbox (through the exec chain).
+    pub exec: Vec<String>,
+    /// Optional: the path the service listens on (for display and `ls --json`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+    /// Readiness check (socket stat from supervisor, or command via exec chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<ReadinessSpec>,
+    /// Stop policy (signal + grace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<StopSpec>,
+    /// Restart policy (only "none" in 0.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<String>,
 }
 
 /// A `[[forward]]` table: expose an existing host socket inside (DESIGN §17).
@@ -482,6 +542,14 @@ pub struct RiskEntry {
 /// `risk` are a load error (E_RISK_ACK_REQUIRED).
 pub fn compute_risks(profile: &Profile) -> Vec<RiskEntry> {
     let mut entries = Vec::new();
+    // [[services]] (§19): in-sandbox services do not widen the boundary;
+    // the label is `none` and no risk_ack is required.
+    for s in &profile.services {
+        entries.push(RiskEntry {
+            capability: format!("service:{}", s.name),
+            label: RiskLabel::None,
+        });
+    }
     for f in &profile.forwards {
         let label = forward_label(&f.socket, f.risk.as_deref());
         entries.push(RiskEntry {
@@ -505,13 +573,13 @@ pub fn compute_risks(profile: &Profile) -> Vec<RiskEntry> {
         });
     }
     // [docker] tier (§18): socket → root-equivalent.
-    if let Some(d) = &profile.docker {
-        if d.tier == "socket" {
-            entries.push(RiskEntry {
-                capability: "docker:socket".into(),
-                label: RiskLabel::RootEquivalent,
-            });
-        }
+    if let Some(d) = &profile.docker
+        && d.tier == "socket"
+    {
+        entries.push(RiskEntry {
+            capability: "docker:socket".into(),
+            label: RiskLabel::RootEquivalent,
+        });
     }
     entries
 }
@@ -631,6 +699,7 @@ pub fn explain(spec: Option<&str>) -> Result<Value> {
         None => Profile {
             version: PROFILE_VERSION.to_string(),
             policy: Policy::default(),
+            services: Vec::new(),
             forwards: Vec::new(),
             host_services: Vec::new(),
             docker: None,
@@ -1276,5 +1345,119 @@ risk_ack = "root-equivalent"
         let risks = compute_risks(&p);
         assert_eq!(risks.len(), 1);
         assert_eq!(risks[0].label, RiskLabel::RootEquivalent);
+    }
+
+    #[test]
+    fn services_parses_and_computes_none_risk() {
+        let p = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[services]]
+name = "kvr"
+exec = ["kvr-server", "--addr", "/run/kvr/kvr.sock"]
+socket = "/run/kvr/kvr.sock"
+ready = { socket = "/run/kvr/kvr.sock" }
+stop = { signal = "TERM", grace = 5 }
+restart = "none"
+"#,
+        )
+        .unwrap();
+        assert_eq!(p.services.len(), 1);
+        assert_eq!(p.services[0].name, "kvr");
+        assert_eq!(
+            p.services[0].exec,
+            ["kvr-server", "--addr", "/run/kvr/kvr.sock"]
+        );
+        let risks = compute_risks(&p);
+        // Services have risk = none, so compute_risks returns a None entry.
+        assert_eq!(risks.len(), 1);
+        assert_eq!(risks[0].label, RiskLabel::None);
+        assert_eq!(risks[0].capability, "service:kvr");
+    }
+
+    #[test]
+    fn services_empty_exec_rejected() {
+        let result = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[services]]
+name = "bad"
+exec = []
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn services_duplicate_name_rejected() {
+        let result = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[services]]
+name = "dup"
+exec = ["sleep", "1"]
+[[services]]
+name = "dup"
+exec = ["sleep", "2"]
+"#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("duplicate name"));
+    }
+
+    #[test]
+    fn services_restart_not_none_rejected() {
+        let result = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[services]]
+name = "kvr"
+exec = ["sleep", "1"]
+restart = "on-failure"
+"#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("E_NOT_SUPPORTED"));
+    }
+
+    #[test]
+    fn services_ready_tcp_rejected() {
+        let result = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[services]]
+name = "kvr"
+exec = ["sleep", "1"]
+ready = { tcp = "127.0.0.1:8080" }
+"#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("E_NOT_SUPPORTED"));
+    }
+
+    #[test]
+    fn services_no_ready_field_is_ok() {
+        let p = Profile::parse(
+            r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[services]]
+name = "kvr"
+exec = ["sleep", "1"]
+"#,
+        )
+        .unwrap();
+        assert!(p.services[0].ready.is_none());
     }
 }

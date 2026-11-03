@@ -1330,3 +1330,149 @@ inode). 2 (seccomp unchanged; the socket is host-side). 3 (the **socket**
 dies with the session; the containers the daemon started do not — this is
 why T2 is root-equivalent and acked; T2 also makes R5/mask/revoke advisory
 for the session, as documented above). 5 (annotation only).
+
+## 19. In-sandbox services `[[services]]` (v0.3, ADR 0002)
+
+A `[[services]]` entry starts a long-lived process **inside the sandbox** after
+the init sequence reports `READY` and before the supervisor sends `START`. The
+service runs under the **same confinement as the main command**: same
+namespaces, same seccomp, same Landlock (re-applied via the exec chain,
+`§14.4`/`§14.12`), same caps (none), same env. It is a sibling of the main
+command in the sandbox pid namespace, reaped by init.
+
+### Schema
+
+```toml
+[[services]]
+name      = "kvr"                             # required, unique among services
+exec      = ["kvr-server", "--addr", "/run/kvr/kvr.sock"]
+socket    = "/run/kvr/kvr.sock"               # optional: the path it listens on
+ready     = { socket = "/run/kvr/kvr.sock" }  # one of: socket | command (not tcp in 0.3)
+stop      = { signal = "TERM", grace = 5 }    # signal name + seconds; default TERM/5
+restart   = "none"                            # only "none" in 0.3; other values → load error
+```
+
+`name` is unique among `[[services]]` entries (duplicate names are a load
+error). `socket` is for display and `ls --json`; it is not validated against
+the actual `bind(2)` address (the service may listen anywhere).
+
+### Lifecycle
+
+1. Init finishes the setup sequence (`DESIGN §3`), reports `READY`.
+2. The supervisor starts each service through the **exec helper chain**
+   (`DESIGN §14.2`, process `C→D→W→P`), exactly as a `hisn exec` would. The
+   service is confined via `§14.4`: same `setns` + re-applied seccomp,
+   Landlock, caps, NNP. The service gets its **own sibling Landlock domain**
+   (`§14.12`); with the default `scoped = []`, the service and the main
+   command may signal each other and reach each other's abstract sockets.
+3. **Readiness**: the supervisor polls `ready` with a timeout (default 15 s;
+   `ready.timeout` per service). On timeout the session fails to start (fail
+   closed) — the service is killed and the session exits `125`.
+   - `ready.socket = "<path>"`: the supervisor stats the path **from the
+     supervisor's mount namespace** (userns S). This works for paths under cwd
+     (a rw bind visible from S) and under `mounts.ro`/`mounts.rw` (also visible
+     from S). It does **not** work for paths on the sandbox's private tmpfs
+     (`/tmp`, `/run`, `$HOME`); for those, use `ready.command` instead.
+   - `ready.command = ["sh", "-c", "test -S /run/kvr/kvr.sock"]`: the supervisor
+     runs the command **through the exec helper chain** (inside the sandbox).
+     This is the readiness check for sockets on private tmpfs.
+   - `ready.tcp` is **not available in 0.3** for in-sandbox services (the
+     supervisor cannot reach the sandbox's netns; `network = "none"` has only
+     loopback). A `ready.tcp` entry is a load error for `[[services]]`.
+4. **Stop** (best-effort): before the supervisor closes the ns fds and
+   removes the session dir (`§10`), it sends `stop.signal` to each service's
+   process group, waits `stop.grace`, then `SIGKILL`. If init exits first
+   (command exit, `hisn kill`), the kernel destroys the pid ns and SIGKILLs
+   everything in it — the graceful stop is moot but harmless. The supervisor
+   does not delay init's exit for the grace period; the stop is best-effort.
+   For `--detach`: the supervisor sends `stop.signal` + grace + `SIGKILL`
+   before closing the ns fds.
+5. `restart = "none"`: if a service exits before the session ends, it stays
+   down. The supervisor logs the exit and does **not** restart. (0.4 may add
+   `restart = "on-failure"`.)
+
+### Service stdio
+
+A service has no client connection; its stdio is directed to `/dev/null` (the
+sandbox's own `/dev/null`, via the exec helper's `child_d` which points fds 0-2
+at `/dev/null`). The service may write to its own stdout/stderr but the output
+is discarded. The status socket for a service is owned by the supervisor
+(the same as an exec), not by a client connection; the supervisor reads the
+`P` and `X` lines to track the service's state for `ls --json`.
+
+### What the service can and cannot do
+
+The service is confined via `§14.4` (re-applied in `D`), like any exec. It can:
+
+- bind a unix socket at `socket` inside the sandbox (via `bind(2)`, which is
+  not `mount --bind`; seccomp denies `mount`, not `bind(2)`). Other sandbox
+  processes can `connect(2)` to it.
+- read/write within the sandbox's writable set (cwd, `$HOME`, `/tmp`, `/run`,
+  `mounts.rw`, `mounts.grantable_rw`).
+
+It cannot:
+
+- escape the sandbox (same seccomp/Landlock/caps as init; no `mount`/`unshare`/
+  `setns`/`open_tree`/`move_mount`).
+- outlive the session (it is in the pid ns; when init exits the kernel kills
+  every process in the namespace).
+
+A hostile main command (same uid, same pid ns) can `kill` the service, `unlink`
+its socket, and `bind(2)` a replacement at the same path — this is inherent to
+the sandbox model (all processes share the same uid and pid ns). The service's
+protocol must be robust against this; the profile author is told by `risk =
+none` that the service adds no host-side capability, not that it is protected
+from the main command.
+
+### `ls --json`
+
+`hisn ls --json` gains a `services` array:
+`[{name, pid, socket, state: "starting|ready|exited", exit}]`. The `pid` is
+the in-sandbox pid (same namespace as `exec` pids). `state` is `starting`
+until readiness is confirmed, `ready` after, `exited` if the service exits
+before the session ends. The schema is additive (`hisn-ls/v1`).
+
+### Risk label
+
+A `[[services]]` entry that starts a process inside the sandbox does not widen
+the boundary beyond the sandbox itself — the service is confined like the main
+command. The risk label is `none` (the service adds no host-side capability;
+it is a sibling process, not a host-side process). `risk_ack` is not required.
+
+### Shipped profile
+
+- `profiles/kvr-example.toml` — a `[[services]]` entry for a kvr-server
+  listening on `{cwd}/.wakil/kvr.sock`, with `ready = { command =
+  ["test", "-S", "{cwd}/.wakil/kvr.sock"] }` (readiness via exec chain, since
+  the socket is on a rw bind under cwd, visible from the supervisor) and
+  `stop = { signal = "TERM", grace = 5 }`.
+
+### Wakil integration
+
+Wakil declares a `[[services]]` entry in its profile. The service's socket
+is at `{cwd}/.wakil/kvr.sock` inside the sandbox. Because cwd is a rw bind of
+the host directory at the identical path (path parity, `§4.1` row 6), the
+socket file is visible on the host at the same path. Wakil's host-side client
+connects to that path. A stale socket file at that path after session end is
+cleaned up by Wakil (not by hisn); the session dir cleanup does not remove
+files created inside cwd by the sandbox. See `docs/WAKIL-INTEGRATION.md`.
+
+### Leak tests
+
+- **L31** (kvr-example): the service socket is connectable from a second exec;
+  the service dies with the session; `inspect` shows the same mount table as
+  the 0.2 plan (the service adds no mounts; the socket is `bind(2)`, not a
+  mount).
+- **L41** (readiness timeout): a service with a readiness check that never
+  succeeds → the session fails closed (exit 125); nothing is left running.
+
+### OCI mapping
+
+Annotation only (`org.hisn.services=[{name,socket,exec}]`). The service runs
+in the same namespaces; there is no `mounts[]` entry (the socket is bound by
+the service, not mounted by the supervisor).
+
+**Invariant touched:** 1 (the root is still an empty tmpfs + pivot_root — the
+service sees the same root). 2 (same seccomp — the service is exec'd through
+the same chain). 3 (the service is in the pid ns and dies with it — `restart =
+"none"` means no out-of-band restart). 5 (annotation only).

@@ -1,0 +1,18 @@
+version = "hisn-profile/v1"
+
+# In-sandbox kvr service example: a kvr-server listening on a socket under
+# the session cwd. The service is started inside the sandbox through the exec
+# helper chain, with the same confinement as the main command.
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "."
+session.network = "none"
+mounts.grantable_rw = ["/srv/out"]
+
+[[services]]
+name = "kvr"
+exec = ["sh", "-c", "mkdir -p .wakil && exec socat UNIX-LISTEN:.wakil/kvr.sock,fork,nonblock STDIO"]
+socket = ".wakil/kvr.sock"
+ready = { socket = ".wakil/kvr.sock" }
+stop = { signal = "TERM", grace = 5 }
+restart = "none"

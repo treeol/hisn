@@ -242,6 +242,7 @@ fn ls(session_id: Option<&str>, json_out: bool, prune: bool) -> Result<ExitCode>
                             "pid": Value::Null,
                             "started": Value::Null,
                             "execs": [],
+                            "services": [],
                         })
                     })
                     .collect();

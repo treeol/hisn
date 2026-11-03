@@ -1,0 +1,4 @@
+version = "hisn-profile/v1"
+
+[policy]
+version = "hisn-policy/v1"

@@ -35,6 +35,7 @@ use crate::init::{self, InitConfig, MSG_ERROR, MSG_GO, MSG_READY, MSG_START};
 use crate::landlock;
 use crate::mounts::{self, HostFacts};
 use crate::policy::{Network, Overrides, Policy, ResolvedPolicy, is_valid_session_id};
+use crate::profile::{self, Profile as ProfileDoc};
 use crate::session::{self, Audit, SessionDir};
 use crate::{seccomp, sig, sys};
 
@@ -756,8 +757,8 @@ pub struct Prepared {
 pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     let cwd_base = std::env::current_dir().context("current dir")?;
-    let (pol, base) = match &args.policy {
-        Some(f) => {
+    let (pol, base) = match (&args.policy, &args.profile) {
+        (Some(f), None) => {
             let p = Policy::load(f).with_context(|| f.display().to_string())?;
             let b = f
                 .parent()
@@ -766,7 +767,24 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
                 .unwrap_or(cwd_base.clone());
             (p, b)
         }
-        None => (Policy::default(), cwd_base.clone()),
+        (None, Some(spec)) => {
+            let (path, source) = profile::resolve_profile_path(spec)?;
+            let prof = ProfileDoc::load(&path)?;
+            let b = path
+                .parent()
+                .filter(|b| !b.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or(cwd_base.clone());
+            // Trust check: a profile under the session cwd or a rw grant
+            // cannot satisfy risk_ack (E_PROFILE_UNTRUSTED). The session cwd
+            // is not known yet (it is resolved from the inner policy), so the
+            // check runs after resolution, in `run`. Here we just load it.
+            let _ = source; // trust check deferred to run()
+            (prof.policy, b)
+        }
+        (None, None) => (Policy::default(), cwd_base.clone()),
+        // (Some, Some) is rejected by check_command() before we get here.
+        _ => unreachable!("--profile and --policy are mutually exclusive (check_command)"),
     };
     let ov = Overrides {
         cwd: args.cwd.as_ref().map(|c| {
@@ -857,6 +875,30 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
     let policy = prep.policy;
     if !args.grants.iter().all(|g| !g.is_empty()) {
         bail!("empty --grant");
+    }
+
+    // Profile trust check: a profile loaded from a file path (--profile
+    // /path/to/profile.toml) that lies under the session cwd or a rw grant
+    // cannot satisfy risk_ack (E_PROFILE_UNTRUSTED) — the sandbox can write
+    // it and self-ack its own risk. Built-in and $HISN_PROFILES profiles are
+    // trusted (they are not under the session's writable set).
+    if let Some(ref spec) = args.profile
+        && spec.contains('/')
+    {
+        let (path, _source) = profile::resolve_profile_path(spec)?;
+        let rw_paths: Vec<&Path> = prep
+            .grants
+            .iter()
+            .filter(|(_, m)| *m == Mode::Rw)
+            .map(|(p, _)| Path::new(p))
+            .collect();
+        profile::check_profile_trust(
+            &path,
+            profile::ProfileSource::Path,
+            &policy.cwd,
+            &rw_paths,
+        )
+        .map_err(anyhow::Error::msg)?;
     }
 
     // Preflight: fail early with a readable report instead of an EPERM.
@@ -1637,10 +1679,12 @@ mod tests {
         let cwd = fs::canonicalize(d.path()).unwrap();
         let args = RunArgs {
             policy: None,
+            profile: None,
             cwd: Some(cwd.clone()),
             session_id: None,
             network: Some(crate::cli::NetworkArg::Host),
             allow_host_abstract_sockets: false,
+            quiet_risk: false,
             grants: vec!["/x:rw".into(), "/y".into()],
             detach: false,
             ready_fd: None,

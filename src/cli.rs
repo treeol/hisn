@@ -42,6 +42,11 @@ pub enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
+    /// Profile utilities (hisn-profile/v1).
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -55,6 +60,10 @@ pub struct RunArgs {
     /// Policy file (hisn-policy/v1 TOML). Built-in defaults if omitted.
     #[arg(long)]
     pub policy: Option<PathBuf>,
+    /// Profile file or built-in name (hisn-profile/v1 envelope). Mutually
+    /// exclusive with `--policy`.
+    #[arg(long)]
+    pub profile: Option<String>,
     /// Working directory (mounted rw at the identical path). Overrides the policy.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
@@ -67,6 +76,9 @@ pub struct RunArgs {
     /// Accept `network = "host"` even without Landlock abstract-socket scoping.
     #[arg(long)]
     pub allow_host_abstract_sockets: bool,
+    /// Suppress risk label output on start.
+    #[arg(long)]
+    pub quiet_risk: bool,
     /// Initial grant, `PATH[:ro|rw]` (default ro). Repeatable.
     #[arg(long = "grant", value_name = "PATH[:ro|rw]")]
     pub grants: Vec<String>,
@@ -85,14 +97,24 @@ pub struct RunArgs {
 
 impl RunArgs {
     /// `--detach` and a command are mutually exclusive; one of them is required.
+    /// `--profile` and `--policy` are mutually exclusive.
     pub fn check_command(&self) -> Result<(), String> {
         match (self.detach, self.command.is_empty()) {
-            (true, false) => Err("--detach starts a session without a command; \
-                                  run commands in it with `hisn exec`"
-                .into()),
-            (false, true) => Err("a command is required (or use --detach)".into()),
-            _ => Ok(()),
+            (true, false) => {
+                return Err(
+                    "--detach starts a session without a command; run commands in it with `hisn exec`"
+                        .to_string(),
+                )
+            }
+            (false, true) => {
+                return Err("a command is required (or use --detach)".to_string())
+            }
+            _ => {}
         }
+        if self.profile.is_some() && self.policy.is_some() {
+            return Err("E_PROFILE_POLICY: --profile and --policy are mutually exclusive".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -197,7 +219,7 @@ pub enum PolicyCommand {
     Plan { file: Option<PathBuf> },
 }
 
-/// Parse `PATH[:ro|rw]` (the mode suffix is optional; default ro).
+/// `PATH[:ro|rw]` (the mode suffix is optional; default ro).
 pub fn parse_grant_spec(spec: &str) -> Result<(String, crate::control::Mode), String> {
     use crate::control::Mode;
     let (path, mode) = match spec.rsplit_once(':') {
@@ -209,6 +231,16 @@ pub fn parse_grant_spec(spec: &str) -> Result<(String, crate::control::Mode), St
         return Err(format!("empty path in grant {spec:?}"));
     }
     Ok((path.to_owned(), mode))
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProfileCommand {
+    /// List the profile search path and built-in profiles.
+    List,
+    /// Explain a profile's capabilities and risk labels (default: base).
+    Explain { name: Option<String> },
+    /// Validate a profile file (default: the built-in base).
+    Validate { file: Option<PathBuf> },
 }
 
 #[cfg(test)]

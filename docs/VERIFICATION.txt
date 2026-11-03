@@ -159,3 +159,38 @@ replaces the affected checks). The 81b0705 host run printed all 12 as PASS.
 | `cargo test` (unit tests) | 81b0705 | sandbox | 205 passed, 0 failed | -- |
 | `make lint && make test` | 81b0705 | host | not run in this record | -- |
 | `x86_64-unknown-linux-musl` build + leak; aarch64 leak; other kernels/distros | -- | -- | not run | -- |
+
+### 0.3a Feature 1 (Profiles) — sandbox (allow_userns)
+
+The 0.3a profile feature adds `hisn-profile/v1` envelope support, `--profile`
+flag, `profile list|explain|validate` CLI, built-in `base` and `wakil`
+profiles, and L25 (profile base == 0.2.2 plan). The `sethostname` call in
+`init.rs` is now best-effort (some containers block it via seccomp even in a
+new UTS ns; the hostname is cosmetic, not a security boundary).
+
+| check | commit | where | result | log file |
+|-------|--------|-------|--------|----------|
+| `cargo fmt --check` | this commit | sandbox | clean | — |
+| `cargo clippy --all-targets -- -D warnings` (x86_64) | this commit | sandbox | clean | — |
+| `cargo clippy --target aarch64-unknown-linux-gnu --all-targets -- -D warnings` | this commit | sandbox | clean | — |
+| `cargo test` (unit tests) | this commit | sandbox | 217 passed, 0 failed | — |
+| `python3 tests/leak/test_l8.py` (L8 comparator self-tests) | this commit | sandbox | 12 passed | — |
+| `make leaktest` (L1-L35 incl. L25) | this commit | sandbox (allow_userns) | 198 passed, 0 failed, 1 skipped (L12), 3 weak | — |
+
+The 3 weak tests (by ID with reason):
+- **L1** (1 weak): `/tankz` does not exist on this host, so ENOENT proves little.
+  (The other L1 probes pass against real host paths: `/home`, `/root`, `/var`,
+  `/etc/shadow`, `/etc/ssh`, `$HOME/.ssh`, `$HOME/.aws` — all exist on the host.)
+- **L14 R5** (1 weak): the control-socket pid-namespace check (R5) is covered by
+  unit tests only; no end-to-end test can place the socket inside the sandbox
+  without a test hook (P16).
+- **L20** (1 weak): `run.sh` stdin is not a tty; rerun with a terminal for the
+  `--tty` terminal-refusal check.
+
+**Note on hostname isolation:** the `sethostname` call in `init.rs` is
+best-effort (some containers block it via seccomp even in a new UTS ns). The
+hostname is cosmetic (the UTS ns is already unshared; it is not a security
+boundary). A WARN line is logged by init when it fails. Hostname isolation
+(UTS ns separation) is only verifiable on the host — in the build sandbox
+`sethostname` fails but the session still starts; on the host it succeeds and
+the hostname inside the sandbox is `hisn`.

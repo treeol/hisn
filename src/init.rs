@@ -100,7 +100,12 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     // 3-9. Filesystem: private propagation, tmpfs root, plan, pivot.
     rootfs::mount_root(&cfg.root_dir)?;
     rootfs::execute(&cfg.plan, &cfg.root_dir)?;
-    rustix::system::sethostname(cfg.policy.hostname.as_bytes()).context("sethostname")?;
+    // The hostname is cosmetic (the UTS ns is already unshared; it is not a
+    // security boundary). Some containers block sethostname via an outer
+    // seccomp policy even inside a new UTS ns; treat that as best-effort.
+    if let Err(e) = rustix::system::sethostname(cfg.policy.hostname.as_bytes()) {
+        tracing::warn!("sethostname failed (non-fatal): {e}");
+    }
     if cfg.policy.network == Network::None {
         loopback_up().context("bringing up lo")?;
     }

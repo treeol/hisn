@@ -863,3 +863,86 @@ for.
   network with the main command; exec does not add isolation between tool calls.
 * The ns-pid returned in `{"ok":true,"pid":N}` is only meaningful for the
   `signal` op of this session.
+
+## 15. Profiles (v0.3, ADR 0001)
+
+A **profile** is an envelope around `hisn-policy/v1`, not a v2. A profile file
+is a TOML document with `version = "hisn-profile/v1"` and one required table
+`[policy]`, whose value is a complete `hisn-policy/v1` document (inline
+table). The inner `[policy]` is resolved by the exact existing
+`policy::load` + `policy::resolve` code path; v1 policy stays valid unchanged.
+
+```
+# profiles/wakil.toml
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "."
+session.network = "none"
+mounts.grantable_rw = ["/srv/out"]
+```
+
+### Search path and precedence
+
+`hisn run --profile <name|path>` resolves the profile in this order:
+
+1. `--profile` with a `/` → that file (must exist, must be a profile not a
+   bare policy). A file that parses as `hisn-policy/v1` (no `version` key or
+   `version = "hisn-policy/v1"`) is rejected with `E_PROFILE_NOT_PROFILE`.
+2. `--profile <name>` → `$HISN_PROFILES/<name>.toml`, then the built-in
+   `profiles/<name>.toml` shipped next to the binary. **`./<name>.toml` is
+   deliberately not in the search path** — a profile resolved from under the
+   session cwd (or any rw grant / persistent home) can be written by the
+   sandbox and self-ack its own risk. Such a profile is rejected with
+   `E_PROFILE_UNTRUSTED` if the resolved path lies under the session cwd, a
+   rw grant, or the persistent home.
+3. `--policy <file>` (existing 0.2 path) → a bare `hisn-policy/v1` document,
+   treated as a profile with no 0.3 surface. Stays for scripts and the leak
+   suite.
+
+`--profile` and `--policy` are mutually exclusive (`E_PROFILE_POLICY`).
+
+### Built-in profiles
+
+`base` (= the 0.2 sandbox: no 0.3 surface, defaults to `Policy::default()`)
+and `wakil` (a default session with `grantable_rw`). A profile that declares
+none of the new tables (`[[services]]`, `[[host_services]]`, `[[forward]]`,
+`[docker]`, `[ssh]`, `[[risk]]`) yields byte-for-byte the 0.2 mount plan —
+the same `mounts::plan` output as a bare policy at the same `[policy]`
+values (L25 asserts this).
+
+### CLI
+
+`hisn profile list` — prints the resolved search path (`$HISN_PROFILES`,
+the built-in directory) and the built-in profile names.
+
+`hisn profile explain [<name>]` — prints each capability of the profile and
+its computed risk label (§16) with one sentence of explanation. With no
+argument, explains the default profile (`base`).
+
+`hisn profile validate [<file>]` — validates a profile file: parses the
+envelope, resolves the inner `[policy]`, and checks the 0.3 surface (risk_ack
+matching, unsupported tiers). Prints the resolved inner policy on success.
+
+### Resolution
+
+`profile::load(path) -> Result<Profile>`: parse the TOML, verify
+`version == "hisn-profile/v1"`, extract the `[policy]` inline table, parse
+it as a `Policy` (same `Policy::parse`), validate the 0.3 surface (§16–§19).
+`profile::resolve(profile, base_dir, overrides, runtime_roots) ->
+Result<ResolvedProfile>`: resolve the inner `[policy]` via the existing
+`Policy::resolve`, then carry the 0.3 surface fields into the resolved
+result. The resolved profile is what `supervisor::run` consumes; the mount
+plan is derived from it exactly as today (no change to `mounts::plan`).
+
+### What the profile layer does not change
+
+- The mount plan (`mounts::plan`): the inner `[policy]` drives it unchanged.
+- The seccomp filter, Landlock ruleset, capability drop, env scrub: all
+  derived from the inner `[policy]` as today.
+- The control socket, grant/revoke, exec: unchanged (the 0.3 surface is
+  orchestration, not isolation).
+
+**Invariant touched:** 5 (the envelope tables have no OCI runtime-spec
+representation; they are annotation only). 1, 2, 3, 4 untouched (same
+resolution, same mount plan, same grants, same env scrub).

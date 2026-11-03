@@ -1,0 +1,6 @@
+version = "hisn-profile/v1"
+
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "."
+session.network = "none"

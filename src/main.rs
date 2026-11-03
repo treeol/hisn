@@ -5,8 +5,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{Value, json};
 
-use hisn::cli::{Cli, Command, PolicyCommand};
+use hisn::cli::{Cli, Command, PolicyCommand, ProfileCommand};
 use hisn::policy::{self, Overrides, Policy};
+use hisn::profile;
 use hisn::{execcli, mounts, session, supervisor};
 
 /// Exit code for hisn-internal errors (policy, host); distinct from a
@@ -83,6 +84,23 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     .collect();
                 rows.sort_by_key(|r| r["target"].as_str().unwrap_or("").to_owned());
                 println!("{}", serde_json::to_string_pretty(&rows)?);
+                Ok(ExitCode::SUCCESS)
+            }
+        },
+        Command::Profile { command } => match command {
+            ProfileCommand::List => {
+                let info = profile::list()?;
+                println!("{}", serde_json::to_string_pretty(&info)?);
+                Ok(ExitCode::SUCCESS)
+            }
+            ProfileCommand::Explain { name } => {
+                let info = profile::explain(name.as_deref())?;
+                println!("{}", serde_json::to_string_pretty(&info)?);
+                Ok(ExitCode::SUCCESS)
+            }
+            ProfileCommand::Validate { file } => {
+                let resolved = profile::validate(file.as_deref())?;
+                print!("{}", resolved.to_toml());
                 Ok(ExitCode::SUCCESS)
             }
         },

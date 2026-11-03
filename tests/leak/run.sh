@@ -1109,6 +1109,55 @@ else
   fail "L35 exec_id" "could not start detached session; hisn said: $(head -c 300 "$WORK/l35-$$.log")"
 fi
 
+# ================================================ L25: profile == 0.2.2 plan (0.3a)
+# A profile with no 0.3 surface (the built-in `base`) must yield the same
+# mount plan as the 0.2.2 default policy. Start a session with `--profile base`
+# and compare its inspect to `hisn policy plan` on a bare policy with the same
+# [policy] values (cwd = the session cwd, network = none).
+L25_CWD=$(new_cwd l25)
+# A bare policy that matches the base profile's inner [policy] = Policy::default():
+# cwd = ".", network = "none", no mounts, no env.pass, no grantable_rw.
+L25_POL="$WORK/L25.toml"
+cat >"$L25_POL" <<L25EOF
+version = "hisn-policy/v1"
+[session]
+cwd = "$L25_CWD"
+network = "none"
+L25EOF
+# Start a session with --profile base (the built-in 0.2 sandbox), NOT --policy.
+# Use --cwd to override the profile's cwd to L25_CWD (the same as write_policy).
+L25_LOG="$WORK/l25.log"
+HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
+  HISN_LEAK_PASSED=visible-ok \
+  "$HISN" run --profile base --cwd "$L25_CWD" --session-id l25-$$ --grant "$WORK/g_ro:ro" \
+  -- "$L25_CWD/leakprobe" loop "$L25_CWD/ctl" \
+  </dev/null >"$L25_LOG.out" 2>"$L25_LOG" &
+L25_PID=$!
+SESSIONS+=("$L25_PID")
+l25_ready=0
+for i in $(seq 1 150); do
+  [ -e "$L25_CWD/ctl/ready" ] && { l25_ready=1; break; }
+  kill -0 "$L25_PID" 2>/dev/null || break
+  sleep 0.1
+done
+if [ "$l25_ready" = 1 ]; then
+  # The mount plan from `hisn policy plan` on the bare policy
+  "$HISN" policy plan "$L25_POL" >"$WORK/l25-plan.json" 2>"$WORK/l25-plan.err" || fail "L25 policy plan" "$(cat "$WORK/l25-plan.err")"
+  # The inspect from the --profile base session
+  hisn_json "$WORK/l25-inspect.json" inspect --session l25-$$ --json
+  cp /proc/self/mountinfo "$WORK/l25-host.mountinfo"
+  # Compare: the L8 comparator checks inspect vs plan. If the profile
+  # changes nothing, the comparison passes identically.
+  if out=$($PY l8 "$WORK/l25-inspect.json" "$WORK/l25-plan.json" "$WORK/l25-host.mountinfo" "$WORK/g_ro:ro" 2>&1); then
+    pass "L25 profile base == 0.2.2 plan: $out"
+  else
+    fail "L25 profile base == 0.2.2 plan" "$out"
+  fi
+  end_session "$L25_CWD" "$L25_PID"
+else
+  fail "L25 profile base == 0.2.2 plan" "session did not start: $(head -c 300 "$L25_LOG")"
+fi
+
 # ----------------------------------------------------------------- manifest
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.

@@ -12,6 +12,7 @@ pub mod init;
 pub mod landlock;
 pub mod mounts;
 pub mod policy;
+pub mod profile;
 pub mod rootfs;
 pub mod seccomp;
 pub mod session;

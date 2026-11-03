@@ -18,7 +18,7 @@ lint:
 check: build
 	./target/release/hisn check
 
-# Leak suite (L1-L35). Needs unprivileged user namespaces: run on a real host,
+# Leak suite (L1-L35, L25). Needs unprivileged user namespaces: run on a real host,
 # not inside a seccomp-restricted container. Never reports a pass it did not run.
 # Exit non-zero on any FAIL; one line per check: L<n>[<sub>] PASS|FAIL|SKIP|WEAK — <reason>.
 leaktest: build

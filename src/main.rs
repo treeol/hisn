@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -289,8 +290,13 @@ fn read_session_policy(path: &Path) -> Option<Value> {
 }
 
 /// `hisn rootfs import`: import a rootfs from a tar archive or Docker image.
+///
+/// Streams the tar into the staging directory — never buffers the archive.
+/// `--from-tar -` reads from stdin; `--from-image` pipes `docker export`
+/// stdout straight into the extractor. SHA-256 is computed in-process via a
+/// `HasherReader` wrapper that hashes as it reads.
 fn rootfs_import(args: hisn::cli::ImportArgs) -> Result<ExitCode> {
-    use std::io::Read;
+    use sha2::Digest;
     use std::process::Command;
 
     if !hisn::rootfs_store::is_valid_name(&args.name) {
@@ -312,25 +318,48 @@ fn rootfs_import(args: hisn::cli::ImportArgs) -> Result<ExitCode> {
         std::fs::remove_dir_all(&staging)?;
     }
     std::fs::create_dir_all(&staging)?;
-    // Get the tar input.
-    let (tar_data, source_label) = match (&args.from_tar, &args.from_image) {
+
+    // Build the streaming reader + source label. The reader is consumed by
+    // extract_tar_streaming; the SHA-256 is computed by a HasherReader
+    // wrapper that tees the bytes into sha2 as they pass through.
+    let (source_label, sha, files, skipped, size_bytes) = match (&args.from_tar, &args.from_image) {
         (Some(path), None) if path == &PathBuf::from("-") => {
-            let mut buf = Vec::new();
-            std::io::stdin().read_to_end(&mut buf)?;
-            (buf, "stdin".to_string())
+            let mut hasher = sha2::Sha256::new();
+            let (f, s, sb) = {
+                let mut hr = HasherReader::new(std::io::stdin(), &mut hasher);
+                extract_tar_streaming(&staging, &mut hr)?
+            };
+            (
+                "stdin".to_string(),
+                format!("{:x}", hasher.finalize()),
+                f,
+                s,
+                sb,
+            )
         }
         (Some(path), None) => {
-            let buf =
-                std::fs::read(path).with_context(|| format!("reading tar {}", path.display()))?;
-            (buf, format!("file:{}", path.display()))
+            let file = std::fs::File::open(path)
+                .with_context(|| format!("reading tar {}", path.display()))?;
+            let mut hasher = sha2::Sha256::new();
+            let (f, s, sb) = {
+                let mut hr = HasherReader::new(file, &mut hasher);
+                extract_tar_streaming(&staging, &mut hr)?
+            };
+            (
+                format!("file:{}", path.display()),
+                format!("{:x}", hasher.finalize()),
+                f,
+                s,
+                sb,
+            )
         }
         (None, Some(image)) => {
-            // docker create + export + rm.
             if !Command::new("docker").arg("--version").output().is_ok() {
                 anyhow::bail!("docker CLI not found (required for --from-image)");
             }
+            let container_name = format!("hisn-rootfs-{}", args.name);
             let create_out = Command::new("docker")
-                .args(["create", "--name", &format!("hisn-rootfs-{}", args.name)])
+                .args(["create", "--name", &container_name])
                 .arg(image)
                 .output()
                 .context("docker create")?;
@@ -340,50 +369,62 @@ fn rootfs_import(args: hisn::cli::ImportArgs) -> Result<ExitCode> {
                     String::from_utf8_lossy(&create_out.stderr)
                 );
             }
-            let export_out = Command::new("docker")
-                .args(["export", &format!("hisn-rootfs-{}", args.name)])
-                .output()
+            // docker export with piped stdout — stream straight into the
+            // extractor, no temp file, no Vec<u8>.
+            let mut export_child = Command::new("docker")
+                .args(["export", &container_name])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
                 .context("docker export")?;
-            // Always rm the container.
+            let export_stdout = export_child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("docker export: no stdout"))?;
+            let mut hasher = sha2::Sha256::new();
+            let (f, s, sb) = {
+                let mut hr = HasherReader::new(export_stdout, &mut hasher);
+                extract_tar_streaming(&staging, &mut hr)?
+            };
+            let sha = format!("{:x}", hasher.finalize());
+            // Wait for docker export to finish, then always rm the container.
+            let _ = export_child.wait();
             let _ = Command::new("docker")
-                .args(["rm", &format!("hisn-rootfs-{}", args.name)])
+                .args(["rm", &container_name])
                 .output();
-            if !export_out.status.success() {
-                anyhow::bail!(
-                    "docker export failed: {}",
-                    String::from_utf8_lossy(&export_out.stderr)
-                );
-            }
-            (export_out.stdout, format!("docker:{}", image))
+            (format!("docker:{image}"), sha, f, s, sb)
         }
         _ => {
             anyhow::bail!("--from-tar or --from-image is required");
         }
     };
-    // Compute sha256 of the tar.
-    let sha = {
-        let mut child = Command::new("sha256sum")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()?;
-        {
-            use std::io::Write;
-            let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(&tar_data)?;
-        }
-        let out = child.wait_with_output()?;
-        let line = String::from_utf8_lossy(&out.stdout);
-        line.split_whitespace()
-            .next()
-            .unwrap_or("unknown")
-            .to_string()
-    };
-    // Extract the tar into the staging directory.
-    let (files, skipped, size_bytes) = extract_tar(&staging, &tar_data)?;
-    // Write the manifest.
+    finish_import(
+        staging,
+        store_path,
+        args.name,
+        source_label,
+        sha,
+        files,
+        skipped,
+        size_bytes,
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Write the manifest and atomically rename staging → store_path.
+#[allow(clippy::too_many_arguments)]
+fn finish_import(
+    staging: PathBuf,
+    store_path: PathBuf,
+    name: String,
+    source: String,
+    sha: String,
+    files: u64,
+    skipped: u64,
+    size_bytes: u64,
+) -> Result<()> {
     let manifest = hisn::rootfs_store::Manifest {
-        name: args.name.clone(),
-        source: source_label,
+        name: name.clone(),
+        source,
         source_digest: None,
         import_timestamp: hisn::session::rfc3339_now(),
         hisn_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -394,105 +435,85 @@ fn rootfs_import(args: hisn::cli::ImportArgs) -> Result<ExitCode> {
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(staging.join("manifest.json"), manifest_json)?;
-    // Atomic rename to the final name.
     std::fs::rename(&staging, &store_path)?;
     eprintln!(
         "imported rootfs {} ({} files, {} skipped, {} bytes)",
-        args.name, files, skipped, size_bytes
+        name, files, skipped, size_bytes
     );
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
-/// Extract a tar archive into `dest` with hardening (0.3.2).
-/// Returns (files, skipped, size_bytes).
-fn extract_tar(dest: &Path, tar_data: &[u8]) -> Result<(u64, u64, u64)> {
-    use std::io::{Cursor, Read};
+/// Reader wrapper that feeds bytes into a SHA-256 hasher as they are read.
+struct HasherReader<'h, R> {
+    inner: R,
+    hasher: &'h mut sha2::Sha256,
+}
+
+impl<'h, R: Read> HasherReader<'h, R> {
+    fn new(inner: R, hasher: &'h mut sha2::Sha256) -> Self {
+        Self { inner, hasher }
+    }
+}
+
+impl<R: Read> Read for HasherReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            use sha2::Digest;
+            self.hasher.update(&buf[..n]);
+        }
+        Ok(n)
+    }
+}
+
+/// Extract a tar archive from a `Read` stream into `dest` with hardening
+/// (0.3.2). Uses the `tar` crate for streaming entry iteration — the archive
+/// is never buffered in memory. Returns (files, skipped, size_bytes).
+fn extract_tar_streaming<R: Read>(dest: &Path, reader: &mut R) -> Result<(u64, u64, u64)> {
     use std::os::unix::fs::PermissionsExt;
 
-    let mut cursor = Cursor::new(tar_data);
+    let mut archive = tar::Archive::new(reader);
     let mut files: u64 = 0;
     let mut skipped: u64 = 0;
     let mut size_bytes: u64 = 0;
-    let mut buf = [0u8; 512];
-    // Track extracted symlinks to detect traversal through them.
+    // Track extracted symlinks to detect traversal through them (S1 fix).
     let mut extracted_symlinks: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
-    loop {
-        // Read a 512-byte header.
-        let n = cursor.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        if n < 512 {
-            anyhow::bail!("truncated tar header (read {} of 512 bytes)", n);
-        }
-        // Check for end-of-archive (two zero blocks).
-        if buf.iter().all(|&b| b == 0) {
-            // Check the next block too.
-            let mut next = [0u8; 512];
-            let n2 = cursor.read(&mut next)?;
-            if n2 == 0 || next.iter().all(|&b| b == 0) {
-                break;
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let header = entry.header();
+        let entry_path = header.path()?.to_path_buf();
+        // Normalize: strip leading '/', reject "..".
+        let rel = match normalize_entry_path(&entry_path) {
+            Some(p) => p,
+            None => {
+                skipped += 1;
+                continue;
             }
-            // Not a double-zero; continue with the next block as the header.
-            buf = next;
-        }
-        // Parse the header.
-        let name = parse_tar_string(&buf[0..100]);
-        if name.is_empty() {
-            // Skip empty name entries.
-            continue;
-        }
-        let mode = parse_tar_octal(&buf[100..108]);
-        let size = parse_tar_octal(&buf[124..136]);
-        let typeflag = buf[156];
-        // Resolve the path: reject absolute, .., etc.
-        let rel = normalize_tar_path(&name);
-        if rel.is_empty() {
-            skipped += 1;
-            // Skip the data blocks.
-            let data_blocks = size.div_ceil(512);
-            cursor.set_position(cursor.position() + data_blocks * 512);
-            continue;
-        }
+        };
         let target = dest.join(&rel);
         // Reject if the path escapes the dest directory.
         if !target.starts_with(dest) {
             skipped += 1;
-            let data_blocks = size.div_ceil(512);
-            cursor.set_position(cursor.position() + data_blocks * 512);
             continue;
         }
         // S1 fix: reject if any ancestor of the target (below dest) is a
-        // symlink extracted earlier. This prevents a symlink like
-        // `usr -> /home/user/.ssh` followed by `usr/authorized_keys` from
-        // writing through the symlink onto the host.
+        // symlink extracted earlier.
         if path_traverses_symlink(dest, &target, &extracted_symlinks) {
             skipped += 1;
-            let data_blocks = size.div_ceil(512);
-            cursor.set_position(cursor.position() + data_blocks * 512);
             continue;
         }
-        // Read the data.
-        let mut data = vec![0u8; size as usize];
-        cursor.read_exact(&mut data)?;
-        // Skip padding.
-        let pad = (512 - (size % 512)) % 512;
-        if pad > 0 {
-            let mut pad_buf = vec![0u8; pad as usize];
-            cursor.read_exact(&mut pad_buf)?;
-        }
-        match typeflag {
-            b'0' | 0 => {
-                // Regular file. Strip setuid/setgid bits.
+        let entry_type = header.entry_type();
+        let mode = header.mode().unwrap_or(0);
+        match entry_type {
+            tar::EntryType::Regular | tar::EntryType::Continuous => {
+                // Strip setuid/setgid bits.
                 let mode = mode & !0o6000;
-                // Create parent directories (create_dir_all on the parent is
-                // safe: we already checked no ancestor is a symlink).
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                // Verify the target is not already a symlink (defense in
-                // depth: a duplicate entry could be a symlink).
+                // Verify the target is not already a symlink (defense in depth).
                 let meta = std::fs::symlink_metadata(&target);
                 if let Ok(m) = &meta
                     && m.file_type().is_symlink()
@@ -500,28 +521,25 @@ fn extract_tar(dest: &Path, tar_data: &[u8]) -> Result<(u64, u64, u64)> {
                     skipped += 1;
                     continue;
                 }
-                std::fs::write(&target, &data)?;
-                std::fs::set_permissions(
-                    &target,
-                    std::fs::Permissions::from_mode((mode & 0o777) as u32),
-                )?;
+                let size = entry.size();
+                let mut file = std::fs::File::create(&target)?;
+                std::io::copy(&mut entry, &mut file)?;
+                drop(file);
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode & 0o777))?;
                 files += 1;
                 size_bytes += size;
             }
-            b'5' => {
-                // Directory.
+            tar::EntryType::Directory => {
                 let mode = mode & !0o6000;
                 std::fs::create_dir_all(&target)?;
-                std::fs::set_permissions(
-                    &target,
-                    std::fs::Permissions::from_mode((mode & 0o777) as u32),
-                )?;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode & 0o777))?;
                 files += 1;
             }
-            b'2' => {
-                // Symlink. Store as-is, but record it so later entries that
-                // traverse through it are rejected.
-                let link_target = parse_tar_string(&buf[157..257]);
+            tar::EntryType::Symlink => {
+                let link_target = header
+                    .link_name()?
+                    .ok_or_else(|| anyhow::anyhow!("symlink entry has no link name"))?
+                    .into_owned();
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -529,32 +547,69 @@ fn extract_tar(dest: &Path, tar_data: &[u8]) -> Result<(u64, u64, u64)> {
                 extracted_symlinks.insert(target.clone());
                 files += 1;
             }
-            b'1' => {
-                // Hard link. Reject if the target is outside dest.
-                let link_target = parse_tar_string(&buf[157..257]);
-                let lt = dest.join(normalize_tar_path(&link_target));
+            // Hardlink: byte '1'. The tar crate may not export a named
+            // constant for this, so match on the byte value.
+            t if t == tar::EntryType::hard_link() => {
+                // Reject if the link target resolves outside dest or
+                // passes through an extracted symlink.
+                let link_name = header
+                    .link_name()?
+                    .ok_or_else(|| anyhow::anyhow!("hardlink entry has no link name"))?
+                    .into_owned();
+                let lt_rel = match normalize_entry_path(&link_name) {
+                    Some(p) => p,
+                    None => {
+                        skipped += 1;
+                        continue;
+                    }
+                };
+                let lt = dest.join(&lt_rel);
                 if !lt.starts_with(dest) {
+                    skipped += 1;
+                    continue;
+                }
+                if path_traverses_symlink(dest, &lt, &extracted_symlinks) {
                     skipped += 1;
                     continue;
                 }
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                // Create a hard link. This may fail if the target doesn't exist yet.
                 let _ = std::fs::hard_link(&lt, &target);
                 files += 1;
             }
-            b'3' | b'4' | b'6' => {
-                // Device nodes or fifo: skip and count.
-                skipped += 1;
-            }
+            // Device nodes, fifos, and unknown types: skip and count.
             _ => {
-                // Unknown type: skip and count.
                 skipped += 1;
             }
         }
     }
     Ok((files, skipped, size_bytes))
+}
+
+/// Normalize a tar entry path: strip leading '/', reject "..".
+/// Returns None if the path should be skipped (contains "..").
+fn normalize_entry_path(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                // Strip leading '/' — make relative.
+            }
+            std::path::Component::ParentDir => {
+                return None;
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(s) => {
+                out.push(s);
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Check if `path` (inside `base`) traverses through any of the extracted
@@ -577,35 +632,4 @@ fn path_traverses_symlink(
         }
     }
     false
-}
-
-/// Parse a null-terminated string from a tar header field.
-fn parse_tar_string(buf: &[u8]) -> String {
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).into_owned()
-}
-
-/// Parse an octal number from a tar header field (null-terminated, space-padded).
-fn parse_tar_octal(buf: &[u8]) -> u64 {
-    let s = parse_tar_string(buf);
-    u64::from_str_radix(s.trim(), 8).unwrap_or(0)
-}
-
-/// Normalize a tar member path: strip leading '/', reject '..'.
-fn normalize_tar_path(name: &str) -> String {
-    let mut out = String::new();
-    let stripped = name.strip_prefix('/').unwrap_or(name);
-    for part in stripped.split('/') {
-        if part == ".." {
-            return String::new(); // signal rejection
-        }
-        if part == "." || part.is_empty() {
-            continue;
-        }
-        if !out.is_empty() {
-            out.push('/');
-        }
-        out.push_str(part);
-    }
-    out
 }

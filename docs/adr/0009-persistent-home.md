@@ -28,6 +28,7 @@ as a post-resolution override (`Policy::resolve`):
 2. Canonicalise the **parent** (which must exist); join the final component.
 3. **Refuse list** (checked before any namespace is created):
    - the real host `$HOME`
+   - any ancestor of the real host `$HOME`
    - `/`
    - the resolved session cwd
    - any ancestor of the session cwd
@@ -61,5 +62,7 @@ a session can poison caches read by later sessions in the same dir. Shown by
 L42: host `$HOME` not visible; persist dir reachable only at the mounted path;
 a symlink inside the persist dir pointing to a host path outside it does not
 grant access; a file written in session A exists in session B; writes anywhere
-else under the former home location fail; invalid paths (the refuse list) are
-rejected before any namespace is created.
+else under the former home location fail; each refuse-list case (real
+`$HOME`, ancestor of `$HOME`, `/`, cwd, ancestor of cwd, non-directory) is
+rejected before any namespace is created — no session dir or socket is
+created.

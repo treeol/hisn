@@ -24,7 +24,8 @@ When `agent = true`, hisn starts a filtering proxy that:
 - with `keys` set, filters `REQUEST_IDENTITIES` responses to the allowlisted
   fingerprints and rejects `SIGN_REQUEST` for non-listed keys,
 - logs every forwarded sign request (fingerprint, session id, timestamp)
-  on hisn's log channel — no payloads.
+  on hisn's log channel — allowlist or not; no payloads. Denied sign
+  requests are logged with the key fingerprint and "sign denied".
 
 The session gets `SSH_AUTH_SOCK` pointing at the proxy's forwarded socket.
 The host `SSH_AUTH_SOCK` path is never mounted into the session.
@@ -68,12 +69,15 @@ clear message when `agent = true`.
 - Git identity, `gpg.format=ssh`, `allowed_signers` and `known_hosts` are
   Wakil's job (cwd-side config); hisn does nothing there.
 
+- The accept loop retries on `EMFILE`/`ENFILE`/`EAGAIN` (logs, sleeps 50 ms,
+  continues); it breaks only on a fatal socket error or session teardown.
+
 ## Leak tests
 
 L45: `ADD_IDENTITY` and `REMOVE_ALL_IDENTITIES` from inside the session
 fail; the host agent's key list is unchanged. With an allowlist of one key,
 `ssh-add -l` in the session lists exactly that key; a sign request for
-another key fails. The host `SSH_AUTH_SOCK` path is not visible in the
-session. The proxy socket disappears with session teardown. An actual
-`ssh-keygen -Y sign` with the allowed key succeeds (skip if `ssh-agent`
-binary is missing).
+another key fails. Without an allowlist, both keys are listed, and
+add/remove still fail. The host `SSH_AUTH_SOCK` path is not visible in the
+session. The proxy socket disappears with session teardown (skip if
+`ssh-agent` or `ssh-add` binary is missing).

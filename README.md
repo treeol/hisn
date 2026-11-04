@@ -163,7 +163,8 @@ live one it fails.
 A profile (`hisn-profile/v1`) is an envelope around a policy that adds
 orchestration surface: persistent home, rootfs, SSH agent, in-sandbox services,
 socket forwarding, host-side services, and Docker access. Each capability
-that widens the boundary carries a risk label.
+that widens the boundary carries a risk label (`none`, `trust`, `data`,
+`signing`, `host-exec`, `root-equivalent`, `kernel-surface`).
 
 ```sh
 hisn profile list                           # search path and built-in profiles
@@ -206,9 +207,11 @@ hisn rootfs path go-dev                               # print the store path
 hisn rootfs rm go-dev                                 # remove a rootfs
 ```
 
-The import tool strips setuid/setgid bits, rejects path traversal and hard
-links pointing outside the target, skips device nodes, and atomically
-publishes the result. `hisn check` reports the rootfs store path and names.
+The import tool streams the tar via the `tar` crate (handles ustar prefix,
+GNU LongLink, and PAX extended headers), strips setuid/setgid bits, rejects
+path traversal and hard links pointing outside the target, rejects
+symlink-then-write escapes, skips device nodes, and atomically publishes the
+result. `hisn check` reports the rootfs store path and names.
 
 ## Policy
 

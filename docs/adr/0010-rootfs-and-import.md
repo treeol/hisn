@@ -73,9 +73,9 @@ resolves `name`/`path` and fails on a missing rootfs.
 
 ## Risk label
 
-`rootfs` (low, `RiskLabel::Data`): the sandbox runs whatever the image
-contains — trust in the image replaces trust in the host toolchain; it
-reduces host exposure.
+`rootfs` (low, `RiskLabel::Trust`): the toolchain comes from the imported
+image instead of the host; host `/usr`, `/opt` and `/nix` are not visible —
+you trust the image, not the host install.
 
 ## Invariants
 
@@ -89,10 +89,14 @@ reduces host exposure.
 
 ## Leak tests
 
-L43 (with `HISN_TEST_ROOTFS`): host `/usr` not visible; a host-only binary
-cannot be executed; rootfs write fails (ro); a setuid binary runs without
-privilege; a crafted symlink does not reach the host; the username equals
-the host username.
+L43 (with `HISN_TEST_ROOTFS`): host `/usr`, `/opt`, `/nix` not visible (host-
+only marker absent in session); a host-only binary cannot be executed;
+rootfs write fails (ro); `/usr` mount shows `ro,nosuid,nodev` in
+`/proc/self/mountinfo`; a remount cannot drop the flags; the username equals
+the host username; `nosuid` is enforced.
+
+L46 (with `HISN_TEST_ROOTFS`): symlink traps in the rootfs (`/usr/local/bin/trap
+→ ../../../../home`, absolute symlink to host `$HOME`) do not reach host data.
 
 L44 (always runs): import-time rejection tests (path traversal, absolute
 names, hard links, setuid stripping) on a synthetic tar.

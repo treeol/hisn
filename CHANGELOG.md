@@ -12,22 +12,26 @@ All notable changes to hisn are recorded here. The format follows
 ### Added
 - **Persistent `$HOME`** (`[home] persist`, `--home-persist`): a profile may
   declare a persistent home directory that survives across sessions, bind-mounted
-  rw at the same in-sandbox path. Refuse list (real `$HOME`, `/`, cwd, ancestors
-  of cwd) enforced before any namespace exists. Risk label `home-persist` (Data).
-  ADR 0009. Leak test L42.
+  rw at the same in-sandbox path. Refuse list (real `$HOME`, ancestors of
+  `$HOME`, `/`, cwd, ancestors of cwd) enforced before any namespace exists. Risk
+  label `home-persist` (Data). ADR 0009. Leak test L42.
 - **Read-only rootfs** (`[rootfs] name|path`, `--rootfs-path`): a profile may
   declare a rootfs tree that replaces the host toolchain dirs (`/usr`, `/bin`,
   `/sbin`, `/lib`, `/lib32`, `/lib64`, `/opt`, `/nix`, `/etc`) inside the sandbox.
   All rootfs mounts are `ro, nosuid, nodev`. Host `/usr`, `/opt`, `/nix` are not
   visible when a rootfs is set. `hisn rootfs import|list|path|rm` subcommand with
-  extraction hardening (strip setuid, reject traversal, reject hard links outside,
-  skip devices, atomic staging). `hisn check` reports the rootfs store. Risk label
-  `rootfs` (Data). ADR 0010. Leak tests L43, L44.
+  streaming extraction (via the `tar` crate — handles ustar prefix, GNU
+  LongLink, and PAX extended headers) and hardening (strip setuid, reject
+  traversal, reject hard links outside, reject symlink-then-write, skip
+  devices, atomic staging). `hisn check` reports the rootfs store. Risk label
+  `rootfs` (Trust). ADR 0010. Leak tests L43, L44, L46.
 - **SSH agent T1** (`[ssh] agent = true`, `keys = [...]`): a filtering proxy that
   forwards only `REQUEST_IDENTITIES` and `SIGN_REQUEST`, rejects all mutations
   (`ADD`, `REMOVE`, `LOCK`, `UNLOCK`, `EXTENSION`), filters by fingerprint
   allowlist, and injects `SSH_AUTH_SOCK` into the scrubbed env. The host
-  `SSH_AUTH_SOCK` is never mounted. Risk label `ssh-agent` (Signing). ADR 0011.
+  `SSH_AUTH_SOCK` is never mounted. Every forwarded sign request is logged
+  (fingerprint, session id) — allowlist or not. The accept loop retries on
+  `EMFILE`/`ENFILE`/`EAGAIN`. Risk label `ssh-agent` (Signing). ADR 0011.
   Leak test L45.
 
 ### Changed
@@ -37,17 +41,24 @@ All notable changes to hisn are recorded here. The format follows
   remains the default download.
 
 ### Tests
-- L42 (home-persist): host `$HOME` not visible, persist dir reachable only at the
-  mounted path, symlink inside persist does not escape, file written in session A
-  exists in session B, invalid paths rejected.
-- L43 (rootfs, with `HISN_TEST_ROOTFS`): host `/usr` not visible, host-only binary
-  not executable, rootfs write fails, setuid stripped, symlink does not reach host,
-  username matches.
-- L44 (rootfs import hardening, always runs): path traversal, absolute names, hard
-  link escape, setuid stripping on a synthetic tar.
-- L45 (ssh-agent): `ADD_IDENTITY`/`REMOVE_ALL` fail, allowlist filters identities,
-  sign for non-listed key fails, host `SSH_AUTH_SOCK` not visible, proxy socket
-  disappears with teardown, `ssh-keygen -Y sign` succeeds (skip if no ssh-agent).
+- L42 (home-persist): persist dir created, cross-session persistence (file
+  written in session A exists in B), symlink escape blocked, pre-0.3.2 home
+  location fails, each refuse-list case (real `$HOME`, ancestor of `$HOME`,
+  `/`, cwd, ancestor of cwd) rejected before any namespace exists, HOME env
+  is the sandbox path, persist ≠ real `$HOME`.
+- L43 (rootfs, with `HISN_TEST_ROOTFS`): host `/opt` marker not visible,
+  host binary not executable, `/usr` mount shows `ro,nosuid,nodev` in
+  mountinfo, remount cannot drop ro, username matches, `nosuid` enforced.
+- L44 (rootfs import hardening, always runs): path traversal, absolute names,
+  hard link escape, setuid stripping on a synthetic tar.
+- L46 (rootfs symlink traps, with `HISN_TEST_ROOTFS`): symlink traps in
+  `/usr/local/bin` and absolute symlinks to host `$HOME` do not reach host
+  data.
+- L45 (ssh-agent): two ed25519 keys; with `keys=[fp1]`: `ssh-add -l` shows
+  only key1, key2 filtered, ssh-add (add) and ssh-add -D (remove all) from
+  inside session fail, host agent still lists both keys, proxy socket absent
+  after teardown; without `keys=`: both keys listed, add/remove still fail
+  (skip if ssh-agent or ssh-add not found).
 
 ## [0.3.1]
 

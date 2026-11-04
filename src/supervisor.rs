@@ -888,7 +888,7 @@ fn getids(verbose: u8) -> (u32, u32, String) {
 }
 
 /// Resolve policy + flags into the resolved policy, grant list, runtime roots,
-/// and the 0.3 surface (services, forwards, host_services) from the profile.
+/// and the 0.3 surface (services, forwards, host_services, ssh) from the profile.
 pub struct Prepared {
     pub policy: ResolvedPolicy,
     pub grants: Vec<(String, Mode)>,
@@ -899,12 +899,14 @@ pub struct Prepared {
     pub forwards: Vec<profile::Forward>,
     /// 0.3 surface: host_services from the profile.
     pub host_services: Vec<profile::HostService>,
+    /// 0.3.2: SSH agent config from the profile.
+    pub ssh: Option<profile::SshConfig>,
 }
 
 pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     let cwd_base = std::env::current_dir().context("current dir")?;
-    let (pol, base, services, forwards, host_services) = match (&args.policy, &args.profile) {
+    let (pol, base, services, forwards, host_services, ssh) = match (&args.policy, &args.profile) {
         (Some(f), None) => {
             let p = Policy::load(f).with_context(|| f.display().to_string())?;
             let b = f
@@ -912,7 +914,7 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
                 .filter(|b| !b.as_os_str().is_empty())
                 .map(Path::to_path_buf)
                 .unwrap_or(cwd_base.clone());
-            (p, b, Vec::new(), Vec::new(), Vec::new())
+            (p, b, Vec::new(), Vec::new(), Vec::new(), None)
         }
         (None, Some(spec)) => {
             let (path, source) = profile::resolve_profile_path(spec)?;
@@ -933,6 +935,7 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
                 prof.services.clone(),
                 prof.forwards.clone(),
                 prof.host_services.clone(),
+                prof.ssh.clone(),
             )
         }
         (None, None) => (
@@ -941,6 +944,7 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
         ),
         // (Some, Some) is rejected by check_command() before we get here.
         _ => unreachable!("--profile and --policy are mutually exclusive (check_command)"),
@@ -1006,6 +1010,7 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
         services,
         forwards,
         host_services,
+        ssh,
     })
 }
 
@@ -1183,6 +1188,8 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         &prep.services,
         &prep.forwards,
         &prep.host_services,
+        prep.ssh.as_ref(),
+        &id,
     );
     sdir.remove();
     result
@@ -1205,6 +1212,8 @@ fn run_session(
     services: &[profile::Service],
     forwards: &[profile::Forward],
     host_services: &[profile::HostService],
+    ssh: Option<&profile::SshConfig>,
+    session_id: &str,
 ) -> Result<i32> {
     sdir.write_resolved_policy(&policy.to_toml())?;
     // Write risk.json (the risk labels for this session, DESIGN §16).
@@ -1246,12 +1255,40 @@ fn run_session(
             .any(|t| p.starts_with(t))
             || p.starts_with(&policy.cwd)
     };
-    let scrub = senv::scrub(
+    let mut scrub = senv::scrub(
         &policy,
         host_env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         username,
         visible,
     );
+
+    // 0.3.2: SSH agent T1 proxy. Start the proxy on the host side, forward
+    // its socket into the sandbox, and set SSH_AUTH_SOCK in the env. The
+    // proxy socket lives under the session dir (not cwd or $HOME).
+    let mut ssh_proxy_handle: Option<thread::JoinHandle<()>> = None;
+    let ssh_agent_expose = "/run/ssh-agent.sock";
+    if let Some(ssh_cfg) = ssh
+        && ssh_cfg.agent
+    {
+        let host_auth_sock = std::env::var("SSH_AUTH_SOCK")
+            .context("ssh-agent: SSH_AUTH_SOCK is not set (agent = true requires a host agent)")?;
+        let proxy_socket_path = sdir.path.join("ssh-agent.sock");
+        ssh_proxy_handle = Some(
+            crate::ssh_agent::start_proxy(
+                &proxy_socket_path,
+                &host_auth_sock,
+                ssh_cfg.keys.clone(),
+                session_id,
+            )
+            .context("ssh-agent proxy")?,
+        );
+        // Inject SSH_AUTH_SOCK into the scrubbed env. The proxy socket is
+        // forwarded into the sandbox at ssh_agent_expose after init is ready.
+        scrub
+            .vars
+            .insert("SSH_AUTH_SOCK".into(), ssh_agent_expose.to_string());
+    }
+
     for n in &scrub.secretish_passed {
         eprintln!("hisn: warning: env.pass forwards {n}, which looks like a secret");
     }
@@ -1441,6 +1478,19 @@ fn run_session(
             let _ = sys::kill(pid, libc::SIGKILL);
             let _ = reap(pid);
             bail!("forward {}: {e}", f.name);
+        }
+    }
+    // 0.3.2: Forward the SSH agent proxy socket into the sandbox.
+    if ssh_proxy_handle.is_some() {
+        let proxy_socket_path = sdir.path.join("ssh-agent.sock");
+        if let Err(e) = shared.do_forward(
+            proxy_socket_path.to_str().unwrap_or(""),
+            ssh_agent_expose,
+            "ssh-agent",
+        ) {
+            let _ = sys::kill(pid, libc::SIGKILL);
+            let _ = reap(pid);
+            bail!("ssh-agent forward: {e}");
         }
     }
     // Process [[host_services]] entries (DESIGN §17): start host process,

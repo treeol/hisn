@@ -744,7 +744,7 @@ fn resolve_home_persist_with(
     // someone else, e.g. in a sticky /tmp, is not ours to hand out).
     {
         use std::os::unix::fs::MetadataExt;
-        if meta.uid() != rustix::process::geteuid().as_raw() {
+        if meta.uid() != rustix::process::getuid().as_raw() {
             return Err(invalid(
                 "home.persist",
                 format!("{} is not owned by the invoking user", path.display()),

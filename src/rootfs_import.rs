@@ -143,7 +143,10 @@ pub fn extract_tar<R: Read>(dest: &Path, reader: R) -> Result<ExtractStats> {
             fs::create_dir_all(&target)?;
             // Applied after the walk: a mode-000 directory must not block
             // the entries below it, nor the cleanup of a failed import.
-            dir_modes.push((target, mode & 0o1777));
+            // Owner always keeps rwx: a non-traversable directory in a
+            // user-owned store has no legitimate use and would defeat
+            // cleanup and `--replace`.
+            dir_modes.push((target, (mode & 0o1777) | 0o700));
             st.files += 1;
         } else if ty == tar::EntryType::Symlink {
             let link = entry
@@ -189,6 +192,14 @@ pub fn extract_tar<R: Read>(dest: &Path, reader: R) -> Result<ExtractStats> {
     // Deepest first, so a restrictive parent does not hide its children.
     dir_modes.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
     for (p, m) in dir_modes {
+        // chmod follows symlinks, and a later entry may have replaced this
+        // directory with one: re-check before touching it. The tree is static
+        // now, so check-then-chmod is safe.
+        let still_dir = fs::symlink_metadata(&p).is_ok_and(|md| md.is_dir());
+        if !still_dir || traverses_symlink(dest, &p, &symlinks) {
+            st.skipped += 1;
+            continue;
+        }
         fs::set_permissions(&p, fs::Permissions::from_mode(m))?;
     }
     Ok(st)
@@ -291,8 +302,14 @@ pub fn import(root: &Path, opts: &ImportOpts, docker: &str) -> Result<Manifest> 
             let old = unique_sibling(root, "old", opts.name);
             fs::rename(&final_path, &old).context("moving the old rootfs aside")?;
             if let Err(e) = fs::rename(&staging, &final_path) {
-                let _ = fs::rename(&old, &final_path);
-                return Err(anyhow!(e).context("publishing the new rootfs"));
+                return Err(match fs::rename(&old, &final_path) {
+                    Ok(()) => anyhow!(e).context("publishing the new rootfs (old rootfs restored)"),
+                    Err(e2) => anyhow!(e).context(format!(
+                        "publishing the new rootfs failed and the old one could not be restored ({e2}); \
+                         it is at {}",
+                        old.display()
+                    )),
+                });
             }
             let _ = fs::remove_dir_all(&old);
         } else {
@@ -1037,10 +1054,9 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0
+            0o700,
+            "owner rwx is always kept"
         );
-        // make it removable for tempdir cleanup
-        fs::set_permissions(root.join("l/locked"), fs::Permissions::from_mode(0o755)).unwrap();
         // ... and a truncated variant fails without leaving a staging dir.
         let tf2 = d.path().join("cut.tar");
         fs::write(&tf2, &tarb[..1024 + 100]).unwrap();
@@ -1086,5 +1102,38 @@ mod tests {
         assert!(e.contains("invalid image reference"), "{e}");
         assert!(!log.exists());
         assert!(no_leftovers(&root));
+    }
+
+    #[test]
+    fn deferred_chmod_never_lands_on_a_symlink_that_replaced_a_directory() {
+        let d = tmp();
+        let dest = d.path().join("dest");
+        let victim = d.path().join("victim");
+        fs::create_dir(&dest).unwrap();
+        fs::create_dir(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+        let tarb = build(|b| {
+            b.append(
+                &raw(b"a/", tar::EntryType::Directory, 0o777, 0, None),
+                io::empty(),
+            )
+            .unwrap();
+            // A later symlink with the same name as the recorded directory.
+            let h = raw(
+                b"a",
+                tar::EntryType::Symlink,
+                0o777,
+                0,
+                Some(victim.to_str().unwrap().as_bytes()),
+            );
+            b.append(&h, io::empty()).unwrap();
+        });
+        // Whether the second entry errors (EEXIST) or replaces, the victim's
+        // mode must be unchanged.
+        let _ = extract_tar(&dest, &tarb[..]);
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
     }
 }

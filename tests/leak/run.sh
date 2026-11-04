@@ -1616,12 +1616,13 @@ write_profile() {
   } >"$f"
 }
 
-# refused RESULT: true only for a real errno-style refusal from the probe.
+# refused RESULT: true only for a bare errno name (EACCES, ENOENT, EROFS, ...)
+# from the probe. Anything else (TIMEOUT, OK..., garbage) is not a refusal.
 # TIMEOUT / UNKNOWN_COMMAND / a success must never count as "isolation holds".
 refused() {
   case "$1" in
-    TIMEOUT*|UNKNOWN_COMMAND*|OK*|UNEXPECTED_SUCCESS*|SPAWN:*|"") return 1 ;;
-    *) return 0 ;;
+    E[A-Z0-9]*) case "$1" in *[!A-Z0-9]*) return 1 ;; *) return 0 ;; esac ;;
+    *) return 1 ;;
   esac
 }
 
@@ -2179,7 +2180,7 @@ before=$(runtime_entries)
 L46M_OUT=$(XDG_DATA_HOME="$WORK/empty-data" "$HISN" run --profile "$L46M_PROFILE" --session-id "l46-missing-$$" --detach </dev/null 2>&1)
 L46M_RC=$?
 after=$(runtime_entries)
-if [ "$L46M_RC" -ne 0 ] && [ "$before" = "$after" ]; then
+if [ "$L46M_RC" -ne 0 ] && [ "$before" = "$after" ] && printf '%s' "$L46M_OUT" | grep -q 'hisn-leak-no-such-rootfs'; then
   pass "L46 missing rootfs name: start fails, no session created (no fallback to the host toolchain)"
 else
   fail "L46 missing rootfs name" "rc=$L46M_RC out=[$(printf '%s' "$L46M_OUT" | head -c 300)]"

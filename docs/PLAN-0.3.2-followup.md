@@ -337,3 +337,17 @@ leak tests — both. Round 1 was therefore NOT complete for groups 1 and 2.
   CI; they run only where `HISN_TEST_ROOTFS` is set.
 - Risk lines with `--profile` plus CLI overrides are computed from the profile.
 - ADR 0011 comment about "multithreaded" corrected in code; ADR text not re-read.
+
+### Review round 2 (fixes only) and its follow-up
+Round 2 delivered from fable only (gpt-6-astra returned VOID on both parts).
+Fixed from it: deferred directory chmod re-checks for a symlink that replaced the
+directory; directory modes keep owner rwx (defeats cleanup/--replace otherwise);
+a failed restore after `--replace` names the `.old-*` path; `refused()` is an
+allowlist of bare errno names; the missing-rootfs leak check also requires the
+name in the message; the home ownership check uses the same uid as `prepare`.
+Not changed: empty `[rootfs]` table is now an error (intended; the previous
+meaning was "no rootfs" and the RISK line still printed trust); persist under
+`$XDG_DATA_HOME/hisn` is refused (hisn documents no default there); state dirs
+are compared after canonicalising only when they exist; `rename` of a dir onto an
+empty dir in the no-`--replace` path is not `RENAME_NOREPLACE`; handler panic
+leaks one client slot; `rootfs_store::list` filtering of dot-entries unchecked.

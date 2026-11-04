@@ -9,6 +9,19 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [0.3.2]
 
+Hardening before the tag (same version):
+- `rootfs import` moved to `rootfs_import`: streaming `tar` crate extraction with
+  explicit hardening, unique staging, no-clobber / rename-aside `--replace`,
+  `manifest.json` written without following archive links, option-like
+  `--from-image` values refused.
+- `[rootfs] name` that cannot be resolved is an error (it used to fall back to the
+  host toolchain); a rootfs overlapping a writable mount, or with a symlinked
+  `/etc`, is refused.
+- `[home] persist` refuses fixed host trees, shared dirs, hisn's own state dirs and
+  directories owned by someone else.
+- ssh proxy rejects malformed SIGN_REQUESTs locally, caps clients, times out idle
+  ones.
+
 ### Added
 - **Persistent `$HOME`** (`[home] persist`, `--home-persist`): a profile may
   declare a persistent home directory that survives across sessions, bind-mounted

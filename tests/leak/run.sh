@@ -1616,6 +1616,18 @@ write_profile() {
   } >"$f"
 }
 
+# refused RESULT: true only for a real errno-style refusal from the probe.
+# TIMEOUT / UNKNOWN_COMMAND / a success must never count as "isolation holds".
+refused() {
+  case "$1" in
+    TIMEOUT*|UNKNOWN_COMMAND*|OK*|UNEXPECTED_SUCCESS*|SPAWN:*|"") return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# opt_has OPTS FLAG: FLAG is a comma-delimited member of the mount options.
+opt_has() { case ",$1," in *",$2,"*) return 0 ;; *) return 1 ;; esac; }
+
 # mount_opts CWD MOUNTPOINT: the per-mount options field of that mount point
 # inside the session (from the probe's mountinfo command).
 mount_opts() {
@@ -1626,7 +1638,8 @@ mount_opts() {
 runtime_entries() { ls -A "$RUNTIME_ROOT" 2>/dev/null | sort; }
 
 # copy_tree SRC DST: cheap as possible (hardlinks if same fs), else real copy.
-copy_tree() { cp -al "$1" "$2" 2>/dev/null || cp -a "$1" "$2"; }
+# Always a real copy: hardlinks would let the later chmod touch the source.
+copy_tree() { cp -a "$1" "$2"; }
 
 # ================================================ L42: persistent home (0.3.2)
 # [home] persist mounts a host dir rw as $HOME. Sub-checks:
@@ -1684,7 +1697,7 @@ if start_profile_session l42-$$ "$L42_CWD" "$L42_PROFILE"; then
       r=$(q "$L42B_CWD" "cat /run/hisn/home/$l")
       case "$r" in
         *l42-host-secret*) fail "L42 R3 read through $l" "host marker content visible: $r" ;;
-        *) pass "L42 R3 read through symlink $l blocked ($r)" ;;
+        *) if refused "$r"; then pass "L42 R3 read through symlink $l blocked ($r)"; else fail "L42 R3 read through $l" "probe gave [$r], not an errno refusal"; fi ;;
       esac
       r=$(q "$L42B_CWD" "write /run/hisn/home/$l")
       if [ "$(cat "$L42_MARKER")" = "l42-host-secret" ]; then
@@ -1694,10 +1707,7 @@ if start_profile_session l42-$$ "$L42_CWD" "$L42_PROFILE"; then
       fi
     done
     r=$(q "$L42B_CWD" "ls /run/hisn/home/l42-link-home")
-    case "$r" in
-      OK*) fail "L42 R3 symlink to real \$HOME" "listing through the link succeeded: $r" ;;
-      *) pass "L42 R3 symlink to real \$HOME not listable ($r)" ;;
-    esac
+    if refused "$r"; then pass "L42 R3 symlink to real \$HOME not listable ($r)"; else fail "L42 R3 symlink to real \$HOME" "probe gave [$r], not an errno refusal"; fi
     end_session "$L42B_CWD" "$S_PID"
   else
     fail "L42 R2/R3 session B" "session B did not start"
@@ -1710,7 +1720,7 @@ fi
 L42R_CWD=$(new_cwd l42refuse)
 L42_FILE="$WORK/l42-not-a-dir"
 echo x >"$L42_FILE"
-L42_CASES=("$HOME|real \$HOME" "/|root" "$L42R_CWD|cwd" "$(dirname "$L42R_CWD")|ancestor of cwd" "$L42_FILE|not a directory")
+L42_CASES=("$HOME|real \$HOME" "/|root" "$L42R_CWD|cwd" "$(dirname "$L42R_CWD")|ancestor of cwd" "$L42_FILE|not a directory" "/etc|host tree /etc" "/tmp|shared dir /tmp")
 [ "$(dirname "$HOME")" != "/" ] && L42_CASES+=("$(dirname "$HOME")|ancestor of \$HOME")
 for L42_CASE in "${L42_CASES[@]}"; do
   L42_REFUSE=${L42_CASE%%|*} L42_WHY=${L42_CASE#*|}
@@ -1756,11 +1766,19 @@ if [ -n "${HISN_TEST_ROOTFS:-}" ] && [ -d "$HISN_TEST_ROOTFS/usr" ]; then
     else
       skip "L43 R1 host /opt marker" "/opt not writable by this user"
     fi
-    r=$(q "$L43_CWD" "exec $PROBE_SRC true")
-    case "$r" in
-      SPAWN:ENOENT|SPAWN:EACCES) pass "L43 R2 host-only binary not executable in session ($r)" ;;
-      *) fail "L43 R2 host binary" "got [$r] (host path $PROBE_SRC should not exist in session)" ;;
-    esac
+    # A host-only executable: a copy of the probe in $WORK (not the cwd, so
+    # never mounted), runnable on the host but not present in the session.
+    L43_HOSTBIN="$WORK/host-only-probe"
+    cp "$PROBE_SRC" "$L43_HOSTBIN"
+    if ! "$L43_HOSTBIN" stat / >/dev/null 2>&1; then
+      skip "L43 R2 host-only binary" "host copy of the probe is not runnable"
+    else
+      r=$(q "$L43_CWD" "exec $L43_HOSTBIN stat /")
+      case "$r" in
+        SPAWN:ENOENT|SPAWN:EACCES) pass "L43 R2 host-only binary not executable in session ($r)" ;;
+        *) fail "L43 R2 host binary" "got [$r] for $L43_HOSTBIN" ;;
+      esac
+    fi
     L43_BAD=""
     L43_SEEN=0
     for mp in /usr /bin /sbin /lib /lib64 /opt; do
@@ -1768,7 +1786,7 @@ if [ -n "${HISN_TEST_ROOTFS:-}" ] && [ -d "$HISN_TEST_ROOTFS/usr" ]; then
       [ -z "$o" ] && continue
       L43_SEEN=$((L43_SEEN + 1))
       for f in ro nosuid nodev; do
-        case ",$o," in *",$f,"*) ;; *) L43_BAD="$L43_BAD $mp(missing $f in $o)" ;; esac
+        opt_has "$o" "$f" || L43_BAD="$L43_BAD $mp(missing $f in $o)"
       done
     done
     if [ "$L43_SEEN" -gt 0 ] && [ -z "$L43_BAD" ]; then
@@ -1776,18 +1794,16 @@ if [ -n "${HISN_TEST_ROOTFS:-}" ] && [ -d "$HISN_TEST_ROOTFS/usr" ]; then
     else
       fail "L43 R3 mount flags" "seen=$L43_SEEN bad:$L43_BAD"
     fi
-    case $(q "$L43_CWD" "remount /usr") in
-      OK*|UNEXPECTED_SUCCESS*) fail "L43 R4 remount" "MS_REMOUNT|MS_BIND on /usr succeeded" ;;
-      *) pass "L43 R4 remount of /usr refused" ;;
-    esac
-    case ",$(mount_opts "$L43_CWD" /usr)," in
-      *,ro,*,nosuid,*,nodev,*|*,ro,*,nodev,*,nosuid,*) pass "L43 R4 /usr flags unchanged after remount attempt" ;;
-      *) fail "L43 R4 flags after remount" "opts=$(mount_opts "$L43_CWD" /usr)" ;;
-    esac
-    case $(q "$L43_CWD" "write /usr/l43-test") in
-      EROFS) pass "L43 R4 /usr is read-only (EROFS)" ;;
-      *) fail "L43 R4 /usr write" "expected EROFS" ;;
-    esac
+    r=$(q "$L43_CWD" "remount /usr")
+    if refused "$r"; then pass "L43 R4 remount of /usr refused ($r)"; else fail "L43 R4 remount" "MS_REMOUNT|MS_BIND on /usr gave [$r]"; fi
+    o=$(mount_opts "$L43_CWD" /usr)
+    if opt_has "$o" ro && opt_has "$o" nosuid && opt_has "$o" nodev; then
+      pass "L43 R4 /usr flags unchanged after the remount attempt ($o)"
+    else
+      fail "L43 R4 flags after remount" "opts=[$o]"
+    fi
+    r=$(q "$L43_CWD" "write /usr/l43-test")
+    eq "L43 R4 /usr is read-only (EROFS)" "$r" "EROFS"
     l43_user=$(q "$L43_CWD" env | sed -n 's/^USER=//p' | head -1)
     eq "L43 R5 username matches host" "$l43_user" "$(id -un)"
     if [ -d /nix ] && [ ! -e "$HISN_TEST_ROOTFS/nix" ]; then
@@ -1851,11 +1867,13 @@ else
     pass "L44 import succeeds"
     g="$L44_STORE/l44-good"
     l44_mode=$(stat -c '%a' "$g/setuid.txt" 2>/dev/null)
-    case "$l44_mode" in
-      "") fail "L44 setuid file" "not found after import" ;;
-      4*|6*) fail "L44 setuid strip" "mode is $l44_mode (setuid not stripped)" ;;
-      *) pass "L44 setuid stripped (mode $l44_mode)" ;;
-    esac
+    if [ -z "$l44_mode" ]; then
+      fail "L44 setuid file" "not found after import"
+    elif [ $(( 8#$l44_mode & 8#6000 )) -ne 0 ]; then
+      fail "L44 setuid strip" "mode is $l44_mode (setuid/setgid not stripped)"
+    else
+      pass "L44 setuid stripped (mode $l44_mode)"
+    fi
     [ -f "$g/normal.txt" ] && pass "L44 normal file extracted" || fail "L44 normal file" "missing"
     [ -f "$g/etc/passwd" ] && pass "L44 absolute path normalised" || fail "L44 absolute path" "etc/passwd missing"
     [ ! -e "$g/dev-null" ] && pass "L44 device node skipped" || fail "L44 device node" "dev-null was created"
@@ -1945,15 +1963,25 @@ if command -v ssh-agent >/dev/null 2>&1 && command -v ssh-add >/dev/null 2>&1 \
   ssh-keygen -t ed25519 -f "$L45_KEY2" -N "" -q 2>/dev/null
   cp "$L45_KEY1.pub" "$L45_CWD/pub/key1.pub"
   cp "$L45_KEY2.pub" "$L45_CWD/pub/key2.pub"
-  cp "$L45_KEY2" "$L45_CWD/addkey/key2"
-  chmod 600 "$L45_CWD/addkey/key2"
+  # Key 3 is never in the host agent: an in-session ssh-add that reached the
+  # host agent would visibly change its key list.
+  L45_KEY3="$WORK/l45-keys/key3"
+  ssh-keygen -t ed25519 -f "$L45_KEY3" -N "" -q 2>/dev/null
+  cp "$L45_KEY3" "$L45_CWD/addkey/key3"
+  chmod 600 "$L45_CWD/addkey/key3"
   echo "to-be-signed" >"$L45_CWD/msg"
+  echo "to-be-signed-2" >"$L45_CWD/msg2"
   L45_SAVED_SOCK="${SSH_AUTH_SOCK:-}"
   L45_SAVED_PID="${SSH_AGENT_PID:-}"
+  # Never touch an inherited agent: start ours first and only load keys if
+  # the new agent's socket differs from the saved one.
+  unset SSH_AUTH_SOCK SSH_AGENT_PID
   eval "$(ssh-agent -s 2>/dev/null)" >/dev/null 2>&1
   L45_HOST_SOCK="${SSH_AUTH_SOCK:-}"
-  ssh-add "$L45_KEY1" >/dev/null 2>&1
-  ssh-add "$L45_KEY2" >/dev/null 2>&1
+  if [ -n "$L45_HOST_SOCK" ] && [ "$L45_HOST_SOCK" != "$L45_SAVED_SOCK" ] && [ -n "${SSH_AGENT_PID:-}" ]; then
+    ssh-add "$L45_KEY1" >/dev/null 2>&1
+    ssh-add "$L45_KEY2" >/dev/null 2>&1
+  fi
   if [ -n "$L45_HOST_SOCK" ] && [ "$L45_HOST_SOCK" != "$L45_SAVED_SOCK" ] && [ -n "${SSH_AGENT_PID:-}" ] \
      && [ "$(ssh-add -l 2>/dev/null | grep -c SHA256:)" = 2 ]; then
     L45_FP1=$(ssh-keygen -lf "$L45_KEY1.pub" | awk '{print $2}')
@@ -1994,16 +2022,17 @@ if command -v ssh-agent >/dev/null 2>&1 && command -v ssh-add >/dev/null 2>&1 \
       else
         fail "L45 sign key1" "ssh-keygen -Y sign in session: $r"
       fi
-      r=$(q "$L45_CWD" "exec-out ssh-keygen -Y sign -n hisnleak -f $L45_CWD/pub/key2.pub $L45_CWD/msg")
-      if [ "$(exit_of "$r")" != 0 ] && [ ! -e "$L45_CWD/msg.sig.2" ]; then
-        pass "L45 sign with non-listed key2 fails"
-      else
-        fail "L45 sign key2" "signing with a non-listed key worked: $r"
-      fi
-      r=$(q "$L45_CWD" "exec-out ssh-add $L45_CWD/addkey/key2")
+      r=$(q "$L45_CWD" "exec-out ssh-keygen -Y sign -n hisnleak -f $L45_CWD/pub/key2.pub $L45_CWD/msg2")
       ec=$(exit_of "$r")
-      if [ -n "$ec" ] && [ "$ec" != 0 ]; then
-        pass "L45 ssh-add (add key) from inside the session fails"
+      if [ -n "$ec" ] && [ "$ec" != 0 ] && [ ! -e "$L45_CWD/msg2.sig" ]; then
+        pass "L45 sign with non-listed key2 fails (exit $ec, no signature file)"
+      else
+        fail "L45 sign key2" "signing with a non-listed key did not fail cleanly: $r"
+      fi
+      r=$(q "$L45_CWD" "exec-out ssh-add $L45_CWD/addkey/key3")
+      ec=$(exit_of "$r")
+      if [ -n "$ec" ] && [ "$ec" != 0 ] && ! ssh-add -l 2>/dev/null | grep -qF "$(ssh-keygen -lf "$L45_KEY3.pub" | awk '{print $2}')"; then
+        pass "L45 ssh-add (add key3) from inside the session fails; host agent did not gain it"
       else
         fail "L45 ssh-add add" "exit=[$ec]: $r"
       fi
@@ -2030,6 +2059,7 @@ if command -v ssh-agent >/dev/null 2>&1 && command -v ssh-add >/dev/null 2>&1 \
     fi
     # --- without keys = : every key the host agent offers ---
     L45B_CWD=$(new_cwd l45b)
+    mkdir -p "$L45B_CWD/addkey" && cp "$L45_CWD/addkey/key3" "$L45B_CWD/addkey/key3" && chmod 600 "$L45B_CWD/addkey/key3"
     L45B_PROFILE="$WORK/L45b-profile.toml"
     write_profile "$L45B_PROFILE" "$L45B_CWD" '[ssh]' 'agent = true'
     if start_profile_session l45b-$$ "$L45B_CWD" "$L45B_PROFILE"; then
@@ -2045,6 +2075,12 @@ if command -v ssh-agent >/dev/null 2>&1 && command -v ssh-add >/dev/null 2>&1 \
         pass "L45 no-allowlist: ssh-add -D still fails"
       else
         fail "L45 no-allowlist -D" "exit=[$ec]"
+      fi
+      ec=$(exit_of "$(q "$L45B_CWD" "exec-out ssh-add $L45B_CWD/addkey/key3")")
+      if [ -n "$ec" ] && [ "$ec" != 0 ]; then
+        pass "L45 no-allowlist: ssh-add (add) still fails"
+      else
+        fail "L45 no-allowlist add" "exit=[$ec]"
       fi
       if host_two_keys; then
         pass "L45 no-allowlist: host agent still lists both keys"
@@ -2094,14 +2130,11 @@ if [ -n "${HISN_TEST_ROOTFS:-}" ] && [ -d "$HISN_TEST_ROOTFS/usr" ]; then
       r=$(q "$L46_CWD" "cat /usr/local/bin/$l")
       case "$r" in
         *l46-host-secret*) fail "L46 symlink $l" "host marker content reached the session: $r" ;;
-        *) pass "L46 symlink $l does not reach host data ($r)" ;;
+        *) if refused "$r"; then pass "L46 symlink $l does not reach host data ($r)"; else fail "L46 symlink $l" "probe gave [$r], not an errno refusal"; fi ;;
       esac
     done
     r=$(q "$L46_CWD" "ls /usr/local/bin/home-dir")
-    case "$r" in
-      OK*) fail "L46 symlink to host home dir" "listing succeeded: $r" ;;
-      *) pass "L46 absolute symlink to the host home dir not listable ($r)" ;;
-    esac
+    if refused "$r"; then pass "L46 absolute symlink to the host home dir not listable ($r)"; else fail "L46 symlink to host home dir" "probe gave [$r], not an errno refusal"; fi
     end_session "$L46_CWD" "$S_PID"
   else
     fail "L46 rootfs symlink traps" "session did not start"
@@ -2109,32 +2142,48 @@ if [ -n "${HISN_TEST_ROOTFS:-}" ] && [ -d "$HISN_TEST_ROOTFS/usr" ]; then
   rm -f "$L46_MARKER"
   chmod -R u+w "$L46_ROOTFS" 2>/dev/null
   rm -rf "$L46_ROOTFS"
-  # Dangling-symlink /etc: start must fail naming the path; nothing mounted.
-  L46D_ROOTFS="$WORK/l46-dangling"
-  rm -rf "$L46D_ROOTFS"
-  mkdir -p "$L46D_ROOTFS/usr"
-  ln -s nonexistent "$L46D_ROOTFS/etc"
-  L46D_CWD=$(new_cwd l46d)
-  L46D_PROFILE="$WORK/L46d-profile.toml"
-  write_profile "$L46D_PROFILE" "$L46D_CWD" '[rootfs]' "path = \"$L46D_ROOTFS\""
-  before=$(runtime_entries)
-  L46D_OUT=$("$HISN" run --profile "$L46D_PROFILE" --session-id "l46-dangling-$$" --detach </dev/null 2>&1)
-  L46D_RC=$?
-  after=$(runtime_entries)
-  if [ "$L46D_RC" -ne 0 ] && printf '%s' "$L46D_OUT" | grep -qF "$L46D_ROOTFS/etc"; then
-    pass "L46 dangling-symlink /etc: start fails, message names the path"
-  else
-    fail "L46 dangling /etc" "rc=$L46D_RC out=[$(printf '%s' "$L46D_OUT" | head -c 300)]"
-  fi
-  if [ "$before" = "$after" ]; then
-    pass "L46 dangling-symlink /etc: no session created, nothing mounted"
-  else
-    fail "L46 dangling /etc session" "runtime root changed: [$before] -> [$after]"
-    rm -rf "$RUNTIME_ROOT/l46-dangling-$$" 2>/dev/null
-  fi
-  rm -rf "$L46D_ROOTFS"
 else
   skip "L46 rootfs symlink traps" "HISN_TEST_ROOTFS not set or missing /usr"
+fi
+# L46 (no rootfs fixture needed): a rootfs whose /etc is a dangling symlink.
+# Dangling-symlink /etc: start must fail naming the path; nothing mounted.
+L46D_ROOTFS="$WORK/l46-dangling"
+rm -rf "$L46D_ROOTFS"
+mkdir -p "$L46D_ROOTFS/usr"
+ln -s nonexistent "$L46D_ROOTFS/etc"
+L46D_CWD=$(new_cwd l46d)
+L46D_PROFILE="$WORK/L46d-profile.toml"
+write_profile "$L46D_PROFILE" "$L46D_CWD" '[rootfs]' "path = \"$L46D_ROOTFS\""
+before=$(runtime_entries)
+L46D_OUT=$("$HISN" run --profile "$L46D_PROFILE" --session-id "l46-dangling-$$" --detach </dev/null 2>&1)
+L46D_RC=$?
+after=$(runtime_entries)
+if [ "$L46D_RC" -ne 0 ] && printf '%s' "$L46D_OUT" | grep -qF "$L46D_ROOTFS/etc"; then
+  pass "L46 dangling-symlink /etc: start fails, message names the path"
+else
+  fail "L46 dangling /etc" "rc=$L46D_RC out=[$(printf '%s' "$L46D_OUT" | head -c 300)]"
+fi
+if [ "$before" = "$after" ]; then
+  pass "L46 dangling-symlink /etc: no session created, nothing mounted"
+else
+  fail "L46 dangling /etc session" "runtime root changed: [$before] -> [$after]"
+  rm -rf "$RUNTIME_ROOT/l46-dangling-$$" 2>/dev/null
+fi
+rm -rf "$L46D_ROOTFS"
+# A profile naming a rootfs that is not in the store must FAIL, never fall
+# back to the host toolchain.
+L46M_CWD=$(new_cwd l46m)
+L46M_PROFILE="$WORK/L46m-profile.toml"
+write_profile "$L46M_PROFILE" "$L46M_CWD" '[rootfs]' 'name = "hisn-leak-no-such-rootfs"'
+before=$(runtime_entries)
+L46M_OUT=$(XDG_DATA_HOME="$WORK/empty-data" "$HISN" run --profile "$L46M_PROFILE" --session-id "l46-missing-$$" --detach </dev/null 2>&1)
+L46M_RC=$?
+after=$(runtime_entries)
+if [ "$L46M_RC" -ne 0 ] && [ "$before" = "$after" ]; then
+  pass "L46 missing rootfs name: start fails, no session created (no fallback to the host toolchain)"
+else
+  fail "L46 missing rootfs name" "rc=$L46M_RC out=[$(printf '%s' "$L46M_OUT" | head -c 300)]"
+  rm -rf "$RUNTIME_ROOT/l46-missing-$$" 2>/dev/null
 fi
 
 # Every id in MANIFEST must produce at least one line. A missing id means

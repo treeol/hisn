@@ -906,6 +906,7 @@ pub struct Prepared {
 pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     let cwd_base = std::env::current_dir().context("current dir")?;
+    let mut profile_doc: Option<ProfileDoc> = None;
     let (pol, base, services, forwards, host_services, ssh) = match (&args.policy, &args.profile) {
         (Some(f), None) => {
             let p = Policy::load(f).with_context(|| f.display().to_string())?;
@@ -929,6 +930,7 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
             // is not known yet (it is resolved from the inner policy), so the
             // check runs after resolution, in `run`. Here we just load it.
             let _ = source; // trust check deferred to run()
+            profile_doc = Some(prof.clone());
             (
                 prof.policy,
                 b,
@@ -961,41 +963,22 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
             crate::cli::NetworkArg::None => Network::None,
             crate::cli::NetworkArg::Host => Network::Host,
         }),
-        home_persist: args.home_persist.clone().or_else(|| {
-            // The profile's [home] persist is the default; the CLI flag
-            // overrides it.
-            match (&args.policy, &args.profile) {
-                (None, Some(spec)) => {
-                    let (path, _source) = profile::resolve_profile_path(spec).ok()?;
-                    let prof = ProfileDoc::load(&path).ok()?;
-                    prof.home.as_ref()?.persist.clone()
-                }
-                _ => None,
-            }
-        }),
-        rootfs_path: args
-            .rootfs_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .or_else(|| {
-                // The profile's [rootfs] name or path; the CLI flag overrides it.
-                match (&args.policy, &args.profile) {
-                    (None, Some(spec)) => {
-                        let (path, _source) = profile::resolve_profile_path(spec).ok()?;
-                        let prof = ProfileDoc::load(&path).ok()?;
-                        prof.rootfs.as_ref().and_then(|r| {
-                            r.path.clone().or_else(|| {
-                                r.name.as_ref().and_then(|n| {
-                                    crate::rootfs_store::resolve_name(n)
-                                        .ok()
-                                        .map(|p| p.to_string_lossy().into_owned())
-                                })
-                            })
-                        })
-                    }
-                    _ => None,
-                }
-            }),
+        home_persist: match &args.home_persist {
+            Some(h) => Some(h.clone()),
+            None => profile_doc
+                .as_ref()
+                .and_then(|d| d.home.as_ref()?.persist.clone()),
+        },
+        rootfs_path: match &args.rootfs_path {
+            Some(p) => Some(p.to_string_lossy().into_owned()),
+            // Strict: a profile naming a rootfs that cannot be resolved is an
+            // error, never a silent fall-back to the host toolchain.
+            None => profile_doc
+                .as_ref()
+                .and_then(|d| d.rootfs.as_ref())
+                .map(profile::rootfs_spec)
+                .transpose()?,
+        },
     };
     let policy = pol.resolve(&base, &ov, &roots)?;
     let grants = args

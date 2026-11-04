@@ -83,6 +83,20 @@ fn traverses_symlink(base: &Path, path: &Path, symlinks: &HashSet<PathBuf>) -> b
 /// * setuid/setgid bits are stripped (sticky is kept) from files and directories.
 /// * device nodes, fifos and anything else exotic are skipped and counted.
 pub fn extract_tar<R: Read>(dest: &Path, reader: R) -> Result<ExtractStats> {
+    // Confinement precondition: the destination is a fresh, empty, real
+    // directory, so every symlink below it was created by this archive and
+    // is tracked in `symlinks`.
+    let md = fs::symlink_metadata(dest).with_context(|| format!("stat {}", dest.display()))?;
+    if !md.is_dir() {
+        bail!(
+            "extraction target {} is not a real directory",
+            dest.display()
+        );
+    }
+    if fs::read_dir(dest)?.next().is_some() {
+        bail!("extraction target {} is not empty", dest.display());
+    }
+    let mut dir_modes: Vec<(PathBuf, u32)> = Vec::new();
     let mut archive = tar::Archive::new(reader);
     let mut st = ExtractStats::default();
     let mut symlinks: HashSet<PathBuf> = HashSet::new();
@@ -127,7 +141,9 @@ pub fn extract_tar<R: Read>(dest: &Path, reader: R) -> Result<ExtractStats> {
             st.size_bytes += size;
         } else if ty == tar::EntryType::Directory {
             fs::create_dir_all(&target)?;
-            fs::set_permissions(&target, fs::Permissions::from_mode(mode & 0o1777))?;
+            // Applied after the walk: a mode-000 directory must not block
+            // the entries below it, nor the cleanup of a failed import.
+            dir_modes.push((target, mode & 0o1777));
             st.files += 1;
         } else if ty == tar::EntryType::Symlink {
             let link = entry
@@ -170,6 +186,11 @@ pub fn extract_tar<R: Read>(dest: &Path, reader: R) -> Result<ExtractStats> {
             st.skipped += 1;
         }
     }
+    // Deepest first, so a restrictive parent does not hide its children.
+    dir_modes.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
+    for (p, m) in dir_modes {
+        fs::set_permissions(&p, fs::Permissions::from_mode(m))?;
+    }
     Ok(st)
 }
 
@@ -189,15 +210,48 @@ fn drain_and_digest<R: Read>(mut hr: HashingReader<R>) -> Result<String> {
     Ok(format!("{:x}", hr.hasher.finalize()))
 }
 
+/// A private, unique sibling name for staging / the displaced old tree.
+fn unique_sibling(root: &Path, kind: &str, name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    root.join(format!(".{kind}-{name}-{}-{nanos}", std::process::id()))
+}
+
+/// Write `manifest.json` without following anything the archive planted: an
+/// existing entry of that name (symlink, directory, file) is removed first
+/// and the new file is created exclusively with `O_NOFOLLOW`.
+fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let p = dir.join("manifest.json");
+    if let Ok(m) = fs::symlink_metadata(&p) {
+        if m.is_dir() {
+            fs::remove_dir_all(&p)?;
+        } else {
+            fs::remove_file(&p)?;
+        }
+    }
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&p)?;
+    f.write_all(serde_json::to_string_pretty(manifest)?.as_bytes())?;
+    Ok(())
+}
+
 /// Import into `root` (the store root). On any failure no store entry and no
-/// staging directory is left behind; with `replace`, the old tree is only
-/// removed after the new one is complete.
+/// staging directory is left behind. Publication never clobbers: without
+/// `replace` the final `rename` fails if a non-empty entry appeared meanwhile;
+/// with `replace` the old tree is moved aside, the new one renamed in, and the
+/// old one removed only afterwards (restored if the rename fails).
 pub fn import(root: &Path, opts: &ImportOpts, docker: &str) -> Result<Manifest> {
     if !rootfs_store::is_valid_name(opts.name) {
         bail!("invalid rootfs name {:?}", opts.name);
     }
     let final_path = root.join(opts.name);
-    if final_path.exists() && !opts.replace {
+    if fs::symlink_metadata(&final_path).is_ok() && !opts.replace {
         bail!(
             "rootfs {} already exists (use --replace to overwrite)",
             opts.name
@@ -208,14 +262,12 @@ pub fn import(root: &Path, opts: &ImportOpts, docker: &str) -> Result<Manifest> 
         _ => bail!("exactly one of --from-tar or --from-image is required"),
     }
     fs::create_dir_all(root)?;
-    let staging = root.join(format!(".staging-{}", opts.name));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)?;
-    }
-    fs::create_dir(&staging)?;
+    // Unique and created with `create_dir` (fails if it exists): never reuse
+    // or delete a directory we did not create.
+    let staging = unique_sibling(root, "staging", opts.name);
+    fs::create_dir(&staging).with_context(|| format!("creating {}", staging.display()))?;
 
-    let res = run_import(&staging, opts, docker);
-    let (source, sha, st) = match res {
+    let (source, sha, st) = match run_import(&staging, opts, docker) {
         Ok(v) => v,
         Err(e) => {
             let _ = fs::remove_dir_all(&staging);
@@ -234,14 +286,18 @@ pub fn import(root: &Path, opts: &ImportOpts, docker: &str) -> Result<Manifest> 
         size_bytes: st.size_bytes,
     };
     let publish = || -> Result<()> {
-        fs::write(
-            staging.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest)?,
-        )?;
-        if final_path.exists() {
-            fs::remove_dir_all(&final_path)?;
+        write_manifest(&staging, &manifest)?;
+        if opts.replace && fs::symlink_metadata(&final_path).is_ok() {
+            let old = unique_sibling(root, "old", opts.name);
+            fs::rename(&final_path, &old).context("moving the old rootfs aside")?;
+            if let Err(e) = fs::rename(&staging, &final_path) {
+                let _ = fs::rename(&old, &final_path);
+                return Err(anyhow!(e).context("publishing the new rootfs"));
+            }
+            let _ = fs::remove_dir_all(&old);
+        } else {
+            fs::rename(&staging, &final_path).context("publishing the rootfs")?;
         }
-        fs::rename(&staging, &final_path)?;
         Ok(())
     };
     if let Err(e) = publish() {
@@ -275,6 +331,9 @@ fn run_import(
             Ok((format!("file:{}", p.display()), sha, st))
         }
         (None, Some(image)) => {
+            if image.is_empty() || image.starts_with('-') {
+                bail!("invalid image reference {image:?} (must not start with '-')");
+            }
             if Command::new(docker).arg("--version").output().is_err() {
                 bail!("docker CLI not found (required for --from-image)");
             }
@@ -558,7 +617,7 @@ mod tests {
 
     // 9
     #[test]
-    fn setuid_setgid_and_sticky_bits_are_stripped() {
+    fn setuid_and_setgid_bits_are_stripped_sticky_is_kept() {
         let tarb = build(|b| {
             file(b, b"suid", 0o4755, b"");
             file(b, b"sgid", 0o2755, b"");
@@ -609,6 +668,14 @@ mod tests {
         }
     }
 
+    /// No `.staging-*` / `.old-*` directory left in the store root.
+    fn no_leftovers(root: &Path) -> bool {
+        fs::read_dir(root).is_ok_and(|rd| {
+            rd.flatten()
+                .all(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        })
+    }
+
     fn small_tar(content: &[u8]) -> Vec<u8> {
         build(|b| file(b, b"f", 0o644, content))
     }
@@ -638,7 +705,7 @@ mod tests {
         import(&root, &mk(true), "docker").unwrap();
         assert!(!root.join("n/f").exists(), "old tree gone");
         assert_eq!(fs::read(root.join("n/g")).unwrap(), b"new");
-        assert!(!root.join(".staging-n").exists());
+        assert!(no_leftovers(&root));
     }
 
     // 12
@@ -661,7 +728,7 @@ mod tests {
         };
         assert!(import(&root, &opts, "docker").is_err());
         assert!(!root.join("t").exists(), "no partial store entry");
-        assert!(!root.join(".staging-t").exists(), "staging cleaned up");
+        assert!(no_leftovers(&root), "staging cleaned up");
     }
 
     // 13
@@ -882,11 +949,142 @@ mod tests {
         };
         assert!(import(&root, &opts, fake.to_str().unwrap()).is_err());
         assert!(!root.join("bad").exists());
-        assert!(!root.join(".staging-bad").exists());
+        assert!(no_leftovers(&root));
         assert!(
             fs::read_to_string(&log)
                 .unwrap()
                 .contains("rm hisn-rootfs-bad")
         );
+    }
+
+    #[test]
+    fn manifest_symlink_in_the_archive_cannot_redirect_the_manifest_write() {
+        let d = tmp();
+        let root = d.path().join("store");
+        let sentinel = d.path().join("sentinel");
+        fs::write(&sentinel, b"untouched").unwrap();
+        let tarb = build(|b| {
+            let h = raw(
+                b"manifest.json",
+                tar::EntryType::Symlink,
+                0o777,
+                0,
+                Some(sentinel.to_str().unwrap().as_bytes()),
+            );
+            b.append(&h, io::empty()).unwrap();
+        });
+        let tf = d.path().join("in.tar");
+        fs::write(&tf, tarb).unwrap();
+        let opts = ImportOpts {
+            name: "m",
+            from_tar: Some(&tf),
+            from_image: None,
+            replace: false,
+        };
+        import(&root, &opts, "docker").unwrap();
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+        let md = fs::symlink_metadata(root.join("m/manifest.json")).unwrap();
+        assert!(
+            md.is_file(),
+            "manifest is a regular file, not the planted link"
+        );
+    }
+
+    #[test]
+    fn a_store_entry_that_looks_like_staging_is_never_deleted() {
+        let d = tmp();
+        let root = d.path().join("store");
+        fs::create_dir_all(root.join(".staging-x")).unwrap();
+        fs::write(root.join(".staging-x/keep"), b"k").unwrap();
+        let tf = d.path().join("in.tar");
+        fs::write(&tf, small_tar(b"1")).unwrap();
+        let opts = ImportOpts {
+            name: "x",
+            from_tar: Some(&tf),
+            from_image: None,
+            replace: false,
+        };
+        import(&root, &opts, "docker").unwrap();
+        assert_eq!(fs::read(root.join(".staging-x/keep")).unwrap(), b"k");
+    }
+
+    #[test]
+    fn restrictive_directory_modes_do_not_break_extraction_or_cleanup() {
+        let d = tmp();
+        let root = d.path().join("store");
+        let tarb = build(|b| {
+            b.append(
+                &raw(b"locked/", tar::EntryType::Directory, 0o000, 0, None),
+                io::empty(),
+            )
+            .unwrap();
+            file(b, b"locked/file", 0o644, b"x");
+            file(b, b"z", 0o644, b"z");
+        });
+        let tf = d.path().join("in.tar");
+        fs::write(&tf, &tarb).unwrap();
+        let opts = ImportOpts {
+            name: "l",
+            from_tar: Some(&tf),
+            from_image: None,
+            replace: false,
+        };
+        // Succeeds (mode applied after the walk) ...
+        import(&root, &opts, "docker").unwrap();
+        assert_eq!(
+            fs::metadata(root.join("l/locked"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0
+        );
+        // make it removable for tempdir cleanup
+        fs::set_permissions(root.join("l/locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        // ... and a truncated variant fails without leaving a staging dir.
+        let tf2 = d.path().join("cut.tar");
+        fs::write(&tf2, &tarb[..1024 + 100]).unwrap();
+        let opts2 = ImportOpts {
+            name: "l2",
+            from_tar: Some(&tf2),
+            from_image: None,
+            replace: false,
+        };
+        assert!(import(&root, &opts2, "docker").is_err());
+        assert!(no_leftovers(&root));
+    }
+
+    #[test]
+    fn extraction_target_must_be_a_fresh_real_directory() {
+        let d = tmp();
+        let real = d.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("pre"), b"x").unwrap();
+        assert!(
+            extract_tar(&real, &small_tar(b"1")[..]).is_err(),
+            "non-empty"
+        );
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(extract_tar(&link, &small_tar(b"1")[..]).is_err(), "symlink");
+    }
+
+    #[test]
+    fn option_like_image_references_are_refused_before_docker_runs() {
+        let d = tmp();
+        let root = d.path().join("store");
+        let log = d.path().join("calls.log");
+        let opts = ImportOpts {
+            name: "o",
+            from_tar: None,
+            from_image: Some("--env-file=/etc/passwd"),
+            replace: false,
+        };
+        let e = import(&root, &opts, "/nonexistent/docker")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("invalid image reference"), "{e}");
+        assert!(!log.exists());
+        assert!(no_leftovers(&root));
     }
 }

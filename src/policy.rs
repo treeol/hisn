@@ -456,6 +456,31 @@ impl Policy {
             &self.mounts.grantable_rw,
             runtime_roots,
         )?;
+        // A rootfs is the session's toolchain: it must not be reachable
+        // read-write through any other mount (cwd, rw, grantable_rw, home),
+        // or the session could rewrite the image later sessions run from.
+        if let Some(r) = &rootfs {
+            let home_dir = match &home {
+                Home::Path(h) => Some(h),
+                Home::Tmpfs => None,
+            };
+            for (what, w) in std::iter::once(("session.cwd", &cwd))
+                .chain(rw.iter().map(|x| ("mounts.rw", x)))
+                .chain(grantable_rw.iter().map(|x| ("mounts.grantable_rw", x)))
+                .chain(home_dir.map(|h| ("home", h)))
+            {
+                if r.starts_with(w) || w.starts_with(r) {
+                    return Err(invalid(
+                        "rootfs.path",
+                        format!(
+                            "{} overlaps the writable {what} {}; the session could modify its own toolchain",
+                            r.display(),
+                            w.display()
+                        ),
+                    ));
+                }
+            }
+        }
         // Masks may name paths that do not exist yet (then there is nothing to
         // hide): normalise lexically, apply R1/R2, never follow symlinks.
         let mut mask = Vec::new();
@@ -537,6 +562,34 @@ fn expand_tilde(raw: &str) -> String {
         return format!("{home}/{rest}");
     }
     raw.to_string()
+}
+
+/// Host trees no persist dir may live in.
+const HOME_REFUSE_TREES: [&str; 12] = [
+    "/etc", "/dev", "/proc", "/sys", "/usr", "/boot", "/bin", "/sbin", "/lib", "/lib64", "/opt",
+    "/nix",
+];
+/// Shared directories refused as the persist dir itself.
+const HOME_REFUSE_EXACT: [&str; 6] = ["/tmp", "/var", "/var/tmp", "/run", "/root", "/home"];
+
+/// hisn's per-user config and data directories (`$XDG_CONFIG_HOME/hisn`,
+/// `$XDG_DATA_HOME/hisn`, with the usual `$HOME` fallbacks).
+fn hisn_state_dirs() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let xdg = |var: &str, fallback: &str| {
+        std::env::var_os(var)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(fallback)))
+            .map(|d| d.join("hisn"))
+    };
+    [
+        xdg("XDG_CONFIG_HOME", ".config"),
+        xdg("XDG_DATA_HOME", ".local/share"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Resolve a `[home] persist` path (0.3.2).
@@ -623,6 +676,40 @@ fn resolve_home_persist_with(
             format!("{} is an ancestor of the session cwd", path.display()),
         ));
     }
+    // Refuse: fixed host trees. Subtrees of these are never a home; the
+    // shared roots below are refused only as the exact directory (a private
+    // child of /tmp is a normal place for a persist dir).
+    for tree in HOME_REFUSE_TREES {
+        if path.starts_with(tree) {
+            return Err(invalid(
+                "home.persist",
+                format!("{} is inside the host tree {tree}", path.display()),
+            ));
+        }
+    }
+    for dir in HOME_REFUSE_EXACT {
+        if path == Path::new(dir) {
+            return Err(invalid(
+                "home.persist",
+                format!("{dir} is a shared host directory, not a persist dir"),
+            ));
+        }
+    }
+    // Refuse: hisn's own config and data (profiles, rootfs store): a session
+    // that could write them would poison every later session.
+    for state in hisn_state_dirs() {
+        let state = fs::canonicalize(&state).unwrap_or(state);
+        if path.starts_with(&state) || state.starts_with(&path) {
+            return Err(invalid(
+                "home.persist",
+                format!(
+                    "{} overlaps hisn's own state directory {}",
+                    path.display(),
+                    state.display()
+                ),
+            ));
+        }
+    }
     // Refuse: overlaps a runtime root.
     check_forbidden(&path, runtime_roots).map_err(|r| invalid("home.persist", r))?;
     // Create the directory if missing (mode 0700, owned by the invoking user).
@@ -652,6 +739,17 @@ fn resolve_home_persist_with(
             "home.persist",
             format!("{} is a symlink; name the target instead", path.display()),
         ));
+    }
+    // The directory must belong to the invoking user (a pre-existing dir of
+    // someone else, e.g. in a sticky /tmp, is not ours to hand out).
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != rustix::process::geteuid().as_raw() {
+            return Err(invalid(
+                "home.persist",
+                format!("{} is not owned by the invoking user", path.display()),
+            ));
+        }
     }
     // Canonicalise the full path (now it exists).
     let canon = fs::canonicalize(&path)
@@ -1055,5 +1153,59 @@ scoped = ["bogus"]
         let pol = Policy::parse("version = \"hisn-policy/v1\"").unwrap();
         let err = pol.resolve(&cwd, &ov, &[]).unwrap_err().to_string();
         assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn home_persist_refuses_fixed_host_trees_and_shared_dirs() {
+        let d = tmp();
+        let cwd = d.path().join("cwd");
+        fs::create_dir(&cwd).unwrap();
+        for bad in [
+            "/etc", "/etc/ssh", "/dev", "/usr", "/opt", "/tmp", "/var", "/run",
+        ] {
+            if !Path::new(bad).exists() {
+                continue;
+            }
+            let r = resolve_home_persist_with(bad, &cwd, &[], None);
+            assert!(r.is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn home_persist_accepts_a_private_child_of_tmp_and_creates_it_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp();
+        let cwd = d.path().join("cwd");
+        fs::create_dir(&cwd).unwrap();
+        let p = d.path().join("persist");
+        let h = resolve_home_persist_with(p.to_str().unwrap(), &cwd, &[], None).unwrap();
+        assert!(matches!(h, Home::Path(_)));
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn rootfs_overlapping_a_writable_path_is_refused() {
+        let d = tmp();
+        let cwd = d.path().join("cwd");
+        let img = cwd.join("image");
+        fs::create_dir_all(img.join("etc")).unwrap();
+        let pol = Policy::parse("version = \"hisn-policy/v1\"").unwrap();
+        let ov = Overrides {
+            rootfs_path: Some(img.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let e = pol.resolve(&cwd, &ov, &[]).unwrap_err().to_string();
+        assert!(e.contains("overlaps the writable session.cwd"), "{e}");
+        // Outside the cwd it is accepted.
+        let img2 = d.path().join("image2");
+        fs::create_dir_all(img2.join("etc")).unwrap();
+        let ov2 = Overrides {
+            rootfs_path: Some(img2.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        assert!(pol.resolve(&cwd, &ov2, &[]).is_ok());
     }
 }

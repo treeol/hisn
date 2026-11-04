@@ -24,6 +24,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
@@ -264,11 +266,19 @@ fn filter_identities_response(response: &[u8], allowed: &[String]) -> Result<Vec
 /// Parse a `SIGN_REQUEST` to extract the key blob for fingerprinting.
 /// Request format (after type byte `SSH_AGENTC_SIGN_REQUEST`, 13):
 ///   string key_blob, string data, uint32 flags
+///
+/// The whole envelope is validated (blob, data, flags, no trailing bytes) so a
+/// request the proxy cannot fully parse is never forwarded.
 fn extract_sign_key_blob(payload: &[u8]) -> Option<Vec<u8>> {
     if payload.is_empty() {
         return None;
     }
-    let (blob, _) = parse_string(&payload[1..])?;
+    let (blob, rest) = parse_string(&payload[1..])?;
+    let (_data, rest) = parse_string(rest)?;
+    let (_flags, rest) = parse_u32(rest)?;
+    if !rest.is_empty() || blob.is_empty() {
+        return None;
+    }
     Some(blob.to_vec())
 }
 
@@ -313,12 +323,24 @@ fn handle_client(mut client: UnixStream, host_agent: &str, allowed: Vec<String>,
             let _ = write_msg(&mut client, &failure_msg());
             continue;
         }
+        if msg_type == SSH_AGENTC_REQUEST_IDENTITIES && payload.len() != 1 {
+            tracing::info!(
+                "ssh-agent proxy [{session_id}]: rejected REQUEST_IDENTITIES with a body"
+            );
+            let _ = write_msg(&mut client, &failure_msg());
+            continue;
+        }
         // SIGN_REQUEST: extract the key fingerprint for logging and
         // allowlist checking. Every forwarded SIGN_REQUEST is logged once
         // (fingerprint, session id) — allowlist or not.
-        if msg_type == SSH_AGENTC_SIGN_REQUEST
-            && let Some(blob) = extract_sign_key_blob(&payload)
-        {
+        if msg_type == SSH_AGENTC_SIGN_REQUEST {
+            let Some(blob) = extract_sign_key_blob(&payload) else {
+                tracing::info!(
+                    "ssh-agent proxy [{session_id}]: sign denied: malformed SIGN_REQUEST"
+                );
+                let _ = write_msg(&mut client, &failure_msg());
+                continue;
+            };
             let fp = ssh_fingerprint(&blob);
             if !allowed.is_empty() && !allowed.iter().any(|a| a == &fp) {
                 tracing::info!(
@@ -356,6 +378,11 @@ fn handle_client(mut client: UnixStream, host_agent: &str, allowed: Vec<String>,
     }
 }
 
+/// Concurrent proxy clients per session.
+const MAX_CLIENTS: usize = 32;
+/// A client that sends nothing for this long is disconnected.
+const CLIENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Bind the proxy listener socket at `socket_path` (mode 0600). Called
 /// before `unshare(NEWUSER)` — must not spawn threads.
 pub fn bind_proxy_socket(socket_path: &Path) -> Result<UnixListener> {
@@ -365,19 +392,22 @@ pub fn bind_proxy_socket(socket_path: &Path) -> Result<UnixListener> {
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
+    // SAFETY: umask is infallible; this runs before any thread exists.
     let old = unsafe { libc::umask(0o077) };
-    let listener = UnixListener::bind(socket_path)
-        .with_context(|| format!("ssh-agent: bind {socket_path:?}"))?;
+    let bound = UnixListener::bind(socket_path);
+    // SAFETY: restores the previous mask on every path, including failure.
     unsafe { libc::umask(old) };
+    let listener = bound.with_context(|| format!("ssh-agent: bind {socket_path:?}"))?;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).ok();
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("ssh-agent: chmod {socket_path:?}"))?;
     Ok(listener)
 }
 
 /// Start the accept loop on a bound listener. Spawns a thread that accepts
 /// connections and handles them with filtering. Called **after**
-/// `unshare(NEWUSER)` — the process is already multithreaded by this point
-/// (the init clone has forked).
+/// `unshare(NEWUSER)`: `unshare` fails with `EINVAL` in a multithreaded
+/// process, which is why the bind happens first and threads start only here.
 ///
 /// Returns the join handle (the thread lives for the duration of the
 /// session; the listener is moved into the thread).
@@ -387,14 +417,36 @@ pub fn spawn_accept_loop(
     allowed: Vec<String>,
     session_id: String,
 ) -> thread::JoinHandle<()> {
+    let active = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
         loop {
             match listener.accept() {
                 Ok((s, _)) => {
+                    // Cap concurrent clients: each pins a host-agent
+                    // connection and a thread. Over the cap: drop the client.
+                    if active.fetch_add(1, Ordering::SeqCst) >= MAX_CLIENTS {
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        tracing::warn!(
+                            "ssh-agent proxy [{session_id}]: client limit ({MAX_CLIENTS}) reached; dropping connection"
+                        );
+                        continue;
+                    }
+                    let _ = s.set_read_timeout(Some(CLIENT_IDLE_TIMEOUT));
                     let h = host_auth_sock.clone();
                     let a = allowed.clone();
                     let id = session_id.clone();
-                    thread::spawn(move || handle_client(s, &h, a, &id));
+                    let counter = Arc::clone(&active);
+                    // Builder::spawn returns Err instead of panicking when the
+                    // OS refuses a thread.
+                    let spawned = thread::Builder::new().spawn(move || {
+                        handle_client(s, &h, a, &id);
+                        counter.fetch_sub(1, Ordering::SeqCst);
+                    });
+                    if let Err(e) = spawned {
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        tracing::warn!("ssh-agent proxy [{session_id}]: cannot spawn worker: {e}");
+                        thread::sleep(std::time::Duration::from_millis(50));
+                    }
                 }
                 Err(e) => {
                     let kind = e.raw_os_error();
@@ -590,5 +642,35 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let result = read_msg(&mut cursor);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn sign_request_envelope_must_be_complete_and_exact() {
+        let s = |b: &[u8]| {
+            let mut v = (b.len() as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(b);
+            v
+        };
+        let mut ok = vec![SSH_AGENTC_SIGN_REQUEST];
+        ok.extend(s(b"blob"));
+        ok.extend(s(b"data"));
+        ok.extend(0u32.to_be_bytes());
+        assert_eq!(extract_sign_key_blob(&ok), Some(b"blob".to_vec()));
+        // trailing bytes
+        let mut trailing = ok.clone();
+        trailing.push(0);
+        assert_eq!(extract_sign_key_blob(&trailing), None);
+        // missing flags
+        assert_eq!(extract_sign_key_blob(&ok[..ok.len() - 4]), None);
+        // missing data
+        let mut nodata = vec![SSH_AGENTC_SIGN_REQUEST];
+        nodata.extend(s(b"blob"));
+        assert_eq!(extract_sign_key_blob(&nodata), None);
+        // empty blob
+        let mut empty = vec![SSH_AGENTC_SIGN_REQUEST];
+        empty.extend(s(b""));
+        empty.extend(s(b"data"));
+        empty.extend(0u32.to_be_bytes());
+        assert_eq!(extract_sign_key_blob(&empty), None);
     }
 }

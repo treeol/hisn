@@ -270,3 +270,70 @@ Items that are hardening for follow-up, not blocking for the tag:
    renumbered; every new invariant lands in the host leak run. Reason:
    the host leak run is the user's release gate.
 6. No tag, no push, no release.
+
+## Closing session — review round 1 (Mashūra) and what was done
+
+Review coverage (per commit group; see the session report for the delivery table):
+extractor — gpt-6-astra (round 1) + fable VOID twice, so one reader only;
+home/rootfs mount plan — fable only (gpt 429 twice); ssh proxy — both;
+leak tests — both. Round 1 was therefore NOT complete for groups 1 and 2.
+
+### Fixed in this session (BLOCKING)
+- Import: `manifest.json` planted as a symlink in the archive was followed by the
+  publish step. Now removed first and recreated with `O_NOFOLLOW|O_EXCL`.
+- Import: staging dir was a predictable `.staging-<name>` (a valid store name
+  could collide and be deleted). Now a unique `.staging-<name>-<pid>-<ns>`
+  created with `create_dir`; never reuses or deletes a directory it did not make.
+- Import: `--replace` is now rename-aside, rename-in, delete-old (old tree
+  restored if the rename fails); without `--replace` an existing entry is never
+  removed.
+- Import: directory modes are applied after the walk, so a mode-000 directory
+  neither fails the import nor blocks cleanup.
+- Import: `extract_tar` refuses a non-empty or symlinked target; `--from-image`
+  refuses option-like image references.
+- `[rootfs] name` that does not resolve failed open to the host toolchain while
+  the RISK line claimed otherwise. Now a hard error (`profile::rootfs_spec`,
+  shared by `profile validate` and session start); name+path together or neither
+  is an error.
+- `[home] persist` refuses `/etc /dev /proc /sys /usr /boot /bin /sbin /lib
+  /lib64 /opt /nix` subtrees, `/tmp /var /var/tmp /run /root /home` as the exact
+  dir, hisn's own config/data dirs, and a directory not owned by the invoking user.
+- A rootfs overlapping cwd / `mounts.rw` / `grantable_rw` / the persist dir is
+  refused (the session could rewrite its own toolchain).
+- Rootfs `/etc` that is a symlink (incl. dangling) is refused naming the path;
+  a symlinked rootfs `resolv.conf` is not followed.
+- ssh proxy: malformed SIGN_REQUEST (anything but string,string,u32, no trailing
+  bytes) and a REQUEST_IDENTITIES with a body are rejected locally, never
+  forwarded; client cap (32) and idle timeout (300 s); worker spawn failure no
+  longer panics; umask restored on bind failure; chmod error propagated.
+- Leak harness: probe failures (TIMEOUT/UNKNOWN_COMMAND/OK) no longer count as
+  "isolation holds" (`refused`); L43 flag globs replaced by member checks; L43 R2
+  uses a real host-only binary; L44 setuid check is bitwise; L45 uses separate
+  messages, a third key for the add attempt, and never touches an inherited agent;
+  L46 copies the rootfs with `cp -a` (no hardlinks, no chmod of the source).
+
+### Open points — not done
+- Source-path TOCTOU in the mount executor: rootfs/persist sources are opened by
+  path with `AT_SYMLINK_NOFOLLOW` on the final component only; a concurrent
+  same-user writer could swap an intermediate directory. Fix is an `O_PATH` root
+  fd + `openat2(RESOLVE_BENEATH|NO_SYMLINKS)`. The new overlap refusal removes the
+  realistic writer (the session itself).
+- Masks are probed against host paths even when a rootfs is set.
+- `$HOME` is read from the environment, not passwd (`HOME=/tmp` bypasses the
+  real-$HOME refusal); bind-mount aliases of $HOME/cwd are not detected.
+- persist vs `mounts.ro`/`mask` overlap is not refused.
+- `resolv.conf` with a rootfs and `network = "host"` comes from the image, not
+  the host.
+- Import has no entry/byte/extension-size caps; GNU/PAX extension bodies are
+  buffered by the `tar` crate; concurrent imports of one name are not locked.
+- Hard link that precedes its target in the archive is skipped (counted).
+- ssh proxy: certificates are fingerprinted over the whole blob (allowlist a
+  cert identity by that fingerprint, not `ssh-add -l`'s inner-key one); response
+  types for SIGN_REQUEST are not validated; extension messages (incl.
+  `session-bind@openssh.com`) are denied, so destination-constrained keys will
+  not sign; `keys = []` means all keys; no shutdown signal for the accept loop;
+  no integration test with a fake host agent.
+- CI does not provision a rootfs fixture, so L43/L46 (traps) are skip-allowed in
+  CI; they run only where `HISN_TEST_ROOTFS` is set.
+- Risk lines with `--profile` plus CLI overrides are computed from the profile.
+- ADR 0011 comment about "multithreaded" corrected in code; ADR text not re-read.

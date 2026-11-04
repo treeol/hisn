@@ -54,3 +54,9 @@ L17b: --prune removes a stale session dir
 L17b: dir without supervisor.pid is not pruned
 L17b: symlink in a stale dir
 L17b: run over a stale dir
+L42: R5 refuse
+L42: R3 read through symlink
+L44: traversal
+L44: symlink-then-write
+L46: dangling-symlink /etc
+L46: missing rootfs name

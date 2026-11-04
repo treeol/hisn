@@ -256,6 +256,22 @@ pub struct HomeConfig {
     pub persist: Option<String>,
 }
 
+/// Resolve a profile's `[rootfs]` to a path string, strictly: exactly one of
+/// `name` / `path`, and a name must resolve (the store entry is checked later
+/// by `existing_dir`). Used by both `profile validate` and session start so a
+/// missing rootfs can never silently fall back to the host toolchain.
+pub fn rootfs_spec(r: &RootfsConfig) -> Result<String> {
+    match (&r.name, &r.path) {
+        (Some(_), Some(_)) => bail!("[rootfs]: name and path are mutually exclusive"),
+        (None, None) => bail!("[rootfs]: one of name or path is required"),
+        (None, Some(p)) => Ok(p.clone()),
+        (Some(n), None) => Ok(crate::rootfs_store::resolve_name(n)
+            .with_context(|| format!("[rootfs] name {n:?}"))?
+            .to_string_lossy()
+            .into_owned()),
+    }
+}
+
 /// Rootfs config (`[rootfs]` table in a profile).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -914,15 +930,7 @@ pub fn validate(path: Option<&Path>) -> Result<ResolvedPolicy> {
     // Resolve [rootfs] name/path through the same code the session start
     // uses (supervisor::prepare). Overrides::default() sets rootfs_path =
     // None, so we must extract it from the profile and pass it explicitly.
-    let rootfs_path = profile.rootfs.as_ref().and_then(|r| {
-        r.path.clone().or_else(|| {
-            r.name.as_ref().and_then(|n| {
-                crate::rootfs_store::resolve_name(n)
-                    .ok()
-                    .map(|p| p.to_string_lossy().into_owned())
-            })
-        })
-    });
+    let rootfs_path = profile.rootfs.as_ref().map(rootfs_spec).transpose()?;
     let home_persist = profile.home.as_ref().and_then(|h| h.persist.clone());
     let overrides = Overrides {
         home_persist,

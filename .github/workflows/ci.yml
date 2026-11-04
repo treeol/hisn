@@ -181,7 +181,9 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           # Expected skips: L12 (needs write access to /etc), L23/L24 on
-          # Landlock ABI < 6, and L29 when Docker is not installed/running.
+          # Landlock ABI < 6, L29 when Docker is not installed/running,
+          # L43/L46 when HISN_TEST_ROOTFS is not set, and L45 when ssh-agent
+          # or ssh-add is not installed.
           # Anything else is annotated so it is not missed.
-          grep -E '^SKIP  ' "$log" | grep -Ev '^SKIP  (L12 |L2[34] .*ABI < 6|L29 .*not (installed|running))' \
+          grep -E '^SKIP  ' "$log" | grep -Ev '^SKIP  (L12 |L2[34] .*ABI < 6|L29 .*not (installed|running)|L43 .*HISN_TEST_ROOTFS|L45 .*(ssh|not found|not start)|L46 .*HISN_TEST_ROOTFS)' \
             | while IFS= read -r l; do echo "::warning::unexpected SKIP: $l"; done || true

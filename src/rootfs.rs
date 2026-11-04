@@ -370,7 +370,12 @@ pub fn execute(plan: &[MountOp], new_root: &Path) -> Result<()> {
                 }
                 .with_context(ctx)?;
                 let ro = matches!(op.kind, MountKind::BindRo { .. });
-                bind_onto(src, &t, *recursive, ro, sys::MOUNT_ATTR_NOSUID).with_context(ctx)?;
+                let extra = if op.nodev {
+                    sys::MOUNT_ATTR_NOSUID | sys::MOUNT_ATTR_NODEV
+                } else {
+                    sys::MOUNT_ATTR_NOSUID
+                };
+                bind_onto(src, &t, *recursive, ro, extra).with_context(ctx)?;
             }
             MountKind::BindDevice => {
                 let src = op

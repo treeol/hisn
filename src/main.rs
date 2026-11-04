@@ -5,10 +5,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{Value, json};
 
-use hisn::cli::{Cli, Command, PolicyCommand, ProfileCommand};
+use hisn::cli::{Cli, Command, PolicyCommand, ProfileCommand, RootfsCommand};
 use hisn::policy::{self, Overrides, Policy};
 use hisn::profile;
-use hisn::{execcli, mounts, session, supervisor};
+use hisn::{execcli, mounts, rootfs_store, session, supervisor};
 
 /// Exit code for hisn-internal errors (policy, host); distinct from a
 /// command's own exit status.
@@ -155,6 +155,27 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Ls(a) => ls(a.session.as_deref(), a.json, a.prune),
+        Command::Rootfs { command } => match command {
+            RootfsCommand::Import(args) => rootfs_import(args),
+            RootfsCommand::List => {
+                let names = rootfs_store::list()?;
+                for n in names {
+                    println!("{n}");
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            RootfsCommand::Path { name } => {
+                let p = rootfs_store::path_of(&name)?
+                    .ok_or_else(|| anyhow::anyhow!("rootfs {name:?} does not exist"))?;
+                println!("{}", p.display());
+                Ok(ExitCode::SUCCESS)
+            }
+            RootfsCommand::Rm { name } => {
+                rootfs_store::remove(&name)?;
+                eprintln!("removed rootfs {name}");
+                Ok(ExitCode::SUCCESS)
+            }
+        },
     }
 }
 
@@ -265,4 +286,280 @@ fn read_session_policy(path: &Path) -> Option<Value> {
     // Convert the TOML table to a serde_json::Value (toml::Value -> JSON).
     let json_str = serde_json::to_string(&toml_val).ok()?;
     serde_json::from_str(&json_str).ok()
+}
+
+/// `hisn rootfs import`: import a rootfs from a tar archive or Docker image.
+fn rootfs_import(args: hisn::cli::ImportArgs) -> Result<ExitCode> {
+    use std::io::Read;
+    use std::process::Command;
+
+    if !hisn::rootfs_store::is_valid_name(&args.name) {
+        anyhow::bail!("invalid rootfs name {:?}", args.name);
+    }
+    let store_path = hisn::rootfs_store::resolve_name(&args.name)?;
+    if store_path.exists() && !args.replace {
+        anyhow::bail!(
+            "rootfs {} already exists (use --replace to overwrite)",
+            args.name
+        );
+    }
+    if args.replace && store_path.exists() {
+        hisn::rootfs_store::remove(&args.name)?;
+    }
+    // Staging directory.
+    let staging = store_path.with_extension("staging");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    std::fs::create_dir_all(&staging)?;
+    // Get the tar input.
+    let (tar_data, source_label) = match (&args.from_tar, &args.from_image) {
+        (Some(path), None) if path == &PathBuf::from("-") => {
+            let mut buf = Vec::new();
+            std::io::stdin().read_to_end(&mut buf)?;
+            (buf, "stdin".to_string())
+        }
+        (Some(path), None) => {
+            let buf =
+                std::fs::read(path).with_context(|| format!("reading tar {}", path.display()))?;
+            (buf, format!("file:{}", path.display()))
+        }
+        (None, Some(image)) => {
+            // docker create + export + rm.
+            if !Command::new("docker").arg("--version").output().is_ok() {
+                anyhow::bail!("docker CLI not found (required for --from-image)");
+            }
+            let create_out = Command::new("docker")
+                .args(["create", "--name", &format!("hisn-rootfs-{}", args.name)])
+                .arg(image)
+                .output()
+                .context("docker create")?;
+            if !create_out.status.success() {
+                anyhow::bail!(
+                    "docker create failed: {}",
+                    String::from_utf8_lossy(&create_out.stderr)
+                );
+            }
+            let export_out = Command::new("docker")
+                .args(["export", &format!("hisn-rootfs-{}", args.name)])
+                .output()
+                .context("docker export")?;
+            // Always rm the container.
+            let _ = Command::new("docker")
+                .args(["rm", &format!("hisn-rootfs-{}", args.name)])
+                .output();
+            if !export_out.status.success() {
+                anyhow::bail!(
+                    "docker export failed: {}",
+                    String::from_utf8_lossy(&export_out.stderr)
+                );
+            }
+            (export_out.stdout, format!("docker:{}", image))
+        }
+        _ => {
+            anyhow::bail!("--from-tar or --from-image is required");
+        }
+    };
+    // Compute sha256 of the tar.
+    let sha = {
+        let mut child = Command::new("sha256sum")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(&tar_data)?;
+        }
+        let out = child.wait_with_output()?;
+        let line = String::from_utf8_lossy(&out.stdout);
+        line.split_whitespace()
+            .next()
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    // Extract the tar into the staging directory.
+    let (files, skipped, size_bytes) = extract_tar(&staging, &tar_data)?;
+    // Write the manifest.
+    let manifest = hisn::rootfs_store::Manifest {
+        name: args.name.clone(),
+        source: source_label,
+        source_digest: None,
+        import_timestamp: hisn::session::rfc3339_now(),
+        hisn_version: env!("CARGO_PKG_VERSION").to_string(),
+        sha256: Some(sha),
+        files,
+        skipped,
+        size_bytes,
+    };
+    let manifest_json = serde_json::to_string_pretty(&manifest)?;
+    std::fs::write(staging.join("manifest.json"), manifest_json)?;
+    // Atomic rename to the final name.
+    std::fs::rename(&staging, &store_path)?;
+    eprintln!(
+        "imported rootfs {} ({} files, {} skipped, {} bytes)",
+        args.name, files, skipped, size_bytes
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Extract a tar archive into `dest` with hardening (0.3.2).
+/// Returns (files, skipped, size_bytes).
+fn extract_tar(dest: &Path, tar_data: &[u8]) -> Result<(u64, u64, u64)> {
+    use std::io::{Cursor, Read};
+    use std::os::unix::fs::PermissionsExt;
+
+    // Parse the tar manually for hardening.
+    let mut cursor = Cursor::new(tar_data);
+    let mut files: u64 = 0;
+    let mut skipped: u64 = 0;
+    let mut size_bytes: u64 = 0;
+    let mut buf = [0u8; 512];
+    loop {
+        // Read a 512-byte header.
+        let n = cursor.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if n < 512 {
+            anyhow::bail!("truncated tar header (read {} of 512 bytes)", n);
+        }
+        // Check for end-of-archive (two zero blocks).
+        if buf.iter().all(|&b| b == 0) {
+            // Check the next block too.
+            let mut next = [0u8; 512];
+            let n2 = cursor.read(&mut next)?;
+            if n2 == 0 || next.iter().all(|&b| b == 0) {
+                break;
+            }
+            // Not a double-zero; continue with the next block as the header.
+            buf = next;
+        }
+        // Parse the header.
+        let name = parse_tar_string(&buf[0..100]);
+        if name.is_empty() {
+            // Skip empty name entries.
+            continue;
+        }
+        let mode = parse_tar_octal(&buf[100..108]);
+        let size = parse_tar_octal(&buf[124..136]);
+        let typeflag = buf[156];
+        // Resolve the path: reject absolute, .., etc.
+        let rel = normalize_tar_path(&name);
+        if rel.is_empty() {
+            skipped += 1;
+            // Skip the data blocks.
+            let data_blocks = size.div_ceil(512);
+            cursor.set_position(cursor.position() + data_blocks * 512);
+            continue;
+        }
+        let target = dest.join(&rel);
+        // Reject if the path escapes the dest directory.
+        if !target.starts_with(dest) {
+            skipped += 1;
+            let data_blocks = size.div_ceil(512);
+            cursor.set_position(cursor.position() + data_blocks * 512);
+            continue;
+        }
+        // Read the data.
+        let mut data = vec![0u8; size as usize];
+        cursor.read_exact(&mut data)?;
+        // Skip padding.
+        let pad = (512 - (size % 512)) % 512;
+        if pad > 0 {
+            let mut pad_buf = vec![0u8; pad as usize];
+            cursor.read_exact(&mut pad_buf)?;
+        }
+        match typeflag {
+            b'0' | 0 => {
+                // Regular file. Strip setuid/setgid bits.
+                let mode = mode & !0o6000;
+                // Create parent directories.
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&target, &data)?;
+                std::fs::set_permissions(
+                    &target,
+                    std::fs::Permissions::from_mode((mode & 0o777) as u32),
+                )?;
+                files += 1;
+                size_bytes += size;
+            }
+            b'5' => {
+                // Directory.
+                let mode = mode & !0o6000;
+                std::fs::create_dir_all(&target)?;
+                std::fs::set_permissions(
+                    &target,
+                    std::fs::Permissions::from_mode((mode & 0o777) as u32),
+                )?;
+                files += 1;
+            }
+            b'2' => {
+                // Symlink. Store as-is.
+                let link_target = parse_tar_string(&buf[157..257]);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::os::unix::fs::symlink(&link_target, &target)?;
+                files += 1;
+            }
+            b'1' => {
+                // Hard link. Reject if the target is outside dest.
+                let link_target = parse_tar_string(&buf[157..257]);
+                let lt = dest.join(normalize_tar_path(&link_target));
+                if !lt.starts_with(dest) {
+                    skipped += 1;
+                    continue;
+                }
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                // Create a hard link. This may fail if the target doesn't exist yet.
+                let _ = std::fs::hard_link(&lt, &target);
+                files += 1;
+            }
+            b'3' | b'4' | b'6' => {
+                // Device nodes or fifo: skip and count.
+                skipped += 1;
+            }
+            _ => {
+                // Unknown type: skip and count.
+                skipped += 1;
+            }
+        }
+    }
+    Ok((files, skipped, size_bytes))
+}
+
+/// Parse a null-terminated string from a tar header field.
+fn parse_tar_string(buf: &[u8]) -> String {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// Parse an octal number from a tar header field (null-terminated, space-padded).
+fn parse_tar_octal(buf: &[u8]) -> u64 {
+    let s = parse_tar_string(buf);
+    u64::from_str_radix(s.trim(), 8).unwrap_or(0)
+}
+
+/// Normalize a tar member path: strip leading '/', reject '..'.
+fn normalize_tar_path(name: &str) -> String {
+    let mut out = String::new();
+    let stripped = name.strip_prefix('/').unwrap_or(name);
+    for part in stripped.split('/') {
+        if part == ".." {
+            return String::new(); // signal rejection
+        }
+        if part == "." || part.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(part);
+    }
+    out
 }

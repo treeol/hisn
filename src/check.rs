@@ -6,9 +6,11 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+
+use crate::rootfs_store;
 
 /// Minimum kernel for open_tree/move_mount/mount_setattr (5.2 for the
 /// syscalls, 5.12 for idmapped-mount attrs we rely on in the brief).
@@ -559,6 +561,20 @@ fn check_misc() -> Vec<Item> {
         } else {
             "not mounted (limits via setrlimit only)"
         },
+    ));
+    // 0.3.2: rootfs store path and names present.
+    let store = rootfs_store::store_root().unwrap_or_else(|_| PathBuf::from("(unknown)"));
+    let names = rootfs_store::list().unwrap_or_default();
+    v.push(item(
+        "rootfs store",
+        false,
+        Status::Ok,
+        format!(
+            "{} ({} rootfs: {})",
+            store.display(),
+            names.len(),
+            names.join(", ")
+        ),
     ));
     v
 }

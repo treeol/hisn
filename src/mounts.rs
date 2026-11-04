@@ -64,16 +64,44 @@ pub struct HostFacts {
 }
 
 impl HostFacts {
-    /// Snapshot the real host. Impure; everything else in this module is pure.
+    /// Snapshot the real host, or the rootfs if set. Impure; everything else
+    /// in this module is pure. When `rootfs` is set, toolchain dirs and /etc
+    /// entries are probed from `<rootfs>/usr`, `<rootfs>/etc`, etc.
     pub fn probe(policy: &ResolvedPolicy, uid: u32, gid: u32, username: &str) -> Self {
+        let rootfs = policy.rootfs.as_deref();
         let mut toolchain = BTreeMap::new();
         for d in TOOLCHAIN_DIRS.iter().chain(std::iter::once(&NIX_DIR)) {
-            if let Some(k) = EntryKind::of(Path::new(d)) {
+            let host_path = Path::new(d);
+            let probe_path = match rootfs {
+                Some(r) => {
+                    let rel = d.strip_prefix('/').unwrap_or(d);
+                    r.join(rel)
+                }
+                None => host_path.to_path_buf(),
+            };
+            if let Some(k) = EntryKind::of(&probe_path) {
+                // For rootfs: store the source path (rootfs/<dir>) and the
+                // sandbox target path (/usr). The bind op uses the source path.
+                let source = if rootfs.is_some() {
+                    probe_path
+                } else {
+                    host_path.to_path_buf()
+                };
                 toolchain.insert(PathBuf::from(d), k);
+                // Stash the source path in the toolchain map value? No — the
+                // toolchain map is keyed by the sandbox target path. The bind
+                // op in plan() uses `bind(path, ...)` which uses `path` as
+                // both source and target. For rootfs, we need a separate source.
+                // We'll handle this in plan() by checking policy.rootfs.
+                let _ = source; // used in plan()
             }
         }
         let mut etc = BTreeMap::new();
-        if let Ok(rd) = fs::read_dir("/etc") {
+        let etc_path = match rootfs {
+            Some(r) => r.join("etc"),
+            None => PathBuf::from("/etc"),
+        };
+        if let Ok(rd) = fs::read_dir(&etc_path) {
             for e in rd.flatten() {
                 if let (Some(name), Some(k)) = (
                     e.file_name().to_str().map(str::to_owned),
@@ -89,12 +117,24 @@ impl HostFacts {
             .filter_map(|m| EntryKind::of(m).map(|k| (m.clone(), k)))
             .collect();
         let resolv_conf = (policy.network == crate::policy::Network::Host)
-            .then(|| fs::read_to_string("/etc/resolv.conf").ok())
+            .then(|| {
+                let rc_path = match rootfs {
+                    Some(r) => r.join("etc").join("resolv.conf"),
+                    None => PathBuf::from("/etc/resolv.conf"),
+                };
+                fs::read_to_string(&rc_path).ok()
+            })
             .flatten();
         Self {
             toolchain,
             etc,
-            ssl_private: Path::new("/etc/ssl/private").is_dir(),
+            ssl_private: {
+                let ssl_path = match rootfs {
+                    Some(r) => r.join("etc").join("ssl").join("private"),
+                    None => PathBuf::from("/etc/ssl/private"),
+                };
+                ssl_path.is_dir()
+            },
             masks,
             uid,
             gid,
@@ -148,6 +188,9 @@ pub struct MountOp {
     pub target: PathBuf,
     pub source: Option<PathBuf>,
     pub kind: MountKind,
+    /// 0.3.2: mount with MOUNT_ATTR_NODEV in addition to MOUNT_ATTR_NOSUID.
+    /// Used for rootfs binds.
+    pub nodev: bool,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -189,6 +232,16 @@ fn op(target: impl Into<PathBuf>, source: Option<PathBuf>, kind: MountKind) -> M
         target: target.into(),
         source,
         kind,
+        nodev: false,
+    }
+}
+
+fn op_nodev(target: impl Into<PathBuf>, source: Option<PathBuf>, kind: MountKind) -> MountOp {
+    MountOp {
+        target: target.into(),
+        source,
+        kind,
+        nodev: true,
     }
 }
 
@@ -199,6 +252,18 @@ fn bind(p: &Path, kind_is_rw: bool, recursive: bool) -> MountOp {
         MountKind::BindRo { recursive }
     };
     op(p, Some(p.to_path_buf()), kind)
+}
+
+/// Bind `src` to `target` (ro, recursive) with nodev. Used for rootfs
+/// toolchain binds where the source path differs from the sandbox target
+/// path.
+fn bind_src(src: &Path, target: &Path, kind_is_rw: bool, recursive: bool) -> MountOp {
+    let kind = if kind_is_rw {
+        MountKind::BindRw { recursive }
+    } else {
+        MountKind::BindRo { recursive }
+    };
+    op_nodev(target, Some(src.to_path_buf()), kind)
 }
 
 fn passwd_stub(f: &HostFacts, home: &str) -> String {
@@ -237,8 +302,17 @@ pub fn plan(
     }
 
     // 1. Toolchain: ro, recursive; symlinked entries (e.g. /bin -> usr/bin)
-    //    are recreated as symlinks, never followed.
+    //    are recreated as symlinks, never followed. When a rootfs is set,
+    //    the source is `<rootfs>/<dir>` and the target is `/<dir>`.
+    let rootfs = policy.rootfs.as_deref();
     for (path, kind) in &facts.toolchain {
+        let src = match rootfs {
+            Some(r) => {
+                let rel = path.strip_prefix("/").unwrap_or(path);
+                r.join(rel)
+            }
+            None => path.clone(),
+        };
         match kind {
             EntryKind::Symlink(t) => ops.push(op(
                 path,
@@ -247,7 +321,13 @@ pub fn plan(
                     link_target: t.clone(),
                 },
             )),
-            _ => ops.push(bind(path, false, true)),
+            _ => {
+                if rootfs.is_some() {
+                    ops.push(bind_src(&src, path, false, true));
+                } else {
+                    ops.push(bind(path, false, true));
+                }
+            }
         }
     }
 
@@ -266,6 +346,10 @@ pub fn plan(
             continue;
         }
         let p = Path::new("/etc").join(name);
+        let src = match rootfs {
+            Some(r) => r.join("etc").join(name),
+            None => p.clone(),
+        };
         match kind {
             EntryKind::Symlink(t) => ops.push(op(
                 p,
@@ -274,7 +358,13 @@ pub fn plan(
                     link_target: t.clone(),
                 },
             )),
-            _ => ops.push(bind(&p, false, true)),
+            _ => {
+                if rootfs.is_some() {
+                    ops.push(bind_src(&src, &p, false, true));
+                } else {
+                    ops.push(bind(&p, false, true));
+                }
+            }
         }
     }
     let home_str = match &policy.home {

@@ -641,6 +641,32 @@ pub fn compute_risks(profile: &Profile) -> Vec<RiskEntry> {
             label: RiskLabel::RootEquivalent,
         });
     }
+    // 0.3.2: [home] persist → medium (state carries across sessions).
+    if let Some(h) = &profile.home
+        && h.persist.is_some()
+    {
+        entries.push(RiskEntry {
+            capability: "home-persist".into(),
+            label: RiskLabel::Data,
+        });
+    }
+    // 0.3.2: [rootfs] → low (trust in the image replaces trust in the host
+    // toolchain; it reduces host exposure).
+    if profile.rootfs.is_some() {
+        entries.push(RiskEntry {
+            capability: "rootfs".into(),
+            label: RiskLabel::Data,
+        });
+    }
+    // 0.3.2: [ssh] agent → signing (the session can sign with the listed keys).
+    if let Some(s) = &profile.ssh
+        && s.agent
+    {
+        entries.push(RiskEntry {
+            capability: "ssh-agent".into(),
+            label: RiskLabel::Signing,
+        });
+    }
     entries
 }
 

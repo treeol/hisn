@@ -47,6 +47,38 @@ pub enum Command {
         #[command(subcommand)]
         command: ProfileCommand,
     },
+    /// Rootfs store management (0.3.2).
+    Rootfs {
+        #[command(subcommand)]
+        command: RootfsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RootfsCommand {
+    /// Import a rootfs from a tar archive or Docker image.
+    Import(ImportArgs),
+    /// List rootfs images in the store.
+    List,
+    /// Print the path of a named rootfs.
+    Path { name: String },
+    /// Remove a rootfs from the store.
+    Rm { name: String },
+}
+
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    /// Rootfs store name (validated: [A-Za-z0-9._-]{1,64}).
+    pub name: String,
+    /// Import from a tar archive (file or - for stdin).
+    #[arg(long)]
+    pub from_tar: Option<PathBuf>,
+    /// Import from a Docker image (execs docker create + export + rm).
+    #[arg(long)]
+    pub from_image: Option<String>,
+    /// Overwrite an existing rootfs with the same name.
+    #[arg(long)]
+    pub replace: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

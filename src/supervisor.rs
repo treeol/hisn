@@ -1106,8 +1106,11 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
             .map_err(anyhow::Error::msg)?;
     }
 
-    // Compute risk labels from the profile's capabilities (DESIGN §16).
-    // In 0.3a Feature 1 (no 0.3 surface), the risk is always `none`.
+    // Compute risk labels from the effective configuration (profile + CLI
+    // overrides). When --profile is given, compute from the profile (which
+    // already carries [home], [rootfs], [ssh]). When --home-persist or
+    // --rootfs-path are given without a profile, build a synthetic Profile
+    // from the CLI overrides so the RISK line is still printed.
     let risk_entries = if args.profile.is_some() {
         let prof = match &args.profile {
             Some(spec) => {
@@ -1117,6 +1120,26 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
             None => unreachable!("profile is Some"),
         };
         profile::compute_risks(&prof)
+    } else if args.home_persist.is_some() || args.rootfs_path.is_some() {
+        // Build a synthetic profile from the CLI overrides so the RISK
+        // line is printed even without --profile.
+        let synth = ProfileDoc {
+            version: profile::PROFILE_VERSION.to_string(),
+            policy: Policy::default(),
+            home: args.home_persist.as_ref().map(|p| profile::HomeConfig {
+                persist: Some(p.clone()),
+            }),
+            rootfs: args.rootfs_path.as_ref().map(|p| profile::RootfsConfig {
+                name: None,
+                path: Some(p.to_string_lossy().into_owned()),
+            }),
+            ssh: None,
+            services: Vec::new(),
+            forwards: Vec::new(),
+            host_services: Vec::new(),
+            docker: None,
+        };
+        profile::compute_risks(&synth)
     } else {
         Vec::new()
     };

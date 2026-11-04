@@ -561,6 +561,7 @@ pub fn check_profile_trust(
 #[serde(rename_all = "kebab-case")]
 pub enum RiskLabel {
     None,
+    Trust,
     Data,
     Signing,
     HostExec,
@@ -571,13 +572,17 @@ pub enum RiskLabel {
 impl RiskLabel {
     /// The label requires a matching `risk_ack` (DESIGN §16).
     pub fn requires_ack(self) -> bool {
-        matches!(self, Self::RootEquivalent | Self::Signing | Self::HostExec)
+        matches!(
+            self,
+            Self::RootEquivalent | Self::Signing | Self::HostExec | Self::Trust
+        )
     }
 
     /// One-sentence explanation (for `hisn profile explain`).
     pub fn explain(self) -> &'static str {
         match self {
             Self::None => "no widening; the 0.2 sandbox",
+            Self::Trust => "the sandbox trusts an external source instead of the host",
             Self::Data => "the sandbox can read or write host data beyond cwd",
             Self::Signing => "the sandbox can produce a cryptographic signature valid on the host",
             Self::HostExec => "the sandbox can run arbitrary commands on the host as the user",
@@ -594,6 +599,10 @@ impl RiskLabel {
 pub struct RiskEntry {
     pub capability: String,
     pub label: RiskLabel,
+    /// Human-readable description of the risk (shown in `profile explain`
+    /// and the RISK line). Empty for `None`-labelled capabilities.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 /// Compute the risk labels for a profile's capabilities (DESIGN §16).
@@ -608,6 +617,7 @@ pub fn compute_risks(profile: &Profile) -> Vec<RiskEntry> {
         entries.push(RiskEntry {
             capability: format!("service:{}", s.name),
             label: RiskLabel::None,
+            description: String::new(),
         });
     }
     for f in &profile.forwards {
@@ -615,6 +625,7 @@ pub fn compute_risks(profile: &Profile) -> Vec<RiskEntry> {
         entries.push(RiskEntry {
             capability: format!("forward:{}", f.name),
             label,
+            description: label.explain().to_string(),
         });
     }
     for h in &profile.host_services {
@@ -630,6 +641,7 @@ pub fn compute_risks(profile: &Profile) -> Vec<RiskEntry> {
         entries.push(RiskEntry {
             capability: format!("host_service:{}", h.name),
             label,
+            description: label.explain().to_string(),
         });
     }
     // [docker] tier (§18): socket → root-equivalent.
@@ -639,32 +651,66 @@ pub fn compute_risks(profile: &Profile) -> Vec<RiskEntry> {
         entries.push(RiskEntry {
             capability: "docker:socket".into(),
             label: RiskLabel::RootEquivalent,
+            description: RiskLabel::RootEquivalent.explain().to_string(),
         });
     }
-    // 0.3.2: [home] persist → medium (state carries across sessions).
+    // 0.3.2: [home] persist → Data (state carries across sessions).
     if let Some(h) = &profile.home
-        && h.persist.is_some()
+        && let Some(ref p) = h.persist
     {
         entries.push(RiskEntry {
             capability: "home-persist".into(),
             label: RiskLabel::Data,
+            description: format!(
+                "state persists across sessions in {p}; a session can read and poison \
+                 caches used by later sessions sharing this directory"
+            ),
         });
     }
-    // 0.3.2: [rootfs] → low (trust in the image replaces trust in the host
-    // toolchain; it reduces host exposure).
-    if profile.rootfs.is_some() {
+    // 0.3.2: [rootfs] → Trust (the toolchain comes from the imported image
+    // instead of the host; host /usr, /opt and /nix are not visible — you
+    // trust the image, not the host install).
+    if let Some(r) = &profile.rootfs {
+        let label_desc = if let Some(ref n) = r.name {
+            format!(
+                "the toolchain comes from the imported image '{n}' instead of the host; \
+                 host /usr, /opt and /nix are not visible — you trust the image, not the host install"
+            )
+        } else if let Some(ref p) = r.path {
+            format!(
+                "the toolchain comes from the imported image '{p}' instead of the host; \
+                 host /usr, /opt and /nix are not visible — you trust the image, not the host install"
+            )
+        } else {
+            "the toolchain comes from the imported image instead of the host; \
+             host /usr, /opt and /nix are not visible — you trust the image, not the host install"
+                .to_string()
+        };
         entries.push(RiskEntry {
             capability: "rootfs".into(),
-            label: RiskLabel::Data,
+            label: RiskLabel::Trust,
+            description: label_desc,
         });
     }
-    // 0.3.2: [ssh] agent → signing (the session can sign with the listed keys).
+    // 0.3.2: [ssh] agent → Signing (the session can sign with the listed keys).
     if let Some(s) = &profile.ssh
         && s.agent
     {
+        let n_keys = s.keys.len();
+        let desc = if n_keys > 0 {
+            format!(
+                "the session can sign and authenticate with {n_keys} listed keys for its lifetime; \
+                 it cannot add, remove or extract keys"
+            )
+        } else {
+            "the session can sign and authenticate with all keys the host agent offers \
+             for its lifetime; it cannot add, remove or extract keys"
+                .to_string()
+        };
         entries.push(RiskEntry {
             capability: "ssh-agent".into(),
             label: RiskLabel::Signing,
+            description: desc,
         });
     }
     entries
@@ -690,6 +736,7 @@ fn forward_label(socket: &str, explicit: Option<&str>) -> RiskLabel {
     // host-exec). If no `risk` is set, this is a load error — return a
     // sentinel that the caller checks.
     match explicit {
+        Some("trust") => RiskLabel::Trust,
         Some("data") => RiskLabel::Data,
         Some("signing") => RiskLabel::Signing,
         Some("host-exec") => RiskLabel::HostExec,
@@ -733,12 +780,23 @@ pub fn highest_risk(entries: &[RiskEntry]) -> RiskLabel {
 }
 
 /// Format the RISK lines for `hisn run` output (one per widening capability).
-/// Format: `RISK: <label> — <capability>` (DESIGN §16).
+/// Format: `RISK: <label> — <capability> — <description>` (DESIGN §16).
 pub fn format_risk_lines(entries: &[RiskEntry]) -> Vec<String> {
     entries
         .iter()
         .filter(|e| e.label != RiskLabel::None)
-        .map(|e| format!("RISK: {} — {}", e.label.kebab(), e.capability))
+        .map(|e| {
+            if e.description.is_empty() {
+                format!("RISK: {} — {}", e.label.kebab(), e.capability)
+            } else {
+                format!(
+                    "RISK: {} — {} — {}",
+                    e.label.kebab(),
+                    e.capability,
+                    e.description
+                )
+            }
+        })
         .collect()
 }
 
@@ -747,6 +805,7 @@ impl RiskLabel {
     pub fn kebab(self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::Trust => "trust",
             Self::Data => "data",
             Self::Signing => "signing",
             Self::HostExec => "host-exec",
@@ -804,6 +863,7 @@ pub fn explain(spec: Option<&str>) -> Result<Value> {
             json!({
                 "capability": r.capability,
                 "label": r.label.kebab(),
+                "description": r.description,
             })
         })
         .collect();
@@ -851,7 +911,25 @@ pub fn validate(path: Option<&Path>) -> Result<ResolvedPolicy> {
     let uid = rustix::process::getuid().as_raw();
     let roots =
         crate::session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
-    let resolved = profile.resolve(base, &Overrides::default(), &roots)?;
+    // Resolve [rootfs] name/path through the same code the session start
+    // uses (supervisor::prepare). Overrides::default() sets rootfs_path =
+    // None, so we must extract it from the profile and pass it explicitly.
+    let rootfs_path = profile.rootfs.as_ref().and_then(|r| {
+        r.path.clone().or_else(|| {
+            r.name.as_ref().and_then(|n| {
+                crate::rootfs_store::resolve_name(n)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
+        })
+    });
+    let home_persist = profile.home.as_ref().and_then(|h| h.persist.clone());
+    let overrides = Overrides {
+        home_persist,
+        rootfs_path,
+        ..Default::default()
+    };
+    let resolved = profile.resolve(base, &overrides, &roots)?;
     Ok(resolved)
 }
 
@@ -1111,10 +1189,12 @@ version = "hisn-policy/v2"
             RiskEntry {
                 capability: "docker-socket".into(),
                 label: RiskLabel::RootEquivalent,
+                description: String::new(),
             },
             RiskEntry {
                 capability: "ssh-agent".into(),
                 label: RiskLabel::Signing,
+                description: String::new(),
             },
         ];
         let lines = format_risk_lines(&entries);
@@ -1126,6 +1206,7 @@ version = "hisn-policy/v2"
         let none_entries = vec![RiskEntry {
             capability: "base".into(),
             label: RiskLabel::None,
+            description: String::new(),
         }];
         assert!(format_risk_lines(&none_entries).is_empty());
     }
@@ -1136,10 +1217,12 @@ version = "hisn-policy/v2"
             RiskEntry {
                 capability: "data".into(),
                 label: RiskLabel::Data,
+                description: String::new(),
             },
             RiskEntry {
                 capability: "docker".into(),
                 label: RiskLabel::RootEquivalent,
+                description: String::new(),
             },
         ];
         assert_eq!(highest_risk(&entries), RiskLabel::RootEquivalent);

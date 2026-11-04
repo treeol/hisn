@@ -313,15 +313,16 @@ fn handle_client(mut client: UnixStream, host_agent: &str, allowed: Vec<String>,
             let _ = write_msg(&mut client, &failure_msg());
             continue;
         }
-        // SIGN_REQUEST: check the key is in the allowlist.
+        // SIGN_REQUEST: extract the key fingerprint for logging and
+        // allowlist checking. Every forwarded SIGN_REQUEST is logged once
+        // (fingerprint, session id) — allowlist or not.
         if msg_type == SSH_AGENTC_SIGN_REQUEST
-            && !allowed.is_empty()
             && let Some(blob) = extract_sign_key_blob(&payload)
         {
             let fp = ssh_fingerprint(&blob);
-            if !allowed.iter().any(|a| a == &fp) {
+            if !allowed.is_empty() && !allowed.iter().any(|a| a == &fp) {
                 tracing::info!(
-                    "ssh-agent proxy [{session_id}]: sign rejected: key {fp} not in allowlist"
+                    "ssh-agent proxy [{session_id}]: sign denied: key {fp} not in allowlist"
                 );
                 let _ = write_msg(&mut client, &failure_msg());
                 continue;
@@ -387,15 +388,33 @@ pub fn spawn_accept_loop(
     session_id: String,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(s) => {
+        loop {
+            match listener.accept() {
+                Ok((s, _)) => {
                     let h = host_auth_sock.clone();
                     let a = allowed.clone();
                     let id = session_id.clone();
                     thread::spawn(move || handle_client(s, &h, a, &id));
                 }
                 Err(e) => {
+                    let kind = e.raw_os_error();
+                    // Transient fd exhaustion: log, sleep, and continue. The
+                    // listener is still valid; a later accept will succeed once
+                    // fds are freed. Only break on fatal errors (listener closed,
+                    // or anything that is not EMFILE/ENFILE/EAGAIN).
+                    if matches!(kind, Some(libc::EMFILE) | Some(libc::ENFILE)) {
+                        tracing::warn!(
+                            "ssh-agent proxy [{session_id}]: accept: {:?} (fd exhaustion), retrying",
+                            kind
+                        );
+                        thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                    if matches!(e.kind(), io::ErrorKind::WouldBlock) {
+                        tracing::warn!("ssh-agent proxy [{session_id}]: accept: EAGAIN, retrying");
+                        thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
                     tracing::warn!("ssh-agent proxy [{session_id}]: accept: {e}");
                     break;
                 }

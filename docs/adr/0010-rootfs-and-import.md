@@ -1,6 +1,6 @@
 # ADR 0010 — Read-only rootfs and import tool (0.3.2)
 
-Status: proposed. Date: 2026-11-04. Context: `docs/PLAN-0.3.2.md §2`.
+Status: accepted. Date: 2026-11-04. Context: `docs/PLAN-0.3.2.md §2`.
 
 ## Decision
 

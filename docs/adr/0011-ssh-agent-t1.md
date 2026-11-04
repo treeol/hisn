@@ -1,6 +1,6 @@
 # ADR 0011 — SSH agent T1 filtering proxy (0.3.2)
 
-Status: proposed. Date: 2026-11-04. Context: `docs/PLAN-0.3.2.md §3`.
+Status: accepted. Date: 2026-11-04. Context: `docs/PLAN-0.3.2.md §3`.
 
 ## Decision
 

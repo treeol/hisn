@@ -12,11 +12,12 @@ env:
   CARGO_TERM_COLOR: always
 
 # Build decision: glibc (…-unknown-linux-gnu) binaries on NATIVE runners, not
-# musl and not a cross toolchain. At 0.2.0 the musl targets do not compile
-# (src/init.rs passes u64 ioctl request constants where musl's libc::ioctl takes
-# c_int; OPEN-POINTS P22), and the release must not move the host-verified code.
-# Building natively on the oldest available runner keeps the glibc floor low
-# (ubuntu-22.04: glibc 2.35) and avoids cross/zig entirely.
+# a cross toolchain. At 0.3.2 the musl target (x86_64-unknown-linux-musl) is
+# also built natively on ubuntu-22.04 (the ioctl cast issue from P22 was
+# fixed in 0.2.1). Building natively on the oldest available runner keeps the
+# glibc floor low (ubuntu-22.04: glibc 2.35) and avoids cross/zig entirely.
+# The musl binary is statically linked and not leak-tested (said so in the
+# release notes); glibc remains the default download.
 jobs:
   # Qualification gate: the full CI workflow (fmt, clippy x2, tests, and the
   # leak suite with its log verification on Ubuntu 22.04 and 24.04) runs on the

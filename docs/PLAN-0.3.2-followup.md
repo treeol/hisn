@@ -351,3 +351,41 @@ meaning was "no rootfs" and the RISK line still printed trust); persist under
 are compared after canonicalising only when they exist; `rename` of a dir onto an
 empty dir in the no-`--replace` path is not `RENAME_NOREPLACE`; handler panic
 leaks one client slot; `rootfs_store::list` filtering of dot-entries unchecked.
+
+## Release-gate review (session 4) — targeted review of the import code
+
+Chunk 1 (`rootfs_import.rs`, non-test): read by BOTH reviewers (gpt-6-astra, fable-5.1).
+Chunk 2 (fix commits b16ebb0, 2b35ec3 + `run_import`): first attempt void for both
+(429 / VOID); retried once after 60 s, then read by BOTH reviewers.
+
+Fixed (BLOCKING-conditional, one commit):
+- Case-/normalisation-insensitive store filesystem could alias `Etc` (archive symlink)
+  and `etc`: the symlink set is now case-folded (over-matching only skips entries).
+- Names with a leading `.` are no longer valid store names, so `.staging-*` / `.old-*`
+  leftovers (which may contain an archive-planted `manifest.json`) can never be listed
+  or resolved as a rootfs.
+- An archive with zero importable entries is no longer published as an empty rootfs.
+- `manifest.json` is fsynced and the store directory is fsynced after publish.
+
+Open points — not done:
+- File data is not fsynced before publish; a power loss can publish a torn tree
+  (SIGKILL is covered by staging + rename). Needs a recovery/fsync protocol.
+- Casefold fix is a string-level guard; a dirfd/`openat2(RESOLVE_BENEATH)` extractor
+  would be the real primitive. Unicode NFC/NFD aliasing is not covered.
+- Crash leftovers `.staging-*`/`.old-*` are never garbage-collected; `--replace` has a
+  window where the name is absent and the old tree is only under `.old-*`.
+- Truncated-stream behaviour relies on the `tar` crate erroring (unit test 12 passes
+  here); a stream cut exactly on a header boundary is indistinguishable from EOF.
+- `hard_link` failures (EXDEV/EPERM) are counted as skipped, not errors.
+- `--from-image`: fixed container name `hisn-rootfs-<name>` means a leftover container
+  (killed between create and rm) blocks later imports until `docker rm`; using the
+  container id and an explicit command for CMD-less images would be better.
+- Persist state-dir refusal: `canonicalize(state).unwrap_or(state)` falls back to
+  lexical when the state dir does not exist yet; refusal applies only to `home.persist`
+  (not to cwd / `mounts.rw` overlapping the hisn store or profiles dir); skipped when
+  `HOME` and XDG vars are unset; `geteuid` vs `getuid` only matters for setuid launches.
+- `resolve_home_persist` creates the dir (0700) before the trust check for untrusted
+  profiles; bounded by the refuse list.
+- ssh proxy: client-slot counter is not panic-safe (use a Drop guard); host-agent
+  connection has no read timeout.
+- No size/entry-count caps on import.

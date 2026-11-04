@@ -67,8 +67,9 @@ pub fn check_layout(root: &std::path::Path) -> std::result::Result<(), String> {
 pub fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
-        && name != "."
-        && name != ".."
+        // A leading '.' is reserved for hisn's own `.staging-*`/`.old-*`
+        // leftovers, which may hold an archive-planted manifest.json.
+        && !name.starts_with('.')
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -173,6 +174,8 @@ mod tests {
         assert!(!is_valid_name(""));
         assert!(!is_valid_name(".."));
         assert!(!is_valid_name("."));
+        assert!(!is_valid_name(".staging-x-1-2"));
+        assert!(!is_valid_name(".old-x"));
         assert!(!is_valid_name("a/b"));
         assert!(!is_valid_name(&"a".repeat(65)));
     }

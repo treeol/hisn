@@ -59,6 +59,13 @@ fn normalize_entry_path(path: &Path) -> std::result::Result<Option<PathBuf>, ()>
 }
 
 /// True if `path` (inside `base`) is, or lies below, an extracted symlink.
+/// Key for the symlink set. Folded to lowercase so that a case-insensitive
+/// store filesystem cannot alias `Etc` (a symlink) and `etc`. Over-matching
+/// only causes an entry to be skipped, never a write.
+fn fold(p: &Path) -> PathBuf {
+    PathBuf::from(p.to_string_lossy().to_lowercase())
+}
+
 fn traverses_symlink(base: &Path, path: &Path, symlinks: &HashSet<PathBuf>) -> bool {
     let Ok(rel) = path.strip_prefix(base) else {
         return false;
@@ -66,7 +73,7 @@ fn traverses_symlink(base: &Path, path: &Path, symlinks: &HashSet<PathBuf>) -> b
     let mut cur = base.to_path_buf();
     for c in rel.components() {
         cur.push(c);
-        if symlinks.contains(&cur) {
+        if symlinks.contains(&fold(&cur)) {
             return true;
         }
     }
@@ -159,7 +166,7 @@ pub fn extract_tar<R: Read>(dest: &Path, reader: R) -> Result<ExtractStats> {
             }
             std::os::unix::fs::symlink(&link, &target)
                 .with_context(|| format!("symlink {}", target.display()))?;
-            symlinks.insert(target);
+            symlinks.insert(fold(&target));
             st.files += 1;
         } else if ty == tar::EntryType::Link {
             let link = entry
@@ -249,6 +256,7 @@ fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&p)?;
     f.write_all(serde_json::to_string_pretty(manifest)?.as_bytes())?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -278,7 +286,14 @@ pub fn import(root: &Path, opts: &ImportOpts, docker: &str) -> Result<Manifest> 
     let staging = unique_sibling(root, "staging", opts.name);
     fs::create_dir(&staging).with_context(|| format!("creating {}", staging.display()))?;
 
-    let (source, sha, st) = match run_import(&staging, opts, docker) {
+    let (source, sha, st) = match run_import(&staging, opts, docker).and_then(|v| {
+        if v.2.files == 0 {
+            bail!(
+                "the archive contained no importable entries; refusing to publish an empty rootfs"
+            );
+        }
+        Ok(v)
+    }) {
         Ok(v) => v,
         Err(e) => {
             let _ = fs::remove_dir_all(&staging);
@@ -314,6 +329,11 @@ pub fn import(root: &Path, opts: &ImportOpts, docker: &str) -> Result<Manifest> 
             let _ = fs::remove_dir_all(&old);
         } else {
             fs::rename(&staging, &final_path).context("publishing the rootfs")?;
+        }
+        // Make the rename itself durable (file data is NOT fsynced: see the
+        // open points in docs/PLAN-0.3.2-followup.md).
+        if let Ok(d) = fs::File::open(root) {
+            let _ = d.sync_all();
         }
         Ok(())
     };
@@ -1135,5 +1155,47 @@ mod tests {
             fs::metadata(&victim).unwrap().permissions().mode() & 0o7777,
             0o755
         );
+    }
+
+    #[test]
+    fn case_variant_of_an_extracted_symlink_is_not_a_path_through_it() {
+        let outside = tmp();
+        let target = outside.path().to_str().unwrap().to_owned();
+        let bytes = build(|b| {
+            let h = raw(
+                b"Etc",
+                tar::EntryType::Symlink,
+                0o777,
+                0,
+                Some(target.as_bytes()),
+            );
+            b.append(&h, &b""[..]).unwrap();
+            file(b, b"etc/passwd", 0o644, b"x");
+        });
+        let (_d, _dest, _r) = extract(&bytes);
+        assert!(!outside.path().join("passwd").exists());
+    }
+
+    #[test]
+    fn dot_prefixed_names_are_not_store_names() {
+        assert!(!rootfs_store::is_valid_name(".staging-x-1-2"));
+    }
+
+    #[test]
+    fn empty_archive_is_not_published() {
+        let root = tmp();
+        let tar = root.path().join("e.tar");
+        fs::write(&tar, build(|_| {})).unwrap();
+        let opts = ImportOpts {
+            name: "empty",
+            from_tar: Some(tar.as_path()),
+            from_image: None,
+            replace: false,
+        };
+        let store = root.path().join("store");
+        assert!(import(&store, &opts, "docker").is_err());
+        assert!(!store.join("empty").exists());
+        let leftovers = fs::read_dir(&store).unwrap().count();
+        assert_eq!(leftovers, 0, "staging must be cleaned up");
     }
 }

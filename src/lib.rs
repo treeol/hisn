@@ -14,6 +14,7 @@ pub mod mounts;
 pub mod policy;
 pub mod profile;
 pub mod rootfs;
+pub mod rootfs_import;
 pub mod rootfs_store;
 pub mod seccomp;
 pub mod session;

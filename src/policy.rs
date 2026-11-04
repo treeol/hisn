@@ -552,6 +552,18 @@ fn resolve_home_persist(
     cwd: &Path,
     runtime_roots: &[PathBuf],
 ) -> Result<Home, PolicyError> {
+    let host_home = std::env::var("HOME").ok().map(PathBuf::from);
+    resolve_home_persist_with(raw, cwd, runtime_roots, host_home.as_deref())
+}
+
+/// [`resolve_home_persist`] with the real host `$HOME` passed in (so tests
+/// do not mutate the process environment).
+fn resolve_home_persist_with(
+    raw: &str,
+    cwd: &Path,
+    runtime_roots: &[PathBuf],
+    host_home: Option<&Path>,
+) -> Result<Home, PolicyError> {
     let expanded = expand_tilde(raw);
     let raw_path = PathBuf::from(&expanded);
     if !raw_path.is_absolute() {
@@ -571,9 +583,8 @@ fn resolve_home_persist(
         .ok_or_else(|| invalid("home.persist", "path has no final component"))?;
     let path = parent_canon.join(final_name);
     // Check the refuse list before any filesystem mutation.
-    let host_home = std::env::var("HOME").ok().map(PathBuf::from);
     // Refuse: the real host $HOME or any ancestor of it.
-    if let Some(hh) = &host_home {
+    if let Some(hh) = host_home {
         let hh_canon = fs::canonicalize(hh).ok();
         if let Some(hhc) = hh_canon {
             if path == hhc {
@@ -941,61 +952,29 @@ scoped = ["bogus"]
 
     #[test]
     fn home_persist_refuses_real_host_home() {
-        // persist == real $HOME → refused. Use a temp dir as HOME so
-        // canonicalize works.
         let d = tmp();
         let home_dir = d.path().join("home");
         fs::create_dir(&home_dir).unwrap();
         let cwd = d.path().join("cwd");
         fs::create_dir(&cwd).unwrap();
-        // SAFETY: tests are single-threaded.
-        let saved = std::env::var("HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", &home_dir);
-        }
-        let ov = Overrides {
-            home_persist: Some(home_dir.to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-        let pol = Policy::parse("version = \"hisn-policy/v1\"").unwrap();
-        let err = pol.resolve(&cwd, &ov, &[]).unwrap_err().to_string();
+        let err = resolve_home_persist_with(home_dir.to_str().unwrap(), &cwd, &[], Some(&home_dir))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("real host $HOME"), "{err}");
-        // Restore HOME.
-        if let Some(h) = saved {
-            unsafe {
-                std::env::set_var("HOME", h);
-            }
-        }
     }
 
     #[test]
     fn home_persist_refuses_ancestor_of_real_host_home() {
-        // persist = parent of $HOME → refused (the persist dir would contain
-        // the real home).
         let d = tmp();
         let parent = d.path().join("parent");
         let child = parent.join("child");
         fs::create_dir_all(&child).unwrap();
         let cwd = d.path().join("cwd");
         fs::create_dir(&cwd).unwrap();
-        // SAFETY: tests are single-threaded.
-        let saved = std::env::var("HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", &child);
-        }
-        let ov = Overrides {
-            home_persist: Some(parent.to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-        let pol = Policy::parse("version = \"hisn-policy/v1\"").unwrap();
-        let err = pol.resolve(&cwd, &ov, &[]).unwrap_err().to_string();
+        let err = resolve_home_persist_with(parent.to_str().unwrap(), &cwd, &[], Some(&child))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("ancestor of the real host $HOME"), "{err}");
-        // Restore HOME.
-        if let Some(h) = saved {
-            unsafe {
-                std::env::set_var("HOME", h);
-            }
-        }
     }
 
     #[test]

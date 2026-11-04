@@ -544,9 +544,9 @@ fn expand_tilde(raw: &str) -> String {
 /// final directory if missing (mode 0700, owned by the invoking user), and
 /// checks the refuse list before any namespace is created.
 ///
-/// **Refuse list**: the real host `$HOME`, `/`, the resolved session cwd,
-/// any ancestor of the session cwd, or a path that is not a directory after
-/// creation.
+/// **Refuse list**: the real host `$HOME` or any ancestor of it, `/`, the
+/// resolved session cwd, any ancestor of the session cwd, a runtime root,
+/// or a path that is not a directory after creation.
 fn resolve_home_persist(
     raw: &str,
     cwd: &Path,
@@ -572,13 +572,27 @@ fn resolve_home_persist(
     let path = parent_canon.join(final_name);
     // Check the refuse list before any filesystem mutation.
     let host_home = std::env::var("HOME").ok().map(PathBuf::from);
-    // Refuse: the real host $HOME.
+    // Refuse: the real host $HOME or any ancestor of it.
     if let Some(hh) = &host_home {
         let hh_canon = fs::canonicalize(hh).ok();
-        if let Some(hhc) = hh_canon
-            && path == hhc
-        {
-            return Err(invalid("home.persist", "must not be the real host $HOME"));
+        if let Some(hhc) = hh_canon {
+            if path == hhc {
+                return Err(invalid("home.persist", "must not be the real host $HOME"));
+            }
+            // Refuse if the persist path is an ancestor of the real host
+            // $HOME (e.g. persist="/home" when $HOME="/home/valon"). The
+            // persist dir would contain the real home, handing the session
+            // read/write access to the parent of $HOME.
+            if hhc.starts_with(&path) {
+                return Err(invalid(
+                    "home.persist",
+                    format!(
+                        "{} is an ancestor of the real host $HOME ({})",
+                        path.display(),
+                        hhc.display()
+                    ),
+                ));
+            }
         }
     }
     // Refuse: `/`.
@@ -923,5 +937,143 @@ scoped = ["bogus"]
         assert_eq!(v["additionalProperties"], false);
         assert_eq!(v["required"], serde_json::json!(["version"]));
         assert_eq!(v["title"], "hisn-policy/v1");
+    }
+
+    #[test]
+    fn home_persist_refuses_real_host_home() {
+        // persist == real $HOME → refused. Use a temp dir as HOME so
+        // canonicalize works.
+        let d = tmp();
+        let home_dir = d.path().join("home");
+        fs::create_dir(&home_dir).unwrap();
+        let cwd = d.path().join("cwd");
+        fs::create_dir(&cwd).unwrap();
+        // SAFETY: tests are single-threaded.
+        let saved = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &home_dir);
+        }
+        let ov = Overrides {
+            home_persist: Some(home_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let pol = Policy::parse("version = \"hisn-policy/v1\"").unwrap();
+        let err = pol.resolve(&cwd, &ov, &[]).unwrap_err().to_string();
+        assert!(err.contains("real host $HOME"), "{err}");
+        // Restore HOME.
+        if let Some(h) = saved {
+            unsafe {
+                std::env::set_var("HOME", h);
+            }
+        }
+    }
+
+    #[test]
+    fn home_persist_refuses_ancestor_of_real_host_home() {
+        // persist = parent of $HOME → refused (the persist dir would contain
+        // the real home).
+        let d = tmp();
+        let parent = d.path().join("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&child).unwrap();
+        let cwd = d.path().join("cwd");
+        fs::create_dir(&cwd).unwrap();
+        // SAFETY: tests are single-threaded.
+        let saved = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &child);
+        }
+        let ov = Overrides {
+            home_persist: Some(parent.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let pol = Policy::parse("version = \"hisn-policy/v1\"").unwrap();
+        let err = pol.resolve(&cwd, &ov, &[]).unwrap_err().to_string();
+        assert!(err.contains("ancestor of the real host $HOME"), "{err}");
+        // Restore HOME.
+        if let Some(h) = saved {
+            unsafe {
+                std::env::set_var("HOME", h);
+            }
+        }
+    }
+
+    #[test]
+    fn home_persist_refuses_root() {
+        // "/" as persist → refused (no valid parent, or caught by the /
+        // check). Either way it must be an error.
+        let d = tmp();
+        let cwd = d.path().join("cwd");
+        fs::create_dir(&cwd).unwrap();
+        let ov = Overrides {
+            home_persist: Some("/".to_string()),
+            ..Default::default()
+        };
+        let pol = Policy::parse("version = \"hisn-policy/v1\"").unwrap();
+        assert!(pol.resolve(&cwd, &ov, &[]).is_err());
+    }
+
+    #[test]
+    fn home_persist_refuses_session_cwd() {
+        let d = tmp();
+        let cwd = d.path().join("cwd");
+        fs::create_dir(&cwd).unwrap();
+        let ov = Overrides {
+            home_persist: Some(cwd.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let pol = Policy::parse("version = \"hisn-policy/v1\"").unwrap();
+        let err = pol.resolve(&cwd, &ov, &[]).unwrap_err().to_string();
+        assert!(err.contains("session cwd"), "{err}");
+    }
+
+    #[test]
+    fn home_persist_refuses_ancestor_of_cwd() {
+        // persist = parent of cwd → refused.
+        let d = tmp();
+        let parent = d.path().join("parent");
+        let cwd = parent.join("cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let ov = Overrides {
+            home_persist: Some(parent.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let pol = Policy::parse("version = \"hisn-policy/v1\"").unwrap();
+        let err = pol.resolve(&cwd, &ov, &[]).unwrap_err().to_string();
+        assert!(err.contains("ancestor of the session cwd"), "{err}");
+    }
+
+    #[test]
+    fn home_persist_accepts_valid_path() {
+        let d = tmp();
+        let cwd = d.path().join("cwd");
+        fs::create_dir(&cwd).unwrap();
+        let persist = d.path().join("persist");
+        let ov = Overrides {
+            home_persist: Some(persist.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let pol = Policy::parse("version = \"hisn-policy/v1\"").unwrap();
+        let r = pol.resolve(&cwd, &ov, &[]).unwrap();
+        assert!(matches!(r.home, Home::Path(_)));
+        assert!(persist.exists(), "persist dir was created");
+    }
+
+    #[test]
+    fn home_persist_refuses_non_directory() {
+        let d = tmp();
+        let cwd = d.path().join("cwd");
+        fs::create_dir(&cwd).unwrap();
+        // Create a file and try to persist at its path — the parent exists
+        // but the final component is a file, not a directory.
+        let file = d.path().join("notadir");
+        fs::write(&file, b"x").unwrap();
+        let ov = Overrides {
+            home_persist: Some(file.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let pol = Policy::parse("version = \"hisn-policy/v1\"").unwrap();
+        let err = pol.resolve(&cwd, &ov, &[]).unwrap_err().to_string();
+        assert!(err.contains("not a directory"), "{err}");
     }
 }

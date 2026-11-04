@@ -727,6 +727,7 @@ mod tests {
                     shm: false,
                     shm_size: 64,
                     tmp_size: 1024,
+                    rootfs: None,
                 };
                 let ok = set_rlimits(&p).is_ok() && {
                     let mut l: libc::rlimit = std::mem::zeroed();

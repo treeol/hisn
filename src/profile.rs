@@ -34,6 +34,15 @@ pub struct Profile {
     pub version: String,
     /// A complete `hisn-policy/v1` document (inline table).
     pub policy: Policy,
+    /// Persistent-home config (0.3.2).
+    #[serde(default, rename = "home")]
+    pub home: Option<HomeConfig>,
+    /// Rootfs config (0.3.2).
+    #[serde(default, rename = "rootfs")]
+    pub rootfs: Option<RootfsConfig>,
+    /// SSH agent config (0.3.2).
+    #[serde(default, rename = "ssh")]
+    pub ssh: Option<SshConfig>,
     /// In-sandbox services (0.3 §19).
     #[serde(default, rename = "services")]
     pub services: Vec<Service>,
@@ -235,6 +244,40 @@ impl Profile {
             .resolve(base_dir, overrides, runtime_roots)
             .map_err(|e| anyhow!("{e}"))
     }
+}
+
+/// Persistent-home config (`[home]` table in a profile).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HomeConfig {
+    /// Absolute path for the persistent home directory. `~` is expanded.
+    /// Absent → the inner policy's `session.home` (tmpfs by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist: Option<String>,
+}
+
+/// Rootfs config (`[rootfs]` table in a profile).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RootfsConfig {
+    /// Store name to resolve from `$XDG_DATA_HOME/hisn/rootfs/<name>/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Direct path to a rootfs directory. Mutually exclusive with `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// SSH agent config (`[ssh]` table in a profile).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SshConfig {
+    /// Start a filtering ssh-agent proxy inside the session.
+    #[serde(default)]
+    pub agent: bool,
+    /// Optional fingerprint allowlist (`SHA256:…`). Empty/absent = all keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
 }
 
 /// A `[[services]]` table: start a long-lived process inside the sandbox
@@ -718,6 +761,9 @@ pub fn explain(spec: Option<&str>) -> Result<Value> {
         None => Profile {
             version: PROFILE_VERSION.to_string(),
             policy: Policy::default(),
+            home: None,
+            rootfs: None,
+            ssh: None,
             services: Vec::new(),
             forwards: Vec::new(),
             host_services: Vec::new(),

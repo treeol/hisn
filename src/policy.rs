@@ -207,6 +207,9 @@ pub struct ResolvedPolicy {
     pub shm: bool,
     pub shm_size: u64,
     pub tmp_size: u64,
+    /// 0.3.2: the rootfs path if set (from `[rootfs]` or `--rootfs-path`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs: Option<PathBuf>,
 }
 
 /// CLI flags that take precedence over the policy file.
@@ -214,6 +217,10 @@ pub struct ResolvedPolicy {
 pub struct Overrides {
     pub cwd: Option<PathBuf>,
     pub network: Option<Network>,
+    /// `--home-persist`: overrides the profile's `[home] persist`.
+    pub home_persist: Option<String>,
+    /// `--rootfs-path`: overrides the profile's `[rootfs] path`.
+    pub rootfs_path: Option<String>,
 }
 
 pub fn is_valid_env_name(s: &str) -> bool {
@@ -422,6 +429,25 @@ impl Policy {
             Home::Path(p)
         };
 
+        // 0.3.2: `[home] persist` override (from profile or --home-persist).
+        // Expands ~, canonicalises the parent, checks the refuse list, creates
+        // the directory if missing, and overrides `home`.
+        let home = match &overrides.home_persist {
+            Some(raw) => resolve_home_persist(raw, &cwd, runtime_roots)?,
+            None => home,
+        };
+
+        // 0.3.2: `[rootfs]` or `--rootfs-path`. The path must be an existing
+        // directory; the rootfs store resolves names to paths in
+        // `$XDG_DATA_HOME/hisn/rootfs/<name>/`.
+        let rootfs = match &overrides.rootfs_path {
+            Some(raw) => {
+                let p = existing_dir("rootfs.path", raw, runtime_roots)?;
+                Some(p)
+            }
+            None => None,
+        };
+
         let ro = self.resolve_list("mounts.ro", &self.mounts.ro, runtime_roots)?;
         let rw = self.resolve_list("mounts.rw", &self.mounts.rw, runtime_roots)?;
         let grantable_rw = self.resolve_list(
@@ -457,6 +483,7 @@ impl Policy {
             shm: self.session.shm,
             shm_size: self.session.shm_size,
             tmp_size: self.session.tmp_size,
+            rootfs,
         })
     }
 
@@ -496,6 +523,114 @@ fn existing_dir(key: &str, raw: &str, runtime_roots: &[PathBuf]) -> Result<PathB
         return Err(invalid(key, format!("{raw} is not a directory")));
     }
     Ok(p)
+}
+
+/// Expand `~` at the start of a path to the invoking user's home directory.
+fn expand_tilde(raw: &str) -> String {
+    if raw == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+    }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
+    }
+    raw.to_string()
+}
+
+/// Resolve a `[home] persist` path (0.3.2).
+///
+/// Expands `~`, canonicalises the parent (which must exist), creates the
+/// final directory if missing (mode 0700, owned by the invoking user), and
+/// checks the refuse list before any namespace is created.
+///
+/// **Refuse list**: the real host `$HOME`, `/`, the resolved session cwd,
+/// any ancestor of the session cwd, or a path that is not a directory after
+/// creation.
+fn resolve_home_persist(
+    raw: &str,
+    cwd: &Path,
+    runtime_roots: &[PathBuf],
+) -> Result<Home, PolicyError> {
+    let expanded = expand_tilde(raw);
+    let raw_path = PathBuf::from(&expanded);
+    if !raw_path.is_absolute() {
+        return Err(invalid(
+            "home.persist",
+            format!("{raw:?} is not an absolute path"),
+        ));
+    }
+    // Canonicalise the parent (which must exist), then join the final component.
+    let parent = raw_path
+        .parent()
+        .ok_or_else(|| invalid("home.persist", "path has no parent"))?;
+    let parent_canon = fs::canonicalize(parent)
+        .map_err(|e| invalid("home.persist", format!("{}: {e}", parent.display())))?;
+    let final_name = raw_path
+        .file_name()
+        .ok_or_else(|| invalid("home.persist", "path has no final component"))?;
+    let path = parent_canon.join(final_name);
+    // Check the refuse list before any filesystem mutation.
+    let host_home = std::env::var("HOME").ok().map(PathBuf::from);
+    // Refuse: the real host $HOME.
+    if let Some(hh) = &host_home {
+        let hh_canon = fs::canonicalize(hh).ok();
+        if let Some(hhc) = hh_canon
+            && path == hhc
+        {
+            return Err(invalid("home.persist", "must not be the real host $HOME"));
+        }
+    }
+    // Refuse: `/`.
+    if path == Path::new("/") {
+        return Err(invalid("home.persist", "/ is not a valid persist dir"));
+    }
+    // Refuse: the session cwd or any ancestor of it.
+    if path == *cwd {
+        return Err(invalid("home.persist", "must not be the session cwd"));
+    }
+    // Refuse: any ancestor of the session cwd (the persist dir must not
+    // contain the cwd).
+    if cwd.starts_with(&path) && path != *cwd {
+        return Err(invalid(
+            "home.persist",
+            format!("{} is an ancestor of the session cwd", path.display()),
+        ));
+    }
+    // Refuse: overlaps a runtime root.
+    check_forbidden(&path, runtime_roots).map_err(|r| invalid("home.persist", r))?;
+    // Create the directory if missing (mode 0700, owned by the invoking user).
+    if !path.exists() {
+        fs::create_dir(&path)
+            .map_err(|e| invalid("home.persist", format!("create {}: {e}", path.display())))?;
+        // Set permissions to 0700.
+        let meta = fs::metadata(&path)
+            .map_err(|e| invalid("home.persist", format!("stat {}: {e}", path.display())))?;
+        let mut perms = meta.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        fs::set_permissions(&path, perms)
+            .map_err(|e| invalid("home.persist", format!("chmod {}: {e}", path.display())))?;
+    }
+    // Verify it is a directory.
+    let meta = fs::symlink_metadata(&path)
+        .map_err(|e| invalid("home.persist", format!("stat {}: {e}", path.display())))?;
+    if !meta.is_dir() {
+        return Err(invalid(
+            "home.persist",
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+    // Verify it is not a symlink (the final component).
+    if meta.file_type().is_symlink() {
+        return Err(invalid(
+            "home.persist",
+            format!("{} is a symlink; name the target instead", path.display()),
+        ));
+    }
+    // Canonicalise the full path (now it exists).
+    let canon = fs::canonicalize(&path)
+        .map_err(|e| invalid("home.persist", format!("{}: {e}", path.display())))?;
+    Ok(Home::Path(canon))
 }
 
 impl ResolvedPolicy {
@@ -731,6 +866,8 @@ scoped = ["bogus"]
         let o = Overrides {
             cwd: Some(toolchain.clone()),
             network: Some(Network::None),
+            home_persist: None,
+            rootfs_path: None,
         };
         let r = pol.resolve(d.path(), &o, &[]).unwrap();
         assert_eq!(r.cwd, fs::canonicalize(&toolchain).unwrap());

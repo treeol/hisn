@@ -151,6 +151,7 @@ mod tests {
             shm: false,
             shm_size: 64,
             tmp_size: 1024,
+            rootfs: None,
         }
     }
 

@@ -957,6 +957,41 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
             crate::cli::NetworkArg::None => Network::None,
             crate::cli::NetworkArg::Host => Network::Host,
         }),
+        home_persist: args.home_persist.clone().or_else(|| {
+            // The profile's [home] persist is the default; the CLI flag
+            // overrides it.
+            match (&args.policy, &args.profile) {
+                (None, Some(spec)) => {
+                    let (path, _source) = profile::resolve_profile_path(spec).ok()?;
+                    let prof = ProfileDoc::load(&path).ok()?;
+                    prof.home.as_ref()?.persist.clone()
+                }
+                _ => None,
+            }
+        }),
+        rootfs_path: args
+            .rootfs_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| {
+                // The profile's [rootfs] name or path; the CLI flag overrides it.
+                match (&args.policy, &args.profile) {
+                    (None, Some(spec)) => {
+                        let (path, _source) = profile::resolve_profile_path(spec).ok()?;
+                        let prof = ProfileDoc::load(&path).ok()?;
+                        prof.rootfs.as_ref().and_then(|r| {
+                            r.path.clone().or_else(|| {
+                                r.name.as_ref().and_then(|n| {
+                                    crate::rootfs_store::resolve_name(n)
+                                        .ok()
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                })
+                            })
+                        })
+                    }
+                    _ => None,
+                }
+            }),
     };
     let policy = pol.resolve(&base, &ov, &roots)?;
     let grants = args
@@ -2277,6 +2312,7 @@ mod tests {
             shm: false,
             shm_size: 64,
             tmp_size: 1024,
+            rootfs: None,
         }
     }
 
@@ -2310,6 +2346,8 @@ mod tests {
             network: Some(crate::cli::NetworkArg::Host),
             allow_host_abstract_sockets: false,
             quiet_risk: false,
+            home_persist: None,
+            rootfs_path: None,
             grants: vec!["/x:rw".into(), "/y".into()],
             detach: false,
             ready_fd: None,

@@ -79,6 +79,13 @@ pub struct RunArgs {
     /// Suppress risk label output on start.
     #[arg(long)]
     pub quiet_risk: bool,
+    /// Persistent home directory (absolute path; ~ allowed). Overrides the
+    /// profile's `[home] persist`.
+    #[arg(long, value_name = "PATH")]
+    pub home_persist: Option<String>,
+    /// Rootfs directory (absolute path). Overrides the profile's `[rootfs] path`.
+    #[arg(long, value_name = "DIR")]
+    pub rootfs_path: Option<PathBuf>,
     /// Initial grant, `PATH[:ro|rw]` (default ro). Repeatable.
     #[arg(long = "grant", value_name = "PATH[:ro|rw]")]
     pub grants: Vec<String>,

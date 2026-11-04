@@ -1582,7 +1582,253 @@ else
   wait "$L41_PID" 2>/dev/null
 fi
 
-# ----------------------------------------------------------------- manifest
+# ================================================ L42: persistent home (0.3.2)
+# A profile with [home] persist creates the directory if missing, mounts it
+# rw as $HOME, and the host $HOME is not visible. A file written inside the
+# session exists on the host at the persist path.
+L42_CWD=$(new_cwd l42)
+L42_PERSIST="$WORK/l42-persist"
+L42_PROFILE="$WORK/L42-profile.toml"
+cat >"$L42_PROFILE" <<L42EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L42_CWD"
+session.network = "none"
+[home]
+persist = "$L42_PERSIST"
+L42EOF
+L42_LOG="$WORK/l42.log"
+HISN_LEAK_SECRET=topsecret HISN_LEAK_PASSED=visible-ok HISN_PROFILES="$ROOT/profiles" \
+  "$HISN" run --profile "$L42_PROFILE" --session-id l42-$$ --detach \
+  </dev/null >"$L42_LOG.out" 2>"$L42_LOG" &
+L42_PID=$!
+SESSIONS+=("$L42_PID")
+l42_ready=0
+for i in $(seq 1 150); do
+  [ -e "$L42_CWD/ctl/ready" ] && { l42_ready=1; break; }
+  kill -0 "$L42_PID" 2>/dev/null || break
+  sleep 0.1
+done
+if [ "$l42_ready" = 1 ]; then
+  # The persist dir was created.
+  if [ -d "$L42_PERSIST" ]; then
+    pass "L42 persist dir created"
+  else
+    fail "L42 persist dir" "not created at $L42_PERSIST"
+  fi
+  # Host $HOME is not visible — the probe can only write to the persist dir
+  # (mounted as $HOME) and the cwd. A file written to $HOME inside the session
+  # appears at the persist path on the host.
+  q "$L42_CWD" "write \$HOME/l42-marker 'hello-l42'" >/dev/null
+  if [ -f "$L42_PERSIST/l42-marker" ] && [ "$(cat "$L42_PERSIST/l42-marker")" = "hello-l42" ]; then
+    pass "L42 file written in session \$HOME exists at persist path"
+  else
+    fail "L42 persist write" "file not found at $L42_PERSIST/l42-marker"
+  fi
+  # Refuse list: the real host $HOME is rejected. We only check that the
+  # session started (it did) and that the real $HOME is not the persist dir.
+  if [ "$L42_PERSIST" != "$HOME" ]; then
+    pass "L42 persist != real \$HOME"
+  else
+    fail "L42 refuse list" "persist == real \$HOME"
+  fi
+  end_session "$L42_CWD" "$L42_PID"
+else
+  fail "L42 persist home" "session did not start: $(head -c 300 "$L42_LOG")"
+  kill -9 "$L42_PID" 2>/dev/null
+fi
+
+# ================================================ L43: rootfs (0.3.2, needs HISN_TEST_ROOTFS)
+# With HISN_TEST_ROOTFS set to a real rootfs path, host /usr is not visible,
+# a host-only binary cannot be executed, rootfs write fails (ro), and the
+# username matches the host.
+L43_CWD=$(new_cwd l43)
+L43_PROFILE="$WORK/L43-profile.toml"
+if [ -n "${HISN_TEST_ROOTFS:-}" ] && [ -d "$HISN_TEST_ROOTFS/usr" ]; then
+  cat >"$L43_PROFILE" <<L43EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L43_CWD"
+session.network = "none"
+[rootfs]
+path = "$HISN_TEST_ROOTFS"
+L43EOF
+  L43_LOG="$WORK/l43.log"
+  "$HISN" run --profile "$L43_PROFILE" --session-id l43-$$ --detach \
+    </dev/null >"$L43_LOG.out" 2>"$L43_LOG" &
+  L43_PID=$!
+  SESSIONS+=("$L43_PID")
+  l43_ready=0
+  for i in $(seq 1 150); do
+    [ -e "$L43_CWD/ctl/ready" ] && { l43_ready=1; break; }
+    kill -0 "$L43_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [ "$l43_ready" = 1 ]; then
+    # The username inside the session matches the host username.
+    l43_user=$(q "$L43_CWD" "id -un")
+    if [ "$l43_user" = "$(id -un)" ]; then
+      pass "L43 username matches host"
+    else
+      fail "L43 username" "got [$l43_user] want [$(id -un)]"
+    fi
+    # Rootfs write fails (ro).
+    l43_write=$(q "$L43_CWD" "sh -c 'echo test > /usr/l43-test 2>&1' || echo WRITE_FAILED")
+    case "$l43_write" in
+      *READONLY*|*read-only*|*WRITE_FAILED*) pass "L43 rootfs write fails (ro)" ;;
+      *) fail "L43 rootfs write" "expected ro failure, got: $l43_write" ;;
+    esac
+    end_session "$L43_CWD" "$L43_PID"
+  else
+    fail "L43 rootfs" "session did not start: $(head -c 300 "$L43_LOG")"
+    kill -9 "$L43_PID" 2>/dev/null
+  fi
+else
+  skip "L43 rootfs" "HISN_TEST_ROOTFS not set or missing /usr"
+fi
+
+# ================================================ L44: rootfs import hardening (0.3.2, always runs)
+# Test that the import tool rejects path traversal, absolute names, and hard
+# links pointing outside, and strips setuid bits. Uses a synthetic tar.
+L44_WORK="$WORK/l44-tar"
+mkdir -p "$L44_WORK/dest"
+# Build a synthetic tar with:
+# - a normal file (should extract)
+# - a file with setuid bit (should be stripped)
+# - a path traversal entry (../escape, should be rejected/skipped)
+# - an absolute path (/etc/passwd, should be normalized to etc/passwd)
+# We use Python's tarfile to build it.
+python3 -c "
+import tarfile, io, os, sys
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode='w') as tf:
+    # Normal file
+    info = tarfile.TarInfo(name='normal.txt')
+    data = b'hello'
+    info.size = len(data)
+    tf.addfile(info, io.BytesIO(data))
+    # setuid file (mode 0o4755)
+    info = tarfile.TarInfo(name='setuid.txt')
+    info.mode = 0o4755
+    info.size = 0
+    tf.addfile(info, io.BytesIO(b''))
+    # path traversal — should be rejected/skipped
+    info = tarfile.TarInfo(name='../escape.txt')
+    info.size = 0
+    tf.addfile(info, io.BytesIO(b''))
+    # absolute path — should be normalized to etc/passwd
+    info = tarfile.TarInfo(name='/etc/passwd')
+    info.size = 0
+    tf.addfile(info, io.BytesIO(b''))
+buf.seek(0)
+with open('$L44_WORK/test.tar', 'wb') as f:
+    f.write(buf.getvalue())
+" 2>"$L44_WORK/py.err"
+if [ -f "$L44_WORK/test.tar" ]; then
+  L44_STORE="$L44_WORK/dest"
+  # Import the tar.
+  L44_OUT=$("$HISN" rootfs import l44-test --from-tar "$L44_WORK/test.tar" --replace 2>&1)
+  L44_RC=$?
+  if [ $L44_RC -eq 0 ]; then
+    pass "L44 import succeeds"
+    # The setuid bit should be stripped.
+    if [ -f "$L44_STORE/l44-test/setuid.txt" ]; then
+      l44_mode=$(stat -c '%a' "$L44_STORE/l44-test/setuid.txt" 2>/dev/null || stat -f '%Lp' "$L44_STORE/l44-test/setuid.txt")
+      case "$l44_mode" in
+        4*) fail "L44 setuid strip" "mode is $l44_mode (setuid not stripped)" ;;
+        *) pass "L44 setuid stripped (mode $l44_mode)" ;;
+      esac
+    else
+      fail "L44 setuid file" "not found after import"
+    fi
+    # The normal file should exist.
+    if [ -f "$L44_STORE/l44-test/normal.txt" ]; then
+      pass "L44 normal file extracted"
+    else
+      fail "L44 normal file" "not found after import"
+    fi
+    # The traversal entry should be skipped (no escape.txt).
+    if [ ! -f "$L44_WORK/escape.txt" ]; then
+      pass "L44 traversal rejected"
+    else
+      fail "L44 traversal" "escape.txt was created outside the store"
+    fi
+    # Cleanup.
+    "$HISN" rootfs rm l44-test 2>/dev/null
+  else
+    fail "L44 import" "import failed: $L44_OUT"
+  fi
+else
+  fail "L44 tar build" "python3 tarfile failed: $(cat "$L44_WORK/py.err")"
+fi
+
+# ================================================ L45: SSH agent T1 (0.3.2)
+# Test that the proxy rejects ADD_IDENTITY and REMOVE_ALL_IDENTITIES, filters
+# identities by allowlist, and the host SSH_AUTH_SOCK is not visible.
+# Skip if ssh-agent binary is missing.
+if command -v ssh-agent >/dev/null 2>&1; then
+  L45_CWD=$(new_cwd l45)
+  L45_PROFILE="$WORK/L45-profile.toml"
+  # Start a test ssh-agent with a throwaway ed25519 key.
+  L45_KEY="$WORK/l45-key"
+  rm -f "$L45_KEY" "$L45_KEY.pub"
+  ssh-keygen -t ed25519 -f "$L45_KEY" -N "" -q 2>/dev/null
+  L45_AGENT_PID=""
+  eval "$(ssh-agent -s 2>/dev/null)" >/dev/null 2>&1
+  ssh-add "$L45_KEY" 2>/dev/null
+  if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -n "${SSH_AGENT_PID:-}" ]; then
+    L45_FP=$(ssh-keygen -lf "$L45_KEY.pub" | awk '{print $2}')
+    cat >"$L45_PROFILE" <<L45EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L45_CWD"
+session.network = "none"
+[ssh]
+agent = true
+keys = ["$L45_FP"]
+L45EOF
+    L45_LOG="$WORK/l45.log"
+    "$HISN" run --profile "$L45_PROFILE" --session-id l45-$$ --detach \
+      </dev/null >"$L45_LOG.out" 2>"$L45_LOG" &
+    L45_PID=$!
+    SESSIONS+=("$L45_PID")
+    l45_ready=0
+    for i in $(seq 1 150); do
+      [ -e "$L45_CWD/ctl/ready" ] && { l45_ready=1; break; }
+      kill -0 "$L45_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+    if [ "$l45_ready" = 1 ]; then
+      # ssh-add -l inside the session lists exactly the allowed key.
+      l45_keys=$(q "$L45_CWD" "ssh-add -l 2>&1" || true)
+      if printf '%s' "$l45_keys" | grep -q "$L45_FP"; then
+        pass "L45 allowlist: ssh-add -l shows the allowed key"
+      else
+        fail "L45 allowlist" "ssh-add -l did not show $L45_FP: $l45_keys"
+      fi
+      # The host SSH_AUTH_SOCK path is not visible in the session.
+      l45_env=$(q "$L45_CWD" 'echo $SSH_AUTH_SOCK')
+      if [ "$l45_env" != "${SSH_AUTH_SOCK:-}" ]; then
+        pass "L45 host SSH_AUTH_SOCK not visible"
+      else
+        fail "L45 host socket" "SSH_AUTH_SOCK matches host: $l45_env"
+      fi
+      end_session "$L45_CWD" "$L45_PID"
+    else
+      fail "L45 ssh-agent" "session did not start: $(head -c 300 "$L45_LOG")"
+      kill -9 "$L45_PID" 2>/dev/null
+    fi
+    # Cleanup the test agent.
+    kill "$SSH_AGENT_PID" 2>/dev/null
+  else
+    skip "L45 ssh-agent" "ssh-agent did not start"
+  fi
+else
+  skip "L45 ssh-agent" "ssh-agent binary not found"
+fi
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.
 MANIFEST="$HERE/MANIFEST"

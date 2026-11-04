@@ -158,6 +158,58 @@ never followed, and a planted bind mount is never entered.
 `hisn run --session-id X` over a stale directory removes it and proceeds; over a
 live one it fails.
 
+### Profiles (0.3)
+
+A profile (`hisn-profile/v1`) is an envelope around a policy that adds
+orchestration surface: persistent home, rootfs, SSH agent, in-sandbox services,
+socket forwarding, host-side services, and Docker access. Each capability
+that widens the boundary carries a risk label.
+
+```sh
+hisn profile list                           # search path and built-in profiles
+hisn profile explain [name]                  # capabilities and risk labels
+hisn profile validate [file]                 # resolve and print the inner policy
+hisn run --profile base -- make test         # built-in: base (0.2 sandbox)
+hisn run --profile wakil -- make test        # built-in: wakil (grantable_rw)
+hisn run --home-persist ~/.cache/wakil/home/proj -- make test  # persistent $HOME
+hisn run --rootfs-path /path/to/rootfs -- make test            # rootfs toolchain
+```
+
+Profile tables (all optional; absent = 0.3.1 behaviour):
+
+```toml
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+# … inner policy …
+
+[home]
+persist = "/home/user/.cache/wakil/home/proj"   # persistent $HOME (survives sessions)
+
+[rootfs]
+name = "go-dev"            # from the rootfs store ($XDG_DATA_HOME/hisn/rootfs/<name>/)
+# or
+path = "/path/to/rootfs"   # a directory directly
+
+[ssh]
+agent = true               # filtering proxy (T1: sign but never add/remove/extract)
+keys = ["SHA256:…"]       # fingerprint allowlist (absent = all keys)
+```
+
+### Rootfs store (0.3.2)
+
+```sh
+hisn rootfs import go-dev --from-tar rootfs.tar       # import from a tar archive
+hisn rootfs import go-dev --from-image golang:1.24    # import from a Docker image
+hisn rootfs list                                      # list imported rootfs images
+hisn rootfs path go-dev                               # print the store path
+hisn rootfs rm go-dev                                 # remove a rootfs
+```
+
+The import tool strips setuid/setgid bits, rejects path traversal and hard
+links pointing outside the target, skips device nodes, and atomically
+publishes the result. `hisn check` reports the rootfs store path and names.
+
 ## Policy
 
 A policy is a small TOML file (`hisn-policy/v1`). A file that declares nothing

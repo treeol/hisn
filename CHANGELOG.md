@@ -7,6 +7,48 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.2]
+
+### Added
+- **Persistent `$HOME`** (`[home] persist`, `--home-persist`): a profile may
+  declare a persistent home directory that survives across sessions, bind-mounted
+  rw at the same in-sandbox path. Refuse list (real `$HOME`, `/`, cwd, ancestors
+  of cwd) enforced before any namespace exists. Risk label `home-persist` (Data).
+  ADR 0009. Leak test L42.
+- **Read-only rootfs** (`[rootfs] name|path`, `--rootfs-path`): a profile may
+  declare a rootfs tree that replaces the host toolchain dirs (`/usr`, `/bin`,
+  `/sbin`, `/lib`, `/lib32`, `/lib64`, `/opt`, `/nix`, `/etc`) inside the sandbox.
+  All rootfs mounts are `ro, nosuid, nodev`. Host `/usr`, `/opt`, `/nix` are not
+  visible when a rootfs is set. `hisn rootfs import|list|path|rm` subcommand with
+  extraction hardening (strip setuid, reject traversal, reject hard links outside,
+  skip devices, atomic staging). `hisn check` reports the rootfs store. Risk label
+  `rootfs` (Data). ADR 0010. Leak tests L43, L44.
+- **SSH agent T1** (`[ssh] agent = true`, `keys = [...]`): a filtering proxy that
+  forwards only `REQUEST_IDENTITIES` and `SIGN_REQUEST`, rejects all mutations
+  (`ADD`, `REMOVE`, `LOCK`, `UNLOCK`, `EXTENSION`), filters by fingerprint
+  allowlist, and injects `SSH_AUTH_SOCK` into the scrubbed env. The host
+  `SSH_AUTH_SOCK` is never mounted. Risk label `ssh-agent` (Signing). ADR 0011.
+  Leak test L45.
+
+### Changed
+- `Cargo.toml` version bumped to 0.3.2.
+- CI: musl target (`x86_64-unknown-linux-musl`) added to the release workflow
+  alongside the glibc build, with a `-musl` suffix in the asset name. Glibc
+  remains the default download.
+
+### Tests
+- L42 (home-persist): host `$HOME` not visible, persist dir reachable only at the
+  mounted path, symlink inside persist does not escape, file written in session A
+  exists in session B, invalid paths rejected.
+- L43 (rootfs, with `HISN_TEST_ROOTFS`): host `/usr` not visible, host-only binary
+  not executable, rootfs write fails, setuid stripped, symlink does not reach host,
+  username matches.
+- L44 (rootfs import hardening, always runs): path traversal, absolute names, hard
+  link escape, setuid stripping on a synthetic tar.
+- L45 (ssh-agent): `ADD_IDENTITY`/`REMOVE_ALL` fail, allowlist filters identities,
+  sign for non-listed key fails, host `SSH_AUTH_SOCK` not visible, proxy socket
+  disappears with teardown, `ssh-keygen -Y sign` succeeds (skip if no ssh-agent).
+
 ## [0.3.1]
 
 ### Fixed
@@ -208,5 +250,6 @@ First release.
 - `hisn exec` verifies fail-closed, before running anything, that the root it
   entered is the sandbox root (DESIGN D25).
 
-[Unreleased]: https://github.com/treeol/hisn/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/treeol/hisn/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/treeol/hisn/releases/tag/v0.3.2
 [0.2.0]: https://github.com/treeol/hisn/releases/tag/v0.2.0

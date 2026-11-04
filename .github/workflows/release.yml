@@ -42,6 +42,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
             asset: hisn-aarch64-linux-gnu
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            asset: hisn-x86_64-linux-musl
     steps:
       - uses: actions/checkout@v4
 
@@ -57,6 +60,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+          rustup target add ${{ matrix.target }}
           rustc --version
 
       - name: Build
@@ -101,8 +105,8 @@ jobs:
         run: |
           cd dist
           ls -l
-          test "$(ls | wc -l)" -eq 2
-          test -f hisn-x86_64-linux-gnu -a -f hisn-aarch64-linux-gnu
+          test "$(ls | wc -l)" -eq 3
+          test -f hisn-x86_64-linux-gnu -a -f hisn-aarch64-linux-gnu -a -f hisn-x86_64-linux-musl
           chmod +x hisn-*
           sha256sum hisn-* > SHA256SUMS
           cat SHA256SUMS
@@ -121,7 +125,7 @@ jobs:
           fi
           {
             echo
-            echo "The leak suite (L1-L24) passed on Ubuntu 22.04 and 24.04 x86_64 CI runners for this exact commit before these binaries were built; the aarch64 binary is built and started (`--version`) but has not been leak-tested. Binaries are dynamically linked against glibc and built natively on Ubuntu 22.04 (glibc 2.35 or newer required). Verify with \`sha256sum -c SHA256SUMS\`. See README, \"Verifying a build\"."
+            echo "The leak suite (L1-L45) passed on Ubuntu 22.04 and 24.04 x86_64 CI runners for this exact commit before these binaries were built; the aarch64 binary is built and started (\`--version\`) but has not been leak-tested. The glibc binaries (hisn-x86_64-linux-gnu, hisn-aarch64-linux-gnu) are dynamically linked and built natively on Ubuntu 22.04 (glibc 2.35 or newer required). The musl binary (hisn-x86_64-linux-musl) is statically linked. Verify with \`sha256sum -c SHA256SUMS\`. See README, \"Verifying a build\"."
           } >> notes.md
           cat notes.md
 
@@ -133,4 +137,4 @@ jobs:
             --title "hisn ${GITHUB_REF_NAME#v}" \
             --notes-file notes.md \
             --verify-tag \
-            dist/hisn-x86_64-linux-gnu dist/hisn-aarch64-linux-gnu dist/SHA256SUMS
+            dist/hisn-x86_64-linux-gnu dist/hisn-aarch64-linux-gnu dist/hisn-x86_64-linux-musl dist/SHA256SUMS

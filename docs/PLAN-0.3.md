@@ -940,15 +940,16 @@ discovery):
 | 8 | multi-agent discovery (§7): `--name`, `attach`, cwd lookup, L39 | 1.5 | 0.3a |
 | | **0.3a total** | **~10.5 sessions** | |
 
-**0.3b** (ships second — ssh T1 gets its own review cycle after B1, then
-recipes and the threat-model proof layer):
+**0.3b** (ships second — ~~ssh T1 gets its own review cycle after B1, then
+recipes and the threat-model proof layer~~ — **moved to 0.3.2**: ssh T1
+shipped in 0.3.2 as the filtering agent proxy, ADR 0011, leak test L45):
 
 | step | what | est. | ships |
 |---|---|---|---|
-| 7 | ssh T1 (§4b): `hisn-agent-proxy` crate, sign-only, allow_keys, filtered `LIST_IDS`, per-session agent, audit, L27 | 3 | 0.3b |
+| 7 | ~~ssh T1 (§4b)~~ — **shipped in 0.3.2** (ADR 0011, `src/ssh_agent.rs`, leak L45) | — | 0.3.2 |
 | 9 | recipes (§6): profiles + L25/L26/L30/L32 | 2 | 0.3b |
 | 10 | threat model leak tests (§9): L33–L37 | 2 | 0.3b |
-| | **0.3b total** | **~7 sessions** | |
+| | **0.3b total** | **~4 sessions** | |
 | | **0.3 total** | **~17.5 sessions** | |
 
 | step | what | est. | ships |

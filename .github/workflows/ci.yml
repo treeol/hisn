@@ -23,11 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Rust toolchain (stable + rustfmt + clippy + aarch64 target)
+      - name: Rust toolchain (stable + rustfmt + clippy + aarch64 + musl targets)
         run: |
           rustup toolchain install stable --profile minimal \
             --component rustfmt --component clippy \
-            --target aarch64-unknown-linux-gnu
+            --target aarch64-unknown-linux-gnu \
+            --target x86_64-unknown-linux-musl
           rustup default stable
           rustc --version
           cargo --version
@@ -41,6 +42,10 @@ jobs:
       # Cross-check only: nothing is linked or run for aarch64.
       - name: cargo clippy (aarch64-unknown-linux-gnu)
         run: cargo clippy --locked --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+
+      # Cross-check only: the musl target compiles (static binary for release).
+      - name: cargo clippy (x86_64-unknown-linux-musl)
+        run: cargo clippy --locked --all-targets --target x86_64-unknown-linux-musl -- -D warnings
 
       - name: cargo test
         run: cargo test --locked

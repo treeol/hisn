@@ -443,6 +443,7 @@ impl Policy {
         let rootfs = match &overrides.rootfs_path {
             Some(raw) => {
                 let p = existing_dir("rootfs.path", raw, runtime_roots)?;
+                crate::rootfs_store::check_layout(&p).map_err(|e| invalid("rootfs.path", e))?;
                 Some(p)
             }
             None => None,

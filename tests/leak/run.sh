@@ -1582,399 +1582,443 @@ else
   wait "$L41_PID" 2>/dev/null
 fi
 
+# ----------------------------------------------------------------- 0.3.2 helpers
+# start_profile_session NAME CWD PROFILE [extra hisn run args...]; sets S_PID,
+# S_LOG. Unlike start_session this uses --profile (not --policy) and does NOT
+# override SSH_AUTH_SOCK, so L45 can hand the session a real throwaway agent.
+start_profile_session() {
+  local name=$1 cwd=$2 prof=$3
+  shift 3
+  S_LOG="$WORK/$name.log"
+  HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 \
+    "$HISN" run --profile "$prof" --session-id "$name" "$@" -- "$cwd/leakprobe" loop "$cwd/ctl" \
+    </dev/null >"$S_LOG.out" 2>"$S_LOG" &
+  S_PID=$!
+  SESSIONS+=("$S_PID")
+  local i
+  for i in $(seq 1 150); do
+    [ -e "$cwd/ctl/ready" ] && return 0
+    kill -0 "$S_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  echo "session $name did not become ready; hisn said:"; sed 's/^/    /' "$S_LOG"
+  return 1
+}
+
+# write_profile FILE CWD [extra TOML tables...]
+write_profile() {
+  local f=$1 cwd=$2
+  shift 2
+  {
+    printf 'version = "hisn-profile/v1"\n[policy]\nversion = "hisn-policy/v1"\n'
+    printf 'session.cwd = "%s"\nsession.network = "none"\n' "$cwd"
+    printf '%s\n' "$@"
+  } >"$f"
+}
+
+# mount_opts CWD MOUNTPOINT: the per-mount options field of that mount point
+# inside the session (from the probe's mountinfo command).
+mount_opts() {
+  q "$1" mountinfo | awk -v mp="$2" '$5 == mp { print $6; exit }'
+}
+
+# runtime_entries: sorted listing of the host runtime root (session dirs).
+runtime_entries() { ls -A "$RUNTIME_ROOT" 2>/dev/null | sort; }
+
+# copy_tree SRC DST: cheap as possible (hardlinks if same fs), else real copy.
+copy_tree() { cp -al "$1" "$2" 2>/dev/null || cp -a "$1" "$2"; }
+
 # ================================================ L42: persistent home (0.3.2)
-# A profile with [home] persist creates the directory if missing, mounts it
-# rw as $HOME, and the host $HOME is not visible. A file written inside the
-# session exists on the host at the persist path. Sub-checks cover the
-# claimed invariants: cross-session persistence, symlink escape blocked,
-# pre-0.3.2 home location fails, refuse-list rejection, HOME env, persist
-# ≠ real $HOME.
+# [home] persist mounts a host dir rw as $HOME. Sub-checks:
+#   R1 dir created             R2 persists across sessions
+#   R3 symlink out of the persist dir is not followable (read AND write)
+#   R4 the tmpfs home is not in use: /run/hisn/home IS the persist dir
+#   R5 refuse list (real $HOME, its ancestor, /, cwd, cwd ancestor, a file)
+#      is rejected with exit 125 before any session dir exists
+#   R6 HOME env is the sandbox path   R7 persist != real $HOME
 L42_CWD=$(new_cwd l42)
 L42_PERSIST="$WORK/l42-persist"
 rm -rf "$L42_PERSIST"
 L42_PROFILE="$WORK/L42-profile.toml"
-cat >"$L42_PROFILE" <<L42EOF
-version = "hisn-profile/v1"
-[policy]
-version = "hisn-policy/v1"
-session.cwd = "$L42_CWD"
-session.network = "none"
-[home]
-persist = "$L42_PERSIST"
-L42EOF
-if start_session l42-$$ "$L42_CWD" "$L42_PROFILE" --profile "$L42_PROFILE"; then
-  # R1: persist dir created.
+write_profile "$L42_PROFILE" "$L42_CWD" '[home]' "persist = \"$L42_PERSIST\""
+L42_MARKER="$HOME/.hisn-l42-marker-$$"
+if start_profile_session l42-$$ "$L42_CWD" "$L42_PROFILE"; then
   if [ -d "$L42_PERSIST" ]; then
     pass "L42 R1 persist dir created"
   else
     fail "L42 R1 persist dir" "not created at $L42_PERSIST"
   fi
-  # R2: file written in session A readable in session B with the same persist
-  # path (cross-session persistence). Write a file in session A, end it,
-  # start session B with the same persist, and read it.
-  q "$L42_CWD" "write \$HOME/l42-cross" >/dev/null
+  # R4 + R2 part 1: the probe sees the persist dir at /run/hisn/home.
+  q "$L42_CWD" "write /run/hisn/home/l42-cross" >/dev/null
   if [ -f "$L42_PERSIST/l42-cross" ]; then
-    pass "L42 R2 file written in session exists at persist path"
+    pass "L42 R4 /run/hisn/home is the persist dir (write lands on the host persist path)"
   else
-    fail "L42 R2 cross-session" "file not found at $L42_PERSIST/l42-cross"
+    fail "L42 R4 tmpfs home not used" "write to /run/hisn/home did not land in $L42_PERSIST"
+  fi
+  l42_env=$(q "$L42_CWD" env)
+  case "$l42_env" in
+    *"HOME=/run/hisn/home"*) pass "L42 R6 HOME is the sandbox path" ;;
+    *) fail "L42 R6 HOME" "env does not show HOME=/run/hisn/home" ;;
+  esac
+  if [ "$L42_PERSIST" != "$HOME" ]; then
+    pass "L42 R7 persist != real \$HOME"
+  else
+    fail "L42 R7 refuse list" "persist == real \$HOME"
   fi
   end_session "$L42_CWD" "$S_PID"
-  # Start a second session with the same persist path and verify the file
-  # is still there (cross-session persistence).
+
+  # Session B, same persist path, different cwd.
   L42B_CWD=$(new_cwd l42b)
   L42B_PROFILE="$WORK/L42b-profile.toml"
-  cat >"$L42B_PROFILE" <<L42BEOF
-version = "hisn-profile/v1"
-[policy]
-version = "hisn-policy/v1"
-session.cwd = "$L42B_CWD"
-session.network = "none"
-[home]
-persist = "$L42_PERSIST"
-L42BEOF
-  if start_session l42b-$$ "$L42B_CWD" "$L42B_PROFILE" --profile "$L42B_PROFILE"; then
-    l42b_cat=$(q "$L42B_CWD" "cat \$HOME/l42-cross")
-    case "$l42b_cat" in
-      OK*leak*) pass "L42 R2 cross-session: file readable in session B" ;;
-      *) fail "L42 R2 cross-session" "session B got [$l42b_cat]" ;;
+  write_profile "$L42B_PROFILE" "$L42B_CWD" '[home]' "persist = \"$L42_PERSIST\""
+  # Symlink traps planted on the host inside the persist dir, pointing at a
+  # real host file under the real $HOME (a marker with known content).
+  echo "l42-host-secret" >"$L42_MARKER"
+  ln -sf "$L42_MARKER" "$L42_PERSIST/l42-link-abs"
+  ln -sf "../../../../$L42_MARKER" "$L42_PERSIST/l42-link-rel"
+  ln -sf "$HOME" "$L42_PERSIST/l42-link-home"
+  if start_profile_session l42b-$$ "$L42B_CWD" "$L42B_PROFILE"; then
+    l42b_cat=$(q "$L42B_CWD" "cat /run/hisn/home/l42-cross")
+    has "L42 R2 file written in session A is readable in session B" "$l42b_cat" "leak"
+    for l in l42-link-abs l42-link-rel; do
+      r=$(q "$L42B_CWD" "cat /run/hisn/home/$l")
+      case "$r" in
+        *l42-host-secret*) fail "L42 R3 read through $l" "host marker content visible: $r" ;;
+        *) pass "L42 R3 read through symlink $l blocked ($r)" ;;
+      esac
+      r=$(q "$L42B_CWD" "write /run/hisn/home/$l")
+      if [ "$(cat "$L42_MARKER")" = "l42-host-secret" ]; then
+        pass "L42 R3 write through symlink $l did not reach the host file ($r)"
+      else
+        fail "L42 R3 write through $l" "host marker modified: $(cat "$L42_MARKER")"
+      fi
+    done
+    r=$(q "$L42B_CWD" "ls /run/hisn/home/l42-link-home")
+    case "$r" in
+      OK*) fail "L42 R3 symlink to real \$HOME" "listing through the link succeeded: $r" ;;
+      *) pass "L42 R3 symlink to real \$HOME not listable ($r)" ;;
     esac
-    # R3: a symlink created inside the persist dir to a host path outside
-    # it (e.g. the real $HOME) cannot be read or written through.
-    ln -sf "$HOME" "$L42_PERSIST/l42-escape-link"
-    l42b_link=$(q "$L42B_CWD" "cat \$HOME/l42-escape-link")
-    case "$l42b_link" in
-      OK*) fail "L42 R3 symlink escape" "read through symlink to real \$HOME" ;;
-      *) pass "L42 R3 symlink escape blocked ($l42b_link)" ;;
-    esac
-    rm -f "$L42_PERSIST/l42-escape-link"
-    # R4: writes under the pre-0.3.2 home location (/run/hisn/home/...)
-    # fail when persist is set (the mount is the persist dir, not tmpfs).
-    l42b_oldhome=$(q "$L42B_CWD" "write /run/hisn/home/l42-old")
-    case "$l42b_oldhome" in
-      OK*) fail "L42 R4 pre-0.3.2 home" "write to /run/hisn/home succeeded" ;;
-      *) pass "L42 R4 pre-0.3.2 home location fails ($l42b_oldhome)" ;;
-    esac
-    # R6: HOME=/run/hisn/home in the session env.
-    l42b_env=$(q "$L42B_CWD" "env")
-    if printf '%s' "$l42b_env" | grep -q 'HOME=/run/hisn/home'; then
-      pass "L42 R6 HOME is the sandbox path"
-    else
-      fail "L42 R6 HOME" "env does not show HOME=/run/hisn/home"
-    fi
-    # R7: persist ≠ real $HOME.
-    if [ "$L42_PERSIST" != "$HOME" ]; then
-      pass "L42 R7 persist != real \$HOME"
-    else
-      fail "L42 R7 refuse list" "persist == real \$HOME"
-    fi
     end_session "$L42B_CWD" "$S_PID"
   else
-    fail "L42 R2 cross-session" "session B did not start"
+    fail "L42 R2/R3 session B" "session B did not start"
   fi
-  # R5: each refuse-list case is rejected before any namespace exists.
-  # Try to start with persist = real $HOME, /, cwd, and ancestor of cwd.
-  # Each must exit 125 and leave no session dir.
-  for L42_REFUSE in "$HOME" "/" "$L42_CWD" "$(dirname "$L42_CWD")"; do
-    L42R_CWD=$(new_cwd "l42refuse")
-    L42R_PROFILE="$WORK/L42-refuse-$$.toml"
-    cat >"$L42R_PROFILE" <<L42REFEOF
-version = "hisn-profile/v1"
-[policy]
-version = "hisn-policy/v1"
-session.cwd = "$L42R_CWD"
-session.network = "none"
-[home]
-persist = "$L42_REFUSE"
-L42REFEOF
-    L42R_OUT=$("$HISN" run --profile "$L42R_PROFILE" --session-id "l42-refuse-$$" --detach </dev/null 2>&1)
-    L42R_RC=$?
-    if [ "$L42R_RC" -eq 125 ]; then
-      pass "L42 R5 refuse [$L42_REFUSE] rejected (exit 125)"
-    else
-      fail "L42 R5 refuse [$L42_REFUSE]" "rc=$L42R_RC out=[$(printf '%s' "$L42R_OUT" | head -c 200)]"
-    fi
-    # Assert no session dir was created.
-    if [ ! -d "$RUNTIME_ROOT/l42-refuse-$$" ]; then
-      pass "L42 R5 refuse [$L42_REFUSE] no session dir created"
-    else
-      fail "L42 R5 refuse [$L42_REFUSE] session dir" "dir exists at $RUNTIME_ROOT/l42-refuse-$$"
-      rm -rf "$RUNTIME_ROOT/l42-refuse-$$" 2>/dev/null
-    fi
-  done
+  rm -f "$L42_MARKER" "$L42_PERSIST"/l42-link-*
 else
   fail "L42 persist home" "session did not start"
 fi
+# R5: refuse list, each rejected before any namespace/session dir exists.
+L42R_CWD=$(new_cwd l42refuse)
+L42_FILE="$WORK/l42-not-a-dir"
+echo x >"$L42_FILE"
+L42_CASES=("$HOME|real \$HOME" "/|root" "$L42R_CWD|cwd" "$(dirname "$L42R_CWD")|ancestor of cwd" "$L42_FILE|not a directory")
+[ "$(dirname "$HOME")" != "/" ] && L42_CASES+=("$(dirname "$HOME")|ancestor of \$HOME")
+for L42_CASE in "${L42_CASES[@]}"; do
+  L42_REFUSE=${L42_CASE%%|*} L42_WHY=${L42_CASE#*|}
+  L42R_PROFILE="$WORK/L42-refuse.toml"
+  write_profile "$L42R_PROFILE" "$L42R_CWD" '[home]' "persist = \"$L42_REFUSE\""
+  before=$(runtime_entries)
+  L42R_OUT=$("$HISN" run --profile "$L42R_PROFILE" --session-id "l42-refuse-$$" --detach </dev/null 2>&1)
+  L42R_RC=$?
+  after=$(runtime_entries)
+  if [ "$L42R_RC" -eq 125 ]; then
+    pass "L42 R5 refuse $L42_WHY: rejected (exit 125)"
+  else
+    fail "L42 R5 refuse $L42_WHY" "rc=$L42R_RC out=[$(printf '%s' "$L42R_OUT" | head -c 200)]"
+  fi
+  if [ "$before" = "$after" ] && [ ! -e "$RUNTIME_ROOT/l42-refuse-$$" ]; then
+    pass "L42 R5 refuse $L42_WHY: no session dir or socket created"
+  else
+    fail "L42 R5 refuse $L42_WHY: session dir" "runtime root changed: [$before] -> [$after]"
+    rm -rf "$RUNTIME_ROOT/l42-refuse-$$" 2>/dev/null
+  fi
+done
 
 # ================================================ L43: rootfs (0.3.2, needs HISN_TEST_ROOTFS)
-# With HISN_TEST_ROOTFS set to a real rootfs path, host /usr is not visible,
-# a host-only binary cannot be executed, rootfs write fails (ro), the mounts
-# show ro,nosuid,nodev in /proc/self/mountinfo, and the username matches the
-# host. Sub-checks cover the claimed invariants.
+# Sub-checks: R1 host /opt marker absent   R2 host-only binary not executable
+#   R3 every rootfs mount is ro,nosuid,nodev in mountinfo (closes S5)
+#   R4 remount from inside cannot drop the flags; /usr stays read-only
+#   R5 username == host username   R6 /nix: host /nix is not visible
+# Skips: whole test without HISN_TEST_ROOTFS (+ /usr); R1 if /opt is not
+# writable; R6 if the host has no /nix or the rootfs ships its own /nix.
 L43_CWD=$(new_cwd l43)
 L43_PROFILE="$WORK/L43-profile.toml"
 if [ -n "${HISN_TEST_ROOTFS:-}" ] && [ -d "$HISN_TEST_ROOTFS/usr" ]; then
-  cat >"$L43_PROFILE" <<L43EOF
-version = "hisn-profile/v1"
-[policy]
-version = "hisn-policy/v1"
-session.cwd = "$L43_CWD"
-session.network = "none"
-[rootfs]
-path = "$HISN_TEST_ROOTFS"
-L43EOF
-  if start_session l43-$$ "$L43_CWD" "$L43_PROFILE" --profile "$L43_PROFILE"; then
-    # R1: host /usr, /opt, /nix not visible. Create a host-only marker file
-    # under a host path hisn would normally expose, and assert it is absent
-    # in the session.
-    L43_MARKER="/opt/hisn-leak-marker-$$"
-    if [ -w /opt ]; then
-      echo "host-only" >"$L43_MARKER"
-      l43_stat=$(q "$L43_CWD" "stat $L43_MARKER")
-      case "$l43_stat" in
+  write_profile "$L43_PROFILE" "$L43_CWD" '[rootfs]' "path = \"$HISN_TEST_ROOTFS\""
+  L43_MARKER="/opt/hisn-leak-marker-$$"
+  L43_MADE=0
+  if [ -w /opt ] && echo host-only >"$L43_MARKER" 2>/dev/null; then L43_MADE=1; fi
+  if start_profile_session l43-$$ "$L43_CWD" "$L43_PROFILE"; then
+    if [ "$L43_MADE" = 1 ]; then
+      case $(q "$L43_CWD" "stat $L43_MARKER") in
         ENOENT) pass "L43 R1 host /opt marker not visible in session" ;;
-        *) fail "L43 R1 host marker" "stat got [$l43_stat] want ENOENT" ;;
-      esac
-      rm -f "$L43_MARKER"
-    else
-      # /opt not writable — use a different approach: check /usr/bin/id
-      # vs the host binary. If rootfs is set, the host /usr is not
-      # visible, so the host's /usr/bin/id should not be the same as
-      # what's in the session.
-      weak "L43 R1 host /opt marker" "/opt not writable, cannot create marker"
-    fi
-    # R2: a host-only binary (the leakprobe helper) is not executable inside
-    # the session. The leakprobe binary lives in the host's $PROBE_SRC path.
-    L43_HOST_PROBE="$PROBE_SRC"
-    if [ -x "$L43_HOST_PROBE" ]; then
-      l43_exec=$(q "$L43_CWD" "exec $L43_HOST_PROBE true")
-      case "$l43_exec" in
-        SPAWN:ENOENT|ENOENT) pass "L43 R2 host binary not executable in session ($l43_exec)" ;;
-        OK*) fail "L43 R2 host binary" "exec succeeded: $l43_exec" ;;
-        *) pass "L43 R2 host binary not executable ($l43_exec)" ;;
+        *) fail "L43 R1 host marker" "marker visible in session" ;;
       esac
     else
-      weak "L43 R2 host binary" "probe binary not found at $L43_HOST_PROBE"
+      skip "L43 R1 host /opt marker" "/opt not writable by this user"
     fi
-    # R3: rootfs mounts show ro,nosuid,nodev in /proc/self/mountinfo inside
-    # the session (closes S5).
-    l43_mountinfo=$(q "$L43_CWD" "cat /proc/self/mountinfo")
-    L43_USR_LINE=$(printf '%s' "$l43_mountinfo" | grep ' /usr ' | head -1)
-    if [ -n "$L43_USR_LINE" ]; then
-      if printf '%s' "$L43_USR_LINE" | grep -q 'ro,' && \
-         printf '%s' "$L43_USR_LINE" | grep -q 'nosuid,' && \
-         printf '%s' "$L43_USR_LINE" | grep -q 'nodev'; then
-        pass "L43 R3 /usr mounts show ro,nosuid,nodev"
-      else
-        fail "L43 R3 mount flags" "mountinfo line: $L43_USR_LINE"
-      fi
-    else
-      fail "L43 R3 mount flags" "no /usr mount in mountinfo"
-    fi
-    # R4: a remount(MS_REMOUNT|MS_RDWR) attempt from inside the session
-    # cannot drop the read-only flag (write to /usr still fails).
-    l43_remount=$(q "$L43_CWD" "syscall mount" 2>/dev/null || true)
-    l43_write=$(q "$L43_CWD" "write /usr/l43-test")
-    case "$l43_write" in
-      EROFS|EBUSY|EACCES|EPERM) pass "L43 R4 remount cannot drop ro ($l43_write)" ;;
-      OK) fail "L43 R4 remount" "write to /usr succeeded after remount attempt" ;;
-      *) pass "L43 R4 remount cannot drop ro ($l43_write)" ;;
+    r=$(q "$L43_CWD" "exec $PROBE_SRC true")
+    case "$r" in
+      SPAWN:ENOENT|SPAWN:EACCES) pass "L43 R2 host-only binary not executable in session ($r)" ;;
+      *) fail "L43 R2 host binary" "got [$r] (host path $PROBE_SRC should not exist in session)" ;;
     esac
-    # R5: username equals host username.
-    l43_env=$(q "$L43_CWD" "env")
-    l43_user=$(printf '%s' "$l43_env" | grep '^USER=' | head -1 | cut -d= -f2)
-    if [ "$l43_user" = "$(id -un)" ]; then
-      pass "L43 R5 username matches host"
+    L43_BAD=""
+    L43_SEEN=0
+    for mp in /usr /bin /sbin /lib /lib64 /opt; do
+      o=$(mount_opts "$L43_CWD" "$mp")
+      [ -z "$o" ] && continue
+      L43_SEEN=$((L43_SEEN + 1))
+      for f in ro nosuid nodev; do
+        case ",$o," in *",$f,"*) ;; *) L43_BAD="$L43_BAD $mp(missing $f in $o)" ;; esac
+      done
+    done
+    if [ "$L43_SEEN" -gt 0 ] && [ -z "$L43_BAD" ]; then
+      pass "L43 R3 $L43_SEEN rootfs mounts show ro,nosuid,nodev in mountinfo"
     else
-      fail "L43 R5 username" "got [$l43_user] want [$(id -un)]"
+      fail "L43 R3 mount flags" "seen=$L43_SEEN bad:$L43_BAD"
     fi
-    # R6: a setuid-root copy of a rootfs binary, placed in a test copy of
-    # the rootfs, runs without privilege (euid unchanged — nosuid enforced).
-    # We test nosuid by checking that a setuid binary in the rootfs does
-    # not gain root. Since we can't easily create a setuid binary in the
-    # rootfs without root, we check that nosuid is in the mount options
-    # (already verified in R3) and that /usr is mounted nosuid.
-    if printf '%s' "$L43_USR_LINE" | grep -q 'nosuid'; then
-      pass "L43 R6 nosuid enforced on /usr mount"
+    case $(q "$L43_CWD" "remount /usr") in
+      OK*|UNEXPECTED_SUCCESS*) fail "L43 R4 remount" "MS_REMOUNT|MS_BIND on /usr succeeded" ;;
+      *) pass "L43 R4 remount of /usr refused" ;;
+    esac
+    case ",$(mount_opts "$L43_CWD" /usr)," in
+      *,ro,*,nosuid,*,nodev,*|*,ro,*,nodev,*,nosuid,*) pass "L43 R4 /usr flags unchanged after remount attempt" ;;
+      *) fail "L43 R4 flags after remount" "opts=$(mount_opts "$L43_CWD" /usr)" ;;
+    esac
+    case $(q "$L43_CWD" "write /usr/l43-test") in
+      EROFS) pass "L43 R4 /usr is read-only (EROFS)" ;;
+      *) fail "L43 R4 /usr write" "expected EROFS" ;;
+    esac
+    l43_user=$(q "$L43_CWD" env | sed -n 's/^USER=//p' | head -1)
+    eq "L43 R5 username matches host" "$l43_user" "$(id -un)"
+    if [ -d /nix ] && [ ! -e "$HISN_TEST_ROOTFS/nix" ]; then
+      l43_nix=$(q "$L43_CWD" "stat /nix")
+      case "$l43_nix" in
+        ENOENT) pass "L43 R6 host /nix not visible in session" ;;
+        *) fail "L43 R6 host /nix" "stat /nix in session got [$l43_nix] want ENOENT" ;;
+      esac
     else
-      fail "L43 R6 nosuid" "nosuid not in mount options: $L43_USR_LINE"
+      skip "L43 R6 host /nix" "no /nix on host (or rootfs ships its own /nix)"
     fi
     end_session "$L43_CWD" "$S_PID"
   else
     fail "L43 rootfs" "session did not start"
   fi
+  [ "$L43_MADE" = 1 ] && rm -f "$L43_MARKER"
 else
   skip "L43 rootfs" "HISN_TEST_ROOTFS not set or missing /usr"
 fi
 
 # ================================================ L44: rootfs import hardening (0.3.2, always runs)
-# Test that the import tool rejects path traversal, strips setuid bits, and
-# handles absolute names. Uses a synthetic tar built by the test.
+# Synthetic tars built with python3 tarfile, imported through the real CLI.
+#   valid tar: succeeds; setuid stripped; absolute name normalised;
+#              device node skipped; --from-tar - (stdin) works
+#   '..' entry: import FAILS naming the entry, nothing written outside
+#   symlink-then-write: nothing written through the symlink
+#   hard-link escape: not created
+#   existing name without --replace is refused
 L44_WORK="$WORK/l44"
-mkdir -p "$L44_WORK/dest"
-# Build a synthetic tar with a setuid file, a normal file, and a traversal
-# entry. We use Python's tarfile to build it.
-XDG_DATA_HOME="$L44_WORK" python3 -c "
-import tarfile, io, os, sys
-buf = io.BytesIO()
-with tarfile.open(fileobj=buf, mode='w') as tf:
-    # Normal file
-    info = tarfile.TarInfo(name='normal.txt')
-    data = b'hello'
-    info.size = len(data)
-    tf.addfile(info, io.BytesIO(data))
-    # setuid file (mode 0o4755)
-    info = tarfile.TarInfo(name='setuid.txt')
-    info.mode = 0o4755
-    info.size = 0
-    tf.addfile(info, io.BytesIO(b''))
-    # path traversal — should be skipped
-    info = tarfile.TarInfo(name='../escape.txt')
-    info.size = 0
-    tf.addfile(info, io.BytesIO(b''))
-    # absolute path — should be normalized to etc/passwd
-    info = tarfile.TarInfo(name='/etc/passwd')
-    info.size = 0
-    tf.addfile(info, io.BytesIO(b''))
-buf.seek(0)
-with open('$L44_WORK/test.tar', 'wb') as f:
-    f.write(buf.getvalue())
-" 2>"$L44_WORK/py.err"
-if [ -f "$L44_WORK/test.tar" ]; then
-  # Import the tar (XDG_DATA_HOME is set so the store is under L44_WORK).
-  L44_OUT=$(XDG_DATA_HOME="$L44_WORK" "$HISN" rootfs import l44-test --from-tar "$L44_WORK/test.tar" --replace 2>&1)
-  L44_RC=$?
-  if [ $L44_RC -eq 0 ]; then
+mkdir -p "$L44_WORK/victim"
+L44_ENV=(env XDG_DATA_HOME="$L44_WORK")
+L44_STORE="$L44_WORK/hisn/rootfs"
+L44_PYERR="$L44_WORK/py.err"
+python3 - "$L44_WORK" 2>"$L44_PYERR" <<'PYEOF'
+import io, sys, tarfile
+w = sys.argv[1]
+def add(tf, name, data=b'', mode=0o644, type=tarfile.REGTYPE, link=''):
+    i = tarfile.TarInfo(name=name)
+    i.mode, i.type, i.linkname = mode, type, link
+    i.size = len(data) if type == tarfile.REGTYPE else 0
+    tf.addfile(i, io.BytesIO(data) if type == tarfile.REGTYPE else None)
+with tarfile.open(w + '/good.tar', 'w') as tf:
+    add(tf, 'normal.txt', b'hello')
+    add(tf, 'setuid.txt', mode=0o4755)
+    add(tf, '/etc/passwd', b'root')
+    add(tf, 'dev-null', mode=0o666, type=tarfile.CHRTYPE)
+with tarfile.open(w + '/dotdot.tar', 'w') as tf:
+    add(tf, 'ok.txt', b'x')
+    add(tf, '../l44-escape.txt', b'evil')
+with tarfile.open(w + '/symlink.tar', 'w') as tf:
+    add(tf, 'usr', type=tarfile.SYMTYPE, link=w + '/victim')
+    add(tf, 'usr/pwned', b'evil')
+with tarfile.open(w + '/hardlink.tar', 'w') as tf:
+    add(tf, 'h', type=tarfile.LNKTYPE, link='../../../../etc/passwd')
+PYEOF
+if [ ! -f "$L44_WORK/good.tar" ]; then
+  fail "L44 tar build" "python3 tarfile failed: $(cat "$L44_PYERR")"
+else
+  L44_OUT=$("${L44_ENV[@]}" "$HISN" rootfs import l44-good --from-tar "$L44_WORK/good.tar" 2>&1)
+  if [ $? -eq 0 ]; then
     pass "L44 import succeeds"
-    L44_STORE="$L44_WORK/hisn/rootfs/l44-test"
-    # The setuid bit should be stripped.
-    if [ -f "$L44_STORE/setuid.txt" ]; then
-      l44_mode=$(stat -c '%a' "$L44_STORE/setuid.txt" 2>/dev/null || stat -f '%Lp' "$L44_STORE/setuid.txt")
-      case "$l44_mode" in
-        4*) fail "L44 setuid strip" "mode is $l44_mode (setuid not stripped)" ;;
-        *) pass "L44 setuid stripped (mode $l44_mode)" ;;
-      esac
+    g="$L44_STORE/l44-good"
+    l44_mode=$(stat -c '%a' "$g/setuid.txt" 2>/dev/null)
+    case "$l44_mode" in
+      "") fail "L44 setuid file" "not found after import" ;;
+      4*|6*) fail "L44 setuid strip" "mode is $l44_mode (setuid not stripped)" ;;
+      *) pass "L44 setuid stripped (mode $l44_mode)" ;;
+    esac
+    [ -f "$g/normal.txt" ] && pass "L44 normal file extracted" || fail "L44 normal file" "missing"
+    [ -f "$g/etc/passwd" ] && pass "L44 absolute path normalised" || fail "L44 absolute path" "etc/passwd missing"
+    [ ! -e "$g/dev-null" ] && pass "L44 device node skipped" || fail "L44 device node" "dev-null was created"
+    # Existing name without --replace is refused; the tree is untouched.
+    if "${L44_ENV[@]}" "$HISN" rootfs import l44-good --from-tar "$L44_WORK/good.tar" >/dev/null 2>&1; then
+      fail "L44 no overwrite" "second import without --replace succeeded"
     else
-      fail "L44 setuid file" "not found after import"
+      pass "L44 existing name refused without --replace"
     fi
-    # The normal file should exist.
-    if [ -f "$L44_STORE/normal.txt" ]; then
-      pass "L44 normal file extracted"
+    # stdin
+    if cat "$L44_WORK/good.tar" | "${L44_ENV[@]}" "$HISN" rootfs import l44-stdin --from-tar - >/dev/null 2>&1 \
+       && [ -f "$L44_STORE/l44-stdin/normal.txt" ]; then
+      pass "L44 --from-tar - streams from stdin"
     else
-      fail "L44 normal file" "not found after import"
+      fail "L44 stdin" "import from stdin failed"
     fi
-    # The traversal entry should be skipped (no escape.txt outside the store).
-    if [ ! -f "$L44_WORK/escape.txt" ]; then
-      pass "L44 traversal rejected"
-    else
-      fail "L44 traversal" "escape.txt was created outside the store"
-    fi
-    # The absolute path should be normalized to etc/passwd inside the store.
-    if [ -f "$L44_STORE/etc/passwd" ]; then
-      pass "L44 absolute path normalized"
-    else
-      fail "L44 absolute path" "etc/passwd not found in store"
-    fi
-    # Cleanup.
-    XDG_DATA_HOME="$L44_WORK" "$HISN" rootfs rm l44-test 2>/dev/null
   else
     fail "L44 import" "import failed: $L44_OUT"
   fi
+  # '..' entry: the whole import fails and names the entry.
+  L44_OUT=$("${L44_ENV[@]}" "$HISN" rootfs import l44-dotdot --from-tar "$L44_WORK/dotdot.tar" 2>&1)
+  L44_RC=$?
+  if [ $L44_RC -ne 0 ] && printf '%s' "$L44_OUT" | grep -q 'l44-escape.txt'; then
+    pass "L44 '..' entry fails the import and names the entry"
+  else
+    fail "L44 traversal" "rc=$L44_RC out=[$L44_OUT]"
+  fi
+  if [ ! -e "$L44_WORK/l44-escape.txt" ] && [ ! -e "$L44_WORK/hisn/l44-escape.txt" ] \
+     && [ ! -e "$L44_STORE/l44-escape.txt" ] && [ ! -e "$L44_STORE/l44-dotdot" ]; then
+    pass "L44 traversal: nothing written outside, no store entry left"
+  else
+    fail "L44 traversal leftovers" "escape file or store entry exists"
+  fi
+  # symlink-then-write: archive imports, but nothing lands in the victim dir.
+  "${L44_ENV[@]}" "$HISN" rootfs import l44-sym --from-tar "$L44_WORK/symlink.tar" >/dev/null 2>&1
+  if [ ! -e "$L44_WORK/victim/pwned" ]; then
+    pass "L44 symlink-then-write: nothing written through the symlink"
+  else
+    fail "L44 symlink-then-write" "file created in $L44_WORK/victim"
+  fi
+  # hard-link escape: no link to a host file is created.
+  "${L44_ENV[@]}" "$HISN" rootfs import l44-hl --from-tar "$L44_WORK/hardlink.tar" >/dev/null 2>&1
+  if [ ! -e "$L44_STORE/l44-hl/h" ]; then
+    pass "L44 hard link to a target outside the tree not created"
+  else
+    fail "L44 hard-link escape" "h exists in the store"
+  fi
+fi
+# Big streaming test (opt-in: HISN_BIG_TESTS=1): 512 MB through the extractor,
+# peak RSS growth must stay < 64 MB (unit test in src/rootfs_import.rs).
+if [ "${HISN_BIG_TESTS:-}" = 1 ]; then
+  if command -v cargo >/dev/null 2>&1; then
+    L44_BIG=$(cd "$ROOT" && HISN_BIG_TESTS=1 TMPDIR="$WORK" cargo test --release --lib streaming_512mb -- --nocapture 2>&1)
+    L44_BIG_RC=$?
+    if printf '%s' "$L44_BIG" | grep -q 'skipped:'; then
+      skip "L44 big streaming 512 MB" "$(printf '%s' "$L44_BIG" | grep -m1 'skipped:')"
+    elif [ $L44_BIG_RC -eq 0 ]; then
+      pass "L44 big streaming 512 MB import stays under 64 MB RSS ($(printf '%s' "$L44_BIG" | grep -m1 'VmHWM delta'))"
+    else
+      fail "L44 big streaming 512 MB" "$(printf '%s' "$L44_BIG" | tail -5)"
+    fi
+  else
+    skip "L44 big streaming 512 MB" "cargo not found"
+  fi
 else
-  fail "L44 tar build" "python3 tarfile failed: $(cat "$L44_WORK/py.err")"
+  skip "L44 big streaming 512 MB" "HISN_BIG_TESTS=1 not set"
 fi
 
 # ================================================ L45: SSH agent T1 (0.3.2)
-# Test that the proxy rejects mutations, filters identities by allowlist,
-# and the host SSH_AUTH_SOCK is not visible. Uses a throwaway ssh-agent with
-# two ed25519 keys. Sub-checks cover the claimed invariants: allowlist
-# filtering, sign with allowed key, sign with non-listed key fails, add/remove
-# from inside the session fail, host agent unchanged, host socket not visible,
-# proxy socket absent after teardown, no-allowlist case.
-if command -v ssh-agent >/dev/null 2>&1 && command -v ssh-add >/dev/null 2>&1; then
+# Throwaway ssh-agent with two ed25519 keys; keys[] = [key1].
+#   with keys=[fp1]: ssh-add -l lists exactly key1; sign with key1 works;
+#     sign with key2 fails; ssh-add (add) and ssh-add -D fail; host agent
+#     still lists both keys; host SSH_AUTH_SOCK path not visible; proxy
+#     socket exists during the session and is gone after teardown.
+#   without keys=: both keys listed; add/remove still fail.
+# Skip: no ssh-agent / ssh-add / ssh-keygen on the host.
+if command -v ssh-agent >/dev/null 2>&1 && command -v ssh-add >/dev/null 2>&1 \
+   && command -v ssh-keygen >/dev/null 2>&1; then
   L45_CWD=$(new_cwd l45)
-  L45_PROFILE="$WORK/L45-profile.toml"
-  # Start a test ssh-agent with two throwaway ed25519 keys.
-  L45_KEY1="$WORK/l45-key1"
-  L45_KEY2="$WORK/l45-key2"
-  rm -f "$L45_KEY1" "$L45_KEY1.pub" "$L45_KEY2" "$L45_KEY2.pub"
+  # Keys live under the cwd (mounted rw in the session). Only public keys are
+  # in pub/; the private key of key2 sits in addkey/ solely so that an
+  # in-session `ssh-add` has something to add.
+  mkdir -p "$L45_CWD/pub" "$L45_CWD/addkey" "$WORK/l45-keys"
+  L45_KEY1="$WORK/l45-keys/key1"
+  L45_KEY2="$WORK/l45-keys/key2"
   ssh-keygen -t ed25519 -f "$L45_KEY1" -N "" -q 2>/dev/null
   ssh-keygen -t ed25519 -f "$L45_KEY2" -N "" -q 2>/dev/null
-  # Save the current SSH_AUTH_SOCK so we can restore it.
+  cp "$L45_KEY1.pub" "$L45_CWD/pub/key1.pub"
+  cp "$L45_KEY2.pub" "$L45_CWD/pub/key2.pub"
+  cp "$L45_KEY2" "$L45_CWD/addkey/key2"
+  chmod 600 "$L45_CWD/addkey/key2"
+  echo "to-be-signed" >"$L45_CWD/msg"
   L45_SAVED_SOCK="${SSH_AUTH_SOCK:-}"
   L45_SAVED_PID="${SSH_AGENT_PID:-}"
   eval "$(ssh-agent -s 2>/dev/null)" >/dev/null 2>&1
-  ssh-add "$L45_KEY1" 2>/dev/null
-  ssh-add "$L45_KEY2" 2>/dev/null
-  if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -n "${SSH_AGENT_PID:-}" ]; then
+  L45_HOST_SOCK="${SSH_AUTH_SOCK:-}"
+  ssh-add "$L45_KEY1" >/dev/null 2>&1
+  ssh-add "$L45_KEY2" >/dev/null 2>&1
+  if [ -n "$L45_HOST_SOCK" ] && [ "$L45_HOST_SOCK" != "$L45_SAVED_SOCK" ] && [ -n "${SSH_AGENT_PID:-}" ] \
+     && [ "$(ssh-add -l 2>/dev/null | grep -c SHA256:)" = 2 ]; then
     L45_FP1=$(ssh-keygen -lf "$L45_KEY1.pub" | awk '{print $2}')
     L45_FP2=$(ssh-keygen -lf "$L45_KEY2.pub" | awk '{print $2}')
-    # --- With keys = [fingerprint of key1] ---
-    cat >"$L45_PROFILE" <<L45EOF
-version = "hisn-profile/v1"
-[policy]
-version = "hisn-policy/v1"
-session.cwd = "$L45_CWD"
-session.network = "none"
-[ssh]
-agent = true
-keys = ["$L45_FP1"]
-L45EOF
-    if start_session l45-$$ "$L45_CWD" "$L45_PROFILE" --profile "$L45_PROFILE"; then
-      # SSH_AUTH_SOCK points at the proxy socket, not the host agent.
-      l45_env=$(q "$L45_CWD" "env")
-      l45_sock=$(printf '%s' "$l45_env" | grep '^SSH_AUTH_SOCK=' | head -1 | cut -d= -f2)
-      if [ "$l45_sock" = "/run/ssh-agent.sock" ]; then
-        pass "L45 SSH_AUTH_SOCK points at proxy socket"
-      else
-        fail "L45 SSH_AUTH_SOCK" "got [$l45_sock] want [/run/ssh-agent.sock]"
-      fi
-      # Host SSH_AUTH_SOCK path is not visible.
-      if [ "$l45_sock" != "$L45_SAVED_SOCK" ] && [ -n "$l45_sock" ]; then
-        pass "L45 host SSH_AUTH_SOCK not visible"
-      else
-        fail "L45 host socket" "SSH_AUTH_SOCK matches host or is empty"
-      fi
-      # ssh-add -l inside the session lists exactly key1 (allowlist).
-      l45_keys=$(q "$L45_CWD" "exec ssh-add -l")
-      if printf '%s' "$l45_keys" | grep -q "$L45_FP1"; then
-        pass "L45 allowlist: ssh-add -l shows key1"
-      else
-        if printf '%s' "$l45_keys" | grep -q 'SPAWN:ENOENT'; then
-          skip "L45 allowlist" "ssh-add not in sandbox PATH"
-        else
-          fail "L45 allowlist" "ssh-add -l did not show key1: $l45_keys"
-        fi
-      fi
-      # ssh-add -l must NOT show key2 (filtered by allowlist).
-      if printf '%s' "$l45_keys" | grep -q "$L45_FP2"; then
-        fail "L45 allowlist filter" "ssh-add -l shows key2 (should be filtered)"
-      else
-        pass "L45 allowlist: key2 not listed (filtered)"
-      fi
-      # ssh-add (add a key) from inside the session fails.
-      l45_add=$(q "$L45_CWD" "exec ssh-add $L45_KEY2")
-      case "$l45_add" in
-        OK*exit=0*) fail "L45 ssh-add" "add succeeded (should fail)" ;;
-        SPAWN:ENOENT) skip "L45 ssh-add" "ssh-add not in sandbox PATH" ;;
-        *) pass "L45 ssh-add from inside session fails" ;;
-      esac
-      # ssh-add -D (remove all) from inside the session fails.
-      l45_del=$(q "$L45_CWD" "exec ssh-add -D")
-      case "$l45_del" in
-        OK*exit=0*) fail "L45 ssh-add -D" "remove all succeeded (should fail)" ;;
-        SPAWN:ENOENT) skip "L45 ssh-add -D" "ssh-add not in sandbox PATH" ;;
-        *) pass "L45 ssh-add -D from inside session fails" ;;
-      esac
-      # Host agent still lists both keys afterwards.
-      l45_host_keys=$(ssh-add -l 2>/dev/null)
-      if printf '%s' "$l45_host_keys" | grep -q "$L45_FP1" && \
-         printf '%s' "$l45_host_keys" | grep -q "$L45_FP2"; then
-        pass "L45 host agent still lists both keys after session ops"
-      else
-        fail "L45 host agent" "host agent keys changed: $l45_host_keys"
-      fi
-      # Proxy socket absent after teardown.
+    exit_of() { printf '%s' "$1" | sed -n '1s/.*exit=//p'; }
+    host_two_keys() { # both keys still in the host agent, exactly two
+      local l; l=$(ssh-add -l 2>/dev/null)
+      [ "$(printf '%s\n' "$l" | grep -c SHA256:)" = 2 ] \
+        && printf '%s' "$l" | grep -q "$L45_FP1" && printf '%s' "$l" | grep -q "$L45_FP2"
+    }
+    L45_PROFILE="$WORK/L45-profile.toml"
+    write_profile "$L45_PROFILE" "$L45_CWD" '[ssh]' 'agent = true' "keys = [\"$L45_FP1\"]"
+    if start_profile_session l45-$$ "$L45_CWD" "$L45_PROFILE"; then
       L45_PROXY_SOCKET="$RUNTIME_ROOT/l45-$$/ssh-agent.sock"
+      if [ -S "$L45_PROXY_SOCKET" ]; then
+        pass "L45 proxy socket exists during the session"
+      else
+        weak "L45 proxy socket exists" "not at $L45_PROXY_SOCKET (layout changed?); teardown check below is then vacuous"
+      fi
+      l45_env=$(q "$L45_CWD" env)
+      l45_sock=$(printf '%s' "$l45_env" | sed -n 's/^SSH_AUTH_SOCK=//p' | head -1)
+      eq "L45 SSH_AUTH_SOCK points at the proxy socket" "$l45_sock" "/run/ssh-agent.sock"
+      case $(q "$L45_CWD" "stat $L45_HOST_SOCK") in
+        ENOENT) pass "L45 host SSH_AUTH_SOCK path not visible" ;;
+        *) fail "L45 host socket" "host agent socket path $L45_HOST_SOCK is visible in session" ;;
+      esac
+      r=$(q "$L45_CWD" "exec-out ssh-add -l")
+      n=$(printf '%s\n' "$r" | grep -c SHA256:)
+      if [ "$n" = 1 ] && printf '%s' "$r" | grep -q "$L45_FP1" && ! printf '%s' "$r" | grep -q "$L45_FP2"; then
+        pass "L45 allowlist: ssh-add -l lists exactly key1"
+      else
+        fail "L45 allowlist" "ssh-add -l in session: $r"
+      fi
+      r=$(q "$L45_CWD" "exec-out ssh-keygen -Y sign -n hisnleak -f $L45_CWD/pub/key1.pub $L45_CWD/msg")
+      if [ "$(exit_of "$r")" = 0 ] && [ -s "$L45_CWD/msg.sig" ] \
+         && ssh-keygen -Y check-novalidate -n hisnleak -s "$L45_CWD/msg.sig" <"$L45_CWD/msg" >/dev/null 2>&1; then
+        pass "L45 sign with listed key1 succeeds (signature verifies)"
+      else
+        fail "L45 sign key1" "ssh-keygen -Y sign in session: $r"
+      fi
+      r=$(q "$L45_CWD" "exec-out ssh-keygen -Y sign -n hisnleak -f $L45_CWD/pub/key2.pub $L45_CWD/msg")
+      if [ "$(exit_of "$r")" != 0 ] && [ ! -e "$L45_CWD/msg.sig.2" ]; then
+        pass "L45 sign with non-listed key2 fails"
+      else
+        fail "L45 sign key2" "signing with a non-listed key worked: $r"
+      fi
+      r=$(q "$L45_CWD" "exec-out ssh-add $L45_CWD/addkey/key2")
+      ec=$(exit_of "$r")
+      if [ -n "$ec" ] && [ "$ec" != 0 ]; then
+        pass "L45 ssh-add (add key) from inside the session fails"
+      else
+        fail "L45 ssh-add add" "exit=[$ec]: $r"
+      fi
+      r=$(q "$L45_CWD" "exec-out ssh-add -D")
+      ec=$(exit_of "$r")
+      if [ -n "$ec" ] && [ "$ec" != 0 ]; then
+        pass "L45 ssh-add -D (remove all) from inside the session fails"
+      else
+        fail "L45 ssh-add -D" "exit=[$ec]: $r"
+      fi
+      if host_two_keys; then
+        pass "L45 host agent still lists both keys after the session's add/remove attempts"
+      else
+        fail "L45 host agent" "host agent keys changed: $(ssh-add -l 2>&1)"
+      fi
       end_session "$L45_CWD" "$S_PID"
       if [ ! -e "$L45_PROXY_SOCKET" ]; then
         pass "L45 proxy socket absent after teardown"
@@ -1984,104 +2028,115 @@ L45EOF
     else
       fail "L45 ssh-agent" "session did not start"
     fi
-    # --- Without keys = (empty allowlist = all keys) ---
+    # --- without keys = : every key the host agent offers ---
     L45B_CWD=$(new_cwd l45b)
     L45B_PROFILE="$WORK/L45b-profile.toml"
-    cat >"$L45B_PROFILE" <<L45BEOF
-version = "hisn-profile/v1"
-[policy]
-version = "hisn-policy/v1"
-session.cwd = "$L45B_CWD"
-session.network = "none"
-[ssh]
-agent = true
-L45BEOF
-    if start_session l45b-$$ "$L45B_CWD" "$L45B_PROFILE" --profile "$L45B_PROFILE"; then
-      # ssh-add -l lists both keys (empty allowlist = all).
-      l45b_keys=$(q "$L45B_CWD" "exec ssh-add -l")
-      if printf '%s' "$l45b_keys" | grep -q "$L45_FP1" && \
-         printf '%s' "$l45b_keys" | grep -q "$L45_FP2"; then
+    write_profile "$L45B_PROFILE" "$L45B_CWD" '[ssh]' 'agent = true'
+    if start_profile_session l45b-$$ "$L45B_CWD" "$L45B_PROFILE"; then
+      r=$(q "$L45B_CWD" "exec-out ssh-add -l")
+      if [ "$(printf '%s\n' "$r" | grep -c SHA256:)" = 2 ] && printf '%s' "$r" | grep -q "$L45_FP1" \
+         && printf '%s' "$r" | grep -q "$L45_FP2"; then
         pass "L45 no-allowlist: both keys listed"
       else
-        if printf '%s' "$l45b_keys" | grep -q 'SPAWN:ENOENT'; then
-          skip "L45 no-allowlist" "ssh-add not in sandbox PATH"
-        else
-          fail "L45 no-allowlist" "ssh-add -l did not show both keys: $l45b_keys"
-        fi
+        fail "L45 no-allowlist" "ssh-add -l: $r"
       fi
-      # Add/remove still fail even without allowlist.
-      l45b_del=$(q "$L45B_CWD" "exec ssh-add -D")
-      case "$l45b_del" in
-        OK*exit=0*) fail "L45 no-allowlist ssh-add -D" "remove all succeeded" ;;
-        SPAWN:ENOENT) skip "L45 no-allowlist ssh-add -D" "ssh-add not in sandbox PATH" ;;
-        *) pass "L45 no-allowlist: ssh-add -D still fails" ;;
-      esac
+      ec=$(exit_of "$(q "$L45B_CWD" "exec-out ssh-add -D")")
+      if [ -n "$ec" ] && [ "$ec" != 0 ]; then
+        pass "L45 no-allowlist: ssh-add -D still fails"
+      else
+        fail "L45 no-allowlist -D" "exit=[$ec]"
+      fi
+      if host_two_keys; then
+        pass "L45 no-allowlist: host agent still lists both keys"
+      else
+        fail "L45 no-allowlist host agent" "$(ssh-add -l 2>&1)"
+      fi
       end_session "$L45B_CWD" "$S_PID"
     else
       fail "L45 no-allowlist" "session B did not start"
     fi
-    # Cleanup the test agent.
     kill "$SSH_AGENT_PID" 2>/dev/null
-    export SSH_AUTH_SOCK="$L45_SAVED_SOCK"
-    export SSH_AGENT_PID="$L45_SAVED_PID"
   else
-    skip "L45 ssh-agent" "ssh-agent did not start"
+    skip "L45 ssh-agent" "ssh-agent did not start or could not load keys (not found/not start)"
+    [ -n "${SSH_AGENT_PID:-}" ] && kill "$SSH_AGENT_PID" 2>/dev/null
   fi
+  if [ -n "$L45_SAVED_SOCK" ]; then export SSH_AUTH_SOCK="$L45_SAVED_SOCK"; else unset SSH_AUTH_SOCK; fi
+  if [ -n "$L45_SAVED_PID" ]; then export SSH_AGENT_PID="$L45_SAVED_PID"; else unset SSH_AGENT_PID; fi
 else
-  skip "L45 ssh-agent" "ssh-agent or ssh-add binary not found"
+  skip "L45 ssh-agent" "ssh-agent, ssh-add or ssh-keygen binary not found"
 fi
 
 # ================================================ L46: rootfs symlink traps (0.3.2, needs HISN_TEST_ROOTFS)
-# On a test copy of the rootfs, symlink traps in /usr/local/bin and an
-# absolute symlink to the host home do not reach host data. A
-# dangling-symlink mountpoint dir in the rootfs makes session start fail
-# with the message naming it.
+# On a test copy of the rootfs: symlinks in /usr/local/bin pointing (relative
+# and absolute) at a real host marker file must not reach it from the session;
+# a rootfs whose /etc is a dangling symlink makes session start fail with a
+# message naming the path, and no session is created.
+# Skip: HISN_TEST_ROOTFS not set (or without /usr).
 if [ -n "${HISN_TEST_ROOTFS:-}" ] && [ -d "$HISN_TEST_ROOTFS/usr" ]; then
   L46_CWD=$(new_cwd l46)
-  # Make a test copy of the rootfs with symlink traps.
   L46_ROOTFS="$WORK/l46-rootfs"
   rm -rf "$L46_ROOTFS"
   mkdir -p "$L46_ROOTFS"
-  # Copy the rootfs but add symlink traps.
-  cp -a "$HISN_TEST_ROOTFS/usr" "$L46_ROOTFS/usr" 2>/dev/null || true
-  cp -a "$HISN_TEST_ROOTFS/bin" "$L46_ROOTFS/bin" 2>/dev/null || true
-  cp -a "$HISN_TEST_ROOTFS/etc" "$L46_ROOTFS/etc" 2>/dev/null || true
-  # Trap 1: /usr/local/bin/trap -> ../../../../home
+  for d in usr bin sbin lib lib32 lib64 opt etc; do
+    [ -e "$HISN_TEST_ROOTFS/$d" ] || [ -L "$HISN_TEST_ROOTFS/$d" ] && copy_tree "$HISN_TEST_ROOTFS/$d" "$L46_ROOTFS/$d"
+  done
+  L46_MARKER="$HOME/.hisn-l46-marker-$$"
+  echo "l46-host-secret" >"$L46_MARKER"
+  chmod -R u+w "$L46_ROOTFS/usr/local" 2>/dev/null
   mkdir -p "$L46_ROOTFS/usr/local/bin"
-  ln -sf "../../../../home" "$L46_ROOTFS/usr/local/bin/trap"
-  # Trap 2: absolute symlink to the host home
-  ln -sf "$HOME" "$L46_ROOTFS/usr/local/bin/home-link"
+  ln -sf "../../../../${L46_MARKER#/}" "$L46_ROOTFS/usr/local/bin/trap"
+  ln -sf "$L46_MARKER" "$L46_ROOTFS/usr/local/bin/home-link"
+  ln -sf "$HOME" "$L46_ROOTFS/usr/local/bin/home-dir"
   L46_PROFILE="$WORK/L46-profile.toml"
-  cat >"$L46_PROFILE" <<L46EOF
-version = "hisn-profile/v1"
-[policy]
-version = "hisn-policy/v1"
-session.cwd = "$L46_CWD"
-session.network = "none"
-[rootfs]
-path = "$L46_ROOTFS"
-L46EOF
-  if start_session l46-$$ "$L46_CWD" "$L46_PROFILE" --profile "$L46_PROFILE"; then
-    # The symlink trap does not reach host data.
-    l46_trap=$(q "$L46_CWD" "cat /usr/local/bin/trap")
-    case "$l46_trap" in
-      OK*) fail "L46 symlink trap" "read through trap symlink: $l46_trap" ;;
-      *) pass "L46 symlink trap does not reach host data ($l46_trap)" ;;
-    esac
-    # The absolute symlink to the host home does not reach host data.
-    l46_home=$(q "$L46_CWD" "cat /usr/local/bin/home-link")
-    case "$l46_home" in
-      OK*) fail "L46 home symlink" "read through absolute symlink: $l46_home" ;;
-      *) pass "L46 absolute home symlink does not reach host data ($l46_home)" ;;
+  write_profile "$L46_PROFILE" "$L46_CWD" '[rootfs]' "path = \"$L46_ROOTFS\""
+  if start_profile_session l46-$$ "$L46_CWD" "$L46_PROFILE"; then
+    for l in trap home-link; do
+      r=$(q "$L46_CWD" "cat /usr/local/bin/$l")
+      case "$r" in
+        *l46-host-secret*) fail "L46 symlink $l" "host marker content reached the session: $r" ;;
+        *) pass "L46 symlink $l does not reach host data ($r)" ;;
+      esac
+    done
+    r=$(q "$L46_CWD" "ls /usr/local/bin/home-dir")
+    case "$r" in
+      OK*) fail "L46 symlink to host home dir" "listing succeeded: $r" ;;
+      *) pass "L46 absolute symlink to the host home dir not listable ($r)" ;;
     esac
     end_session "$L46_CWD" "$S_PID"
   else
     fail "L46 rootfs symlink traps" "session did not start"
   fi
+  rm -f "$L46_MARKER"
+  chmod -R u+w "$L46_ROOTFS" 2>/dev/null
   rm -rf "$L46_ROOTFS"
+  # Dangling-symlink /etc: start must fail naming the path; nothing mounted.
+  L46D_ROOTFS="$WORK/l46-dangling"
+  rm -rf "$L46D_ROOTFS"
+  mkdir -p "$L46D_ROOTFS/usr"
+  ln -s nonexistent "$L46D_ROOTFS/etc"
+  L46D_CWD=$(new_cwd l46d)
+  L46D_PROFILE="$WORK/L46d-profile.toml"
+  write_profile "$L46D_PROFILE" "$L46D_CWD" '[rootfs]' "path = \"$L46D_ROOTFS\""
+  before=$(runtime_entries)
+  L46D_OUT=$("$HISN" run --profile "$L46D_PROFILE" --session-id "l46-dangling-$$" --detach </dev/null 2>&1)
+  L46D_RC=$?
+  after=$(runtime_entries)
+  if [ "$L46D_RC" -ne 0 ] && printf '%s' "$L46D_OUT" | grep -qF "$L46D_ROOTFS/etc"; then
+    pass "L46 dangling-symlink /etc: start fails, message names the path"
+  else
+    fail "L46 dangling /etc" "rc=$L46D_RC out=[$(printf '%s' "$L46D_OUT" | head -c 300)]"
+  fi
+  if [ "$before" = "$after" ]; then
+    pass "L46 dangling-symlink /etc: no session created, nothing mounted"
+  else
+    fail "L46 dangling /etc session" "runtime root changed: [$before] -> [$after]"
+    rm -rf "$RUNTIME_ROOT/l46-dangling-$$" 2>/dev/null
+  fi
+  rm -rf "$L46D_ROOTFS"
 else
   skip "L46 rootfs symlink traps" "HISN_TEST_ROOTFS not set or missing /usr"
 fi
+
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.
 MANIFEST="$HERE/MANIFEST"

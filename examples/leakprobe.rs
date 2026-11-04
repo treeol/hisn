@@ -276,6 +276,41 @@ fn cmd_exec(args: &[String]) -> String {
     }
 }
 
+/// Like `exec`, but returns the child's exit code, stdout and stderr.
+fn cmd_exec_out(args: &[String]) -> String {
+    match std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .output()
+    {
+        Ok(o) => format!(
+            "OK exit={}\n{}{}",
+            o.status
+                .code()
+                .map_or_else(|| "signal".into(), |c| c.to_string()),
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => format!("SPAWN:{}", err_str(&e)),
+    }
+}
+
+/// Try to drop the ro/nosuid/nodev flags of the mount at `p` with
+/// `MS_REMOUNT|MS_BIND` and no flags. Must be refused inside a session.
+fn cmd_remount(p: &str) -> String {
+    let c = CString::new(p).expect("no NUL");
+    // SAFETY: valid NUL-terminated path; null source/fstype/data are allowed
+    // for a remount.
+    unsafe {
+        syscall_result(libc::mount(
+            std::ptr::null(),
+            c.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_BIND,
+            std::ptr::null(),
+        ) as libc::c_long)
+    }
+}
+
 thread_local! {
     /// A socket pair holding one never-received SCM_RIGHTS fd (L13).
     static QUEUE: RefCell<Option<(OwnedFd, OwnedFd)>> = const { RefCell::new(None) };
@@ -646,6 +681,8 @@ fn dispatch(a: &[String]) -> String {
         "unlink" => cmd_unlink(arg(1)),
         "loopback" => cmd_loopback(),
         "exec" if a.len() > 1 => cmd_exec(&a[1..]),
+        "exec-out" if a.len() > 1 => cmd_exec_out(&a[1..]),
+        "remount" => cmd_remount(arg(1)),
         "hold-queued" => cmd_hold_queued(arg(1)),
         "recv-write" => cmd_recv_write(),
         "mountinfo" => cmd_mountinfo(),

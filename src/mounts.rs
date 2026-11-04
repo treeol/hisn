@@ -122,7 +122,16 @@ impl HostFacts {
                     Some(r) => r.join("etc").join("resolv.conf"),
                     None => PathBuf::from("/etc/resolv.conf"),
                 };
-                fs::read_to_string(&rc_path).ok()
+                // With a rootfs, never follow a symlinked resolv.conf: the
+                // host would resolve it outside the tree and copy host file
+                // contents into the session.
+                let is_symlink = rootfs.is_some()
+                    && fs::symlink_metadata(&rc_path).is_ok_and(|m| m.file_type().is_symlink());
+                if is_symlink {
+                    None
+                } else {
+                    fs::read_to_string(&rc_path).ok()
+                }
             })
             .flatten();
         Self {

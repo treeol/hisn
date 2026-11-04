@@ -39,6 +39,30 @@ pub fn store_root() -> Result<PathBuf> {
     Ok(base.join("hisn").join("rootfs"))
 }
 
+/// Refuse a rootfs whose layout would make the host path walk escape it.
+///
+/// `<rootfs>/etc` is enumerated with `read_dir` on the host and each entry is
+/// bound from `<rootfs>/etc/<name>`; if `etc` were a symlink (absolute, or
+/// dangling) the host would resolve it outside the tree. It must therefore be
+/// a real directory. Toolchain dirs that are symlinks (`bin -> usr/bin`) are
+/// only ever recreated as symlinks, never followed, and stay allowed.
+pub fn check_layout(root: &std::path::Path) -> std::result::Result<(), String> {
+    let etc = root.join("etc");
+    match std::fs::symlink_metadata(&etc) {
+        Ok(m) if m.file_type().is_symlink() => {
+            let t = std::fs::read_link(&etc)
+                .map(|t| t.display().to_string())
+                .unwrap_or_default();
+            let dangling = if etc.exists() { "" } else { " (dangling)" };
+            Err(format!(
+                "{} is a symlink -> {t}{dangling}; the rootfs /etc must be a real directory",
+                etc.display()
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Validate a rootfs store name: `^[A-Za-z0-9._-]{1,64}$`, not `.` or `..`.
 pub fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -125,6 +149,21 @@ pub fn manifest(name: &str) -> Result<Manifest> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn check_layout_refuses_symlinked_etc() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        std::fs::create_dir(r.join("etc")).unwrap();
+        assert!(check_layout(r).is_ok());
+        std::fs::remove_dir(r.join("etc")).unwrap();
+        std::os::unix::fs::symlink("nonexistent", r.join("etc")).unwrap();
+        let e = check_layout(r).unwrap_err();
+        assert!(e.contains("/etc") && e.contains("dangling"), "{e}");
+        std::fs::remove_file(r.join("etc")).unwrap();
+        std::os::unix::fs::symlink("/home", r.join("etc")).unwrap();
+        assert!(check_layout(r).unwrap_err().contains("symlink -> /home"));
+    }
+
     use super::*;
 
     #[test]

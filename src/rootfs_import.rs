@@ -755,6 +755,20 @@ mod tests {
         }
     }
 
+    /// Wait out `ETXTBSY`: another test thread may fork while our freshly
+    /// written script still has a write fd open in the child.
+    fn wait_executable(p: &Path) {
+        for _ in 0..200 {
+            match Command::new(p).arg("--version").output() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => return,
+            }
+        }
+        panic!("{} stayed ETXTBSY", p.display());
+    }
+
     fn vm_kb(field: &str) -> Option<u64> {
         let s = fs::read_to_string("/proc/self/status").ok()?;
         let l = s.lines().find(|l| l.starts_with(field))?;
@@ -820,6 +834,7 @@ mod tests {
         .unwrap();
         drop(f);
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        wait_executable(&fake);
         let opts = ImportOpts {
             name: "img",
             from_tar: None,
@@ -858,6 +873,7 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        wait_executable(&fake);
         let opts = ImportOpts {
             name: "bad",
             from_tar: None,

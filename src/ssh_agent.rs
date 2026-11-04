@@ -93,9 +93,11 @@ fn parse_string(data: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 /// Compute the SHA-256 fingerprint of a public key blob: `SHA256:base64(sha256(blob))`.
+/// Matches OpenSSH format: base64 with padding (`=`) stripped, as `ssh-keygen -lf` prints.
 fn ssh_fingerprint(blob: &[u8]) -> String {
     let hash = sha256(blob);
-    format!("SHA256:{}", base64_encode(&hash))
+    let b64 = base64_encode(&hash);
+    format!("SHA256:{}", b64.trim_end_matches('='))
 }
 
 /// Minimal SHA-256 (FIPS 180-4). No extra dependency for fingerprint computation.
@@ -353,8 +355,9 @@ fn handle_client(mut client: UnixStream, host_agent: &str, allowed: Vec<String>,
     }
 }
 
-/// Bind the proxy listener socket at `socket_path` (mode 0600).
-fn bind_proxy_socket(socket_path: &Path) -> Result<UnixListener> {
+/// Bind the proxy listener socket at `socket_path` (mode 0600). Called
+/// before `unshare(NEWUSER)` — must not spawn threads.
+pub fn bind_proxy_socket(socket_path: &Path) -> Result<UnixListener> {
     if socket_path.exists() {
         std::fs::remove_file(socket_path).ok();
     }
@@ -370,45 +373,46 @@ fn bind_proxy_socket(socket_path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// Start the ssh-agent proxy: bind a listener at `socket_path`, connect to
-/// the host agent at `host_auth_sock`, and spawn a thread that accepts
-/// connections and handles them with filtering.
+/// Start the accept loop on a bound listener. Spawns a thread that accepts
+/// connections and handles them with filtering. Called **after**
+/// `unshare(NEWUSER)` — the process is already multithreaded by this point
+/// (the init clone has forked).
 ///
 /// Returns the join handle (the thread lives for the duration of the
 /// session; the listener is moved into the thread).
-pub fn start_proxy(
-    socket_path: &Path,
-    host_auth_sock: &str,
+pub fn spawn_accept_loop(
+    listener: UnixListener,
+    host_auth_sock: String,
     allowed: Vec<String>,
-    session_id: &str,
-) -> Result<thread::JoinHandle<()>> {
-    // Verify the host agent socket.
+    session_id: String,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => {
+                    let h = host_auth_sock.clone();
+                    let a = allowed.clone();
+                    let id = session_id.clone();
+                    thread::spawn(move || handle_client(s, &h, a, &id));
+                }
+                Err(e) => {
+                    tracing::warn!("ssh-agent proxy [{session_id}]: accept: {e}");
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Verify that the host SSH agent socket exists and is a socket. Called
+/// before `unshare` (no threads).
+pub fn check_host_agent(host_auth_sock: &str) -> Result<()> {
     let meta = std::fs::symlink_metadata(host_auth_sock)
         .with_context(|| format!("ssh-agent: host SSH_AUTH_SOCK {host_auth_sock} not found"))?;
     if !meta.file_type().is_socket() {
         bail!("ssh-agent: host SSH_AUTH_SOCK {host_auth_sock} is not a socket");
     }
-    let listener = bind_proxy_socket(socket_path)?;
-    let host = host_auth_sock.to_owned();
-    let sid = session_id.to_owned();
-    let handle = thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(s) => {
-                    let h = host.clone();
-                    let a = allowed.clone();
-                    let id = sid.clone();
-                    thread::spawn(move || handle_client(s, &h, a, &id));
-                }
-                Err(e) => {
-                    tracing::warn!("ssh-agent proxy [{sid}]: accept: {e}");
-                    break;
-                }
-            }
-        }
-    });
-    tracing::info!("ssh-agent proxy: listening on {socket_path:?}");
-    Ok(handle)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -447,10 +451,10 @@ mod tests {
 
     #[test]
     fn fingerprint_of_empty_blob() {
-        // SHA-256 of empty = e3b0c442...; base64 of that = 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=
+        // SHA-256 of empty = e3b0c442...; base64 without padding = 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU
         assert_eq!(
             ssh_fingerprint(b""),
-            "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+            "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU"
         );
     }
 

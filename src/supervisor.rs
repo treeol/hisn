@@ -1262,25 +1262,22 @@ fn run_session(
         visible,
     );
 
-    // 0.3.2: SSH agent T1 proxy. Start the proxy on the host side, forward
-    // its socket into the sandbox, and set SSH_AUTH_SOCK in the env. The
-    // proxy socket lives under the session dir (not cwd or $HOME).
-    let mut ssh_proxy_handle: Option<thread::JoinHandle<()>> = None;
+    // 0.3.2: SSH agent T1 proxy. Bind the proxy socket on the host side
+    // (before unshare — must not spawn threads), then spawn the accept loop
+    // after the init clone (the process is multithreaded by then). The
+    // proxy socket is forwarded into the sandbox at /run/ssh-agent.sock
+    // and SSH_AUTH_SOCK is set in the scrubbed env.
+    let mut ssh_proxy_listener: Option<UnixListener> = None;
     let ssh_agent_expose = "/run/ssh-agent.sock";
     if let Some(ssh_cfg) = ssh
         && ssh_cfg.agent
     {
         let host_auth_sock = std::env::var("SSH_AUTH_SOCK")
             .context("ssh-agent: SSH_AUTH_SOCK is not set (agent = true requires a host agent)")?;
+        crate::ssh_agent::check_host_agent(&host_auth_sock)?;
         let proxy_socket_path = sdir.path.join("ssh-agent.sock");
-        ssh_proxy_handle = Some(
-            crate::ssh_agent::start_proxy(
-                &proxy_socket_path,
-                &host_auth_sock,
-                ssh_cfg.keys.clone(),
-                session_id,
-            )
-            .context("ssh-agent proxy")?,
+        ssh_proxy_listener = Some(
+            crate::ssh_agent::bind_proxy_socket(&proxy_socket_path).context("ssh-agent proxy")?,
         );
         // Inject SSH_AUTH_SOCK into the scrubbed env. The proxy socket is
         // forwarded into the sandbox at ssh_agent_expose after init is ready.
@@ -1480,8 +1477,20 @@ fn run_session(
             bail!("forward {}: {e}", f.name);
         }
     }
-    // 0.3.2: Forward the SSH agent proxy socket into the sandbox.
-    if ssh_proxy_handle.is_some() {
+    // 0.3.2: Spawn the SSH agent proxy accept loop and forward its socket
+    // into the sandbox. The listener was bound before unshare (single-
+    // threaded); the accept loop is spawned now (post-clone, multithreaded).
+    if let Some(listener) = ssh_proxy_listener.take() {
+        let host_auth_sock = std::env::var("SSH_AUTH_SOCK").unwrap_or_default();
+        let ssh_keys = ssh
+            .and_then(|c| if c.agent { Some(c.keys.clone()) } else { None })
+            .unwrap_or_default();
+        let _ssh_handle = crate::ssh_agent::spawn_accept_loop(
+            listener,
+            host_auth_sock,
+            ssh_keys,
+            session_id.to_owned(),
+        );
         let proxy_socket_path = sdir.path.join("ssh-agent.sock");
         if let Err(e) = shared.do_forward(
             proxy_socket_path.to_str().unwrap_or(""),

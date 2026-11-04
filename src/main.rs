@@ -409,12 +409,14 @@ fn extract_tar(dest: &Path, tar_data: &[u8]) -> Result<(u64, u64, u64)> {
     use std::io::{Cursor, Read};
     use std::os::unix::fs::PermissionsExt;
 
-    // Parse the tar manually for hardening.
     let mut cursor = Cursor::new(tar_data);
     let mut files: u64 = 0;
     let mut skipped: u64 = 0;
     let mut size_bytes: u64 = 0;
     let mut buf = [0u8; 512];
+    // Track extracted symlinks to detect traversal through them.
+    let mut extracted_symlinks: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
     loop {
         // Read a 512-byte header.
         let n = cursor.read(&mut buf)?;
@@ -461,6 +463,16 @@ fn extract_tar(dest: &Path, tar_data: &[u8]) -> Result<(u64, u64, u64)> {
             cursor.set_position(cursor.position() + data_blocks * 512);
             continue;
         }
+        // S1 fix: reject if any ancestor of the target (below dest) is a
+        // symlink extracted earlier. This prevents a symlink like
+        // `usr -> /home/user/.ssh` followed by `usr/authorized_keys` from
+        // writing through the symlink onto the host.
+        if path_traverses_symlink(dest, &target, &extracted_symlinks) {
+            skipped += 1;
+            let data_blocks = size.div_ceil(512);
+            cursor.set_position(cursor.position() + data_blocks * 512);
+            continue;
+        }
         // Read the data.
         let mut data = vec![0u8; size as usize];
         cursor.read_exact(&mut data)?;
@@ -474,9 +486,19 @@ fn extract_tar(dest: &Path, tar_data: &[u8]) -> Result<(u64, u64, u64)> {
             b'0' | 0 => {
                 // Regular file. Strip setuid/setgid bits.
                 let mode = mode & !0o6000;
-                // Create parent directories.
+                // Create parent directories (create_dir_all on the parent is
+                // safe: we already checked no ancestor is a symlink).
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
+                }
+                // Verify the target is not already a symlink (defense in
+                // depth: a duplicate entry could be a symlink).
+                let meta = std::fs::symlink_metadata(&target);
+                if let Ok(m) = &meta
+                    && m.file_type().is_symlink()
+                {
+                    skipped += 1;
+                    continue;
                 }
                 std::fs::write(&target, &data)?;
                 std::fs::set_permissions(
@@ -497,12 +519,14 @@ fn extract_tar(dest: &Path, tar_data: &[u8]) -> Result<(u64, u64, u64)> {
                 files += 1;
             }
             b'2' => {
-                // Symlink. Store as-is.
+                // Symlink. Store as-is, but record it so later entries that
+                // traverse through it are rejected.
                 let link_target = parse_tar_string(&buf[157..257]);
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::os::unix::fs::symlink(&link_target, &target)?;
+                extracted_symlinks.insert(target.clone());
                 files += 1;
             }
             b'1' => {
@@ -531,6 +555,28 @@ fn extract_tar(dest: &Path, tar_data: &[u8]) -> Result<(u64, u64, u64)> {
         }
     }
     Ok((files, skipped, size_bytes))
+}
+
+/// Check if `path` (inside `base`) traverses through any of the extracted
+/// symlinks. Returns true if any ancestor of `path` (below `base`) is in
+/// the symlink set.
+fn path_traverses_symlink(
+    base: &Path,
+    path: &Path,
+    symlinks: &std::collections::HashSet<PathBuf>,
+) -> bool {
+    let rel = match path.strip_prefix(base) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let mut current = base.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        if symlinks.contains(&current) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Parse a null-terminated string from a tar header field.

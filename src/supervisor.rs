@@ -346,6 +346,20 @@ impl Shared {
     /// it at `expose` with `MOUNT_ATTR_RDONLY`. The forward is tracked in
     /// the grant table like a ro grant.
     fn do_forward(&self, socket: &str, expose: &str, name: &str) -> Result<()> {
+        self.do_forward_inner(socket, expose, name, false)
+    }
+
+    /// `internal`: the source is hisn's own ssh-agent proxy socket, which by
+    /// construction lives in the session directory (inside the runtime root).
+    /// Only the R1b alias check is skipped, and only after the caller-supplied
+    /// path was verified to be exactly that socket (a socket inode, below).
+    fn do_forward_inner(
+        &self,
+        socket: &str,
+        expose: &str,
+        name: &str,
+        internal: bool,
+    ) -> Result<()> {
         let _g = self.op_lock.lock().expect("op lock");
         self.log("forward", "start", Some(socket), None, None, None);
         // Canonicalize the socket path: /var/run is a symlink to /run on
@@ -375,8 +389,13 @@ impl Shared {
                 }
             );
         }
-        // R1b on the source.
-        if let Ok(mi) = fs::read_to_string("/proc/self/mountinfo") {
+        // R1b on the source (skipped only for hisn's own proxy socket).
+        if internal {
+            // the source must be exactly <session dir>/ssh-agent.sock
+            if canon.file_name().and_then(|n| n.to_str()) != Some("ssh-agent.sock") {
+                bail!("internal forward source {} is not the proxy socket", canon.display());
+            }
+        } else if let Ok(mi) = fs::read_to_string("/proc/self/mountinfo") {
             match alias::check_tree(&mi, &canon, false, &self.rules.runtime_roots) {
                 Ok(None) => {}
                 Ok(Some(a)) => bail!("{socket} aliases the runtime directory: {a:?}"),
@@ -1498,10 +1517,11 @@ fn run_session(
             session_id.to_owned(),
         );
         let proxy_socket_path = sdir.path.join("ssh-agent.sock");
-        if let Err(e) = shared.do_forward(
+        if let Err(e) = shared.do_forward_inner(
             proxy_socket_path.to_str().unwrap_or(""),
             ssh_agent_expose,
             "ssh-agent",
+            true,
         ) {
             let _ = sys::kill(pid, libc::SIGKILL);
             let _ = reap(pid);

@@ -389,3 +389,17 @@ Open points — not done:
 - ssh proxy: client-slot counter is not panic-safe (use a Drop guard); host-agent
   connection has no read timeout.
 - No size/entry-count caps on import.
+
+## Host run 1 (2026-11-05, rubin) — 257 passed, 4 failed, 1 skipped, 1 weak
+
+| Test | Sub-check | Class | Cause | Fix | Re-run |
+|---|---|---|---|---|---|
+| L43 | all (session did not start) | (a) harness | probe built dynamically against host glibc 2.39; the wakil-dev rootfs has an older libc: `GLIBC_2.39 not found` | `make leaktest` builds the probe with `+crt-static` and passes it via `PROBE=` | host |
+| L46 | rootfs symlink traps | (a) harness | same | same | host |
+| L45 | ssh-agent (keys=) | (c) real hisn | `do_forward` applied the R1b runtime-dir alias check to hisn's own proxy socket, which lives in the session dir by construction, so `[ssh] agent = true` could never start a session | `do_forward_inner(.., internal=true)` skips only the alias check, and only for a source named `ssh-agent.sock`; all other checks (socket inode, expose R1-R3) still apply | host |
+| L45 | no-allowlist | (c) same | same | same | host |
+| L12 host-creates-secret | skip | known | no /etc write access | none | - |
+| L14 R5 | weak | known | | | |
+
+Impact of the (c) finding before the fix: none on isolation (fail-closed): any session with `[ssh] agent = true` refused to start. The 0.3.2 ssh feature was non-functional; its leak test was the first thing to exercise it.
+Note: L45 sub-checks after session start have still never run; further failures may surface behind this one.

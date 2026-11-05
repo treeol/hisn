@@ -21,9 +21,14 @@ check: build
 # Leak suite (L1-L41, L25-L41). Needs unprivileged user namespaces: run on a real host,
 # not inside a seccomp-restricted container. Never reports a pass it did not run.
 # Exit non-zero on any FAIL; one line per check: L<n>[<sub>] PASS|FAIL|SKIP|WEAK — <reason>.
+# The probe is built statically: it also runs inside an imported rootfs (L43/L46)
+# whose libc may be older than the host's.
+PROBE_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
+PROBE_BIN := target/probe/$(PROBE_TARGET)/release/examples/leakprobe
+
 leaktest: build
-	$(CARGO) build --release --example leakprobe
-	bash tests/leak/run.sh ./target/release/hisn
+	RUSTFLAGS="-C target-feature=+crt-static" $(CARGO) build --release --example leakprobe --target $(PROBE_TARGET) --target-dir target/probe
+	PROBE=$(CURDIR)/$(PROBE_BIN) bash tests/leak/run.sh ./target/release/hisn
 
 # Leak suite with a log at docs/leaktest-host-YYYY-MM-DD.log. The first lines
 # are a header (commit, tree state -- ignoring the log files themselves -- date, hostname, kernel, hisn version); the

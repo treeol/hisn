@@ -1930,7 +1930,14 @@ fn start_host_service(h: &profile::HostService) -> Result<i32> {
         // sandbox's scrubbed one. The host service runs as the user.
         // Close all fds > 2 (don't leak supervisor fds into the host process).
         unsafe {
-            libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as i32);
+            // Raw syscall: the libc crate has no close_range wrapper on musl.
+            // 4 = CLOSE_RANGE_CLOEXEC.
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                u32::MAX as libc::c_uint,
+                4 as libc::c_uint,
+            );
         }
         // execve the command.
         let argv: Vec<std::ffi::CString> = h

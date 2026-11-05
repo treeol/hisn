@@ -393,7 +393,10 @@ impl Shared {
         if internal {
             // the source must be exactly <session dir>/ssh-agent.sock
             if canon.file_name().and_then(|n| n.to_str()) != Some("ssh-agent.sock") {
-                bail!("internal forward source {} is not the proxy socket", canon.display());
+                bail!(
+                    "internal forward source {} is not the proxy socket",
+                    canon.display()
+                );
             }
         } else if let Ok(mi) = fs::read_to_string("/proc/self/mountinfo") {
             match alias::check_tree(&mi, &canon, false, &self.rules.runtime_roots) {

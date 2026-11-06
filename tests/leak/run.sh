@@ -2308,7 +2308,9 @@ if [ -n "${HISN_TEST_ROOTFS:-}" ] && [ -d "$HISN_TEST_ROOTFS/usr" ]; then
   fi
   rm -rf "$L50_ROOTFS"
 else
-  skip "L50 rootfs DNS" "HISN_TEST_ROOTFS not set or missing /usr"
+  skip "L50 rootfs empty resolv.conf" "HISN_TEST_ROOTFS not set or missing /usr"
+  skip "L50 no loopback nameserver" "HISN_TEST_ROOTFS not set or missing /usr"
+  skip "L50 getent resolves" "HISN_TEST_ROOTFS not set or missing /usr"
 fi
 
 # Every id in MANIFEST must produce at least one line. A missing id means

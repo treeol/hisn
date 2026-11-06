@@ -182,9 +182,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           # Expected skips: L12 (needs write access to /etc), L23/L24 on
           # Landlock ABI < 6, L29 when Docker is not installed/running,
-          # L43/L46 when HISN_TEST_ROOTFS is not set (L43 R1 also when /opt is not
+          # L43/L46/L50 when HISN_TEST_ROOTFS is not set (L43 R1 also when /opt is not
           # writable, R6 when the host has no /nix), L44's 512 MB test unless
           # HISN_BIG_TESTS=1, and L45 when ssh-agent/ssh-add/ssh-keygen are missing.
           # Anything else is annotated so it is not missed.
-          grep -E '^SKIP  ' "$log" | grep -Ev '^SKIP  (L12 |L2[34] .*ABI < 6|L29 .*not (installed|running)|L43 .*HISN_TEST_ROOTFS|L43 R1 .*not writable|L43 R6 .*no /nix|L44 big streaming .*HISN_BIG_TESTS|L45 .*(ssh|not found|not start)|L46 .*HISN_TEST_ROOTFS)' \
+          grep -E '^SKIP  ' "$log" | grep -Ev '^SKIP  (L12 |L2[34] .*ABI < 6|L29 .*not (installed|running)|L43 .*HISN_TEST_ROOTFS|L43 R1 .*not writable|L43 R6 .*no /nix|L44 big streaming .*HISN_BIG_TESTS|L45 .*(ssh|not found|not start)|L46 .*HISN_TEST_ROOTFS|L50 .*HISN_TEST_ROOTFS)' \
             | while IFS= read -r l; do echo "::warning::unexpected SKIP: $l"; done || true

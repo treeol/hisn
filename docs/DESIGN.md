@@ -794,8 +794,10 @@ can reach a session that is not fully set up.
   of fd 0-2 is a terminal and neither `--tty` nor `--no-tty` was given, instead
   of handing the host tty over (`TIOCSTI`-class attacks stay impossible, §11).
   `--no-tty` (0.3.3): no pty; the request carries `/dev/null` as stdin and the
-  caller's stdout/stderr as-is (pipes or terminals), so the caller's terminal
-  is never polled or handed over as stdin. `--tty --no-tty` is a usage error.
+  client-owned pipes for stdout and stderr, which the client copies to its own
+  fd 1 and 2 (drained concurrently with the exit wait, so output larger than a
+  pipe buffer does not deadlock). The sandbox never receives a descriptor for the
+  caller's terminal. `--tty --no-tty` is a usage error.
 * Status/signals use the per-exec **status socketpair** (`W` ↔ supervisor):
   `W → S: P <pid>`, `X exit <code>` | `X sig <n>`; `S → W: K <n>` (1 ≤ n ≤ 64,
   delivered with `kill(-P, n)`). EOF from the supervisor side means "cancel":

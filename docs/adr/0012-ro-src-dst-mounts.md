@@ -16,11 +16,14 @@ would point at a host path that does not exist inside it.
 
 ```toml
 [mounts]
-ro = ["/opt/toolchains", "/home/me/.gitconfig:/etc/gitconfig.d/user"]
+ro = ["/opt/toolchains", "/home/me/.gitconfig:/home/sandbox/.gitconfig"]
 ```
 
 - The grammar splits at the single `:`. Both sides must be absolute and NUL-free.
   A `:` in the same-path form is not valid.
+- `src` may not lie under `/etc` (the generated `/etc` view and its masks must
+  not be re-exposed at another path; R3 is checked on dst only, so this is
+  checked on src). Other host paths are allowed.
 - `src` is a host path. It is resolved as every other mount source: a symlinked
   final component is refused, intermediate symlinks are canonicalised on the host
   before mounting. The session never sees the link, and never sees the host
@@ -67,6 +70,8 @@ ro = ["/opt/toolchains", "/home/me/.gitconfig:/etc/gitconfig.d/user"]
 - Unit (policy): grammar (`split_ro_entry`), `src` canonicalised, symlinked final
   `src` refused, `dst` under `/run/hisn` refused with the path named, `dst` with
   `..` refused.
+- Unit (policy, review round): `src` under `/etc` refused; `dst` onto an owned
+  toolchain symlink (`/bin`) refused.
 - Unit (mounts): `src:dst` mounts the source at `dst` only (nodev, ro); same-path
   unchanged; collision with `/tmp` and with the toolchain `/usr` refused with
   `RoConflict` naming the path.

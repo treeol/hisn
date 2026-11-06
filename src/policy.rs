@@ -508,6 +508,18 @@ impl Policy {
         for raw in &self.mounts.ro {
             let (src_raw, dst_raw) = split_ro_entry(raw).map_err(|r| invalid("mounts.ro", r))?;
             let src = existing_dir_or_file("mounts.ro", &src_raw, runtime_roots)?;
+            // 0.3.3 (review): a host source under /etc would re-expose the
+            // host's /etc, or a masked entry of it, at dst, bypassing the
+            // generated /etc view and its masks (R3 is checked on dst only).
+            if src.starts_with("/etc") {
+                return Err(invalid(
+                    "mounts.ro",
+                    format!(
+                        "{raw}: src {} is under /etc; the generated /etc view must not be re-exposed",
+                        src.display()
+                    ),
+                ));
+            }
             let dst = if src_raw == dst_raw {
                 src.clone()
             } else {
@@ -1108,6 +1120,25 @@ scoped = ["bogus"]
             .resolve(d.path(), &Overrides::default(), &[])
             .unwrap_err();
         assert!(e.to_string().contains("is a symlink"), "{e}");
+    }
+
+    #[test]
+    fn ro_src_under_etc_is_rejected() {
+        // The reviewer's case: a relocated host /etc or masked /etc entry must
+        // not re-expose what the generated /etc view hides.
+        for src in ["/etc", "/etc/hosts"] {
+            let pol = Policy::parse(&format!(
+                "version = \"hisn-policy/v1\"\n[mounts]\nro = [{:?}]\n",
+                format!("{src}:/exposed")
+            ))
+            .unwrap();
+            let d = tmp();
+            let e = pol
+                .resolve(d.path(), &Overrides::default(), &[])
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("under /etc"), "{src}: {e}");
+        }
     }
 
     #[test]

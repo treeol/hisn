@@ -201,25 +201,117 @@ pub fn run(args: ExecArgs) -> Result<i32> {
         }
     }
 
-    // The request line and its descriptors travel in one sendmsg. With
-    // --no-tty stdin is /dev/null, never the caller's (possibly a terminal);
-    // stdout and stderr are the caller's own descriptors as given.
+    // The request line and its descriptors travel in one sendmsg. The sandbox
+    // never receives a descriptor that refers to the caller's terminal:
+    // - default (no pty flag): fds 0-2 are the caller's, as before (a terminal
+    //   on any of them was already refused above);
+    // - --no-tty: stdin is /dev/null, stdout and stderr are client-owned pipes
+    //   whose read ends the client copies to its own fd 1 and 2.
     let line = format!("{req}\n");
-    let devnull: Option<fs::File> = if args.no_tty && slave.is_none() {
-        Some(fs::File::open("/dev/null").context("opening /dev/null for --no-tty stdin")?)
+    let mut relay_pipes: Option<[OwnedFd; 2]> = None;
+    if let Some(s) = &slave {
+        sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), &[s.as_raw_fd()])
+            .context("sending request")?;
+    } else if args.no_tty {
+        let stdin = fs::File::open("/dev/null").context("opening /dev/null for --no-tty stdin")?;
+        let (out_r, out_w) = open_pipe().context("creating stdout pipe")?;
+        let (err_r, err_w) = open_pipe().context("creating stderr pipe")?;
+        let fds = [stdin.as_raw_fd(), out_w.as_raw_fd(), err_w.as_raw_fd()];
+        sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), &fds).context("sending request")?;
+        // The client's write ends close now: the read ends see EOF exactly
+        // when the sandbox's side has closed.
+        drop((stdin, out_w, err_w));
+        relay_pipes = Some([out_r, err_r]);
     } else {
-        None
-    };
-    let fds: Vec<RawFd> = match (&slave, &devnull) {
-        (Some(s), _) => vec![s.as_raw_fd()],
-        (None, Some(d)) => vec![d.as_raw_fd(), 1, 2],
-        (None, None) => vec![0, 1, 2],
-    };
-    sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), &fds).context("sending request")?;
+        sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), &[0, 1, 2])
+            .context("sending request")?;
+    }
     drop(slave); // the master sees EOF/EIO once the program's side closes
 
-    let finish = relay(&conn, &args.session, master)?;
-    Ok(exit_code(&finish))
+    // The pipes are pumped on their own thread, concurrently with the exit
+    // wait: a program writing more than a pipe buffer would otherwise block on
+    // write and never send its exit line.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pump = relay_pipes.map(|p| {
+        let stop = stop.clone();
+        std::thread::spawn(move || pump_pipes(p, &stop))
+    });
+    let finish = relay(&conn, &args.session, master);
+    // The exit line is in (or the relay failed). The pump drains what is
+    // already buffered, then stops at EOF or after its grace period.
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(h) = pump {
+        let _ = h.join();
+    }
+    Ok(exit_code(&finish?))
+}
+
+/// A fresh anonymous pipe as `(read, write)`, both close-on-exec.
+fn open_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe2 writes two descriptors into the array we own.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both are fresh descriptors owned by nobody else.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// Copy the `--no-tty` pipes to the caller's stdout and stderr until both reach
+/// EOF, or until `stop` is set and a final poll finds nothing more (a background
+/// grandchild may hold a pipe open; the program's exit is already known then).
+fn pump_pipes(pipes: [OwnedFd; 2], stop: &std::sync::atomic::AtomicBool) {
+    let [out, err] = pipes;
+    let mut open: Vec<(OwnedFd, i32)> = vec![(out, 1i32), (err, 2i32)];
+    let mut buf = vec![0u8; 16384];
+    let mut drained_after_stop = false;
+    while !open.is_empty() {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            if drained_after_stop {
+                break;
+            }
+            drained_after_stop = true;
+        }
+        let mut pfds: Vec<libc::pollfd> = open
+            .iter()
+            .map(|(f, _)| libc::pollfd {
+                fd: f.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: a valid pollfd array of the length passed.
+        let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
+        if r < 0 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        let mut i = 0;
+        while i < open.len() {
+            let ready = pfds[i].revents != 0;
+            let mut closed = false;
+            if ready {
+                let fd = open[i].0.as_raw_fd();
+                // SAFETY: reading into our buffer from a pipe we own.
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n > 0 {
+                    write_all_fd(open[i].1, &buf[..n as usize]);
+                } else if n == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN)
+                {
+                    closed = true;
+                }
+            }
+            if closed {
+                open.remove(i);
+                pfds.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let _ = io::stdout().flush();
 }
 
 /// Everything after the request is sent: responses, pty relay, signals.

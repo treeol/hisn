@@ -27,7 +27,8 @@ All notable changes to hisn are recorded here. The format follows
 - **`[net] nameservers = ["ip", ...]`** (profile): replaces the derived resolver
   list. Empty, non-IP and loopback entries are rejected at `hisn profile validate`.
 - **`hisn exec --no-tty`**: non-interactive exec with no pty. Stdin is
-  `/dev/null`; stdout and stderr pass through even when they are terminals.
+  `/dev/null`; stdout and stderr are client-owned pipes that the client copies to
+  its own stdout and stderr, so the sandbox never receives the caller's terminal.
   `--tty --no-tty` is a usage error. The refusal for a terminal without either
   flag still applies and now names both options.
 - **`mounts.ro` accepts `src:dst`** (ADR 0012): the host path `src` is bound

@@ -170,7 +170,8 @@ pub struct ExecArgs {
     #[arg(long, conflicts_with = "no_tty")]
     pub tty: bool,
     /// Non-interactive: no pty, stdin from /dev/null, stdout and stderr passed
-    /// through as pipes even when the caller's descriptors are terminals.
+    /// through pipes that the client copies to its own stdout and stderr, so the
+    /// sandbox never receives a descriptor for the caller's terminal.
     #[arg(long = "no-tty", conflicts_with = "tty")]
     pub no_tty: bool,
     /// Command and arguments.

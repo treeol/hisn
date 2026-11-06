@@ -244,7 +244,7 @@ shm_size = 64        # MiB, only with shm = true
 tmp_size = 1024      # MiB, 16..=65536
 
 [mounts]
-ro = ["/opt/toolchains", "/home/me/.gitconfig:/etc/gitconfig.d/user"]
+ro = ["/opt/toolchains", "/home/me/.gitconfig:/home/sandbox/.gitconfig"]
 # ro entries: "path" (same path, recursive ro) or "src:dst" (0.3.3: host src at
 # in-session dst, ro,nosuid,nodev; src may not be a symlink, dst may not sit
 # under a hisn runtime dir or another session mount; see ADR 0012)

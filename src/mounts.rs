@@ -220,14 +220,24 @@ impl HostFacts {
             if policy.network != crate::policy::Network::Host {
                 None
             } else if let Some(r) = rootfs {
+                // The rootfs's own resolv.conf is the only host-side source
+                // here (no systemd upstream file inside an image). A symlinked
+                // one is never followed. The same rules apply: loopback never
+                // enters the session, an empty result fails the launch, and
+                // `[net] nameservers` overrides.
                 let rc_path = r.join("etc").join("resolv.conf");
                 let is_symlink =
                     fs::symlink_metadata(&rc_path).is_ok_and(|m| m.file_type().is_symlink());
-                if is_symlink {
+                let text = if is_symlink {
                     None
                 } else {
-                    fs::read_to_string(&rc_path).ok().map(Ok)
-                }
+                    fs::read_to_string(&rc_path).ok()
+                };
+                Some(build_resolv_conf(
+                    text.as_deref(),
+                    None,
+                    policy.nameservers.as_deref(),
+                ))
             } else {
                 let host = fs::read_to_string("/etc/resolv.conf").ok();
                 let up = fs::read_to_string(RESOLVED_UPSTREAM_FILE).ok();
@@ -687,7 +697,9 @@ pub fn plan(
     // src:dst op is excluded by identity (same dst AND same src).
     for b in policy.ro_binds.iter().filter(|b| b.src != b.dst) {
         for o in &ops {
-            if !is_mount(&o.kind) {
+            // Symlinks count too: a dst at an owned symlink (e.g. merged-usr
+            // /bin -> usr/bin) would otherwise replace it by later-wins dedupe.
+            if !(is_mount(&o.kind) || matches!(o.kind, MountKind::Symlink { .. })) {
                 continue;
             }
             if o.target == b.dst && o.source.as_deref() == Some(b.src.as_path()) {
@@ -1050,6 +1062,21 @@ mod tests {
     }
 
     #[test]
+    fn rootfs_style_empty_or_stub_resolver_fails_closed() {
+        // A rootfs's resolv.conf goes through the same builder (B3): an empty
+        // file or a loopback-only stub is a launch failure, never an empty
+        // resolv.conf or a stub passed into the session.
+        assert!(build_resolv_conf(Some(""), None, None).is_err());
+        assert!(build_resolv_conf(Some("nameserver 127.0.0.11\n"), None, None).is_err());
+        assert!(build_resolv_conf(None, None, None).is_err());
+        let ns = vec!["1.1.1.1".to_owned()];
+        assert_eq!(
+            build_resolv_conf(Some(""), None, Some(&ns)).unwrap(),
+            "nameserver 1.1.1.1\n"
+        );
+    }
+
+    #[test]
     fn loopback_addresses_are_recognised() {
         for a in ["127.0.0.1", "127.8.9.10", "::1"] {
             assert!(is_loopback_ns(a), "{a}");
@@ -1114,6 +1141,22 @@ mod tests {
                 assert!(reason.contains("/tmp"), "{reason}");
             }
             other => panic!("expected RoConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn src_dst_onto_an_owned_toolchain_symlink_is_rejected() {
+        // /bin is a symlink (usr/bin) in the test facts: a dst equal to it
+        // must be refused, not allowed to replace it.
+        let p = bind_pol(vec![crate::policy::RoBind {
+            src: PathBuf::from("/host/x"),
+            dst: PathBuf::from("/bin"),
+        }]);
+        match plan(&p, &facts(), &[]) {
+            Err(PlanError::RoConflict { reason, .. }) => {
+                assert!(reason.contains("/bin"), "{reason}");
+            }
+            other => panic!("expected RoConflict on the /bin symlink, got {other:?}"),
         }
     }
 

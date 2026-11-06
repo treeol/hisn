@@ -21,7 +21,7 @@ shm_size = 64           # /dev/shm size in MiB (1..=65536); 0.2.1
 tmp_size = 1024         # /tmp size in MiB (16..=65536); 0.2.1
 
 [mounts]
-ro   = []               # extra read-only binds (absolute paths, recursive)
+ro   = []               # extra read-only binds: "path" or "src:dst" (0.3.3, ADR 0012)
 rw   = []               # extra read-write binds (absolute paths, non-recursive)
 mask = []               # extra paths masked inside allowed trees
 grantable_rw = []       # NEW (DESIGN D3): prefixes under which dynamic rw grants are allowed
@@ -51,7 +51,8 @@ nproc  = 4096
 | `session.shm` | bool | `false` | mount `/dev/shm` (tmpfs); 0.2.1. Default off = no `/dev/shm` (0.2 behavior) |
 | `session.shm_size` | u64 (MiB) | `64` | `/dev/shm` size; range `1..=65536`; 0.2.1 |
 | `session.tmp_size` | u64 (MiB) | `1024` | `/tmp` size; range `16..=65536`; 0.2.1 |
-| `mounts.ro` / `.rw` | list of abs paths | `[]` | each must exist at session start; canonicalised; no symlinked final component accepted |
+| `mounts.ro` | list of `path` or `src:dst` | `[]` | 0.3.3: `path` = same path, recursive ro (unchanged); `src:dst` = host `src` mounted read-only (`ro,nosuid,nodev`) at in-session `dst`; both absolute; each source must exist and is canonicalised on the host; no symlinked final component; `dst` must not contain `..`, lie under `/run/hisn` or a runtime root, or shadow/sit inside another session mount (ADR 0012) |
+| `mounts.rw` | list of abs paths | `[]` | each must exist at session start; canonicalised; no symlinked final component accepted |
 | `mounts.mask` | list of abs paths | `[]` | paths that must lie inside another allowed tree; non-existent → skipped, logged |
 | `mounts.grantable_rw` | list of abs paths | `[]` | Landlock write prefixes for dynamic rw grants; also bounds `hisn grant --rw` |
 | `env.pass` | list of names | `[]` | `[A-Za-z_][A-Za-z0-9_]*`; cannot name `HOME` (`USER`/`LOGNAME` are accepted but ignored: the computed value wins, 0.2.2) |

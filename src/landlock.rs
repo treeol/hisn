@@ -145,6 +145,7 @@ mod tests {
             network: net,
             hostname: "hisn".into(),
             ro: vec!["/opt/tc".into()],
+            ro_binds: vec![],
             rw: vec!["/data/out".into()],
             mask: vec![],
             grantable_rw: vec!["/data/shared".into()],

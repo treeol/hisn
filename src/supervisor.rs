@@ -1027,7 +1027,9 @@ fn mountinfo_check(policy: &ResolvedPolicy, roots: &[PathBuf]) -> Result<()> {
     let mi = fs::read_to_string("/proc/self/mountinfo")
         .context("reading mountinfo (R1b fails closed)")?;
     let mut trees: Vec<(PathBuf, bool)> = vec![(policy.cwd.clone(), true)];
-    trees.extend(policy.ro.iter().map(|p| (p.clone(), true)));
+    // 0.3.3: a `src:dst` bind is a host tree (`src`) mounted in the session;
+    // the R1b alias check is about host paths, so it checks `src`.
+    trees.extend(policy.ro_binds.iter().map(|b| (b.src.clone(), true)));
     trees.extend(policy.rw.iter().map(|p| (p.clone(), false)));
     for d in mounts::TOOLCHAIN_DIRS.iter().chain(&[mounts::NIX_DIR]) {
         if Path::new(d).is_dir() {
@@ -2400,6 +2402,7 @@ mod tests {
             network: Network::None,
             hostname: "hisn".into(),
             ro: vec!["/opt/tc".into()],
+            ro_binds: vec![],
             rw: vec![],
             mask: vec![],
             grantable_rw: vec!["/data/shared".into()],

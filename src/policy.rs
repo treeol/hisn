@@ -186,6 +186,42 @@ pub enum Home {
     Path(PathBuf),
 }
 
+/// One read-only bind (0.3.3). `src` is the canonical host path; `dst` the
+/// in-session path. Same-path entries have `src == dst`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoBind {
+    pub src: PathBuf,
+    pub dst: PathBuf,
+}
+
+/// Split a `mounts.ro` entry into `(src, dst)` (0.3.3). `"/p"` is `("/p",
+/// "/p")`; `"src:dst"` splits at the first `:`. Both sides must be absolute and
+/// NUL-free. The raw strings are returned; canonicalisation happens in `resolve`.
+pub fn split_ro_entry(raw: &str) -> Result<(String, String), String> {
+    if raw.contains('\0') {
+        return Err("NUL byte in path".into());
+    }
+    match raw.split_once(':') {
+        None => {
+            if !raw.starts_with('/') {
+                return Err(format!("{raw:?} is not an absolute path"));
+            }
+            Ok((raw.to_owned(), raw.to_owned()))
+        }
+        Some((src, dst)) => {
+            if !src.starts_with('/') || !dst.starts_with('/') {
+                return Err(format!(
+                    "{raw:?}: src:dst needs two absolute paths (src is a host path, dst an in-session path)"
+                ));
+            }
+            if dst.contains(':') || src.contains(':') {
+                return Err(format!("{raw:?}: only one ':' separates src and dst"));
+            }
+            Ok((src.to_owned(), dst.to_owned()))
+        }
+    }
+}
+
 /// Fully resolved policy: absolute, canonical paths; CLI overrides applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedPolicy {
@@ -194,7 +230,12 @@ pub struct ResolvedPolicy {
     pub home: Home,
     pub network: Network,
     pub hostname: String,
+    /// In-session target paths of the read-only binds (`ro_binds[i].dst`).
     pub ro: Vec<PathBuf>,
+    /// Read-only binds with their host source (0.3.3, `src:dst`). A same-path
+    /// entry has `src == dst`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ro_binds: Vec<RoBind>,
     pub rw: Vec<PathBuf>,
     pub mask: Vec<PathBuf>,
     pub grantable_rw: Vec<PathBuf>,
@@ -338,8 +379,10 @@ impl Policy {
                 "must be \"tmpfs\" or an absolute path",
             ));
         }
+        for e in &self.mounts.ro {
+            split_ro_entry(e).map_err(|r| invalid("mounts.ro", r))?;
+        }
         for (key, list) in [
-            ("mounts.ro", &self.mounts.ro),
             ("mounts.rw", &self.mounts.rw),
             ("mounts.mask", &self.mounts.mask),
             ("mounts.grantable_rw", &self.mounts.grantable_rw),
@@ -455,7 +498,41 @@ impl Policy {
             None => None,
         };
 
-        let ro = self.resolve_list("mounts.ro", &self.mounts.ro, runtime_roots)?;
+        // 0.3.3: `mounts.ro` entries are `path` or `src:dst`. `src` is a host
+        // path, resolved here exactly like any other mount source (symlinked
+        // final component refused, intermediate links canonicalised on the host).
+        // `dst` is an in-session path: lexically normalised, never under a
+        // hisn runtime root.
+        let mut ro = Vec::new();
+        let mut ro_binds = Vec::new();
+        for raw in &self.mounts.ro {
+            let (src_raw, dst_raw) = split_ro_entry(raw).map_err(|r| invalid("mounts.ro", r))?;
+            let src = existing_dir_or_file("mounts.ro", &src_raw, runtime_roots)?;
+            let dst = if src_raw == dst_raw {
+                src.clone()
+            } else {
+                if Path::new(&dst_raw)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(invalid(
+                        "mounts.ro",
+                        format!("{raw}: dst must not contain '..'"),
+                    ));
+                }
+                let d = lexical_normalize(Path::new(&dst_raw));
+                check_forbidden(&d, runtime_roots).map_err(|r| invalid("mounts.ro", r))?;
+                if d == Path::new("/run/hisn") || d.starts_with("/run/hisn") {
+                    return Err(invalid(
+                        "mounts.ro",
+                        format!("{raw}: dst {} is under /run/hisn", d.display()),
+                    ));
+                }
+                d
+            };
+            ro.push(dst.clone());
+            ro_binds.push(RoBind { src, dst });
+        }
         let rw = self.resolve_list("mounts.rw", &self.mounts.rw, runtime_roots)?;
         let grantable_rw = self.resolve_list(
             "mounts.grantable_rw",
@@ -503,6 +580,7 @@ impl Policy {
             network: overrides.network.unwrap_or(self.session.network),
             hostname: self.session.hostname.clone(),
             ro,
+            ro_binds,
             rw,
             mask,
             grantable_rw,
@@ -973,6 +1051,93 @@ scoped = ["bogus"]
             PathBuf::from("/a/c")
         );
         assert_eq!(lexical_normalize(Path::new("/../..")), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn ro_entry_grammar() {
+        assert_eq!(
+            split_ro_entry("/a/b").unwrap(),
+            ("/a/b".into(), "/a/b".into())
+        );
+        assert_eq!(
+            split_ro_entry("/host/x:/in/x").unwrap(),
+            ("/host/x".into(), "/in/x".into())
+        );
+        assert!(split_ro_entry("rel").is_err());
+        assert!(split_ro_entry("/host:rel").is_err());
+        assert!(split_ro_entry("rel:/in").is_err());
+        assert!(split_ro_entry("/a:/b:/c").is_err());
+        assert!(split_ro_entry("/a\0:/b").is_err());
+    }
+
+    #[test]
+    fn ro_src_dst_resolves_the_host_source_and_keeps_dst() {
+        let d = tmp();
+        let host = d.path().join("host.conf");
+        fs::write(&host, "x").unwrap();
+        let spec = format!("{}:/etc-like/app.conf", host.to_str().unwrap());
+        let pol = Policy::parse(&format!(
+            "version = \"hisn-policy/v1\"\n[mounts]\nro = [{spec:?}]\n"
+        ))
+        .unwrap();
+        let r = pol.resolve(d.path(), &Overrides::default(), &[]).unwrap();
+        assert_eq!(r.ro, vec![PathBuf::from("/etc-like/app.conf")]);
+        assert_eq!(
+            r.ro_binds,
+            vec![RoBind {
+                src: fs::canonicalize(&host).unwrap(),
+                dst: PathBuf::from("/etc-like/app.conf"),
+            }]
+        );
+    }
+
+    #[test]
+    fn ro_src_is_resolved_on_the_host_symlinks_refused_at_the_final_component() {
+        let d = tmp();
+        let real = d.path().join("real.txt");
+        fs::write(&real, "x").unwrap();
+        let link = d.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // a symlinked final src component is refused, as for every mount source
+        let pol = Policy::parse(&format!(
+            "version = \"hisn-policy/v1\"\n[mounts]\nro = [{:?}]\n",
+            format!("{}:/in/x", link.to_str().unwrap())
+        ))
+        .unwrap();
+        let e = pol
+            .resolve(d.path(), &Overrides::default(), &[])
+            .unwrap_err();
+        assert!(e.to_string().contains("is a symlink"), "{e}");
+    }
+
+    #[test]
+    fn ro_dst_under_hisn_runtime_is_rejected_and_names_the_path() {
+        let d = tmp();
+        let host = d.path().join("h");
+        fs::write(&host, "x").unwrap();
+        let spec = format!("{}:/run/hisn/evil", host.to_str().unwrap());
+        let pol = Policy::parse(&format!(
+            "version = \"hisn-policy/v1\"\n[mounts]\nro = [{spec:?}]\n"
+        ))
+        .unwrap();
+        let e = pol
+            .resolve(d.path(), &Overrides::default(), &[])
+            .unwrap_err();
+        let s = e.to_string();
+        assert!(s.contains("/run/hisn/evil"), "{s}");
+    }
+
+    #[test]
+    fn ro_dst_with_dotdot_is_rejected() {
+        let d = tmp();
+        let host = d.path().join("h");
+        fs::write(&host, "x").unwrap();
+        let spec = format!("{}:/a/../b", host.to_str().unwrap());
+        let pol = Policy::parse(&format!(
+            "version = \"hisn-policy/v1\"\n[mounts]\nro = [{spec:?}]\n"
+        ))
+        .unwrap();
+        assert!(pol.resolve(d.path(), &Overrides::default(), &[]).is_err());
     }
 
     #[test]

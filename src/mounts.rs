@@ -541,8 +541,32 @@ pub fn plan(
             }
         }
     }
-    for p in &policy.ro {
-        ops.push(bind(p, false, true));
+    // Same-path entries: unchanged (`bind`, recursive ro). `src:dst` entries
+    // (0.3.3) bind `src` at `dst` with ro,nosuid,nodev; their collisions are
+    // checked once the whole plan exists (see `check_ro_dst` below).
+    // A policy built with only `ro` (no `ro_binds`) is all same-path entries.
+    let ro_binds: Vec<crate::policy::RoBind> = if policy.ro_binds.is_empty() {
+        policy
+            .ro
+            .iter()
+            .map(|p| crate::policy::RoBind {
+                src: p.clone(),
+                dst: p.clone(),
+            })
+            .collect()
+    } else {
+        policy.ro_binds.clone()
+    };
+    for b in &ro_binds {
+        if b.src == b.dst {
+            ops.push(bind(&b.dst, false, true));
+        } else {
+            ops.push(op_nodev(
+                &b.dst,
+                Some(b.src.clone()),
+                MountKind::BindRo { recursive: true },
+            ));
+        }
     }
 
     // 3. Private tmpfs areas.
@@ -654,6 +678,32 @@ pub fn plan(
         ));
     }
 
+    // 0.3.3: a `src:dst` dst must not shadow or sit inside another session
+    // mount (owned by the profile or the toolchain), nor equal another entry.
+    // Checked before dedupe, which would otherwise hide the collision.
+    //
+    // "Another mount" means any real mount op (bind, tmpfs, mask, proc, dev)
+    // whose target is the dst, sits above it, or sits below it. The dst's own
+    // src:dst op is excluded by identity (same dst AND same src).
+    for b in policy.ro_binds.iter().filter(|b| b.src != b.dst) {
+        for o in &ops {
+            if !is_mount(&o.kind) {
+                continue;
+            }
+            if o.target == b.dst && o.source.as_deref() == Some(b.src.as_path()) {
+                continue; // this bind itself
+            }
+            let covers = o.target.starts_with(&b.dst) || b.dst.starts_with(&o.target);
+            if covers {
+                return Err(PlanError::RoConflict {
+                    src: b.src.clone(),
+                    dst: b.dst.clone(),
+                    reason: format!("collides with the session mount at {}", o.target.display()),
+                });
+            }
+        }
+    }
+
     let ops = order_and_dedupe(ops);
     // The executor builds paths lexically under the new root and must never
     // walk a symlink it created (an absolute link would resolve on the host).
@@ -745,6 +795,7 @@ mod tests {
             network: Network::None,
             hostname: "hisn".into(),
             ro: vec![],
+            ro_binds: vec![],
             rw: vec![],
             mask: vec![],
             grantable_rw: vec![],
@@ -1007,6 +1058,76 @@ mod tests {
             assert!(!is_loopback_ns(a), "{a}");
         }
         assert!(is_loopback_ns("not-an-ip"), "unparsable is kept out");
+    }
+
+    fn bind_pol(ro: Vec<crate::policy::RoBind>) -> ResolvedPolicy {
+        let mut p = pol("/work/p");
+        p.ro = ro.iter().map(|b| b.dst.clone()).collect();
+        p.ro_binds = ro;
+        p
+    }
+
+    #[test]
+    fn src_dst_mounts_the_source_at_dst_only() {
+        let p = bind_pol(vec![crate::policy::RoBind {
+            src: PathBuf::from("/host/secret-ish/app.conf"),
+            dst: PathBuf::from("/etc-app/app.conf"),
+        }]);
+        let ops = plan(&p, &facts(), &[]).unwrap();
+        let o = find(&ops, "/etc-app/app.conf").expect("mounted at dst");
+        assert_eq!(
+            o.source.as_deref(),
+            Some(Path::new("/host/secret-ish/app.conf"))
+        );
+        assert_eq!(o.kind, MountKind::BindRo { recursive: true });
+        assert!(o.nodev, "src:dst keeps nodev as well as nosuid and ro");
+        // nothing is mounted at the host source path itself
+        assert!(
+            ops.iter()
+                .all(|x| x.target != Path::new("/host/secret-ish/app.conf"))
+        );
+    }
+
+    #[test]
+    fn same_path_ro_is_unchanged() {
+        let p = bind_pol(vec![crate::policy::RoBind {
+            src: PathBuf::from("/opt/tc"),
+            dst: PathBuf::from("/opt/tc"),
+        }]);
+        let ops = plan(&p, &facts(), &[]).unwrap();
+        let o = find(&ops, "/opt/tc").unwrap();
+        assert_eq!(o.kind, MountKind::BindRo { recursive: true });
+        assert_eq!(o.source.as_deref(), Some(Path::new("/opt/tc")));
+        assert!(!o.nodev, "same-path entries keep their 0.2 flags");
+    }
+
+    #[test]
+    fn src_dst_colliding_with_a_session_mount_is_rejected_and_named() {
+        // /tmp is a private tmpfs mount: a dst inside it must be refused.
+        let p = bind_pol(vec![crate::policy::RoBind {
+            src: PathBuf::from("/host/x"),
+            dst: PathBuf::from("/tmp/x"),
+        }]);
+        match plan(&p, &facts(), &[]) {
+            Err(PlanError::RoConflict { dst, reason, .. }) => {
+                assert_eq!(dst, PathBuf::from("/tmp/x"));
+                assert!(reason.contains("/tmp"), "{reason}");
+            }
+            other => panic!("expected RoConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn src_dst_shadowing_the_toolchain_is_rejected() {
+        // /usr is a toolchain bind (in facts): dst beneath it is refused.
+        let p = bind_pol(vec![crate::policy::RoBind {
+            src: PathBuf::from("/host/x"),
+            dst: PathBuf::from("/usr/lib/x"),
+        }]);
+        assert!(matches!(
+            plan(&p, &facts(), &[]),
+            Err(PlanError::RoConflict { .. })
+        ));
     }
 
     #[test]

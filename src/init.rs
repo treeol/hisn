@@ -715,6 +715,7 @@ mod tests {
                     network: Network::None,
                     hostname: "h".into(),
                     ro: vec![],
+                    ro_binds: vec![],
                     rw: vec![],
                     mask: vec![],
                     grantable_rw: vec![],

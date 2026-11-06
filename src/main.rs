@@ -65,6 +65,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             PolicyCommand::Validate { file } => {
                 let (_, resolved) = load_resolved(file)?;
+                // 0.3.3: validate also runs the mount plan against the host, so
+                // mount conflicts (src:dst colliding with a session mount) are
+                // refused here, not only at session start.
+                check_mount_plan(&resolved)?;
                 print!("{}", resolved.to_toml());
                 Ok(ExitCode::SUCCESS)
             }
@@ -177,6 +181,16 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
         },
     }
+}
+
+/// Run the mount plan against the host (validate-time check, 0.3.3): the same
+/// refusals a session start would give, before any namespace exists.
+fn check_mount_plan(resolved: &policy::ResolvedPolicy) -> Result<()> {
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
+    let facts = mounts::HostFacts::probe(resolved, uid, gid, "user");
+    mounts::plan(resolved, &facts, &[])?;
+    Ok(())
 }
 
 fn load_resolved(file: Option<PathBuf>) -> Result<(PathBuf, policy::ResolvedPolicy)> {

@@ -2215,6 +2215,90 @@ if [ -f "$MANIFEST" ]; then
   fi
 fi
 
+# ================================================ L47-L49: ro src:dst mounts (0.3.3, ADR 0012)
+# L47: a host file bound as `src:dst` is visible at dst only, read-only, nodev,
+#      and the host source path is not visible in the session.
+# L48: dst under /run/hisn and dst colliding with another session mount are
+#      refused at validate, naming the path; `..` in dst is refused.
+# L49: a symlinked directory in src is resolved on the host before mounting:
+#      the session sees the file through the real path only.
+L47_CWD=$(new_cwd l47)
+L47_SRC_DIR="$WORK/l47-host"
+mkdir -p "$L47_SRC_DIR"
+echo "l47-host-file" >"$L47_SRC_DIR/app.conf"
+L47_POL="$WORK/L47.toml"
+write_policy "$L47_POL" "$L47_CWD"
+printf 'ro = ["%s:/l47-dst/app.conf"]\n' "$L47_SRC_DIR/app.conf" >>"$L47_POL"
+if start_session l47-$$ "$L47_CWD" "$L47_POL"; then
+  r=$(q "$L47_CWD" cat /l47-dst/app.conf)
+  case "$r" in
+    *l47-host-file*) pass "L47 src:dst file visible at dst" ;;
+    *) fail "L47 src:dst file visible at dst" "cat dst gave [$r]" ;;
+  esac
+  r=$(q "$L47_CWD" sh -c "echo x >> /l47-dst/app.conf 2>&1; echo rc=\$?")
+  case "$r" in
+    *"Read-only"*|*rc=[1-9]*) pass "L47 src:dst is read-only (write refused)" ;;
+    *) fail "L47 src:dst read-only" "write did not fail: [$r]" ;;
+  esac
+  r=$(q "$L47_CWD" sh -c "grep ' /l47-dst/app.conf ' /proc/self/mountinfo")
+  if printf '%s' "$r" | grep -q 'ro,nosuid,nodev'; then
+    pass "L47 src:dst mount flags ro,nosuid,nodev"
+  else
+    fail "L47 src:dst mount flags" "mountinfo line: [$r]"
+  fi
+  r=$(q "$L47_CWD" sh -c "test -e $L47_SRC_DIR/app.conf && echo VISIBLE || echo HIDDEN")
+  case "$r" in
+    *HIDDEN*) pass "L47 host source path not visible in the session" ;;
+    *) fail "L47 host source path" "probe gave [$r]" ;;
+  esac
+  end_session "$L47_CWD" "$S_PID"
+else
+  fail "L47 src:dst mount" "session did not start"
+fi
+
+L48_HOST="$WORK/l48-host.conf"
+echo "x" >"$L48_HOST"
+for spec in "$L48_HOST:/run/hisn/l48" "$L48_HOST:/tmp/../etc/l48" "$L48_HOST:/usr/l48" "$L48_HOST:/l48/../x"; do
+  L48_POL="$WORK/L48.toml"
+  write_policy "$L48_POL" "$L47_CWD"
+  printf 'ro = ["%s"]\n' "$spec" >>"$L48_POL"
+  out=$("$HISN" policy validate "$L48_POL" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    pass "L48 refused at validate: $spec"
+  else
+    fail "L48 refused at validate: $spec" "accepted: $out"
+  fi
+done
+# the message names the conflicting path for the /run/hisn case
+L48_POL2="$WORK/L48b.toml"
+write_policy "$L48_POL2" "$L47_CWD"
+printf 'ro = ["%s:/run/hisn/l48"]\n' "$L48_HOST" >>"$L48_POL2"
+out=$("$HISN" policy validate "$L48_POL2" 2>&1)
+case "$out" in
+  *"/run/hisn/l48"*) pass "L48 /run/hisn refusal names the path" ;;
+  *) fail "L48 /run/hisn refusal names the path" "message: [$out]" ;;
+esac
+
+L49_REAL="$WORK/l49-real"
+L49_LINK="$WORK/l49-link"
+mkdir -p "$L49_REAL"
+echo "l49-real-file" >"$L49_REAL/f.conf"
+ln -sfn "$L49_REAL" "$L49_LINK"
+L49_POL="$WORK/L49.toml"
+write_policy "$L49_POL" "$L47_CWD"
+printf 'ro = ["%s/f.conf:/l49-dst/f.conf"]\n' "$L49_LINK" >>"$L49_POL"
+if start_session l49-$$ "$L47_CWD" "$L49_POL"; then
+  r=$(q "$L47_CWD" cat /l49-dst/f.conf)
+  case "$r" in
+    *l49-real-file*) pass "L49 symlinked src directory resolved on the host" ;;
+    *) fail "L49 symlinked src directory" "cat gave [$r]" ;;
+  esac
+  end_session "$L47_CWD" "$S_PID"
+else
+  fail "L49 symlinked src directory" "session did not start"
+fi
+
 # ----------------------------------------------------------------- summary
 printf '\nRESULT: %d passed, %d failed, %d skipped, %d weak\n' "$PASSES" "$FAILS" "$SKIPS" "$WEAKS"
 [ "$FAILS" -eq 0 ] && [ "$PASSES" -gt 0 ]

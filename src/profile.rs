@@ -976,6 +976,12 @@ pub fn validate(path: Option<&Path>) -> Result<ResolvedPolicy> {
         ..Default::default()
     };
     let resolved = profile.resolve(base, &overrides, &roots)?;
+    // 0.3.3: the mount plan's conflicts (src:dst vs session mounts) are
+    // validate-time errors too, as at session start.
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
+    let facts = crate::mounts::HostFacts::probe(&resolved, uid, gid, "user");
+    crate::mounts::plan(&resolved, &facts, &[]).map_err(|e| anyhow!("mount plan: {e}"))?;
     Ok(resolved)
 }
 

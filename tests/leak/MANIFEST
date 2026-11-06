@@ -60,3 +60,13 @@ L44: traversal
 L44: symlink-then-write
 L46: dangling-symlink /etc
 L46: missing rootfs name
+L47
+L48
+L49
+L47: src:dst file visible at dst
+L47: src:dst is read-only
+L47: src:dst mount flags
+L47: host source path not visible
+L48: refused at validate
+L48: /run/hisn refusal names the path
+L49: symlinked src directory

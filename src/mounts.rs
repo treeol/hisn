@@ -59,8 +59,100 @@ pub struct HostFacts {
     pub uid: u32,
     pub gid: u32,
     pub username: String,
-    /// Host resolver config content, copied only for `network = "host"`.
-    pub resolv_conf: Option<String>,
+    /// Session resolver config, built only for `network = "host"`. `Err` when
+    /// no usable resolver exists (the launch fails; see `build_resolv_conf`).
+    pub resolv_conf: Option<Result<String, String>>,
+}
+
+/// Systemd-resolved's real upstream list (the host `/etc/resolv.conf` is only a
+/// loopback stub on such hosts).
+pub const RESOLVED_UPSTREAM_FILE: &str = "/run/systemd/resolve/resolv.conf";
+
+/// Is this nameserver address a loopback address (127.0.0.0/8 or ::1)? A
+/// loopback resolver is unreachable from the session's network namespace, so it
+/// is never passed into the session.
+pub fn is_loopback_ns(addr: &str) -> bool {
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        // Unparsable: keep out of the session (never pass what we cannot vouch for).
+        Err(_) => true,
+    }
+}
+
+/// Non-loopback `nameserver` addresses, in file order.
+fn usable_nameservers(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for l in text.lines() {
+        let mut it = l.split_whitespace();
+        if it.next() != Some("nameserver") {
+            continue;
+        }
+        if let Some(a) = it.next()
+            && !is_loopback_ns(a)
+        {
+            out.push(a.to_owned());
+        }
+    }
+    out
+}
+
+/// Lines that carry search/domain/options (kept from the host file).
+fn search_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| {
+            matches!(
+                l.split_whitespace().next(),
+                Some("search" | "domain" | "options")
+            )
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Build the session's `/etc/resolv.conf` (pure; see `docs/configuration.md`
+/// `[net]`). `override_ns` (from the profile) replaces everything. Otherwise:
+/// the host file's non-loopback nameservers, else the systemd-resolved upstream
+/// file's. Returns `Err` when no usable resolver exists: an empty resolv.conf is
+/// never written.
+pub fn build_resolv_conf(
+    host: Option<&str>,
+    upstream: Option<&str>,
+    override_ns: Option<&[String]>,
+) -> Result<String, String> {
+    if let Some(ns) = override_ns {
+        let mut out = String::new();
+        for a in ns {
+            out.push_str(&format!("nameserver {a}\n"));
+        }
+        return Ok(out);
+    }
+    let host = host.unwrap_or("");
+    let mut servers = usable_nameservers(host);
+    let mut extra = search_lines(host);
+    if servers.is_empty() {
+        let up = upstream.unwrap_or("");
+        servers = usable_nameservers(up);
+        if extra.is_empty() {
+            extra = search_lines(up);
+        }
+    }
+    if servers.is_empty() {
+        return Err(
+            "no usable DNS resolver: host resolv.conf lists only loopback stubs and \
+             /run/systemd/resolve/resolv.conf has none; set [net] nameservers in the profile"
+                .to_owned(),
+        );
+    }
+    let mut out = String::new();
+    for l in &extra {
+        out.push_str(l);
+        out.push('\n');
+    }
+    for a in &servers {
+        out.push_str(&format!("nameserver {a}\n"));
+    }
+    Ok(out)
 }
 
 impl HostFacts {
@@ -116,24 +208,35 @@ impl HostFacts {
             .iter()
             .filter_map(|m| EntryKind::of(m).map(|k| (m.clone(), k)))
             .collect();
-        let resolv_conf = (policy.network == crate::policy::Network::Host)
-            .then(|| {
-                let rc_path = match rootfs {
-                    Some(r) => r.join("etc").join("resolv.conf"),
-                    None => PathBuf::from("/etc/resolv.conf"),
-                };
-                // With a rootfs, never follow a symlinked resolv.conf: the
-                // host would resolve it outside the tree and copy host file
-                // contents into the session.
-                let is_symlink = rootfs.is_some()
-                    && fs::symlink_metadata(&rc_path).is_ok_and(|m| m.file_type().is_symlink());
+        // Host networking: the session's resolver is built from the host file,
+        // then systemd-resolved's upstream list, then the profile override
+        // (`build_resolv_conf`). A failure is kept and reported at launch; it
+        // never yields an empty file.
+        //
+        // With a rootfs, the resolver is still the rootfs's own
+        // `etc/resolv.conf` (copied verbatim, never through a symlink), as
+        // before 0.3.3.
+        let resolv_conf: Option<Result<String, String>> =
+            if policy.network != crate::policy::Network::Host {
+                None
+            } else if let Some(r) = rootfs {
+                let rc_path = r.join("etc").join("resolv.conf");
+                let is_symlink =
+                    fs::symlink_metadata(&rc_path).is_ok_and(|m| m.file_type().is_symlink());
                 if is_symlink {
                     None
                 } else {
-                    fs::read_to_string(&rc_path).ok()
+                    fs::read_to_string(&rc_path).ok().map(Ok)
                 }
-            })
-            .flatten();
+            } else {
+                let host = fs::read_to_string("/etc/resolv.conf").ok();
+                let up = fs::read_to_string(RESOLVED_UPSTREAM_FILE).ok();
+                Some(build_resolv_conf(
+                    host.as_deref(),
+                    up.as_deref(),
+                    policy.nameservers.as_deref(),
+                ))
+            };
         Self {
             toolchain,
             etc,
@@ -212,6 +315,17 @@ pub enum PlanError {
     MaskOutsideTree { path: PathBuf },
     #[error("{path}: lies below the symlink {link}; the executor never traverses symlinks")]
     UnderSymlink { path: PathBuf, link: PathBuf },
+    /// No usable DNS resolver for `network = "host"` (C1). Never an empty file.
+    #[error("{0}")]
+    NoResolver(String),
+    /// A `mounts.ro` `src:dst` (or same-path) entry conflicts with an owned or
+    /// existing session path (C3).
+    #[error("mounts.ro {src}:{dst}: {reason}")]
+    RoConflict {
+        src: PathBuf,
+        dst: PathBuf,
+        reason: String,
+    },
 }
 
 /// True if a top-level `/etc` entry name is masked by default (brief:
@@ -394,10 +508,11 @@ pub fn plan(
         },
     ));
     if let (true, Some(c)) = (host_net, &facts.resolv_conf) {
+        let content = c.clone().map_err(PlanError::NoResolver)?;
         ops.push(op(
             "/etc/resolv.conf",
             None,
-            MountKind::Generated { content: c.clone() },
+            MountKind::Generated { content },
         ));
     }
     if facts.ssl_private && matches!(facts.etc.get("ssl"), Some(EntryKind::Dir)) {
@@ -643,6 +758,7 @@ mod tests {
             shm_size: 64,
             tmp_size: 1024,
             rootfs: None,
+            nameservers: None,
         }
     }
 
@@ -833,7 +949,7 @@ mod tests {
         let mut p = pol("/work/p");
         p.network = Network::Host;
         let mut f = facts();
-        f.resolv_conf = Some("nameserver 1.1.1.1\n".into());
+        f.resolv_conf = Some(Ok("nameserver 1.1.1.1\n".into()));
         let ops = plan(&p, &f, &[]).unwrap();
         assert_eq!(
             find(&ops, "/etc/resolv.conf").unwrap().kind,
@@ -841,6 +957,68 @@ mod tests {
                 content: "nameserver 1.1.1.1\n".into()
             }
         );
+    }
+
+    const STUB_HOST: &str = "# systemd stub\nnameserver 127.0.0.53\nsearch home\n";
+    const UPSTREAMS: &str = "# real\nnameserver 192.168.1.111\nnameserver 2001:db8::1\nsearch corp.example\noptions edns0\n";
+
+    #[test]
+    fn stub_only_host_uses_the_resolver_file_upstreams() {
+        let out = build_resolv_conf(Some(STUB_HOST), Some(UPSTREAMS), None).unwrap();
+        assert!(out.contains("nameserver 192.168.1.111\n"), "{out}");
+        assert!(out.contains("nameserver 2001:db8::1\n"), "{out}");
+        assert!(!out.contains("127.0.0.53"), "loopback passed: {out}");
+        // the host had a search line, so it wins over the upstream file's
+        assert!(
+            out.contains("search home\n") && !out.contains("corp.example"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn stub_only_host_without_resolver_file_fails() {
+        let e = build_resolv_conf(Some(STUB_HOST), None, None).unwrap_err();
+        assert!(e.starts_with("no usable DNS resolver"), "{e}");
+        assert!(e.contains("[net] nameservers"), "{e}");
+        // an upstream file with only loopback stubs is the same failure
+        assert!(build_resolv_conf(Some(STUB_HOST), Some("nameserver ::1\n"), None).is_err());
+    }
+
+    #[test]
+    fn host_with_real_nameservers_is_copied_minus_loopback() {
+        let host = "nameserver 127.0.0.1\nnameserver 10.0.0.2\nsearch lan\noptions ndots:2\n";
+        let out = build_resolv_conf(Some(host), Some(UPSTREAMS), None).unwrap();
+        assert_eq!(out, "search lan\noptions ndots:2\nnameserver 10.0.0.2\n");
+    }
+
+    #[test]
+    fn profile_override_is_used_verbatim() {
+        let ns = vec!["1.1.1.1".to_owned(), "9.9.9.9".to_owned()];
+        let out = build_resolv_conf(Some(STUB_HOST), Some(UPSTREAMS), Some(&ns)).unwrap();
+        assert_eq!(out, "nameserver 1.1.1.1\nnameserver 9.9.9.9\n");
+    }
+
+    #[test]
+    fn loopback_addresses_are_recognised() {
+        for a in ["127.0.0.1", "127.8.9.10", "::1"] {
+            assert!(is_loopback_ns(a), "{a}");
+        }
+        for a in ["10.0.0.1", "2001:db8::1", "1.1.1.1"] {
+            assert!(!is_loopback_ns(a), "{a}");
+        }
+        assert!(is_loopback_ns("not-an-ip"), "unparsable is kept out");
+    }
+
+    #[test]
+    fn planner_fails_closed_without_a_resolver() {
+        let mut p = pol("/work/p");
+        p.network = Network::Host;
+        let mut f = facts();
+        f.resolv_conf = Some(Err("no usable DNS resolver".into()));
+        match plan(&p, &f, &[]) {
+            Err(PlanError::NoResolver(m)) => assert!(m.contains("no usable DNS resolver")),
+            other => panic!("expected NoResolver, got {other:?}"),
+        }
     }
 
     #[test]

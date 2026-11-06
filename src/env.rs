@@ -152,6 +152,7 @@ mod tests {
             shm_size: 64,
             tmp_size: 1024,
             rootfs: None,
+            nameservers: None,
         }
     }
 

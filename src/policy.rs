@@ -210,6 +210,10 @@ pub struct ResolvedPolicy {
     /// 0.3.2: the rootfs path if set (from `[rootfs]` or `--rootfs-path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs: Option<PathBuf>,
+    /// 0.3.3: `[net] nameservers` from the profile; replaces the host-derived
+    /// resolver list when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nameservers: Option<Vec<String>>,
 }
 
 /// CLI flags that take precedence over the policy file.
@@ -221,6 +225,8 @@ pub struct Overrides {
     pub home_persist: Option<String>,
     /// `--rootfs-path`: overrides the profile's `[rootfs] path`.
     pub rootfs_path: Option<String>,
+    /// `[net] nameservers` from the profile (0.3.3).
+    pub nameservers: Option<Vec<String>>,
 }
 
 pub fn is_valid_env_name(s: &str) -> bool {
@@ -510,6 +516,7 @@ impl Policy {
             shm_size: self.session.shm_size,
             tmp_size: self.session.tmp_size,
             rootfs,
+            nameservers: overrides.nameservers.clone(),
         })
     }
 
@@ -992,6 +999,7 @@ scoped = ["bogus"]
             network: Some(Network::None),
             home_persist: None,
             rootfs_path: None,
+            nameservers: None,
         };
         let r = pol.resolve(d.path(), &o, &[]).unwrap();
         assert_eq!(r.cwd, fs::canonicalize(&toolchain).unwrap());

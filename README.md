@@ -195,7 +195,20 @@ path = "/path/to/rootfs"   # a directory directly
 [ssh]
 agent = true               # filtering proxy (T1: sign but never add/remove/extract)
 keys = ["SHA256:…"]       # fingerprint allowlist (absent = all keys)
+
+[net]
+nameservers = ["192.168.1.111"]   # optional (0.3.3): DNS resolvers for network = "host"
 ```
+
+**DNS with `network = "host"` (0.3.3).** The session's `/etc/resolv.conf` is
+built from the host's `/etc/resolv.conf` (non-loopback `nameserver` lines plus
+its `search`/`options`). When the host file lists only a loopback stub
+(systemd-resolved's `127.0.0.53`), the upstreams are taken from
+`/run/systemd/resolve/resolv.conf`. Loopback addresses are never passed into
+the session. If no usable resolver remains, the launch fails with
+`no usable DNS resolver …`; hisn never writes an empty resolv.conf. `[net]
+nameservers` replaces this derivation entirely and is rejected at
+`hisn profile validate` if it is empty, not an IP, or loopback.
 
 ### Rootfs store (0.3.2)
 

@@ -991,6 +991,10 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
                 .as_ref()
                 .and_then(|d| d.home.as_ref()?.persist.clone()),
         },
+        // 0.3.3: `[net] nameservers` from the profile (no CLI flag).
+        nameservers: profile_doc
+            .as_ref()
+            .and_then(|d| d.net.as_ref()?.nameservers.clone()),
         rootfs_path: match &args.rootfs_path {
             Some(p) => Some(p.to_string_lossy().into_owned()),
             // Strict: a profile naming a rootfs that cannot be resolved is an
@@ -1138,6 +1142,7 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
                 name: None,
                 path: Some(p.to_string_lossy().into_owned()),
             }),
+            net: None,
             ssh: None,
             services: Vec::new(),
             forwards: Vec::new(),
@@ -2408,6 +2413,7 @@ mod tests {
             shm_size: 64,
             tmp_size: 1024,
             rootfs: None,
+            nameservers: None,
         }
     }
 

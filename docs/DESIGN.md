@@ -80,7 +80,10 @@ session before the command runs (fail closed).
    new devpts, `/tmp`, `/run`, `$HOME` tmpfs (or the persistent home bind).
 7. Generate `/etc/passwd`, `/etc/group` (mapped uid only; the user name is
    the host's `getpwuid_r(euid)` name, §8), `/etc/resolv.conf`
-   (only for `network = "host"`) in `R/.stage`, bind over the `/etc` entries,
+   (only for `network = "host"`; 0.3.3: built by `mounts::build_resolv_conf`
+   from the host file's non-loopback nameservers, else
+   `/run/systemd/resolve/resolv.conf`, else `[net] nameservers`; never empty,
+   launch fails instead) in `R/.stage`, bind over the `/etc` entries,
    unlink the staging names (the bind keeps the inode alive).
 8. `sethostname`; for `network = "none"` bring `lo` up (`SIOCSIFFLAGS`).
 9. `chdir(R)`, `pivot_root(R, R/.old)`, `chdir("/")`, `umount2("/.old",

@@ -43,6 +43,9 @@ pub struct Profile {
     /// SSH agent config (0.3.2).
     #[serde(default, rename = "ssh")]
     pub ssh: Option<SshConfig>,
+    /// Session network resolver override (0.3.3).
+    #[serde(default, rename = "net")]
+    pub net: Option<NetConfig>,
     /// In-sandbox services (0.3 §19).
     #[serde(default, rename = "services")]
     pub services: Vec<Service>,
@@ -81,6 +84,11 @@ impl Profile {
     /// `[[host_services]]`, and `[docker]`. Enforces risk_ack matching
     /// (§16–§18) and path sanity.
     fn validate_surface(&self) -> Result<()> {
+        if let Some(n) = &self.net
+            && let Some(ns) = &n.nameservers
+        {
+            validate_nameservers(ns)?;
+        }
         // Validate [[services]] (§19).
         let mut service_names = std::collections::HashSet::new();
         for s in &self.services {
@@ -244,6 +252,34 @@ impl Profile {
             .resolve(base_dir, overrides, runtime_roots)
             .map_err(|e| anyhow!("{e}"))
     }
+}
+
+/// `[net]` table (0.3.3): the session's DNS resolvers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NetConfig {
+    /// Nameserver addresses written verbatim to the session's `/etc/resolv.conf`,
+    /// replacing the host-derived list. Loopback addresses are rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nameservers: Option<Vec<String>>,
+}
+
+/// Validate `[net] nameservers`: non-empty, each an IP address, none loopback.
+pub fn validate_nameservers(ns: &[String]) -> Result<()> {
+    if ns.is_empty() {
+        bail!("[net] nameservers: must list at least one address (omit the key to use the host's)");
+    }
+    for a in ns {
+        let ip: std::net::IpAddr = a
+            .parse()
+            .map_err(|_| anyhow!("[net] nameservers: {a:?} is not an IP address"))?;
+        if crate::mounts::is_loopback_ns(a) {
+            bail!(
+                "[net] nameservers: {ip} is a loopback address; it is unreachable from the session"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Persistent-home config (`[home]` table in a profile).
@@ -864,6 +900,7 @@ pub fn explain(spec: Option<&str>) -> Result<Value> {
             policy: Policy::default(),
             home: None,
             rootfs: None,
+            net: None,
             ssh: None,
             services: Vec::new(),
             forwards: Vec::new(),
@@ -935,6 +972,7 @@ pub fn validate(path: Option<&Path>) -> Result<ResolvedPolicy> {
     let overrides = Overrides {
         home_persist,
         rootfs_path,
+        nameservers: profile.net.as_ref().and_then(|n| n.nameservers.clone()),
         ..Default::default()
     };
     let resolved = profile.resolve(base, &overrides, &roots)?;
@@ -945,6 +983,33 @@ pub fn validate(path: Option<&Path>) -> Result<ResolvedPolicy> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn net_nameservers_loopback_only_is_rejected_at_validate() {
+        let loop_only = r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[net]
+nameservers = ["127.0.0.53", "::1"]
+"#;
+        let e = Profile::parse(loop_only).unwrap_err().to_string();
+        assert!(e.contains("loopback") && e.contains("127.0.0.53"), "{e}");
+        let mixed = loop_only.replace("[\"127.0.0.53\", \"::1\"]", "[\"1.1.1.1\", \"::1\"]");
+        assert!(Profile::parse(&mixed).is_err());
+        let good = loop_only.replace("[\"127.0.0.53\", \"::1\"]", "[\"1.1.1.1\"]");
+        let p = Profile::parse(&good).unwrap();
+        assert_eq!(p.net.unwrap().nameservers, Some(vec!["1.1.1.1".to_owned()]));
+        let empty = loop_only.replace("[\"127.0.0.53\", \"::1\"]", "[]");
+        assert!(Profile::parse(&empty).is_err());
+        let not_ip = loop_only.replace("[\"127.0.0.53\", \"::1\"]", "[\"dns.example\"]");
+        assert!(
+            Profile::parse(&not_ip)
+                .unwrap_err()
+                .to_string()
+                .contains("not an IP")
+        );
+    }
 
     fn tmp() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")

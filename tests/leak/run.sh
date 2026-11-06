@@ -2266,6 +2266,49 @@ else
   fail "L49 symlinked src directory" "session did not start"
 fi
 
+# ================================================ L50: rootfs + network=host DNS (0.3.3)
+# A rootfs whose etc/resolv.conf is empty (the wakil-dev image) must not fail a
+# network=host session: the host's resolvers are authoritative in that netns.
+# The session starts, its resolv.conf carries a non-loopback nameserver, and a
+# name the host resolves resolves inside. Needs HISN_TEST_ROOTFS (skips with
+# a reason otherwise); the profile lives outside the session cwd.
+if [ -n "${HISN_TEST_ROOTFS:-}" ] && [ -d "$HISN_TEST_ROOTFS/usr" ]; then
+  L50_CWD=$(new_cwd l50)
+  L50_ROOTFS="$WORK/l50-rootfs"
+  rm -rf "$L50_ROOTFS"
+  mkdir -p "$L50_ROOTFS"
+  for d in usr bin sbin lib lib32 lib64 opt etc; do
+    [ -e "$HISN_TEST_ROOTFS/$d" ] || [ -L "$HISN_TEST_ROOTFS/$d" ] && copy_tree "$HISN_TEST_ROOTFS/$d" "$L50_ROOTFS/$d"
+  done
+  : >"$L50_ROOTFS/etc/resolv.conf"
+  L50_PROFILE="$WORK/L50-profile.toml"
+  write_profile "$L50_PROFILE" "$L50_CWD" '[rootfs]' "path = \"$L50_ROOTFS\""
+  sed -i 's/session.network = "none"/session.network = "host"/' "$L50_PROFILE"
+  if start_profile_session l50-$$ "$L50_CWD" "$L50_PROFILE"; then
+    r=$(q "$L50_CWD" cat /etc/resolv.conf)
+    case "$r" in
+      *nameserver*) pass "L50 rootfs empty resolv.conf: session has a usable nameserver" ;;
+      *) fail "L50 rootfs empty resolv.conf" "resolv.conf gave [$r]" ;;
+    esac
+    case "$r" in
+      *127.*|*::1*) fail "L50 loopback in session resolv.conf" "[$r]" ;;
+      *) pass "L50 no loopback nameserver in the session" ;;
+    esac
+    # exec-out: "OK exit=<rc>" then the child's stdout/stderr
+    r=$(q "$L50_CWD" exec-out /usr/bin/getent hosts example.com)
+    case "$r" in
+      "OK exit=0"*[0-9a-f]*:*) pass "L50 getent resolves a name inside the rootfs session" ;;
+      *) fail "L50 getent" "probe gave [$r]" ;;
+    esac
+    end_session "$L50_CWD" "$S_PID"
+  else
+    fail "L50 rootfs network=host session" "session did not start (the rootfs empty-resolver regression)"
+  fi
+  rm -rf "$L50_ROOTFS"
+else
+  skip "L50 rootfs DNS" "HISN_TEST_ROOTFS not set or missing /usr"
+fi
+
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.
 MANIFEST="$HERE/MANIFEST"

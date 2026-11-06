@@ -70,3 +70,7 @@ L47: host source path not visible in the session
 L48: refused at validate
 L48: /run/hisn refusal names the path
 L49: symlinked src directory resolved on the host
+L50
+L50: rootfs empty resolv.conf
+L50: no loopback nameserver
+L50: getent resolves

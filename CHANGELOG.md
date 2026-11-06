@@ -22,6 +22,16 @@ All notable changes to hisn are recorded here. The format follows
   host itself was not re-run for this release. On the build host (non-loopback
   host resolv.conf) a `network = "host"` session showed the host nameserver
   with loopback dropped, and `getent hosts example.com` returned rc=0.
+- **Rootfs sessions on `network = "host"` no longer fail with `no usable DNS
+  resolver`** when the image's own `etc/resolv.conf` is empty (the wakil-dev
+  image). The first version of this fix read only the image file for a rootfs
+  session, so such a launch failed closed while the host had working
+  resolvers. The precedence is now: `[net] nameservers`, then the image's
+  `etc/resolv.conf` if it has a non-loopback nameserver, then the host
+  `/etc/resolv.conf`, then `/run/systemd/resolve/resolv.conf`, else fail. The
+  image file is never followed through a symlink, and the upstream file is read
+  from the real host, not from inside the image. Regression check: leak test
+  L50 (runs when `HISN_TEST_ROOTFS` is set).
 
 ### Added
 - **`[net] nameservers = ["ip", ...]`** (profile): replaces the derived resolver

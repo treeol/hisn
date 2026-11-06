@@ -120,12 +120,47 @@ pub fn build_resolv_conf(
     upstream: Option<&str>,
     override_ns: Option<&[String]>,
 ) -> Result<String, String> {
+    build_resolv_conf_ordered(None, host, upstream, override_ns)
+}
+
+/// Build the session's resolv.conf (0.3.3). Candidates, in order:
+/// `image` (a rootfs's own resolv.conf, rootfs sessions only), `host`, and
+/// `upstream` (systemd-resolved's real list).
+///
+/// The profile override wins over everything. Otherwise the image file is used
+/// only if it has a usable (non-loopback) nameserver, since on `network = "host"`
+/// the host's resolvers are authoritative and an image's placeholder must not
+/// shadow a working host resolver. The host file then supplies both its
+/// nameservers and its search/options lines, falling back to the upstream file
+/// for nameservers (and for search/options when the host had none), exactly as
+/// before 0.3.3 for a host session. Loopback is never passed in, and when
+/// nothing usable remains the result is `Err`, never an empty file.
+pub fn build_resolv_conf_ordered(
+    image: Option<&str>,
+    host: Option<&str>,
+    upstream: Option<&str>,
+    override_ns: Option<&[String]>,
+) -> Result<String, String> {
     if let Some(ns) = override_ns {
         let mut out = String::new();
         for a in ns {
             out.push_str(&format!("nameserver {a}\n"));
         }
         return Ok(out);
+    }
+    if let Some(img) = image {
+        let servers = usable_nameservers(img);
+        if !servers.is_empty() {
+            let mut out = String::new();
+            for l in search_lines(img) {
+                out.push_str(&l);
+                out.push('\n');
+            }
+            for a in &servers {
+                out.push_str(&format!("nameserver {a}\n"));
+            }
+            return Ok(out);
+        }
     }
     let host = host.unwrap_or("");
     let mut servers = usable_nameservers(host);
@@ -220,22 +255,26 @@ impl HostFacts {
             if policy.network != crate::policy::Network::Host {
                 None
             } else if let Some(r) = rootfs {
-                // The rootfs's own resolv.conf is the only host-side source
-                // here (no systemd upstream file inside an image). A symlinked
-                // one is never followed. The same rules apply: loopback never
-                // enters the session, an empty result fails the launch, and
-                // `[net] nameservers` overrides.
+                // A rootfs session on network = "host" shares the host netns, so
+                // the host's resolvers are the authoritative ones. The image's
+                // own resolv.conf is tried first only when it has a usable
+                // nameserver; otherwise the host file, then the host's
+                // systemd-resolved upstream file (read from the real host, never
+                // from inside the image). A symlinked image file is never followed.
                 let rc_path = r.join("etc").join("resolv.conf");
                 let is_symlink =
                     fs::symlink_metadata(&rc_path).is_ok_and(|m| m.file_type().is_symlink());
-                let text = if is_symlink {
+                let image = if is_symlink {
                     None
                 } else {
                     fs::read_to_string(&rc_path).ok()
                 };
-                Some(build_resolv_conf(
-                    text.as_deref(),
-                    None,
+                let host = fs::read_to_string("/etc/resolv.conf").ok();
+                let up = fs::read_to_string(RESOLVED_UPSTREAM_FILE).ok();
+                Some(build_resolv_conf_ordered(
+                    image.as_deref(),
+                    host.as_deref(),
+                    up.as_deref(),
                     policy.nameservers.as_deref(),
                 ))
             } else {
@@ -1059,6 +1098,72 @@ mod tests {
         let ns = vec!["1.1.1.1".to_owned(), "9.9.9.9".to_owned()];
         let out = build_resolv_conf(Some(STUB_HOST), Some(UPSTREAMS), Some(&ns)).unwrap();
         assert_eq!(out, "nameserver 1.1.1.1\nnameserver 9.9.9.9\n");
+    }
+
+    const IMAGE_EMPTY: &str = "";
+    const IMAGE_REAL: &str = "nameserver 9.9.9.9\nsearch img.example\n";
+
+    #[test]
+    fn rootfs_empty_resolver_uses_the_host_upstream() {
+        // The wakil-dev case: the image's resolv.conf is empty, the host file is
+        // a stub, and the systemd upstream file has real servers.
+        let out =
+            build_resolv_conf_ordered(Some(IMAGE_EMPTY), Some(STUB_HOST), Some(UPSTREAMS), None)
+                .unwrap();
+        assert!(out.contains("nameserver 192.168.1.111\n"), "{out}");
+        assert!(
+            !out.contains("9.9.9.9") && !out.contains("127.0.0.53"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn rootfs_real_resolver_wins_over_the_host() {
+        let out = build_resolv_conf_ordered(
+            Some(IMAGE_REAL),
+            Some("nameserver 10.0.0.2\n"),
+            Some(UPSTREAMS),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, "search img.example\nnameserver 9.9.9.9\n");
+    }
+
+    #[test]
+    fn rootfs_empty_image_uses_the_host_file_when_it_has_servers() {
+        let out = build_resolv_conf_ordered(
+            Some(IMAGE_EMPTY),
+            Some("search lan\nnameserver 10.0.0.2\n"),
+            Some(UPSTREAMS),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, "search lan\nnameserver 10.0.0.2\n");
+    }
+
+    #[test]
+    fn rootfs_loopback_only_everywhere_fails_closed() {
+        let r = build_resolv_conf_ordered(
+            Some("nameserver 127.0.0.11\n"),
+            Some(STUB_HOST),
+            Some("nameserver ::1\n"),
+            None,
+        );
+        assert!(r.is_err(), "{r:?}");
+        assert!(build_resolv_conf_ordered(Some(IMAGE_EMPTY), None, None, None).is_err());
+    }
+
+    #[test]
+    fn profile_override_wins_over_every_rootfs_candidate() {
+        let ns = vec!["1.1.1.1".to_owned()];
+        let out = build_resolv_conf_ordered(
+            Some(IMAGE_REAL),
+            Some("nameserver 10.0.0.2\n"),
+            Some(UPSTREAMS),
+            Some(&ns),
+        )
+        .unwrap();
+        assert_eq!(out, "nameserver 1.1.1.1\n");
     }
 
     #[test]

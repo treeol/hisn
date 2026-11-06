@@ -64,9 +64,9 @@ L47
 L48
 L49
 L47: src:dst file visible at dst
-L47: src:dst is read-only
-L47: src:dst mount flags
-L47: host source path not visible
+L47: src:dst is read-only (write refused EROFS)
+L47: src:dst mount flags ro,nosuid,nodev
+L47: host source path not visible in the session
 L48: refused at validate
 L48: /run/hisn refusal names the path
-L49: symlinked src directory
+L49: symlinked src directory resolved on the host

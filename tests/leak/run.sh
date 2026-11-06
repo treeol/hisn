@@ -2187,34 +2187,6 @@ else
   rm -rf "$RUNTIME_ROOT/l46-missing-$$" 2>/dev/null
 fi
 
-# Every id in MANIFEST must produce at least one line. A missing id means
-# the test was silently dropped from the suite — FAIL.
-MANIFEST="$HERE/MANIFEST"
-if [ -f "$MANIFEST" ]; then
-  EMITTED=$(printf '%s\n' "$OUTPUT_LOG" | sed -n 's/^\(L[0-9][0-9]*[a-z]*\)\([^0-9a-z].*\)\{0,1\}$/\1/p' | sort -u)
-  MISSING=""
-  while IFS= read -r id; do
-    [ -z "$id" ] && continue
-    case "$id" in \#*) continue ;; esac
-    case "$id" in
-      *": "*)
-        # "L17b: text" -- a line of test L17b whose name contains "text".
-        want_id=${id%%: *} want_txt=${id#*: }
-        printf '%s\n' "$OUTPUT_LOG" | grep -F -- "$want_id " | grep -qF -- "$want_txt" ||
-          { fail "manifest $id" "no $want_id line containing [$want_txt] (check silently dropped?)"; }
-        ;;
-      *)
-        printf '%s\n' "$EMITTED" | grep -qxF "$id" || MISSING="$MISSING $id"
-        ;;
-    esac
-  done <"$MANIFEST"
-  if [ -n "$MISSING" ]; then
-    for id in $MISSING; do
-      fail "manifest $id" "test id $id produced no line (silently dropped?)"
-    done
-  fi
-fi
-
 # ================================================ L47-L49: ro src:dst mounts (0.3.3, ADR 0012)
 # L47: a host file bound as `src:dst` is visible at dst only, read-only, nodev,
 #      and the host source path is not visible in the session.
@@ -2228,29 +2200,23 @@ mkdir -p "$L47_SRC_DIR"
 echo "l47-host-file" >"$L47_SRC_DIR/app.conf"
 L47_POL="$WORK/L47.toml"
 write_policy "$L47_POL" "$L47_CWD"
-printf 'ro = ["%s:/l47-dst/app.conf"]\n' "$L47_SRC_DIR/app.conf" >>"$L47_POL"
+sed -i "s|^\[mounts\]|[mounts]\nro = [\"$L47_SRC_DIR/app.conf:/l47-dst/app.conf\"]|" "$L47_POL"
 if start_session l47-$$ "$L47_CWD" "$L47_POL"; then
   r=$(q "$L47_CWD" cat /l47-dst/app.conf)
   case "$r" in
     *l47-host-file*) pass "L47 src:dst file visible at dst" ;;
     *) fail "L47 src:dst file visible at dst" "cat dst gave [$r]" ;;
   esac
-  r=$(q "$L47_CWD" sh -c "echo x >> /l47-dst/app.conf 2>&1; echo rc=\$?")
-  case "$r" in
-    *"Read-only"*|*rc=[1-9]*) pass "L47 src:dst is read-only (write refused)" ;;
-    *) fail "L47 src:dst read-only" "write did not fail: [$r]" ;;
-  esac
-  r=$(q "$L47_CWD" sh -c "grep ' /l47-dst/app.conf ' /proc/self/mountinfo")
-  if printf '%s' "$r" | grep -q 'ro,nosuid,nodev'; then
+  r=$(q "$L47_CWD" write /l47-dst/app.conf)
+  if [ "$r" = "EROFS" ]; then pass "L47 src:dst is read-only (write refused EROFS)"; else fail "L47 src:dst read-only" "write gave [$r], not EROFS"; fi
+  r=$(q "$L47_CWD" mountinfo)
+  if printf '%s' "$r" | grep ' /l47-dst/app.conf ' | grep -q 'ro,nosuid,nodev'; then
     pass "L47 src:dst mount flags ro,nosuid,nodev"
   else
     fail "L47 src:dst mount flags" "mountinfo line: [$r]"
   fi
-  r=$(q "$L47_CWD" sh -c "test -e $L47_SRC_DIR/app.conf && echo VISIBLE || echo HIDDEN")
-  case "$r" in
-    *HIDDEN*) pass "L47 host source path not visible in the session" ;;
-    *) fail "L47 host source path" "probe gave [$r]" ;;
-  esac
+  r=$(q "$L47_CWD" stat "$L47_SRC_DIR/app.conf")
+  if refused "$r"; then pass "L47 host source path not visible in the session ($r)"; else fail "L47 host source path" "probe gave [$r], not an errno refusal"; fi
   end_session "$L47_CWD" "$S_PID"
 else
   fail "L47 src:dst mount" "session did not start"
@@ -2285,18 +2251,47 @@ L49_LINK="$WORK/l49-link"
 mkdir -p "$L49_REAL"
 echo "l49-real-file" >"$L49_REAL/f.conf"
 ln -sfn "$L49_REAL" "$L49_LINK"
+L49_CWD=$(new_cwd l49)
 L49_POL="$WORK/L49.toml"
-write_policy "$L49_POL" "$L47_CWD"
-printf 'ro = ["%s/f.conf:/l49-dst/f.conf"]\n' "$L49_LINK" >>"$L49_POL"
-if start_session l49-$$ "$L47_CWD" "$L49_POL"; then
-  r=$(q "$L47_CWD" cat /l49-dst/f.conf)
+write_policy "$L49_POL" "$L49_CWD"
+sed -i "s|^\[mounts\]|[mounts]\nro = [\"$L49_LINK/f.conf:/l49-dst/f.conf\"]|" "$L49_POL"
+if start_session l49-$$ "$L49_CWD" "$L49_POL"; then
+  r=$(q "$L49_CWD" cat /l49-dst/f.conf)
   case "$r" in
     *l49-real-file*) pass "L49 symlinked src directory resolved on the host" ;;
     *) fail "L49 symlinked src directory" "cat gave [$r]" ;;
   esac
-  end_session "$L47_CWD" "$S_PID"
+  end_session "$L49_CWD" "$S_PID"
 else
   fail "L49 symlinked src directory" "session did not start"
+fi
+
+# Every id in MANIFEST must produce at least one line. A missing id means
+# the test was silently dropped from the suite — FAIL.
+MANIFEST="$HERE/MANIFEST"
+if [ -f "$MANIFEST" ]; then
+  EMITTED=$(printf '%s\n' "$OUTPUT_LOG" | sed -n 's/^\(L[0-9][0-9]*[a-z]*\)\([^0-9a-z].*\)\{0,1\}$/\1/p' | sort -u)
+  MISSING=""
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    case "$id" in \#*) continue ;; esac
+    case "$id" in
+      *": "*)
+        # "L17b: text" -- a line of test L17b whose name contains "text".
+        want_id=${id%%: *} want_txt=${id#*: }
+        printf '%s\n' "$OUTPUT_LOG" | grep -F -- "$want_id " | grep -qF -- "$want_txt" ||
+          { fail "manifest $id" "no $want_id line containing [$want_txt] (check silently dropped?)"; }
+        ;;
+      *)
+        printf '%s\n' "$EMITTED" | grep -qxF "$id" || MISSING="$MISSING $id"
+        ;;
+    esac
+  done <"$MANIFEST"
+  if [ -n "$MISSING" ]; then
+    for id in $MISSING; do
+      fail "manifest $id" "test id $id produced no line (silently dropped?)"
+    done
+  fi
 fi
 
 # ----------------------------------------------------------------- summary

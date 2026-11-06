@@ -2290,10 +2290,12 @@ if [ -n "${HISN_TEST_ROOTFS:-}" ] && [ -d "$HISN_TEST_ROOTFS/usr" ]; then
       *nameserver*) pass "L50 rootfs empty resolv.conf: session has a usable nameserver" ;;
       *) fail "L50 rootfs empty resolv.conf" "resolv.conf gave [$r]" ;;
     esac
-    case "$r" in
-      *127.*|*::1*) fail "L50 loopback in session resolv.conf" "[$r]" ;;
-      *) pass "L50 no loopback nameserver in the session" ;;
-    esac
+    ns=$(printf '%s\n' "$r" | awk '$1=="nameserver"{print $2}')
+    if printf '%s\n' "$ns" | grep -Eq '^(127\.|::1$)'; then
+      fail "L50 no loopback nameserver in the session" "[$ns]"
+    else
+      pass "L50 no loopback nameserver in the session"
+    fi
     # exec-out: "OK exit=<rc>" then the child's stdout/stderr
     r=$(q "$L50_CWD" exec-out /usr/bin/getent hosts example.com)
     case "$r" in

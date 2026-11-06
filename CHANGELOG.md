@@ -7,6 +7,38 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.3]
+
+### Fixed
+- **Session DNS on systemd-resolved hosts.** The session's `/etc/resolv.conf`
+  is now built from the host's non-loopback nameservers, else the
+  systemd-resolved upstream file `/run/systemd/resolve/resolv.conf`, else the
+  launch fails with `no usable DNS resolver …`. Loopback nameservers are never
+  passed in, and an empty resolv.conf is never written. Evidence reported from a
+  Fedora 45 host (hisn 0.3.2, wakil-dev rootfs): the session's resolv.conf was
+  empty, `getent hosts example.com` returned rc=2, while `curl -sI https://1.1.1.1`
+  returned HTTP/2 301. The host resolv.conf was the systemd stub (127.0.0.53)
+  and the real upstreams were in `/run/systemd/resolve/resolv.conf`. The Fedora
+  host itself was not re-run for this release. On the build host (non-loopback
+  host resolv.conf) a `network = "host"` session showed the host nameserver
+  with loopback dropped, and `getent hosts example.com` returned rc=0.
+
+### Added
+- **`[net] nameservers = ["ip", ...]`** (profile): replaces the derived resolver
+  list. Empty, non-IP and loopback entries are rejected at `hisn profile validate`.
+- **`hisn exec --no-tty`**: non-interactive exec with no pty. Stdin is
+  `/dev/null`; stdout and stderr pass through even when they are terminals.
+  `--tty --no-tty` is a usage error. The refusal for a terminal without either
+  flag still applies and now names both options.
+- **`mounts.ro` accepts `src:dst`** (ADR 0012): the host path `src` is bound
+  read-only (`ro,nosuid,nodev`) at the in-session path `dst`. Same-path entries
+  are unchanged. `dst` under `/run/hisn` or a runtime root, `dst` containing
+  `..`, and `dst` colliding with another session mount are rejected at validate,
+  naming the path. A symlinked `src` directory is resolved on the host.
+- `policy validate` and `profile validate` now run the mount plan, so mount
+  conflicts are refused at validate, not only at session start.
+- Leak tests L47–L49 (`src:dst` mount, validate refusals, symlinked source).
+
 ## [0.3.2]
 
 Hardening before the tag (same version):

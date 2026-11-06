@@ -115,6 +115,33 @@ fn search_lines(text: &str) -> Vec<String> {
 /// the host file's non-loopback nameservers, else the systemd-resolved upstream
 /// file's. Returns `Err` when no usable resolver exists: an empty resolv.conf is
 /// never written.
+/// Read `<rootfs>/etc/resolv.conf` without following any symlink (0.3.3).
+///
+/// Uses `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+/// RESOLVE_NO_MAGICLINKS`, so a symlink in ANY component (the `etc` directory
+/// included) fails the open, and the read goes through the same descriptor, so
+/// there is no check-then-read window. Any failure reads as "absent".
+fn read_image_resolv_conf(rootfs: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let root = fs::File::open(rootfs).ok()?;
+    let rel = std::ffi::CString::new(b"etc/resolv.conf".as_slice()).ok()?;
+    let flags = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
+    let fd = crate::sys::openat2(
+        std::os::unix::io::AsRawFd::as_raw_fd(&root),
+        &rel,
+        flags,
+        0,
+        crate::sys::RESOLVE_BENEATH
+            | crate::sys::RESOLVE_NO_SYMLINKS
+            | crate::sys::RESOLVE_NO_MAGICLINKS,
+    )
+    .ok()?;
+    let mut f = fs::File::from(fd);
+    let mut s = String::new();
+    f.read_to_string(&mut s).ok()?;
+    Some(s)
+}
+
 pub fn build_resolv_conf(
     host: Option<&str>,
     upstream: Option<&str>,
@@ -127,14 +154,13 @@ pub fn build_resolv_conf(
 /// `image` (a rootfs's own resolv.conf, rootfs sessions only), `host`, and
 /// `upstream` (systemd-resolved's real list).
 ///
-/// The profile override wins over everything. Otherwise the image file is used
-/// only if it has a usable (non-loopback) nameserver, since on `network = "host"`
-/// the host's resolvers are authoritative and an image's placeholder must not
-/// shadow a working host resolver. The host file then supplies both its
-/// nameservers and its search/options lines, falling back to the upstream file
-/// for nameservers (and for search/options when the host had none), exactly as
-/// before 0.3.3 for a host session. Loopback is never passed in, and when
-/// nothing usable remains the result is `Err`, never an empty file.
+/// The profile override wins over everything. Otherwise the host file supplies
+/// its usable nameservers and search/options lines; if it has none, the
+/// upstream file does. The image file is consulted only when both host sources
+/// are unusable, so it never shadows a working host resolver (on
+/// `network = "host"` the host's resolvers are authoritative). Loopback is never
+/// passed in, and when nothing usable remains the result is `Err`, never an
+/// empty file.
 pub fn build_resolv_conf_ordered(
     image: Option<&str>,
     host: Option<&str>,
@@ -148,20 +174,6 @@ pub fn build_resolv_conf_ordered(
         }
         return Ok(out);
     }
-    if let Some(img) = image {
-        let servers = usable_nameservers(img);
-        if !servers.is_empty() {
-            let mut out = String::new();
-            for l in search_lines(img) {
-                out.push_str(&l);
-                out.push('\n');
-            }
-            for a in &servers {
-                out.push_str(&format!("nameserver {a}\n"));
-            }
-            return Ok(out);
-        }
-    }
     let host = host.unwrap_or("");
     let mut servers = usable_nameservers(host);
     let mut extra = search_lines(host);
@@ -171,6 +183,12 @@ pub fn build_resolv_conf_ordered(
         if extra.is_empty() {
             extra = search_lines(up);
         }
+    }
+    // The image's own file is a last resort: it is consulted only when neither
+    // host source has a usable nameserver, so it never shadows a host resolver.
+    if let (true, Some(img)) = (servers.is_empty(), image) {
+        servers = usable_nameservers(img);
+        extra = search_lines(img);
     }
     if servers.is_empty() {
         return Err(
@@ -261,14 +279,7 @@ impl HostFacts {
                 // nameserver; otherwise the host file, then the host's
                 // systemd-resolved upstream file (read from the real host, never
                 // from inside the image). A symlinked image file is never followed.
-                let rc_path = r.join("etc").join("resolv.conf");
-                let is_symlink =
-                    fs::symlink_metadata(&rc_path).is_ok_and(|m| m.file_type().is_symlink());
-                let image = if is_symlink {
-                    None
-                } else {
-                    fs::read_to_string(&rc_path).ok()
-                };
+                let image = read_image_resolv_conf(r);
                 let host = fs::read_to_string("/etc/resolv.conf").ok();
                 let up = fs::read_to_string(RESOLVED_UPSTREAM_FILE).ok();
                 Some(build_resolv_conf_ordered(
@@ -1100,6 +1111,44 @@ mod tests {
         assert_eq!(out, "nameserver 1.1.1.1\nnameserver 9.9.9.9\n");
     }
 
+    #[test]
+    fn image_resolv_conf_plain_file_is_read() {
+        let d = tempdir_for("img-plain");
+        fs::create_dir_all(d.join("etc")).unwrap();
+        fs::write(d.join("etc/resolv.conf"), "nameserver 9.9.9.9\n").unwrap();
+        assert_eq!(
+            read_image_resolv_conf(&d).as_deref(),
+            Some("nameserver 9.9.9.9\n")
+        );
+    }
+
+    #[test]
+    fn image_resolv_conf_symlinked_leaf_is_refused() {
+        let d = tempdir_for("img-leaf");
+        fs::create_dir_all(d.join("etc")).unwrap();
+        fs::write(d.join("real.conf"), "nameserver 9.9.9.9\n").unwrap();
+        std::os::unix::fs::symlink(d.join("real.conf"), d.join("etc/resolv.conf")).unwrap();
+        assert!(read_image_resolv_conf(&d).is_none());
+    }
+
+    #[test]
+    fn image_resolv_conf_symlinked_etc_dir_is_refused() {
+        // An image whose etc is a symlink to a real directory elsewhere must
+        // not be read through that link.
+        let d = tempdir_for("img-etcdir");
+        let elsewhere = tempdir_for("img-etcdir-target");
+        fs::write(elsewhere.join("resolv.conf"), "nameserver 9.9.9.9\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, d.join("etc")).unwrap();
+        assert!(read_image_resolv_conf(&d).is_none());
+    }
+
+    fn tempdir_for(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("hisn-mounts-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
     const IMAGE_EMPTY: &str = "";
     const IMAGE_REAL: &str = "nameserver 9.9.9.9\nsearch img.example\n";
 
@@ -1118,11 +1167,36 @@ mod tests {
     }
 
     #[test]
-    fn rootfs_real_resolver_wins_over_the_host() {
+    fn host_resolver_is_not_shadowed_by_a_populated_image() {
+        // The image has a real-looking resolver, but the host has a working
+        // one: the host's wins, the image's is never used (DO-NOT-ALTER).
         let out = build_resolv_conf_ordered(
             Some(IMAGE_REAL),
             Some("nameserver 10.0.0.2\n"),
             Some(UPSTREAMS),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, "nameserver 10.0.0.2\n");
+        assert!(!out.contains("9.9.9.9"), "{out}");
+    }
+
+    #[test]
+    fn image_populated_while_host_is_loopback_and_upstream_usable() {
+        // Loopback-only host file, usable upstream: the upstream wins over the image.
+        let out =
+            build_resolv_conf_ordered(Some(IMAGE_REAL), Some(STUB_HOST), Some(UPSTREAMS), None)
+                .unwrap();
+        assert!(out.contains("nameserver 192.168.1.111\n"), "{out}");
+        assert!(!out.contains("9.9.9.9"), "{out}");
+    }
+
+    #[test]
+    fn image_is_the_last_resort_when_both_host_sources_are_unusable() {
+        let out = build_resolv_conf_ordered(
+            Some(IMAGE_REAL),
+            Some(STUB_HOST),
+            Some("nameserver 127.0.0.53\n"),
             None,
         )
         .unwrap();

@@ -26,10 +26,12 @@ All notable changes to hisn are recorded here. The format follows
   resolver`** when the image's own `etc/resolv.conf` is empty (the wakil-dev
   image). The first version of this fix read only the image file for a rootfs
   session, so such a launch failed closed while the host had working
-  resolvers. The precedence is now: `[net] nameservers`, then the image's
-  `etc/resolv.conf` if it has a non-loopback nameserver, then the host
-  `/etc/resolv.conf`, then `/run/systemd/resolve/resolv.conf`, else fail. The
-  image file is never followed through a symlink, and the upstream file is read
+  resolvers. The precedence is now: `[net] nameservers`, then the host
+  `/etc/resolv.conf`, then `/run/systemd/resolve/resolv.conf`, and the image's
+  `etc/resolv.conf` only when neither host source has a usable nameserver. A
+  populated image never shadows a working host resolver. The image file is read
+  with `openat2` (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`), so a symlink in any
+  component, including `etc`, is refused, and the upstream file is read
   from the real host, not from inside the image. Regression check: leak test
   L50 (runs when `HISN_TEST_ROOTFS` is set).
 

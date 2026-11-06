@@ -791,8 +791,11 @@ can reach a session that is not fully set up.
   `SIGWINCH` → `TIOCSWINSZ` on the master, which the kernel propagates to the
   foreground group of the slave. `P` makes the slave its controlling tty
   (`TIOCSCTTY`) after `setsid`. The CLI refuses (exit 125 with a hint) when any
-  of fd 0-2 is a terminal and `--tty` was not given, instead of handing the
-  host tty over (`TIOCSTI`-class attacks stay impossible, §11).
+  of fd 0-2 is a terminal and neither `--tty` nor `--no-tty` was given, instead
+  of handing the host tty over (`TIOCSTI`-class attacks stay impossible, §11).
+  `--no-tty` (0.3.3): no pty; the request carries `/dev/null` as stdin and the
+  caller's stdout/stderr as-is (pipes or terminals), so the caller's terminal
+  is never polled or handed over as stdin. `--tty --no-tty` is a usage error.
 * Status/signals use the per-exec **status socketpair** (`W` ↔ supervisor):
   `W → S: P <pid>`, `X exit <code>` | `X sig <n>`; `S → W: K <n>` (1 ≤ n ≤ 64,
   delivered with `kill(-P, n)`). EOF from the supervisor side means "cancel":

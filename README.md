@@ -129,6 +129,7 @@ hisn run --session-id agent1 --detach &      # a session with no command of its 
 
 hisn exec   --session agent1 -- ls -la                  # another command, same confinement
 hisn exec   --session agent1 --tty -- bash              # interactive, on its own pty
+hisn exec   --session agent1 --no-tty -- make test      # non-interactive: no pty, stdin /dev/null (0.3.3)
 hisn grant  --session agent1 /srv/reference             # read-only, gone with the session
 hisn grant  --session agent1 --rw /srv/out              # needs a mounts.grantable_rw prefix
 hisn revoke --session agent1 /srv/reference             # the path becomes ENOENT

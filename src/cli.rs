@@ -167,8 +167,12 @@ pub struct ExecArgs {
     #[arg(long = "env", value_name = "K=V")]
     pub env: Vec<String>,
     /// Run on a pty (allocated here, never the caller's own terminal).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_tty")]
     pub tty: bool,
+    /// Non-interactive: no pty, stdin from /dev/null, stdout and stderr passed
+    /// through as pipes even when the caller's descriptors are terminals.
+    #[arg(long = "no-tty", conflicts_with = "tty")]
+    pub no_tty: bool,
     /// Command and arguments.
     #[arg(last = true, required = true, value_name = "CMD")]
     pub command: Vec<String>,

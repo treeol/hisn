@@ -6,6 +6,7 @@
 //! process exit status. Prints nothing of its own on stdout.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -147,8 +148,14 @@ fn write_all_fd(fd: RawFd, mut data: &[u8]) {
 }
 
 /// Refuse to hand the caller's own terminal to the sandbox (DESIGN §14.8).
-pub fn refuse_real_terminal(tty_flag: bool, is_tty: impl Fn(RawFd) -> bool) -> Result<()> {
-    if tty_flag {
+/// `--tty` allocates its own pty and `--no-tty` passes pipes/`/dev/null`
+/// instead, so neither hands over the caller's terminal.
+pub fn refuse_real_terminal(
+    tty_flag: bool,
+    no_tty_flag: bool,
+    is_tty: impl Fn(RawFd) -> bool,
+) -> Result<()> {
+    if tty_flag || no_tty_flag {
         return Ok(());
     }
     let names = ["stdin", "stdout", "stderr"];
@@ -161,7 +168,8 @@ pub fn refuse_real_terminal(tty_flag: bool, is_tty: impl Fn(RawFd) -> bool) -> R
     }
     bail!(
         "{} is a terminal; hisn never hands your terminal to the sandbox. \
-         Use --tty to run on a pty, or redirect it",
+         Use --tty to run on a pty, or --no-tty to run without one (stdin from /dev/null, \
+         stdout/stderr as pipes), or redirect it",
         ttys.join(" and ")
     )
 }
@@ -169,7 +177,7 @@ pub fn refuse_real_terminal(tty_flag: bool, is_tty: impl Fn(RawFd) -> bool) -> R
 /// Run `hisn exec`; returns the process exit code.
 pub fn run(args: ExecArgs) -> Result<i32> {
     let req = build_request(&args)?;
-    refuse_real_terminal(args.tty, sys::isatty)?;
+    refuse_real_terminal(args.tty, args.no_tty, sys::isatty)?;
     let sock = supervisor::socket_for(&args.session)?;
     let conn = UnixStream::connect(&sock)
         .with_context(|| format!("connecting to session {}", args.session))?;
@@ -193,11 +201,19 @@ pub fn run(args: ExecArgs) -> Result<i32> {
         }
     }
 
-    // The request line and its descriptors travel in one sendmsg.
+    // The request line and its descriptors travel in one sendmsg. With
+    // --no-tty stdin is /dev/null, never the caller's (possibly a terminal);
+    // stdout and stderr are the caller's own descriptors as given.
     let line = format!("{req}\n");
-    let fds: Vec<RawFd> = match &slave {
-        Some(s) => vec![s.as_raw_fd()],
-        None => vec![0, 1, 2],
+    let devnull: Option<fs::File> = if args.no_tty && slave.is_none() {
+        Some(fs::File::open("/dev/null").context("opening /dev/null for --no-tty stdin")?)
+    } else {
+        None
+    };
+    let fds: Vec<RawFd> = match (&slave, &devnull) {
+        (Some(s), _) => vec![s.as_raw_fd()],
+        (None, Some(d)) => vec![d.as_raw_fd(), 1, 2],
+        (None, None) => vec![0, 1, 2],
     };
     sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), &fds).context("sending request")?;
     drop(slave); // the master sees EOF/EIO once the program's side closes
@@ -431,16 +447,56 @@ mod tests {
 
     #[test]
     fn a_real_terminal_is_refused_unless_tty_is_requested() {
-        assert!(refuse_real_terminal(false, |_| false).is_ok());
-        assert!(refuse_real_terminal(true, |_| true).is_ok());
-        let e = refuse_real_terminal(false, |fd| fd == 1)
+        assert!(refuse_real_terminal(false, false, |_| false).is_ok());
+        assert!(refuse_real_terminal(true, false, |_| true).is_ok());
+        let e = refuse_real_terminal(false, false, |fd| fd == 1)
             .unwrap_err()
             .to_string();
         assert!(e.contains("stdout") && e.contains("--tty"), "{e}");
-        let e = refuse_real_terminal(false, |fd| fd != 1)
+        assert!(
+            e.contains("--no-tty"),
+            "refusal must name both options: {e}"
+        );
+        let e = refuse_real_terminal(false, false, |fd| fd != 1)
             .unwrap_err()
             .to_string();
         assert!(e.contains("stdin and stderr"), "{e}");
+    }
+
+    #[test]
+    fn no_tty_accepts_terminals_on_every_descriptor() {
+        // --no-tty never inspects the caller's descriptors: all three being
+        // terminals is fine (stdin becomes /dev/null, stdout/stderr pass through).
+        assert!(refuse_real_terminal(false, true, |_| true).is_ok());
+    }
+
+    #[test]
+    fn tty_and_no_tty_together_is_a_usage_error() {
+        let r = Cli::try_parse_from([
+            "hisn",
+            "exec",
+            "--session",
+            "s",
+            "--tty",
+            "--no-tty",
+            "--",
+            "ls",
+        ]);
+        let err = match r {
+            Ok(_) => panic!("--tty with --no-tty must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn no_tty_parses_and_is_not_sent_as_a_tty_request() {
+        let a = exec_args(&["hisn", "exec", "--session", "s", "--no-tty", "--", "ls"]);
+        assert!(a.no_tty && !a.tty);
+        assert_eq!(
+            build_request(&a).unwrap(),
+            json!({"op":"exec","argv":["ls"],"cwd":null,"env":{},"tty":false})
+        );
     }
 
     #[test]

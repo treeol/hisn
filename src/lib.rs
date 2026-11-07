@@ -1,6 +1,7 @@
 //! hisn — rootless, daemonless sandbox for AI coding agents.
 
 pub mod alias;
+pub mod attach;
 pub mod authz;
 pub mod check;
 pub mod cli;

@@ -94,6 +94,12 @@ pub enum Request {
         env: BTreeMap<String, String>,
         #[serde(default)]
         tty: bool,
+        /// 0.4.0 step 2: an attach is an exec with `attach: true`. The
+        /// supervisor starts the session's shell ($SHELL from the env
+        /// snapshot, else /bin/sh) in the session cwd. Old clients that
+        /// don't send this field default to `false` (a normal exec).
+        #[serde(default)]
+        attach: bool,
     },
     /// Signal a live exec'd program (by `exec_id` preferred, or by
     /// in-sandbox pid for 0.2 clients — deprecated).
@@ -660,7 +666,8 @@ mod tests {
                 argv: vec!["sh".into(), "-c".into(), "true".into()],
                 cwd: None,
                 env: BTreeMap::new(),
-                tty: false
+                tty: false,
+                attach: false
             }
         );
         let r =
@@ -672,7 +679,8 @@ mod tests {
                 argv: vec!["x".into()],
                 cwd: Some("/w".into()),
                 env: BTreeMap::from([("K".into(), "V".into())]),
-                tty: true
+                tty: true,
+                attach: false
             }
         );
         assert_eq!(
@@ -681,7 +689,8 @@ mod tests {
                 argv: vec!["x".into()],
                 cwd: None,
                 env: BTreeMap::new(),
-                tty: false
+                tty: false,
+                attach: false
             }
         );
         assert_eq!(

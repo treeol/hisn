@@ -687,17 +687,10 @@ impl Shared {
         conn: &UnixStream,
     ) -> Value {
         let argv0 = req.argv.first().cloned().unwrap_or_default();
-        self.log_client("exec", "request", Some(&argv0), None, None, client, true);
+        let op = if req.attach { "attach" } else { "exec" };
+        self.log_client(op, "request", Some(&argv0), None, None, client, true);
         let fail = |code: &str, msg: String| {
-            self.log_client(
-                "exec",
-                "result",
-                Some(&argv0),
-                None,
-                Some(code),
-                client,
-                true,
-            );
+            self.log_client(op, "result", Some(&argv0), None, Some(code), client, true);
             err(code, msg)
         };
         let spec = match exec::validate(
@@ -907,6 +900,8 @@ struct ExecRequest {
     cwd: Option<String>,
     env: std::collections::BTreeMap<String, String>,
     tty: bool,
+    /// 0.4.0 step 2: when true, this is an attach (interactive shell).
+    attach: bool,
 }
 
 struct Ctl {
@@ -983,18 +978,56 @@ impl Handler for Ctl {
                 cwd,
                 env,
                 tty,
-            } => self.sh.do_exec(
-                &auth,
-                &client,
-                ExecRequest {
-                    argv,
-                    cwd,
-                    env,
-                    tty,
-                },
-                fds,
-                peer,
-            ),
+                attach,
+            } => {
+                if attach {
+                    // 0.4.0 step 2: an attach is an exec with the session's
+                    // shell ($SHELL from the env snapshot, else /bin/sh) in
+                    // the session cwd. The base env is the session snapshot.
+                    let shell = if argv.is_empty() {
+                        self.sh
+                            .exec_rules
+                            .base_env
+                            .get("SHELL")
+                            .cloned()
+                            .unwrap_or_else(|| "/bin/sh".into())
+                    } else {
+                        argv[0].clone()
+                    };
+                    let attach_argv = if argv.is_empty() {
+                        vec![shell.clone(), "-l".into()]
+                    } else {
+                        argv
+                    };
+                    let attach_cwd = cwd.or_else(|| Some(self.sh.exec_rules.default_cwd.clone()));
+                    return self.sh.do_exec(
+                        &auth,
+                        &client,
+                        ExecRequest {
+                            argv: attach_argv,
+                            cwd: attach_cwd,
+                            env,
+                            tty: true,
+                            attach: true,
+                        },
+                        fds,
+                        peer,
+                    );
+                }
+                self.sh.do_exec(
+                    &auth,
+                    &client,
+                    ExecRequest {
+                        argv,
+                        cwd,
+                        env,
+                        tty,
+                        attach: false,
+                    },
+                    fds,
+                    peer,
+                )
+            }
             Request::Signal {
                 exec_id,
                 pid,

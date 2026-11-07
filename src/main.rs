@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use hisn::cli::{Cli, Command, PolicyCommand, ProfileCommand, RootfsCommand};
 use hisn::policy::{self, Overrides, Policy};
 use hisn::profile;
-use hisn::{execcli, mounts, rootfs_store, session, supervisor};
+use hisn::{attach, execcli, mounts, rootfs_store, session, supervisor};
 
 /// Exit code for hisn-internal errors (policy, host); distinct from a
 /// command's own exit status.
@@ -115,6 +115,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Ok(exit_u8(code))
         }
         Command::Exec(a) => Ok(exit_u8(execcli::run(a)?)),
+        Command::Attach(a) => Ok(exit_u8(attach::run(a)?)),
         Command::Grant(a) => {
             let mode = if a.rw { "rw" } else { "ro" };
             let r = supervisor::client_request(

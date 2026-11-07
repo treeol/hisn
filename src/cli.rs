@@ -33,6 +33,9 @@ pub enum Command {
     Inspect(InspectArgs),
     /// Run a command inside a running session (same namespaces and confinement).
     Exec(ExecArgs),
+    /// Attach to a session: start an interactive shell in the session's cwd
+    /// (0.4.0 step 2). Multiple attaches are peers (same pid namespace, same cwd).
+    Attach(AttachArgs),
     /// Signal the sandbox of a session.
     Kill(KillArgs),
     /// Report host capabilities required by hisn.
@@ -186,6 +189,19 @@ pub struct ExecArgs {
     /// Command and arguments.
     #[arg(last = true, required = true, value_name = "CMD")]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AttachArgs {
+    /// Session name or id.
+    #[arg(long)]
+    pub session: String,
+    /// Working directory inside the sandbox (default: the session's cwd).
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// Label for this client in the audit log (default: derived from SSH or "local").
+    #[arg(long)]
+    pub client: Option<String>,
 }
 
 /// Parse `K=V` (the value may contain `=`; the name must be non-empty).

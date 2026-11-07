@@ -1,0 +1,233 @@
+//! Client side of `attach` (0.4.0 step 2): `hisn attach`.
+//!
+//! An attach is an exec with `tty: true` and `attach: true` and no command
+//! (the supervisor starts the session's shell, `$SHELL` from the env
+//! snapshot else `/bin/sh`, in the session cwd). Multiple concurrent
+//! attaches are peers in the same pid namespace (L21 semantics).
+//!
+//! The detach key is Ctrl-] then `d`, intercepted client-side: it closes
+//! the connection, which cancels the shell through the existing TERM→KILL
+//! path. The key sequence is never forwarded to the shell.
+
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
+
+use anyhow::{Context, Result};
+use serde_json::{Value, json};
+
+use crate::cli::AttachArgs;
+use crate::execcli::Finish;
+use crate::sys;
+
+/// Build the control-protocol request for an attach.
+pub fn build_request(args: &AttachArgs) -> Result<Value> {
+    Ok(json!({
+        "op": "exec",
+        "argv": [],
+        "cwd": args.cwd,
+        "env": {},
+        "tty": true,
+        "attach": true,
+    }))
+}
+
+/// Run `hisn attach`. Allocates a pty, sends the request, relays I/O, and
+/// intercepts the detach key (Ctrl-] d).
+pub fn run(args: AttachArgs) -> Result<i32> {
+    let req = build_request(&args)?;
+    let sock = crate::supervisor::socket_for(&args.session)?;
+    let conn = UnixStream::connect(&sock)
+        .with_context(|| format!("connecting to session {}", args.session))?;
+
+    let (master, slave) = open_host_pty().context("allocating a pty for attach")?;
+    // Set a sane initial size.
+    // SAFETY: winsize ioctl on fds we own, zeroed storage.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) != 0 || ws.ws_col == 0 {
+            ws.ws_row = 24;
+            ws.ws_col = 80;
+        }
+        libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
+    }
+
+    let line = format!("{req}\n");
+    sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), &[slave.as_raw_fd()])
+        .context("sending attach request")?;
+    drop(slave);
+
+    // Relay the pty with detach-key interception.
+    let finish = relay_with_detach(&conn, master)?;
+    Ok(crate::execcli::exit_code(&finish))
+}
+
+/// Open a host pty pair `(master, slave)` for the attach.
+fn open_host_pty() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut master_fd: libc::c_int = -1;
+    let mut slave_fd: libc::c_int = -1;
+    // SAFETY: openpty writes two fresh fds into the pointers we pass.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both are fresh descriptors we just created.
+    Ok(unsafe {
+        (
+            OwnedFd::from_raw_fd(master_fd),
+            OwnedFd::from_raw_fd(slave_fd),
+        )
+    })
+}
+
+/// Relay the pty master to stdin/stdout, intercepting Ctrl-] d as the
+/// detach key. When the detach key is seen, the connection is closed (the
+/// shell receives TERM→KILL through the existing path).
+fn relay_with_detach(conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
+    let conn_fd = conn.as_raw_fd();
+    let master_fd = master.as_raw_fd();
+    let mut stdout = io::stdout();
+
+    let mut in_detach = false;
+    let mut buf = [0u8; 4096];
+    let mut reply_buf = String::new();
+
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: master_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            }, // stdin
+            libc::pollfd {
+                fd: conn_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: poll on our own fds.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
+        if r < 0 {
+            return Err(io::Error::last_os_error()).context("attach: poll");
+        }
+
+        // Shell output → stdout.
+        if fds[0].revents & libc::POLLIN != 0 {
+            let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n > 0 {
+                stdout.write_all(&buf[..n as usize])?;
+                stdout.flush()?;
+            } else {
+                break;
+            }
+        }
+        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0
+            && fds[0].revents & libc::POLLIN == 0
+        {
+            break;
+        }
+
+        // Stdin → master (with detach-key interception).
+        if fds[1].revents & libc::POLLIN != 0 {
+            let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n > 0 {
+                let data = &buf[..n as usize];
+                let mut out = Vec::with_capacity(data.len());
+                for &b in data {
+                    if in_detach {
+                        if b == b'd' {
+                            // Detach: close the connection.
+                            return read_exit(conn);
+                        }
+                        out.push(0x1d);
+                        out.push(b);
+                        in_detach = false;
+                    } else if b == 0x1d {
+                        in_detach = true;
+                    } else {
+                        out.push(b);
+                    }
+                }
+                if !out.is_empty() {
+                    let _ = unsafe { libc::write(master_fd, out.as_ptr() as *const _, out.len()) };
+                }
+            }
+        }
+
+        // Conn reply (exit line).
+        if fds[2].revents & libc::POLLIN != 0 {
+            let mut byte = [0u8; 1];
+            match (&*conn).read(&mut byte) {
+                Ok(0) => return Ok(Finish::Lost),
+                Ok(_) => {
+                    reply_buf.push(byte[0] as char);
+                    if byte[0] == b'\n' {
+                        if let Some(f) = parse_exit(reply_buf.trim()) {
+                            return Ok(f);
+                        }
+                        reply_buf.clear();
+                    }
+                }
+                Err(e) => return Err(e).context("attach: reading reply"),
+            }
+        }
+    }
+
+    // Master closed: read the exit line from the connection.
+    read_exit(conn)
+}
+
+/// Read the exit line from the connection (blocking).
+fn read_exit(mut conn: &UnixStream) -> Result<Finish> {
+    let mut buf = String::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match conn.read(&mut byte) {
+            Ok(0) => return Ok(Finish::Lost),
+            Ok(_) => {
+                buf.push(byte[0] as char);
+                if byte[0] == b'\n' {
+                    if let Some(f) = parse_exit(buf.trim()) {
+                        return Ok(f);
+                    }
+                    buf.clear();
+                }
+            }
+            Err(e) => return Err(e).context("attach: reading exit"),
+        }
+    }
+}
+
+fn parse_exit(line: &str) -> Option<Finish> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    if let Some(x) = v.get("exit") {
+        if x["lost"] == true {
+            return Some(Finish::Lost);
+        }
+        if let Some(c) = x["code"].as_i64() {
+            return Some(Finish::Code(c as i32));
+        }
+        if let Some(s) = x["signal"].as_str()
+            && let Some(n) = crate::control::parse_signal(s)
+        {
+            return Some(Finish::Signal(n));
+        }
+    }
+    if v.get("error").is_some() {
+        return Some(Finish::Lost);
+    }
+    None
+}

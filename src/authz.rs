@@ -212,6 +212,7 @@ mod tests {
                     cwd: None,
                     env: BTreeMap::new(),
                     tty: false,
+                    attach: false,
                 },
                 Op::Exec,
             ),

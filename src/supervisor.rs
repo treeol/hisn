@@ -1409,11 +1409,34 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         label: crate::session::local_label(),
         client_id: String::new(),
     };
+    // 0.4.0 step 4: parse --env K=V as the session env snapshot. Computed
+    // names (HOME, USER, LOGNAME, cache vars) are refused at run with the
+    // same error exec gives. Secret-looking values are stored on disk as
+    // "<redacted>"; the real values go into the exec base_env.
+    let mut declared_env: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut declared_env_disk: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for pair in &args.env {
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) if !k.is_empty() => (k.to_owned(), v.to_owned()),
+            _ => bail!("--env {pair:?}: expected K=V"),
+        };
+        if crate::env::is_computed(&k) {
+            bail!("--env {k}: computed name (HOME, USER, LOGNAME, cache vars) cannot be declared");
+        }
+        declared_env.insert(k.clone(), v.clone());
+        if crate::env::looks_secret(&k) {
+            declared_env_disk.insert(k, "<redacted>".into());
+        } else {
+            declared_env_disk.insert(k, v);
+        }
+    }
     let prepared = (|| -> Result<()> {
         if let Some(n) = &name {
             crate::registry::write_name_file(&tmp.path, n)?;
         }
-        sessionmeta::SessionMeta::new(
+        let mut meta = sessionmeta::SessionMeta::new(
             &id,
             name.as_deref(),
             owner,
@@ -1422,8 +1445,9 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
                 Network::None => "none",
                 Network::Host => "host",
             },
-        )
-        .write_to(&tmp.path)?;
+        );
+        meta.env_declared = declared_env_disk.clone();
+        meta.write_to(&tmp.path)?;
         Ok(())
     })();
     if let Err(e) = prepared {
@@ -1454,6 +1478,7 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         &prep.host_services,
         prep.ssh.as_ref(),
         &id,
+        &declared_env,
     );
     sdir.remove();
     // Release the name when the session is removed (step 1b). A crashed
@@ -1484,6 +1509,7 @@ fn run_session(
     host_services: &[profile::HostService],
     ssh: Option<&profile::SshConfig>,
     session_id: &str,
+    declared_env: &std::collections::BTreeMap<String, String>,
 ) -> Result<i32> {
     sdir.write_resolved_policy(&policy.to_toml())?;
     // Write risk.json (the risk labels for this session, DESIGN §16).
@@ -1560,10 +1586,17 @@ fn run_session(
         eprintln!("hisn: warning: env.pass forwards {n}, which looks like a secret");
     }
 
+    // 0.4.0 step 4: the session env snapshot is applied on top of the
+    // scrub base, below computed vars (scrub already has computed vars;
+    // declared_env cannot name computed names — checked at run).
+    for (k, v) in declared_env {
+        scrub.vars.insert(k.clone(), v.clone());
+    }
     let exec_rules = ExecRules {
         env_pass: policy.env_pass.clone(),
         base_env: scrub.vars.clone(),
         default_cwd: policy.cwd.display().to_string(),
+        declared_env: declared_env.keys().cloned().collect(),
     };
     let exec_rules_for_services = exec_rules.clone();
     let exec_policy = policy.clone();
@@ -2711,6 +2744,7 @@ mod tests {
             detach: false,
             ready_fd: None,
             command: vec!["true".into()],
+            env: vec![],
         };
         let p = prepare(&args, 1000).unwrap();
         assert_eq!(p.policy.cwd, cwd);

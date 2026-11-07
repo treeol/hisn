@@ -13,6 +13,7 @@
 //! `members` (append-only, 0.4.0 step 3) and `lease` (step 5) are optional so
 //! old `session.json` files load unchanged when the fields are absent.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -91,6 +92,11 @@ pub struct SessionMeta {
     pub members: Vec<Member>,
     #[serde(default, skip_serializing_if = "Option::is_none", skip_serializing)]
     pub lease: Option<Lease>,
+    /// Session env snapshot: keys declared at `run --env K=V` (0.4.0 step 4).
+    /// Values matching `looks_secret` are stored as `"<redacted>"` on disk;
+    /// the real values are held in supervisor memory.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_declared: std::collections::BTreeMap<String, String>,
 }
 
 impl SessionMeta {
@@ -110,6 +116,7 @@ impl SessionMeta {
             state: State::Creating,
             members: Vec::new(),
             lease: None,
+            env_declared: std::collections::BTreeMap::new(),
         }
     }
 

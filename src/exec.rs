@@ -55,6 +55,9 @@ pub struct ExecRules {
     pub base_env: BTreeMap<String, String>,
     /// Working directory when the request has none.
     pub default_cwd: String,
+    /// Session env snapshot keys declared at `run --env` (0.4.0 step 4):
+    /// a request naming one of these is rejected with E_ENV_LOCKED.
+    pub declared_env: std::collections::BTreeSet<String>,
 }
 
 /// A validated request, exactly as sent to the helper.
@@ -159,6 +162,18 @@ pub fn validate(
         .collect();
     if !rejected.is_empty() {
         return Err(Invalid::RejectedEnvKeys(rejected));
+    }
+    // 0.4.0 step 4: a request may not name a session-declared key.
+    let locked: Vec<String> = req_env
+        .keys()
+        .filter(|k| rules.declared_env.contains(*k))
+        .cloned()
+        .collect();
+    if !locked.is_empty() {
+        return Err(Invalid::Env(format!(
+            "E_ENV_LOCKED: {} locked by the session env snapshot",
+            locked.join(", ")
+        )));
     }
     let mut env = rules.base_env.clone();
     env.extend(req_env);
@@ -1204,6 +1219,7 @@ mod tests {
                 ("CI".into(), "1".into()),
             ]),
             default_cwd: "/work/p".into(),
+            declared_env: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1305,6 +1321,52 @@ mod tests {
                 argv(&["x"]),
                 None,
                 env(&[("CARGO_HOME", "/e")]),
+                false,
+                3,
+                &r
+            )
+            .is_err()
+        );
+    }
+
+    // ---- 0.4.0 step 4: session env snapshot (declared env lock)
+
+    #[test]
+    fn request_cannot_override_a_declared_key() {
+        let mut r = rules();
+        r.declared_env.insert("GOFLAGS".into());
+        let e = validate(argv(&["x"]), None, env(&[("GOFLAGS", "-x")]), false, 3, &r).unwrap_err();
+        assert!(e.to_string().contains("E_ENV_LOCKED"));
+        assert!(e.to_string().contains("GOFLAGS"));
+    }
+
+    #[test]
+    fn request_can_add_a_name_in_env_pass_that_is_not_declared() {
+        let mut r = rules();
+        r.declared_env.insert("GOFLAGS".into());
+        // HISN_LEAK_PASSED is in env_pass and not declared: allowed.
+        let s = validate(
+            argv(&["x"]),
+            None,
+            env(&[("HISN_LEAK_PASSED", "v")]),
+            false,
+            3,
+            &r,
+        )
+        .unwrap();
+        assert_eq!(s.env["HISN_LEAK_PASSED"], "v");
+    }
+
+    #[test]
+    fn declared_env_still_wins_over_request_even_if_env_pass_allows() {
+        // GOFLAGS is in env_pass AND declared: the request is locked out.
+        let mut r = rules();
+        r.declared_env.insert("GOFLAGS".into());
+        assert!(
+            validate(
+                argv(&["x"]),
+                None,
+                env(&[("GOFLAGS", "override")]),
                 false,
                 3,
                 &r

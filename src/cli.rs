@@ -125,6 +125,11 @@ pub struct RunArgs {
     /// Initial grant, `PATH[:ro|rw]` (default ro). Repeatable.
     #[arg(long = "grant", value_name = "PATH[:ro|rw]")]
     pub grants: Vec<String>,
+    /// Declare a session env var `K=V` (applied to every exec/attach; cannot
+    /// be overridden by a request). Computed names (HOME, USER, LOGNAME,
+    /// cache vars) are refused. Repeatable.
+    #[arg(long = "env", value_name = "K=V")]
+    pub env: Vec<String>,
     /// Start the session without a command: PID 1 only reaps, and the
     /// session lives until `hisn kill` / SIGTERM. Use `hisn exec` to run things in it.
     #[arg(long)]

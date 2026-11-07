@@ -2421,6 +2421,63 @@ else
   skip "L58 R5 refusal audit line present" "no audit file"
 fi
 
+# ================================================ L59: declared env does not leak host secrets (0.4.0)
+# A session created with --env PATH=... (a declared env) must not leak the
+# host's HISN_LEAK_SECRET. The declared env is applied on top of the scrub
+# base, and the scrub base already excludes secrets. The test starts a
+# session with --env and checks that HISN_LEAK_SECRET is absent in exec.
+L59_CWD=$(new_cwd l59)
+L59_POL="$WORK/l59.toml"
+write_policy "$L59_POL" "$L59_CWD"
+L59_CWD2=$(new_cwd l59env)
+if start_session l59-$$ "$L59_CWD" "$L59_POL" --env "GOFLAGS=-mod=mod"; then
+  r=$(q "$L59_CWD" "exec-out /usr/bin/env")
+  case "$r" in
+    *HISN_LEAK_SECRET*) fail "L59 declared env leaks host secret" "[${r%%$'\n'*}]" ;;
+    "OK exit="*) pass "L59 declared env does not leak host secret" ;;
+    *) fail "L59 declared env probe" "no result [$r]" ;;
+  esac
+  end_session "$L59_CWD" "$S_PID"
+else
+  fail "L59 session did not start" "hisn run --env"
+fi
+rm -rf "$L59_CWD"
+
+# ================================================ L60: declared GIT_CONFIG_GLOBAL present in exec (0.4.0)
+# A session created with --env GIT_CONFIG_GLOBAL=/sandbox/gitconfig must
+# have that value in exec, and the host's GIT_CONFIG_GLOBAL (if any) must
+# not leak through. Uses the main session's env to avoid a second start.
+L60_CWD=$(new_cwd l60)
+L60_POL="$WORK/l60.toml"
+cat >"$L60_POL" <<EOF
+version = "hisn-policy/v1"
+[session]
+cwd = "$L60_CWD"
+network = "none"
+[mounts]
+grantable_rw = ["$WORK/g_rw"]
+[env]
+pass = ["HISN_LEAK_PASSED", "GIT_CONFIG_GLOBAL"]
+EOF
+if start_session l60-$$ "$L60_CWD" "$L60_POL" --env "GIT_CONFIG_GLOBAL=/sandbox/gitconfig"; then
+  r=$(q "$L60_CWD" "exec-out /usr/bin/env")
+  case "$r" in
+    *GIT_CONFIG_GLOBAL=/sandbox/gitconfig*)
+      if echo "$r" | grep -q "GIT_CONFIG_GLOBAL=/host"; then
+        fail "L60 host GIT_CONFIG_GLOBAL leaked" "[${r%%$'\n'*}]"
+      else
+        pass "L60 declared GIT_CONFIG_GLOBAL present, host value absent"
+      fi
+      ;;
+    "OK exit="*) fail "L60 GIT_CONFIG_GLOBAL not present" "[${r%%$'\n'*}]" ;;
+    *) fail "L60 GIT_CONFIG_GLOBAL probe" "no result [$r]" ;;
+  esac
+  end_session "$L60_CWD" "$S_PID"
+else
+  fail "L60 session did not start" "hisn run --env GIT_CONFIG_GLOBAL"
+fi
+rm -rf "$L60_CWD"
+
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.
 MANIFEST="$HERE/MANIFEST"

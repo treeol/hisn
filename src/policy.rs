@@ -720,6 +720,7 @@ fn hisn_state_dirs() -> Vec<PathBuf> {
     [
         xdg("XDG_CONFIG_HOME", ".config"),
         xdg("XDG_DATA_HOME", ".local/share"),
+        xdg("XDG_STATE_HOME", ".local/state"),
     ]
     .into_iter()
     .flatten()
@@ -1409,6 +1410,30 @@ scoped = ["bogus"]
             }
             let r = resolve_home_persist_with(bad, &cwd, &[], None);
             assert!(r.is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn home_persist_refuses_state_dir() {
+        // 0.4.0 F3: $XDG_STATE_HOME/hisn (or ~/.local/state/hisn) is in the
+        // refuse set (the audit archive lives there). Test with the actual
+        // state dirs hisn_state_dirs() returns.
+        let d = tmp();
+        let cwd = d.path().join("cwd");
+        fs::create_dir(&cwd).unwrap();
+        let state_dirs = hisn_state_dirs();
+        for sd in &state_dirs {
+            // Create the state dir if it doesn't exist so canonicalize works.
+            let _ = fs::create_dir_all(sd);
+            let err = resolve_home_persist_with(
+                sd.to_str().unwrap(),
+                &cwd,
+                &[],
+                Some(&d.path().join("home")),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("overlaps hisn"), "state dir {:?}: {err}", sd);
         }
     }
 

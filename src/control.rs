@@ -252,6 +252,10 @@ pub trait Handler: Send + Sync + 'static {
     /// Decide whether this peer may talk to the socket (R5). Called on accept
     /// and again before every request. `Err` closes the connection.
     fn authorize(&self, peer: &UnixStream) -> Result<(), String>;
+    /// F2 fix: a client connected (serve_conn thread started, after authorize).
+    fn connect(&self) {}
+    /// F2 fix: a client disconnected (serve_conn thread exited).
+    fn disconnect(&self) {}
     /// Handle one request and return its (final) response line. `fds` are the
     /// descriptors that arrived with the request: the server only lets them
     /// through on the *first* request line of a connection and only for
@@ -396,10 +400,22 @@ pub fn drain(timeout: Duration) -> bool {
     true
 }
 
+/// F2 fix: calls `disconnect` on drop so the connection count stays accurate
+/// even if `serve_conn` returns early (EOF, error, misuse).
+struct ClientGuard<'a>(&'a dyn Handler);
+
+impl Drop for ClientGuard<'_> {
+    fn drop(&mut self) {
+        self.0.disconnect();
+    }
+}
+
 fn serve_conn(h: &dyn Handler, stream: UnixStream) {
     if h.authorize(&stream).is_err() {
         return;
     }
+    h.connect();
+    let _guard = ClientGuard(h);
     let mut reader = FdLineReader::new(stream.as_raw_fd());
     let mut out = &stream;
     let mut lines = 0usize;

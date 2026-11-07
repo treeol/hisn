@@ -1542,10 +1542,13 @@ declared key gets `E_ENV_LOCKED`.
 
 `[session] idle_timeout` (duration string, default none = never).
 `last_activity` is updated on authorized requests (rate-limited to 10 s).
-Idle = zero clients ∧ no exec ∧ timeout elapsed. `hisn stop` sets state
-stopped. `ls --prune` archives `grants.jsonl` and the final `session.json`
-to `$XDG_STATE_HOME/hisn/audit/<id>.jsonl` (0600) before removing; `--purge`
-skips archival.
+Idle = zero connected clients ∧ no running exec ∧ timeout elapsed. The
+session's main command does not count as activity; idle is defined by
+connected clients and running execs. Set `idle_timeout` only on sessions
+whose main command is a keeper (detached seats), not on foreground runs.
+`hisn stop` sets state stopped. `ls --prune` archives `grants.jsonl` and
+the final `session.json` to `$XDG_STATE_HOME/hisn/audit/<id>.jsonl` (0600)
+before removing; `--purge` skips archival.
 
 **Invariants touched:** 2 (same seccomp — attach is an exec through the
 same chain). 3 (the session env snapshot is built from the scrub base,

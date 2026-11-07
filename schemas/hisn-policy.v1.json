@@ -234,7 +234,7 @@
           "minimum": 0
         },
         "idle_timeout": {
-          "description": "Idle timeout after which a session with zero clients and no running exec stops itself. A duration string like \"30m\", \"2h\", \"1d\", or a bare number of seconds. None = never.",
+          "description": "Idle timeout after which a session with zero connected clients and no running exec stops itself. The session's main command does not count as activity; idle is defined by connected clients and running execs. Set only on sessions whose main command is a keeper (detached seats), not on foreground runs. A duration string like \"30m\", \"2h\", \"1d\", or a bare number of seconds. None = never.",
           "type": ["string", "null"]
         }
       },

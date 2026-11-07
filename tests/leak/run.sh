@@ -2612,8 +2612,10 @@ else
 fi
 
 # ================================================ L61: idle session with attached client survives (0.4.0)
-# A session with an idle_timeout and an attached client must not be stopped.
-# A session with zero clients and no exec past the timeout stops itself.
+# A session with an idle_timeout and a running exec must not be stopped.
+# A session with zero connected clients and no running exec past the
+# timeout stops itself. The session's main command does not count as
+# activity; idle is defined by connected clients and running execs.
 # On a host where hisn check passes, this runs a real idle-timeout test.
 # In CI it skips because the suite exits at preflight.
 if needs_host; then
@@ -2631,15 +2633,41 @@ grantable_rw = ["$WORK/g_rw"]
 pass = ["HISN_LEAK_PASSED"]
 L61EOF
   if start_session l61-$$ "$L61_CWD" "$L61_POL"; then
-    # With a connected client (the probe), the session must survive past the
-    # idle timeout.
+    # Hold a real exec open (the session's main command does not count as
+    # activity under the 0.4.0 idle definition; only connected clients and
+    # running execs do). An exec --no-tty -- sleep 10 keeps the session alive.
+    "$HISN" exec --no-tty --session l61-$$ -- sleep 10 </dev/null >/dev/null 2>&1 &
+    L61_EXEC_PID=$!
+    # With a running exec, the session must survive past the idle timeout.
     sleep 3
     if "$HISN" ls --json 2>/dev/null | grep -q 'l61-$$'; then
       pass "L61 idle with attached client survives"
     else
-      fail "L61 idle with attached client survives" "session gone after 3s with a client"
+      fail "L61 idle with attached client survives" "session gone after 3s with a running exec"
     fi
-    end_session "$L61_CWD" "$S_PID"
+    # Kill the holding exec so the session becomes idle.
+    kill "$L61_EXEC_PID" 2>/dev/null
+    wait "$L61_EXEC_PID" 2>/dev/null
+    # Wait past the idle timeout for the session to stop itself.
+    L61_DEADLINE=$(( $(date +%s) + 15 ))
+    while [ $(date +%s) -lt "$L61_DEADLINE" ]; do
+      "$HISN" ls --json 2>/dev/null | grep -q 'l61-$$' || break
+      sleep 1
+    done
+    if ! "$HISN" ls --json 2>/dev/null | grep -q 'l61-$$'; then
+      pass "L61 idle session stops after timeout"
+    else
+      fail "L61 idle session stops after timeout" "session still listed after exec ended + timeout"
+    fi
+    # The session dir stays as stopped; the audit has a lease/expired line.
+    L61_AUDIT="$RUNTIME_ROOT/l61-$$/grants.jsonl"
+    if [ -f "$L61_AUDIT" ] && grep -q 'lease.*expired\|expired.*lease\|"lease"' "$L61_AUDIT" 2>/dev/null; then
+      pass "L61 lease/expired audit line present"
+    else
+      fail "L61 lease/expired audit line present" "no lease/expired line in $L61_AUDIT"
+    fi
+    # Clean up the stopped session dir if still present.
+    "$HISN" ls --prune 2>/dev/null
   else
     skip "L61 idle with attached client survives" "session did not start"
   fi

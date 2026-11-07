@@ -53,6 +53,31 @@ function and a policy source — nothing else.
 - **F7**: detach shuts down the write side (triggers TERM→KILL), reads the exit line with a 5 s timeout; SIGWINCH forwarded.
 - **F8**: members keyed by `(uid, label)`, not uid alone.
 
+## Host evidence
+- `make leaktest` on rubin: RESULT 308 passed, 0 failed, 6 skipped, 1 weak.
+- Remote attach verified on smaragd (Fedora 44, kernel 7.2.13): `hisn run
+  --name seat-b --detach`, `ssh -t smaragd hisn attach --session seat-b
+  --client rubin-wakil` landed in a shell inside the session; `hisn ls`
+  showed CLIENTS 1 and `ls --json` the member `{"label":"rubin-wakil",
+  "uid":1000}`; `hisn stop` left state stopped with the dir kept; `hisn ls
+  --prune` archived the audit at mode 0600.
+- Probes (a) and (b) were not run (non-gating).
+
+## Security
+Equal access per uid in 0.4.0; the client record, the single `authorize()`
+seam and the per-client audit ship now, so roles are a policy change later.
+
+## Known issues (0.4.1)
+- `hisn run --detach` stays in the foreground instead of returning once the
+  session is ready.
+- Inside an attach, `ttyname()` fails (`tty: no such device`): the client's
+  pty slave is not visible in the session's private `/dev/pts` (`isatty` is
+  true, L20).
+- `hisn ls --json` lacks the `clients` array and does not list a live attach
+  under `execs`.
+- CLIENTS is not zeroed on a stopped session.
+- L56 and L58 remain host-only / documented.
+
 ## What's NOT in 0.4.0
 - No daemon, no network listener, no public service. SSH is the only remote transport.
 - No `--detach` for attach.

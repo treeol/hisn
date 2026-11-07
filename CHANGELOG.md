@@ -7,7 +7,22 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
-### Added — 0.4.0 (seats)
+## [0.4.0] - 2026-11-07
+
+0.4.0 adds seats: a hisn session is a named place that several clients join,
+locally or over SSH (`ssh -t host hisn attach --session <name>`), sharing one
+sandbox, one pid namespace, one session env snapshot and one audit log, with
+idle leases, an explicit `hisn stop` that keeps the session directory, and
+archival of the audit on prune.
+
+**Host evidence:** `make leaktest` on rubin: 308 passed, 0 failed, 6 skipped,
+1 weak; remote attach verified on smaragd (Fedora 44, kernel 7.2.13).
+
+**Security:** equal access per uid in 0.4.0; the client record, the single
+`authorize()` seam and the per-client audit ship now, so roles are a policy
+change later.
+
+### Added
 - **Named sessions:** `hisn run --name <name>` (unique per user); `--session`
   accepts a name or id everywhere; `hisn ls` shows NAME, ID, STATE, CWD,
   ROOTFS, NET, AGE, CLIENTS, LEASE. A per-user index in the `/tmp/hisn-$UID`
@@ -36,6 +51,19 @@ All notable changes to hisn are recorded here. The format follows
   the dir. `hisn ls --json` gains `dir`.
 - **Lifecycle state:** `session.json` carries `state ∈ {creating, running,
   stopping, stopped, crashed}`.
+
+### Known issues (0.4.1)
+- `hisn run --detach` stays in the foreground instead of returning once the
+  session is ready.
+- Inside an attach, `ttyname()` fails (`tty: no such device`): the client's
+  pty slave is not visible in the session's private `/dev/pts`. `isatty` is
+  true (L20), so interactive programs work; programs that need the tty's
+  name do not.
+- `hisn ls --json` lacks the `clients` array and does not list a live
+  attach under `execs`.
+- CLIENTS is not zeroed on a stopped session.
+- L56 and L58 remain host-only / documented checks (not automated in the
+  leak suite).
 
 ### Changed
 - Repository cleanup (no code change): process documents (plans, patches,
@@ -357,6 +385,7 @@ First release.
 - `hisn exec` verifies fail-closed, before running anything, that the root it
   entered is the sandbox root (DESIGN D25).
 
-[Unreleased]: https://github.com/treeol/hisn/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/treeol/hisn/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/treeol/hisn/releases/tag/v0.4.0
 [0.3.2]: https://github.com/treeol/hisn/releases/tag/v0.3.2
 [0.2.0]: https://github.com/treeol/hisn/releases/tag/v0.2.0

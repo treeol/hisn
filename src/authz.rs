@@ -79,8 +79,8 @@ impl Op {
         match req {
             Request::Grant { .. } => Op::Grant,
             Request::Revoke { .. } => Op::Revoke,
-            Request::List {} => Op::List,
-            Request::Inspect {} => Op::Inspect,
+            Request::List { .. } => Op::List,
+            Request::Inspect { .. } => Op::Inspect,
             Request::Kill { .. } => Op::Kill,
             Request::Exec { .. } => Op::Exec,
             Request::Signal { .. } => Op::Signal,
@@ -187,6 +187,7 @@ mod tests {
                     path: "/p".into(),
                     mode: Default::default(),
                     recursive: false,
+                    client: None,
                 },
                 Op::Grant,
             ),
@@ -195,14 +196,16 @@ mod tests {
                     path: "/p".into(),
                     hard: false,
                     kill_holders: false,
+                    client: None,
                 },
                 Op::Revoke,
             ),
-            (Request::List {}, Op::List),
-            (Request::Inspect {}, Op::Inspect),
+            (Request::List { client: None }, Op::List),
+            (Request::Inspect { client: None }, Op::Inspect),
             (
                 Request::Kill {
                     signal: "TERM".into(),
+                    client: None,
                 },
                 Op::Kill,
             ),
@@ -213,6 +216,7 @@ mod tests {
                     env: BTreeMap::new(),
                     tty: false,
                     attach: false,
+                    client: None,
                 },
                 Op::Exec,
             ),
@@ -221,6 +225,7 @@ mod tests {
                     exec_id: None,
                     pid: None,
                     signal: "TERM".into(),
+                    client: None,
                 },
                 Op::Signal,
             ),
@@ -233,14 +238,14 @@ mod tests {
 
     #[test]
     fn owner_uid_is_allowed() {
-        let a = authorize(&client(1000), &sess(), &Request::List {}).unwrap();
+        let a = authorize(&client(1000), &sess(), &Request::List { client: None }).unwrap();
         assert_eq!(a.op(), Op::List);
         assert_eq!(a.role(), "owner");
     }
 
     #[test]
     fn foreign_uid_is_refused_with_op_and_reason() {
-        let r = authorize(&client(1001), &sess(), &Request::Inspect {}).unwrap_err();
+        let r = authorize(&client(1001), &sess(), &Request::Inspect { client: None }).unwrap_err();
         assert_eq!(r.op, Op::Inspect);
         assert!(r.reason.contains("not the session owner"));
     }
@@ -249,7 +254,7 @@ mod tests {
     fn internal_record_acts_as_owner() {
         let c = ClientRecord::internal(1000, 7);
         assert_eq!(c.label_source, "internal");
-        assert!(authorize(&c, &sess(), &Request::List {}).is_ok());
+        assert!(authorize(&c, &sess(), &Request::List { client: None }).is_ok());
     }
 
     /// The seam must reach every request path. Each variant of Request is
@@ -262,21 +267,25 @@ mod tests {
                 path: "/p".into(),
                 mode: Default::default(),
                 recursive: false,
+                client: None,
             },
             Request::Revoke {
                 path: "/p".into(),
                 hard: false,
                 kill_holders: false,
+                client: None,
             },
-            Request::List {},
-            Request::Inspect {},
+            Request::List { client: None },
+            Request::Inspect { client: None },
             Request::Kill {
                 signal: "TERM".into(),
+                client: None,
             },
             Request::Signal {
                 exec_id: None,
                 pid: None,
                 signal: "TERM".into(),
+                client: None,
             },
         ];
         for r in &reqs {

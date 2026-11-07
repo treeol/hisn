@@ -965,15 +965,29 @@ impl Handler for Ctl {
             Ok((p, u)) => (Some(p), u),
             Err(_) => (None, u32::MAX),
         };
-        // The single transport entry (0.4.0 step 3): build the client record
-        // and authorize BEFORE any effect. Operations take the token.
+        // The single transport entry (0.4.0 step 3, F1): build the client
+        // record from SO_PEERCRED (uid, pid — never from the request) plus
+        // the client-supplied label/label_source/req_id, and authorize
+        // BEFORE any effect.
         let seq = self.sh.next_seq();
+        let (label, label_source, req_id) = req
+            .client_field()
+            .map(|c| {
+                (
+                    c.label
+                        .clone()
+                        .unwrap_or_else(|| self.sh.client_label(peer_uid)),
+                    c.label_source.clone().unwrap_or_else(|| "none".to_string()),
+                    c.req_id.clone(),
+                )
+            })
+            .unwrap_or_else(|| (self.sh.client_label(peer_uid), "none".to_string(), None));
         let client = authz::ClientRecord {
             uid: peer_uid,
             pid: peer_pid,
-            label: self.sh.client_label(peer_uid),
-            label_source: "local".into(),
-            req_id: None,
+            label,
+            label_source,
+            req_id,
             seq,
             principal: None,
         };
@@ -1004,6 +1018,7 @@ impl Handler for Ctl {
                 env,
                 tty,
                 attach,
+                client: _,
             } => {
                 if attach {
                     // 0.4.0 step 2: an attach is an exec with the session's
@@ -1057,18 +1072,21 @@ impl Handler for Ctl {
                 exec_id,
                 pid,
                 signal,
+                client: _,
             } => self.sh.do_signal(&auth, &client, exec_id, pid, &signal),
             Request::Grant {
                 path,
                 mode,
                 recursive,
+                client: _,
             } => self.sh.do_grant(&auth, &client, &path, mode, recursive),
             Request::Revoke {
                 path,
                 hard,
                 kill_holders,
+                client: _,
             } => self.sh.do_revoke(&auth, &client, &path, hard, kill_holders),
-            Request::List {} => {
+            Request::List { client: _ } => {
                 let _ = &auth;
                 let t = self.sh.table.lock().expect("table");
                 let grants: Vec<Value> = t
@@ -1078,8 +1096,8 @@ impl Handler for Ctl {
                     .collect();
                 ok(json!({ "grants": grants }))
             }
-            Request::Inspect {} => self.sh.inspect(&auth),
-            Request::Kill { signal } => {
+            Request::Inspect { client: _ } => self.sh.inspect(&auth),
+            Request::Kill { signal, client: _ } => {
                 self.sh
                     .log_client("kill", "request", None, None, Some(&signal), &client, true);
                 match control::parse_signal(&signal) {
@@ -1846,6 +1864,7 @@ fn run_session(
                 path: path.to_string(),
                 mode: *mode,
                 recursive: false,
+                client: None,
             },
         )
         .expect("internal startup grant is authorized as the owner");

@@ -23,6 +23,14 @@ use crate::sys;
 
 /// Build the control-protocol request for an attach.
 pub fn build_request(args: &AttachArgs) -> Result<Value> {
+    let client = if args.client.is_some() {
+        Some(json!({
+            "label": args.client,
+            "label_source": "flag",
+        }))
+    } else {
+        None
+    };
     Ok(json!({
         "op": "exec",
         "argv": [],
@@ -30,6 +38,7 @@ pub fn build_request(args: &AttachArgs) -> Result<Value> {
         "env": {},
         "tty": true,
         "attach": true,
+        "client": client,
     }))
 }
 

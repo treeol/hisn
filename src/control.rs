@@ -68,6 +68,8 @@ pub enum Request {
         mode: Mode,
         #[serde(default)]
         recursive: bool,
+        #[serde(default)]
+        client: Option<ClientField>,
     },
     Revoke {
         path: String,
@@ -75,14 +77,24 @@ pub enum Request {
         hard: bool,
         #[serde(default)]
         kill_holders: bool,
+        #[serde(default)]
+        client: Option<ClientField>,
     },
     // Struct variants (not unit): serde ignores unknown fields on unit variants
     // of internally tagged enums, which would break "unknown keys are errors".
-    List {},
-    Inspect {},
+    List {
+        #[serde(default)]
+        client: Option<ClientField>,
+    },
+    Inspect {
+        #[serde(default)]
+        client: Option<ClientField>,
+    },
     Kill {
         #[serde(default = "term")]
         signal: String,
+        #[serde(default)]
+        client: Option<ClientField>,
     },
     /// Run a program inside the running session (DESIGN §14). The request
     /// travels with its stdio descriptors (`SCM_RIGHTS`).
@@ -100,6 +112,8 @@ pub enum Request {
         /// don't send this field default to `false` (a normal exec).
         #[serde(default)]
         attach: bool,
+        #[serde(default)]
+        client: Option<ClientField>,
     },
     /// Signal a live exec'd program (by `exec_id` preferred, or by
     /// in-sandbox pid for 0.2 clients — deprecated).
@@ -110,7 +124,21 @@ pub enum Request {
         pid: Option<i32>,
         #[serde(default = "term")]
         signal: String,
+        #[serde(default)]
+        client: Option<ClientField>,
     },
+}
+
+/// The client-supplied identity fields (0.4.0 F1). The supervisor fills
+/// uid/pid from SO_PEERCRED; these are the labels the client may send.
+/// `uid` is not a field here (nor in the request): uid comes only from
+/// SO_PEERCRED. A request whose `client` object contains `uid` is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientField {
+    pub label: Option<String>,
+    pub label_source: Option<String>,
+    pub req_id: Option<String>,
 }
 
 impl Request {
@@ -118,8 +146,8 @@ impl Request {
         match self {
             Request::Grant { .. } => "grant",
             Request::Revoke { .. } => "revoke",
-            Request::List {} => "list",
-            Request::Inspect {} => "inspect",
+            Request::List { .. } => "list",
+            Request::Inspect { .. } => "inspect",
             Request::Kill { .. } => "kill",
             Request::Exec { .. } => "exec",
             Request::Signal { .. } => "signal",
@@ -130,6 +158,19 @@ impl Request {
         match self {
             Request::Grant { path, .. } | Request::Revoke { path, .. } => Some(path),
             _ => None,
+        }
+    }
+
+    /// The client-supplied identity fields (0.4.0 F1), if any.
+    pub fn client_field(&self) -> Option<&ClientField> {
+        match self {
+            Request::Grant { client, .. }
+            | Request::Revoke { client, .. }
+            | Request::List { client, .. }
+            | Request::Inspect { client, .. }
+            | Request::Kill { client, .. }
+            | Request::Exec { client, .. }
+            | Request::Signal { client, .. } => client.as_ref(),
         }
     }
 }
@@ -438,7 +479,8 @@ mod tests {
             Request::Grant {
                 path: "/a".into(),
                 mode: Mode::Ro,
-                recursive: false
+                recursive: false,
+                client: None
             }
         );
         assert_eq!(
@@ -446,7 +488,8 @@ mod tests {
             Request::Grant {
                 path: "/a".into(),
                 mode: Mode::Rw,
-                recursive: true
+                recursive: true,
+                client: None
             }
         );
         assert_eq!(
@@ -454,18 +497,23 @@ mod tests {
             Request::Revoke {
                 path: "/a".into(),
                 hard: false,
-                kill_holders: false
+                kill_holders: false,
+                client: None
             }
         );
-        assert_eq!(parse_request(r#"{"op":"list"}"#).unwrap(), Request::List {});
+        assert_eq!(
+            parse_request(r#"{"op":"list"}"#).unwrap(),
+            Request::List { client: None }
+        );
         assert_eq!(
             parse_request(r#"{"op":"inspect"}"#).unwrap(),
-            Request::Inspect {}
+            Request::Inspect { client: None }
         );
         assert_eq!(
             parse_request(r#"{"op":"kill"}"#).unwrap(),
             Request::Kill {
-                signal: "TERM".into()
+                signal: "TERM".into(),
+                client: None
             }
         );
     }
@@ -573,7 +621,7 @@ mod tests {
         fn handle(&self, req: Request, _: Vec<OwnedFd>, _: &UnixStream) -> Value {
             self.seen.lock().unwrap().push(req.op_name().to_owned());
             match req {
-                Request::List {} => ok(json!({"grants": []})),
+                Request::List { .. } => ok(json!({"grants": []})),
                 _ => err(E_INTERNAL, "unsupported in test"),
             }
         }
@@ -667,7 +715,8 @@ mod tests {
                 cwd: None,
                 env: BTreeMap::new(),
                 tty: false,
-                attach: false
+                attach: false,
+                client: None
             }
         );
         let r =
@@ -680,7 +729,8 @@ mod tests {
                 cwd: Some("/w".into()),
                 env: BTreeMap::from([("K".into(), "V".into())]),
                 tty: true,
-                attach: false
+                attach: false,
+                client: None
             }
         );
         assert_eq!(
@@ -690,7 +740,8 @@ mod tests {
                 cwd: None,
                 env: BTreeMap::new(),
                 tty: false,
-                attach: false
+                attach: false,
+                client: None
             }
         );
         assert_eq!(
@@ -698,9 +749,34 @@ mod tests {
             Request::Signal {
                 exec_id: None,
                 pid: Some(7),
-                signal: "TERM".into()
+                signal: "TERM".into(),
+                client: None
             }
         );
+    }
+
+    #[test]
+    fn client_field_is_parsed() {
+        let r = parse_request(
+            r#"{"op":"exec","argv":["x"],"client":{"label":"wakil@rubin","label_source":"ssh"}}"#,
+        )
+        .unwrap();
+        match r {
+            Request::Exec {
+                client: Some(c), ..
+            } => {
+                assert_eq!(c.label.as_deref(), Some("wakil@rubin"));
+                assert_eq!(c.label_source.as_deref(), Some("ssh"));
+            }
+            _ => panic!("expected Exec with client"),
+        }
+    }
+
+    #[test]
+    fn client_field_with_uid_is_refused() {
+        // `uid` is not a field of ClientField — deny_unknown_fields rejects it.
+        let r = parse_request(r#"{"op":"exec","argv":["x"],"client":{"label":"x","uid":1000}}"#);
+        assert!(r.is_err(), "uid in client object must be refused");
     }
 
     /// Handler that records what reached it and streams two lines for exec.

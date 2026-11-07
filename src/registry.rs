@@ -241,7 +241,7 @@ mod tests {
     }
 
     fn uid() -> u32 {
-        fs::metadata(std::env::temp_dir()).unwrap().uid()
+        rustix::process::getuid().as_raw()
     }
 
     fn mk_session(root: &Path, id: &str, name: Option<&str>) {

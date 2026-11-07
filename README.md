@@ -278,7 +278,7 @@ is one consumer; nothing in the contract is specific to it.
   `pid` form is deprecated, and a pid recycled by a different exec is rejected
   with `E_NOT_FOUND`.
 - **Frozen JSON.** `hisn ls --json` and `hisn inspect --json` carry a
-  `schema` field (`hisn-ls/v1`, `hisn-inspect/v1`). Fields are only ever added.
+  `schema` field (`hisn-ls/v2`, `hisn-inspect/v1`). Fields are only ever added.
   `hisn ls --json` with no sessions returns an empty list.
 - **Control socket.** `<session>/control.sock`, one JSON object per line
   (`grant`, `revoke`, `list`, `inspect`, `exec`, `signal`, `kill`). The

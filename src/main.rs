@@ -134,7 +134,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let uid = rustix::process::getuid().as_raw();
             let roots =
                 session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
-            let dir = session::find_session(&roots, &a.session)?;
+            let reg_root = hisn::registry::registry_root(uid);
+            let id = session::resolve_session_arg(&roots, &reg_root, &a.session)?;
+            let dir = session::find_session(&roots, &id)?;
             if session::is_stale(&dir) {
                 session::remove_safe(&dir, uid).map_err(|e| {
                     anyhow::Error::msg(format!("cannot remove stale session {}: {e}", a.session))
@@ -257,6 +259,14 @@ fn ls(session_id: Option<&str>, json_out: bool, prune: bool) -> Result<ExitCode>
                         tracing::info!("prune: {n} not stale; skipped");
                     }
                 }
+                // Reconcile the name index with what is on disk (step 1c).
+                let reg_root = hisn::registry::registry_root(uid);
+                if let Ok(_lock) = hisn::registry::Lock::take(&reg_root, uid) {
+                    match hisn::registry::repair(&reg_root, &roots) {
+                        Ok(n) => eprintln!("name index repaired: {n} name(s)"),
+                        Err(e) => eprintln!("name index repair failed: {e}"),
+                    }
+                }
                 return Ok(ExitCode::SUCCESS);
             }
             let rows: Vec<(String, PathBuf, bool)> = sessions
@@ -281,15 +291,92 @@ fn ls(session_id: Option<&str>, json_out: bool, prune: bool) -> Result<ExitCode>
                         })
                     })
                     .collect();
-                println!("{}", json!({"schema": "hisn-ls/v1", "sessions": sessions}));
+                println!("{}", json!({"schema": "hisn-ls/v2", "sessions": sessions}));
             } else {
-                for (n, _p, live) in rows {
-                    println!("{n}\t{}", if live { "live" } else { "stale" });
+                println!("NAME\tID\tSTATE\tCWD\tROOTFS\tNET\tAGE\tCLIENTS\tLEASE");
+                for (n, p, live) in rows {
+                    let meta = hisn::sessionmeta::read(&p);
+                    let name = meta
+                        .as_ref()
+                        .and_then(|m| m.name.clone())
+                        .unwrap_or_else(|| "-".into());
+                    let state = session_state_label(&p, live);
+                    let cwd = meta
+                        .as_ref()
+                        .map(|m| m.cwd.clone())
+                        .unwrap_or_else(|| "-".into());
+                    let rootfs = meta
+                        .as_ref()
+                        .and_then(|m| m.rootfs.clone())
+                        .unwrap_or_else(|| "-".into());
+                    let net = meta
+                        .as_ref()
+                        .map(|m| m.network.clone())
+                        .unwrap_or_else(|| "-".into());
+                    let age = meta
+                        .as_ref()
+                        .map(|m| age_label(&m.created.ts))
+                        .unwrap_or_else(|| "-".into());
+                    // CLIENTS and LEASE are filled in by steps 2 and 5.
+                    println!("{name}\t{n}\t{state}\t{cwd}\t{rootfs}\t{net}\t{age}\t-\t-");
                 }
             }
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// The state shown by `ls`: `session.json`'s state when present, else the
+/// legacy live/stale word, and `crashed` for a dir that is not live and whose
+/// recorded state is not `stopped`.
+fn session_state_label(p: &Path, live: bool) -> String {
+    if live {
+        return "running".into();
+    }
+    match hisn::sessionmeta::read(p).map(|m| m.state) {
+        Some(hisn::sessionmeta::State::Stopped) => "stopped".into(),
+        Some(hisn::sessionmeta::State::Creating) => "creating".into(),
+        Some(_) | None => "crashed".into(),
+    }
+}
+
+/// Human age from an RFC 3339 timestamp: `42s`, `7m`, `3h`, `2d`; `-` if the
+/// timestamp does not parse.
+fn age_label(ts: &str) -> String {
+    let Some(then) = parse_rfc3339_secs(ts) else {
+        return "-".into();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(then);
+    let d = (now - then).max(0);
+    match d {
+        0..=119 => format!("{d}s"),
+        120..=7199 => format!("{}m", d / 60),
+        7200..=172799 => format!("{}h", d / 3600),
+        _ => format!("{}d", d / 86400),
+    }
+}
+
+/// Parse `YYYY-MM-DDTHH:MM:SSZ` (the form `rfc3339_now` writes) to epoch seconds.
+fn parse_rfc3339_secs(ts: &str) -> Option<i64> {
+    let b = ts.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[10] != b'T' {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| ts.get(r)?.parse::<i64>().ok();
+    let (y, mo, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (h, mi, se) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    // Days since epoch via the civil-from-days inverse (Howard Hinnant).
+    let y2 = if mo <= 2 { y - 1 } else { y };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + h * 3600 + mi * 60 + se)
 }
 
 /// Read `policy.resolved.toml` from a session dir and parse it as TOML into a
@@ -317,4 +404,23 @@ fn rootfs_import(args: hisn::cli::ImportArgs) -> Result<ExitCode> {
         m.name, m.files, m.skipped, m.size_bytes
     );
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod ls_tests {
+    use super::parse_rfc3339_secs;
+
+    /// Known values checked with `date -u -d ... +%s`.
+    #[test]
+    fn rfc3339_parses_to_epoch_seconds() {
+        assert_eq!(parse_rfc3339_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_secs("2026-11-07T12:34:56Z"), Some(1794054896));
+        assert_eq!(parse_rfc3339_secs("2000-02-29T23:59:59Z"), Some(951868799));
+    }
+
+    #[test]
+    fn rfc3339_rejects_garbage() {
+        assert_eq!(parse_rfc3339_secs("nope"), None);
+        assert_eq!(parse_rfc3339_secs("2026-13-x"), None);
+    }
 }

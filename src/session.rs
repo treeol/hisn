@@ -207,6 +207,30 @@ pub fn find_session(roots: &[PathBuf], id: &str) -> Result<PathBuf, SessionError
         .ok_or_else(|| SessionError::NotFound(id.into()))
 }
 
+/// Resolve a `--session` argument (an id or a name) to a session id.
+///
+/// An argument that is an existing id under some root resolves to itself,
+/// so id-based scripts keep working. Otherwise it is looked up as a name in
+/// the per-user registry (authoritative index; scan of the name files when
+/// the index is missing or unparseable). Returns `NotFound` if neither.
+pub fn resolve_session_arg(
+    roots: &[PathBuf],
+    reg_root: &Path,
+    arg: &str,
+) -> Result<String, SessionError> {
+    if !is_valid_session_id(arg) {
+        // Not a valid id (e.g. a leading '.' or too long): must be a name.
+        return crate::registry::resolve_name(reg_root, roots, arg)
+            .ok_or_else(|| SessionError::NotFound(arg.into()));
+    }
+    if roots.iter().any(|r| r.join(arg).is_dir()) {
+        return Ok(arg.into());
+    }
+    crate::registry::resolve_name(reg_root, roots, arg)
+        .filter(|id| roots.iter().any(|r| r.join(id).is_dir()))
+        .ok_or_else(|| SessionError::NotFound(arg.into()))
+}
+
 /// Session ids present under any root.
 pub fn list_sessions(roots: &[PathBuf]) -> Vec<(String, PathBuf)> {
     let mut v = Vec::new();
@@ -670,6 +694,46 @@ mod tests {
     fn dot_prefixed_ids_are_refused() {
         assert!(!is_valid_session_id(".tmp-x"));
         assert!(is_valid_session_id("ab12cd"));
+    }
+
+    /// Step 1c: an id resolves to itself; a name resolves through the index;
+    /// an unknown name is NotFound.
+    #[test]
+    fn resolve_session_arg_accepts_id_or_name() {
+        let base = std::env::temp_dir().join(format!("hisn-res-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("r");
+        let reg = base.join("reg");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&reg).unwrap();
+        fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        fs::set_permissions(&reg, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let uid = fs::metadata(&root).unwrap().uid();
+        let roots = vec![root.clone()];
+        // Same order as `run`: reserve the name first, then publish the dir
+        // that carries it. A name already on disk would count as taken.
+        {
+            let _l = crate::registry::Lock::take(&reg, uid).unwrap();
+            crate::registry::reserve(&reg, &roots, "mysess", "sid42").unwrap();
+        }
+        let sd = SessionDir::create(&root, uid, "sid42").unwrap();
+        crate::registry::write_name_file(&sd.path, "mysess").unwrap();
+        assert_eq!(resolve_session_arg(&roots, &reg, "sid42").unwrap(), "sid42");
+        assert_eq!(
+            resolve_session_arg(&roots, &reg, "mysess").unwrap(),
+            "sid42"
+        );
+        assert!(matches!(
+            resolve_session_arg(&roots, &reg, "unknown"),
+            Err(SessionError::NotFound(_))
+        ));
+        // Index points at a dir that is gone: NotFound, not a stale hit.
+        fs::remove_dir_all(&sd.path).unwrap();
+        assert!(matches!(
+            resolve_session_arg(&roots, &reg, "mysess"),
+            Err(SessionError::NotFound(_))
+        ));
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

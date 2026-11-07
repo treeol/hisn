@@ -2313,6 +2313,36 @@ else
   skip "L50 getent resolves" "HISN_TEST_ROOTFS not set or missing /usr"
 fi
 
+# ================================================ L51: name registry unreadable from a session (0.4.0)
+# The per-user name registry (names.json, names.lock) lives in the /tmp/hisn-$UID
+# root. A session must not be able to read or rewrite it: the registry is host
+# state, and a session that could edit it could re-point a name at another id.
+# Starts a named session with the standard probe and asks the sandbox to touch
+# both files. The probe's `sh` is run inside the session via `q`.
+L51_CWD=$(new_cwd l51)
+L51_REG="/tmp/hisn-$(id -u)"
+L51_NAME="l51n$$"
+if start_session l51-$$ "$L51_CWD" "$POL" --name "$L51_NAME"; then
+  # exec-out runs argv directly (no shell): cat exits 0 only if it could read.
+  r=$(q "$L51_CWD" "exec-out /bin/cat $L51_REG/names.json")
+  case "$r" in
+    "OK exit=0"*) fail "L51 names.json readable from a session" "[${r%%$'\n'*}]" ;;
+    "OK exit="*) pass "L51 names.json not readable from a session" ;;
+    *) fail "L51 names.json probe" "no result [$r]" ;;
+  esac
+  # Writable check: `touch` on an existing file exits 0 only if writable.
+  r=$(q "$L51_CWD" "exec-out /usr/bin/touch $L51_REG/names.lock")
+  case "$r" in
+    "OK exit=0"*) fail "L51 names.lock writable from a session" "[${r%%$'\n'*}]" ;;
+    "OK exit="*) pass "L51 names.lock not writable from a session" ;;
+    *) fail "L51 names.lock probe" "no result [$r]" ;;
+  esac
+  end_session "$L51_CWD" "$S_PID"
+else
+  fail "L51 named session did not start" "hisn run --name $L51_NAME"
+fi
+rm -rf "$L51_CWD"
+
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.
 MANIFEST="$HERE/MANIFEST"

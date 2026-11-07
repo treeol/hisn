@@ -2256,20 +2256,23 @@ impl Drop for RawTerm {
 // ----------------------------------------------------------- client commands
 
 /// Locate the control socket of a session or fail with a clear message.
-pub fn socket_for(session_id: &str) -> Result<PathBuf> {
+/// Resolve a `--session` argument (id or name) to its control socket.
+pub fn socket_for(session_arg: &str) -> Result<PathBuf> {
     let uid = rustix::process::getuid().as_raw();
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
-    let dir = session::find_session(&roots, session_id)?;
+    let reg_root = crate::registry::registry_root(uid);
+    let id = session::resolve_session_arg(&roots, &reg_root, session_arg)?;
+    let dir = session::find_session(&roots, &id)?;
     use std::os::unix::fs::MetadataExt;
     if fs::metadata(&dir)?.uid() != uid {
-        bail!("session {session_id} belongs to another user");
+        bail!("session {session_arg} belongs to another user");
     }
     Ok(dir.join("control.sock"))
 }
 
-pub fn client_request(session_id: &str, req: &Value) -> Result<Value> {
-    let sock = socket_for(session_id)?;
-    control::request(&sock, req).with_context(|| format!("talking to session {session_id}"))
+pub fn client_request(session_arg: &str, req: &Value) -> Result<Value> {
+    let sock = socket_for(session_arg)?;
+    control::request(&sock, req).with_context(|| format!("talking to session {session_arg}"))
 }
 
 #[cfg(test)]

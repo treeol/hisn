@@ -1441,7 +1441,7 @@ from the main command.
 `[{name, pid, socket, state: "starting|ready|exited", exit}]`. The `pid` is
 the in-sandbox pid (same namespace as `exec` pids). `state` is `starting`
 until readiness is confirmed, `ready` after, `exited` if the service exits
-before the session ends. The schema is additive (`hisn-ls/v1`).
+before the session ends. The schema is additive (`hisn-ls/v2`; `v1` fields are kept).
 
 ### Risk label
 

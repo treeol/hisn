@@ -316,10 +316,10 @@ was allowed in that task.
 
 ## Review log — 0.2.1 patch spec (round 1)
 
-**Round 1 (patch spec review of `docs/PATCH-0.2.1.md`)** — both reviewers
+**Round 1 (patch spec review of `docs/PATCH-0.2.1.md` (removed from the tree; see the v0.2.1 tag))** — both reviewers
 answered (`openai/gpt-6-astra`, `anthropic/claude-fable-5.1`); both quoted
 patches 5 and 6, so the round is valid and spent. BLOCKING findings are
-folded into `docs/PATCH-0.2.1.md` (patches 1, 4, 5, 6, 7, 8). Non-blocking
+folded into `docs/PATCH-0.2.1.md` (removed from the tree; see the v0.2.1 tag) (patches 1, 4, 5, 6, 7, 8). Non-blocking
 findings are recorded here.
 
 | # | finding | triage | resolution |
@@ -345,7 +345,7 @@ findings are recorded here.
 truncated at `max_tokens`. The reviewer saw the full implementation of all
 10 patches (src/session.rs, src/sys.rs, src/init.rs, src/supervisor.rs,
 src/main.rs, src/policy.rs, src/mounts.rs, src/control.rs, src/execcli.rs,
-src/cli.rs) and docs/PATCH-0.2.1.md.
+src/cli.rs) and docs/PATCH-0.2.1.md (removed from the tree; see the v0.2.1 tag).
 
 | # | finding | triage | resolution |
 |---|---------|--------|-----------|

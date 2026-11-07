@@ -1,13 +1,15 @@
 # hisn — design
 
-Status: v0 implemented (code and design reconciled in §12); §14 (exec, v0.2) is the design for the next step and is implemented after review. Binding input: `docs/BRIEF.md`
-(the DO NOT ALTER block there always wins). This document expands the brief's
-architecture and records every place where working it through forced a
-refinement (§12 "Deviations from the brief"). Items marked **[HOST-VERIFY]**
-cannot be exercised in the Wakil build sandbox (user namespaces and the mount
-API are blocked there, see `hisn check` output in the README/close-out) and
-must be confirmed by `make leaktest` on a real host. `docs/VERIFICATION.txt`
-records which commit each result was obtained on.
+Status: current as of hisn 0.3.3. §1–§14 describe the sandbox core (0.2 exec
+included); §15–§19 describe the 0.3 orchestration layer. The decisions behind
+each part are in [`docs/adr/`](adr/README.md). Binding input: `docs/BRIEF.md`
+(the DO NOT ALTER block there always wins). §12 records where working the
+design through forced a refinement from the brief.
+
+Items marked **[HOST-VERIFY]** cannot be exercised in an unprivileged build
+environment (user namespaces and the mount API are blocked there) and must be
+confirmed by `make leaktest` on a real host. The leak suite is the acceptance
+test for the isolation claims; see the README, "Verifying a build".
 
 ## 1. Goals and non-goals
 
@@ -52,7 +54,8 @@ that `open_tree(OPEN_TREE_CLONE)` works in S on the target kernels.
 
 S and U are both single-id maps (`uid→uid`, `gid→gid`, `setgroups=deny`).
 Files owned by other host users appear as `nobody`. The 65536-id range via
-`newuidmap` is detected by `hisn check` but **not used in v0** (§12, D4).
+`newuidmap` is detected by `hisn check` but **not used** by the mapping code; every
+session uses a single-id map (§12, D4).
 
 The supervisor must be single-threaded for `unshare(CLONE_NEWUSER)`; all
 namespace work therefore happens before the control thread starts, and the one
@@ -835,8 +838,8 @@ loop with a real child process over a socketpair (signal forwarding, exit code
 vs signal reporting), multi-fd `SCM_RIGHTS`, CLI parsing. **Host only
 (`make leaktest`, L15-L20):** the `setns` chain, `D`'s confinement, the
 `init → W → P` ancestry, grants seen by exec'd processes, fd/zombie hygiene,
-pty behaviour. See `docs/VERIFICATION.txt` for which commit each result is
-for.
+pty behaviour. Results from a given host run are recorded in the log that run
+produced (`make leaktest-log`), not in this document.
 
 ### 14.12 Known limits of this design
 

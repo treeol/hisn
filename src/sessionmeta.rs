@@ -308,4 +308,51 @@ mod tests {
         assert_eq!(back.env_declared["SECRET_TOKEN"], "<redacted>");
         fs::remove_dir_all(&d).unwrap();
     }
+
+    #[test]
+    fn touch_lease_noop_without_lease() {
+        // F5: touch_lease on a session without a lease field is a no-op
+        // (the lease is None, so last_activity is not set).
+        let d = std::env::temp_dir().join(format!("hisn-noop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let m = SessionMeta::new("abc", None, owner(), "/w", "none");
+        m.write_to(&d).unwrap();
+        // touch_lease on a session without a lease sets last_activity if
+        // the lease exists; here lease is None, so it stays None.
+        touch_lease(&d, "2026-11-07T12:00:00Z").unwrap();
+        let back = read(&d).unwrap();
+        assert_eq!(
+            back.lease, None,
+            "lease must stay None without idle_timeout"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn session_json_writes_are_serialised() {
+        // F5: the rewrite function uses a fixed .session.json.tmp name with
+        // create_new(true). Two concurrent calls would race on the tmp name.
+        // The caller (Shared) holds session_json_lock; this test just
+        // verifies record_member and touch_lease can both be called
+        // sequentially without error.
+        let d = std::env::temp_dir().join(format!("hisn-serial-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let mut m = SessionMeta::new("abc", None, owner(), "/w", "none");
+        m.lease = Some(Lease {
+            idle_timeout_s: Some(300),
+            last_activity: Some("2026-11-07T12:00:00Z".into()),
+        });
+        m.write_to(&d).unwrap();
+        record_member(&d, 1000, "local", "2026-11-07T12:00:00Z").unwrap();
+        touch_lease(&d, "2026-11-07T12:00:05Z").unwrap();
+        let back = read(&d).unwrap();
+        assert_eq!(back.members.len(), 1);
+        assert_eq!(
+            back.lease.as_ref().unwrap().last_activity.as_deref(),
+            Some("2026-11-07T12:00:05Z")
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
 }

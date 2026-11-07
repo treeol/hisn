@@ -158,6 +158,10 @@ struct Shared {
     /// Last `last_seen` timestamp written to `session.json` for the rate
     /// limit (60 s). Keyed by uid. Protected by `members_lock`.
     members_lock: Mutex<std::collections::BTreeMap<u32, String>>,
+    /// F5: serialises all `session.json` rewrites (record_member, touch_lease).
+    session_json_lock: Mutex<()>,
+    /// F5: the idle timeout for this session (None = never, no lease writes).
+    idle_timeout_s: Option<u64>,
 }
 
 /// The state of an in-sandbox service for `ls --json` (DESIGN §19).
@@ -189,11 +193,10 @@ impl Shared {
     }
 
     /// Record a request's client in the `session.json` members list
-    /// (append-only, with a 60 s `last_seen` rate limit).
+    /// (append-only, with a 60 s `last_seen` rate limit, F5: serialised
+    /// through `session_json_lock`).
     fn record_member(&self, client: &authz::ClientRecord) {
         let now = crate::session::rfc3339_now();
-        // Rate limit: only write if the stored last_seen for this uid is
-        // absent or more than 60 s old.
         let should_write = {
             let ml = self.members_lock.lock().expect("members lock");
             match ml.get(&client.uid) {
@@ -208,6 +211,7 @@ impl Shared {
         if !should_write {
             return;
         }
+        let _lock = self.session_json_lock.lock().expect("session_json lock");
         let _ =
             crate::sessionmeta::record_member(&self.session_dir, client.uid, &client.label, &now);
         let mut ml = self.members_lock.lock().expect("members lock");
@@ -236,15 +240,18 @@ impl Shared {
         !self.execs.lock().expect("execs").is_empty()
     }
 
-    /// Update `last_activity` in `session.json` (0.4.0 step 5), rate-limited
-    /// to once per 10 s. Called on every authorized request.
+    /// Update `last_activity` in `session.json` (0.4.0 step 5, F5), rate-limited
+    /// to once per 10 s. No-op when `idle_timeout` is unset. All session.json
+    /// rewrites go through `session_json_lock`.
     fn touch_lease(&self) {
+        if self.idle_timeout_s.is_none() {
+            return;
+        }
         let now = crate::session::rfc3339_now();
         let now_secs = crate::session::parse_rfc3339_secs(&now).unwrap_or(0);
         let should_write = {
             let ml = self.members_lock.lock().expect("members lock");
             match ml.get(&u32::MAX) {
-                // u32::MAX is the "lease" key in the members_lock map.
                 None => true,
                 Some(stored) => {
                     let stored_secs = crate::session::parse_rfc3339_secs(stored).unwrap_or(0);
@@ -255,6 +262,7 @@ impl Shared {
         if !should_write {
             return;
         }
+        let _lock = self.session_json_lock.lock().expect("session_json lock");
         let _ = crate::sessionmeta::touch_lease(&self.session_dir, &now);
         let mut ml = self.members_lock.lock().expect("members lock");
         ml.insert(u32::MAX, now);
@@ -1856,6 +1864,8 @@ fn run_session(
         services: Mutex::new(Default::default()),
         session_dir: sdir.path.clone(),
         members_lock: Mutex::new(Default::default()),
+        session_json_lock: Mutex::new(()),
+        idle_timeout_s: policy.idle_timeout_s,
     });
     // The only way to start `network = "host"` without abstract-socket
     // scoping is the explicit flag; it is audited (DESIGN §7, B1).

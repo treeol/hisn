@@ -104,7 +104,7 @@ fn open_host_pty() -> io::Result<(OwnedFd, OwnedFd)> {
 /// Relay the pty master to stdin/stdout, intercepting Ctrl-] d as the
 /// detach key. When the detach key is seen, the connection is dropped
 /// (the shell receives TERM→KILL through the existing path) and we
-/// return `Finish::Code(0)` (clean detach).
+/// read the exit line from the connection like a normal exec end.
 fn relay_with_detach(mut conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
     let conn_fd = conn.as_raw_fd();
     let master_fd = master.as_raw_fd();
@@ -112,6 +112,30 @@ fn relay_with_detach(mut conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
 
     let mut in_detach = false;
     let mut buf = [0u8; 4096];
+    let mut reply_buf = String::new();
+
+    // Install a SIGWINCH handler that resizes the pty to match stdin.
+    // SAFETY: signal handler only does an ioctl on a static fd.
+    static mut WINCH_MASTER: libc::c_int = -1;
+    static mut WINCH_STDIN: libc::c_int = -1;
+    extern "C" fn winch_handler(_sig: libc::c_int) {
+        // SAFETY: ioctl on fds we own, zeroed storage.
+        unsafe {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(WINCH_STDIN, libc::TIOCGWINSZ, &mut ws) == 0 {
+                let _ = libc::ioctl(WINCH_MASTER, libc::TIOCSWINSZ, &ws);
+            }
+        }
+    }
+    // SAFETY: we set the static fds before installing the handler.
+    unsafe {
+        WINCH_MASTER = master_fd;
+        WINCH_STDIN = 0;
+        let _ = libc::signal(
+            libc::SIGWINCH,
+            winch_handler as *const () as libc::sighandler_t,
+        );
+    }
 
     loop {
         let mut fds = [
@@ -134,6 +158,9 @@ fn relay_with_detach(mut conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
         // SAFETY: poll on our own fds.
         let r = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
         if r < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue; // SIGWINCH interrupted poll; retry
+            }
             return Err(io::Error::last_os_error()).context("attach: poll");
         }
 
@@ -144,7 +171,6 @@ fn relay_with_detach(mut conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
                 stdout.write_all(&buf[..n as usize])?;
                 stdout.flush()?;
             } else {
-                // Master closed (shell exited).
                 break;
             }
         }
@@ -163,12 +189,14 @@ fn relay_with_detach(mut conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
                 for &b in data {
                     if in_detach {
                         if b == b'd' {
-                            // Detach: drop the connection and return.
-                            // The supervisor sees the socket close and
-                            // cancels the exec (TERM→KILL).
-                            return Ok(Finish::Code(0));
+                            // F7: detach — drop the connection (the shell
+                            // receives TERM→KILL) and read the exit line.
+                            // Reset the SIGWINCH handler before returning.
+                            unsafe {
+                                let _ = libc::signal(libc::SIGWINCH, libc::SIG_DFL);
+                            }
+                            return read_exit_after_detach(conn);
                         }
-                        // Not the detach key: forward both bytes.
                         out.push(0x1d);
                         out.push(b);
                         in_detach = false;
@@ -188,17 +216,34 @@ fn relay_with_detach(mut conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
         if fds[2].revents & libc::POLLIN != 0 {
             let mut byte = [0u8; 1];
             match conn.read(&mut byte) {
-                Ok(0) => return Ok(Finish::Lost),
-                Ok(_) => {}
+                Ok(0) => {
+                    // Reset SIGWINCH before returning.
+                    unsafe {
+                        let _ = libc::signal(libc::SIGWINCH, libc::SIG_DFL);
+                    }
+                    return Ok(Finish::Lost);
+                }
+                Ok(_) => {
+                    reply_buf.push(byte[0] as char);
+                    if byte[0] == b'\n' {
+                        if let Some(f) = parse_exit(reply_buf.trim()) {
+                            unsafe {
+                                let _ = libc::signal(libc::SIGWINCH, libc::SIG_DFL);
+                            }
+                            return Ok(f);
+                        }
+                        reply_buf.clear();
+                    }
+                }
                 Err(e) => return Err(e).context("attach: reading reply"),
             }
-            // We don't parse the exit line here — we rely on the master
-            // closing to signal shell exit. The conn reply is consumed to
-            // avoid stale data.
         }
     }
 
     // Master closed: drain the conn for the exit line.
+    unsafe {
+        let _ = libc::signal(libc::SIGWINCH, libc::SIG_DFL);
+    }
     let mut buf = String::new();
     let mut byte = [0u8; 1];
     loop {
@@ -214,6 +259,43 @@ fn relay_with_detach(mut conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
                 }
             }
             Err(e) => return Err(e).context("attach: reading exit"),
+        }
+    }
+}
+
+/// After a detach (connection still open), read the exit line from the
+/// connection with a short timeout (the shell is being killed).
+fn read_exit_after_detach(mut conn: &UnixStream) -> Result<Finish> {
+    let mut buf = String::new();
+    let mut byte = [0u8; 1];
+    // Give the supervisor up to 5 s to send the exit line after the kill.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Ok(Finish::Lost);
+        }
+        // Poll with a 1 s timeout.
+        let mut fds = [libc::pollfd {
+            fd: conn.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 1, 1000) };
+        if r <= 0 {
+            continue;
+        }
+        match conn.read(&mut byte) {
+            Ok(0) => return Ok(Finish::Lost),
+            Ok(_) => {
+                buf.push(byte[0] as char);
+                if byte[0] == b'\n' {
+                    if let Some(f) = parse_exit(buf.trim()) {
+                        return Ok(f);
+                    }
+                    buf.clear();
+                }
+            }
+            Err(e) => return Err(e).context("attach: reading exit after detach"),
         }
     }
 }

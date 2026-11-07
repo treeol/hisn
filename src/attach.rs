@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 use crate::cli::AttachArgs;
 use crate::execcli::Finish;
+use crate::supervisor;
 use crate::sys;
 
 /// Build the control-protocol request for an attach.
@@ -36,7 +37,7 @@ pub fn build_request(args: &AttachArgs) -> Result<Value> {
 /// intercepts the detach key (Ctrl-] d).
 pub fn run(args: AttachArgs) -> Result<i32> {
     let req = build_request(&args)?;
-    let sock = crate::supervisor::socket_for(&args.session)?;
+    let sock = supervisor::socket_for(&args.session)?;
     let conn = UnixStream::connect(&sock)
         .with_context(|| format!("connecting to session {}", args.session))?;
 
@@ -56,6 +57,9 @@ pub fn run(args: AttachArgs) -> Result<i32> {
     sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), &[slave.as_raw_fd()])
         .context("sending attach request")?;
     drop(slave);
+
+    // Enter raw mode on the host tty so input is passed through unfiltered.
+    let _raw = supervisor::RawTerm::enter(0);
 
     // Relay the pty with detach-key interception.
     let finish = relay_with_detach(&conn, master)?;
@@ -89,16 +93,16 @@ fn open_host_pty() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 /// Relay the pty master to stdin/stdout, intercepting Ctrl-] d as the
-/// detach key. When the detach key is seen, the connection is closed (the
-/// shell receives TERM→KILL through the existing path).
-fn relay_with_detach(conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
+/// detach key. When the detach key is seen, the connection is dropped
+/// (the shell receives TERM→KILL through the existing path) and we
+/// return `Finish::Code(0)` (clean detach).
+fn relay_with_detach(mut conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
     let conn_fd = conn.as_raw_fd();
     let master_fd = master.as_raw_fd();
     let mut stdout = io::stdout();
 
     let mut in_detach = false;
     let mut buf = [0u8; 4096];
-    let mut reply_buf = String::new();
 
     loop {
         let mut fds = [
@@ -131,6 +135,7 @@ fn relay_with_detach(conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
                 stdout.write_all(&buf[..n as usize])?;
                 stdout.flush()?;
             } else {
+                // Master closed (shell exited).
                 break;
             }
         }
@@ -149,9 +154,12 @@ fn relay_with_detach(conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
                 for &b in data {
                     if in_detach {
                         if b == b'd' {
-                            // Detach: close the connection.
-                            return read_exit(conn);
+                            // Detach: drop the connection and return.
+                            // The supervisor sees the socket close and
+                            // cancels the exec (TERM→KILL).
+                            return Ok(Finish::Code(0));
                         }
+                        // Not the detach key: forward both bytes.
                         out.push(0x1d);
                         out.push(b);
                         in_detach = false;
@@ -170,28 +178,18 @@ fn relay_with_detach(conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
         // Conn reply (exit line).
         if fds[2].revents & libc::POLLIN != 0 {
             let mut byte = [0u8; 1];
-            match (&*conn).read(&mut byte) {
+            match conn.read(&mut byte) {
                 Ok(0) => return Ok(Finish::Lost),
-                Ok(_) => {
-                    reply_buf.push(byte[0] as char);
-                    if byte[0] == b'\n' {
-                        if let Some(f) = parse_exit(reply_buf.trim()) {
-                            return Ok(f);
-                        }
-                        reply_buf.clear();
-                    }
-                }
+                Ok(_) => {}
                 Err(e) => return Err(e).context("attach: reading reply"),
             }
+            // We don't parse the exit line here — we rely on the master
+            // closing to signal shell exit. The conn reply is consumed to
+            // avoid stale data.
         }
     }
 
-    // Master closed: read the exit line from the connection.
-    read_exit(conn)
-}
-
-/// Read the exit line from the connection (blocking).
-fn read_exit(mut conn: &UnixStream) -> Result<Finish> {
+    // Master closed: drain the conn for the exit line.
     let mut buf = String::new();
     let mut byte = [0u8; 1];
     loop {

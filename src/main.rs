@@ -163,7 +163,16 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
             // Audit the stop (the supervisor logs it when it receives the kill).
-            let _ = supervisor::client_request(&a.session, &json!({"op":"kill","signal":"TERM"}));
+            let kill_r =
+                supervisor::client_request(&a.session, &json!({"op":"kill","signal":"TERM"}))?;
+            if kill_r["ok"] != true {
+                eprintln!(
+                    "session {} stop failed: {}",
+                    a.session,
+                    kill_r["message"].as_str().unwrap_or("unknown error")
+                );
+                return Ok(ExitCode::from(1));
+            }
             // Set state to stopped in session.json.
             let _ = hisn::sessionmeta::set_state(&dir, hisn::sessionmeta::State::Stopped);
             eprintln!("session {} stopped", a.session);

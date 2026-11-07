@@ -1544,7 +1544,14 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         &id,
         &declared_env,
     );
-    sdir.remove();
+    // 0.4.0 step 5: keep the dir as stopped if the session was stopped
+    // (hisn stop or idle expiry). Otherwise remove it (normal exit).
+    let stopped = sessionmeta::read(&sdir.path)
+        .map(|m| m.state == sessionmeta::State::Stopped)
+        .unwrap_or(false);
+    if !stopped {
+        sdir.remove();
+    }
     // Release the name when the session is removed (step 1b). A crashed
     // session keeps its name until `ls --prune` (step 1c) repairs the index.
     if let Some(n) = &name {

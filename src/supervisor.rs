@@ -169,6 +169,10 @@ struct Shared {
     lease_lock: Mutex<()>,
     /// F8: the last touch timestamp (for the 10 s lease rate limit).
     lease_last_touch: Mutex<Option<String>>,
+    /// F2 fix: in-memory last activity seconds (updated on every authorized
+    /// request, not rate-limited). The idle timer reads this instead of
+    /// the persisted lease value, which is throttled to 10 s writes.
+    last_activity_secs: std::sync::atomic::AtomicI64,
 }
 
 /// The state of an in-sandbox service for `ls --json` (DESIGN §19).
@@ -227,13 +231,11 @@ impl Shared {
     }
 
     /// 0.4.0 F2: last activity time in epoch seconds (for the idle timer).
+    /// F2 fix: reads the in-memory atomic (updated on every request) rather
+    /// than the persisted lease value (throttled to 10 s writes).
     pub fn last_activity_secs(&self) -> i64 {
-        let meta = crate::sessionmeta::read(&self.session_dir);
-        meta.as_ref()
-            .and_then(|m| m.lease.as_ref())
-            .and_then(|l| l.last_activity.as_deref())
-            .and_then(crate::session::parse_rfc3339_secs)
-            .unwrap_or(0)
+        self.last_activity_secs
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 0.4.0 F2 fix: are there any connected control clients? Counted by
@@ -272,6 +274,9 @@ impl Shared {
         }
         let now = crate::session::rfc3339_now();
         let now_secs = crate::session::parse_rfc3339_secs(&now).unwrap_or(0);
+        // F2 fix: update the in-memory clock on every request (not rate-limited).
+        self.last_activity_secs
+            .store(now_secs, std::sync::atomic::Ordering::Relaxed);
         let should_write = {
             let _ll = self.lease_lock.lock().expect("lease lock");
             let stored = self.lease_last_touch.lock().expect("lease ts");
@@ -1900,6 +1905,7 @@ fn run_session(
         members_lock: Mutex::new(Default::default()),
         lease_lock: Mutex::new(()),
         lease_last_touch: Mutex::new(None),
+        last_activity_secs: std::sync::atomic::AtomicI64::new(0),
     });
     // The only way to start `network = "host"` without abstract-socket
     // scoping is the explicit flag; it is audited (DESIGN §7, B1).
@@ -2107,27 +2113,45 @@ fn run_session(
                     && (now_secs - last) as u64 > timeout_s
                 {
                     // F2 fix: route through the stop path, not a bare kill.
-                    // 1. state → Stopping.
-                    let _ = crate::sessionmeta::set_state(
-                        &session_dir,
-                        crate::sessionmeta::State::Stopping,
-                    );
+                    // 1. state → Stopping (under the session_json_lock).
+                    {
+                        let _lock = sh.session_json_lock.lock().expect("session_json lock");
+                        let _ = crate::sessionmeta::set_state(
+                            &session_dir,
+                            crate::sessionmeta::State::Stopping,
+                        );
+                    }
                     // 2. audit op lease / stage expired / client null / reason idle.
                     sh.log("lease", "expired", None, None, Some("idle"), None);
                     // 3. send SIGTERM to init.
                     let _ = sys::kill(init_pid, libc::SIGTERM);
-                    // 4. wait for init to exit (poll up to 30 s).
-                    for _ in 0..300 {
+                    // 4. wait for init to exit (poll up to 10 s), then SIGKILL.
+                    let mut exited = false;
+                    for _ in 0..100 {
                         if unsafe { libc::kill(init_pid, 0) } != 0 {
+                            exited = true;
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
-                    // 5. state → Stopped (dir is kept by the cleanup code).
-                    let _ = crate::sessionmeta::set_state(
-                        &session_dir,
-                        crate::sessionmeta::State::Stopped,
-                    );
+                    if !exited {
+                        let _ = sys::kill(init_pid, libc::SIGKILL);
+                        for _ in 0..50 {
+                            if unsafe { libc::kill(init_pid, 0) } != 0 {
+                                exited = true;
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    }
+                    // 5. state → Stopped only if init is confirmed dead.
+                    if exited {
+                        let _lock = sh.session_json_lock.lock().expect("session_json lock");
+                        let _ = crate::sessionmeta::set_state(
+                            &session_dir,
+                            crate::sessionmeta::State::Stopped,
+                        );
+                    }
                     break;
                 }
                 let _ = (has_clients, has_execs, now_secs, last);

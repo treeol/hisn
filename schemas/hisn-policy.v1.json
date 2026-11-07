@@ -11,6 +11,12 @@
         "set": {}
       }
     },
+    "landlock": {
+      "$ref": "#/$defs/LandlockPolicy",
+      "default": {
+        "scoped": []
+      }
+    },
     "limits": {
       "$ref": "#/$defs/Limits",
       "default": {
@@ -39,7 +45,10 @@
         "cwd": ".",
         "home": "tmpfs",
         "hostname": "hisn",
-        "network": "none"
+        "network": "none",
+        "shm": false,
+        "shm_size": 64,
+        "tmp_size": 1024
       }
     },
     "version": {
@@ -73,6 +82,35 @@
         }
       },
       "additionalProperties": false
+    },
+    "LandlockPolicy": {
+      "type": "object",
+      "properties": {
+        "scoped": {
+          "description": "IPC scopes to apply (ABI >= 6). Default empty.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/LandlockScope"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "LandlockScope": {
+      "description": "Which Landlock IPC scopes to apply (ABI >= 6). Default empty: execs of the\nsame session may signal each other and reach each other's abstract unix\nsockets. Isolation is against the host, not between execs (P17).",
+      "oneOf": [
+        {
+          "description": "`LANDLOCK_SCOPE_SIGNAL` — execs cannot signal processes in other\nLandlock domains of the same session.",
+          "type": "string",
+          "const": "signal"
+        },
+        {
+          "description": "`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` — execs cannot connect to\nabstract unix sockets bound by processes in other domains.",
+          "type": "string",
+          "const": "abstract_unix_socket"
+        }
+      ]
     },
     "Limits": {
       "type": "object",
@@ -174,6 +212,25 @@
         "network": {
           "$ref": "#/$defs/Network",
           "default": "none"
+        },
+        "shm": {
+          "description": "Mount /dev/shm (tmpfs) inside the sandbox. Default false.",
+          "type": "boolean",
+          "default": false
+        },
+        "shm_size": {
+          "description": "/dev/shm size in MiB (default 64; range 1..=65536).",
+          "type": "integer",
+          "format": "uint64",
+          "default": 64,
+          "minimum": 0
+        },
+        "tmp_size": {
+          "description": "/tmp size in MiB (default 1024; range 16..=65536).",
+          "type": "integer",
+          "format": "uint64",
+          "default": 1024,
+          "minimum": 0
         }
       },
       "additionalProperties": false

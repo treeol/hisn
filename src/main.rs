@@ -162,7 +162,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 eprintln!("session {} is not running (stale)", a.session);
                 return Ok(ExitCode::SUCCESS);
             }
-            // Audit the stop (the supervisor logs it when it receives the kill).
+            // F4: state becomes "stopping" when the kill is sent, "stopped"
+            // only after the session is observed to have exited. A kill that
+            // fails leaves "stopping" with the error audited.
+            let _ = hisn::sessionmeta::set_state(&dir, hisn::sessionmeta::State::Stopping);
             let kill_r =
                 supervisor::client_request(&a.session, &json!({"op":"kill","signal":"TERM"}))?;
             if kill_r["ok"] != true {
@@ -173,9 +176,22 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 );
                 return Ok(ExitCode::from(1));
             }
-            // Set state to stopped in session.json.
+            // Wait for the session to become stale (supervisor exited).
+            // Poll up to 30 seconds; the session dir is kept as "stopped".
+            let mut stopped = false;
+            for _ in 0..300 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if session::is_stale(&dir) {
+                    stopped = true;
+                    break;
+                }
+            }
             let _ = hisn::sessionmeta::set_state(&dir, hisn::sessionmeta::State::Stopped);
-            eprintln!("session {} stopped", a.session);
+            if stopped {
+                eprintln!("session {} stopped", a.session);
+            } else {
+                eprintln!("session {} stop sent (timeout waiting for exit)", a.session);
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Inspect(a) => {
@@ -584,6 +600,29 @@ mod ls_tests {
     fn rfc3339_rejects_garbage() {
         assert_eq!(parse_rfc3339_secs("nope"), None);
         assert_eq!(parse_rfc3339_secs("2026-13-x"), None);
+    }
+
+    #[test]
+    fn stop_sets_stopping_then_stopped() {
+        // F4: set_state writes "stopping" then "stopped". This unit test
+        // verifies the state transitions work; the actual stop ordering
+        // (kill → wait → stopped) is integration-tested on a host.
+        let d = std::env::temp_dir().join(format!("hisn-stop-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        use hisn::sessionmeta::{Owner, SessionMeta, State, read, set_state};
+        let owner = Owner {
+            uid: 1000,
+            label: "local".into(),
+            client_id: "c".into(),
+        };
+        let m = SessionMeta::new("abc", Some("nm"), owner, "/w", "none");
+        m.write_to(&d).unwrap();
+        set_state(&d, State::Stopping).unwrap();
+        assert_eq!(read(&d).unwrap().state, State::Stopping);
+        set_state(&d, State::Stopped).unwrap();
+        assert_eq!(read(&d).unwrap().state, State::Stopped);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

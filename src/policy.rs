@@ -306,15 +306,23 @@ pub fn is_valid_session_id(s: &str) -> bool {
 }
 
 /// Parse a duration string ("30s", "10m", "2h", "1d", or a bare number of
-/// seconds) to seconds. Returns `None` on parse failure.
+/// seconds) to seconds. Returns `None` on parse failure or non-ASCII input.
 pub fn parse_duration(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
+    // F6: reject non-ASCII (multibyte units would panic on split_at).
+    if !s.is_ascii() {
+        return None;
+    }
     // Bare number = seconds.
     if let Ok(n) = s.parse::<u64>() {
         return Some(n);
+    }
+    // Must be at least 2 chars: a number followed by a single ASCII unit.
+    if s.len() < 2 {
+        return None;
     }
     let (num, unit) = s.split_at(s.len() - 1);
     let n: u64 = num.parse().ok()?;
@@ -1491,5 +1499,18 @@ scoped = ["bogus"]
         assert_eq!(parse_duration("abc"), None);
         assert_eq!(parse_duration("3x"), None);
         assert_eq!(parse_duration("-5"), None);
+    }
+
+    #[test]
+    fn parse_duration_never_panics_on_random_bytes() {
+        // F6: property test — parse_duration must never panic on any input.
+        for b in 0u8..=255 {
+            let s: String = String::from_utf8(vec![b]).unwrap_or_default();
+            let _ = parse_duration(&s);
+        }
+        // Also test some multibyte strings.
+        for s in ["café", "日本語", "🦀", "30💡", "5\n"] {
+            let _ = parse_duration(s);
+        }
     }
 }

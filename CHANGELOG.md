@@ -29,7 +29,11 @@ All notable changes to hisn are recorded here. The format follows
   default none). `hisn stop --session X` sets state stopped and keeps the
   dir. `ls --prune` archives `grants.jsonl` + `session.json` to
   `$XDG_STATE_HOME/hisn/audit/<id>.jsonl` (0600) before removing; `--purge`
-  skips archival (ADR 0019).
+  skips archival (ADR 0019). Idle expiry runs the same stop function as
+  `hisn stop` (dir kept as `stopped`, audit `lease/expired`); a foreground
+  `hisn run` then exits 143 with `hisn: session <name|id> stopped: idle for
+  <d> (idle_timeout <d>)`. A stop racing the session end no longer removes
+  the dir. `hisn ls --json` gains `dir`.
 - **Lifecycle state:** `session.json` carries `state ∈ {creating, running,
   stopping, stopped, crashed}`.
 

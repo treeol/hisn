@@ -414,8 +414,11 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
     if h.authorize(&stream).is_err() {
         return;
     }
-    h.connect();
-    let _guard = ClientGuard(h);
+    // A connection is a client (idle accounting) only once it sent a request
+    // line: a bare connect-and-close (`hisn ls` liveness probe, is_stale) is
+    // neither a connected client nor activity — counting it made every `ls`
+    // poll reset the idle timer (0.4.0 L61).
+    let mut _guard: Option<ClientGuard> = None;
     let mut reader = FdLineReader::new(stream.as_raw_fd());
     let mut out = &stream;
     let mut lines = 0usize;
@@ -425,6 +428,10 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
             _ => return, // EOF, oversized, truncated or malformed framing: close
         };
         lines += 1;
+        if _guard.is_none() {
+            h.connect();
+            _guard = Some(ClientGuard(h));
+        }
         if h.authorize(&stream).is_err() {
             return;
         }
@@ -738,6 +745,51 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(h.open.load(O::SeqCst), 0, "connection count leaked");
+    }
+
+    #[test]
+    fn a_bare_connect_is_not_a_client() {
+        // Regression (0.4.0 L61): `hisn ls` probes liveness with a bare
+        // connect-and-close; that must not count as a connected client (the
+        // idle timer would never see zero clients while `ls` is polled), and
+        // a real request still does.
+        use std::sync::atomic::{AtomicU64, Ordering as O};
+        #[derive(Default)]
+        struct Counting {
+            connects: AtomicU64,
+            disconnects: AtomicU64,
+        }
+        impl Handler for Counting {
+            fn authorize(&self, _: &UnixStream) -> Result<(), String> {
+                Ok(())
+            }
+            fn connect(&self) {
+                self.connects.fetch_add(1, O::SeqCst);
+            }
+            fn disconnect(&self) {
+                self.disconnects.fetch_add(1, O::SeqCst);
+            }
+            fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream) -> Value {
+                ok(json!({}))
+            }
+        }
+        let h = Arc::new(Counting::default());
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("probe.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let hh: Arc<dyn Handler> = h.clone();
+        thread::spawn(move || serve(l, hh));
+        for _ in 0..5 {
+            drop(UnixStream::connect(&sock).unwrap());
+        }
+        request(&sock, &json!({"op":"list"})).unwrap();
+        let t0 = Instant::now();
+        while h.disconnects.load(O::SeqCst) != 1 && t0.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(h.connects.load(O::SeqCst), 1, "bare connects were counted");
+        assert_eq!(h.disconnects.load(O::SeqCst), 1);
     }
 
     #[test]

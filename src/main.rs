@@ -164,37 +164,80 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             // F4: state becomes "stopping" when the kill is sent, "stopped"
             // only after the session is observed to have exited. A kill that
-            // fails leaves "stopping" with the error audited.
-            let _ = hisn::sessionmeta::set_state(&dir, hisn::sessionmeta::State::Stopping);
-            let kill_r =
-                supervisor::client_request(&a.session, &json!({"op":"kill","signal":"TERM"}))?;
-            if kill_r["ok"] != true {
-                eprintln!(
-                    "session {} stop failed: {}",
-                    a.session,
-                    kill_r["message"].as_str().unwrap_or("unknown error")
-                );
-                return Ok(ExitCode::from(1));
+            // fails leaves "stopping". Same function as idle expiry.
+            struct Client<'a> {
+                session: &'a str,
+                dir: &'a Path,
             }
-            // Wait for the session to become stale (supervisor exited).
-            // Poll up to 30 s; the session dir is kept as "stopped".
-            let mut stopped = false;
-            for _ in 0..300 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if session::is_stale(&dir) {
-                    stopped = true;
-                    break;
+            impl hisn::lifecycle::StopTarget for Client<'_> {
+                fn signal(&self, _sig: i32) -> Result<(), String> {
+                    let r = supervisor::client_request(
+                        self.session,
+                        &json!({"op":"kill","signal":"TERM"}),
+                    )
+                    .map_err(|e| format!("{e:#}"))?;
+                    if r["ok"] == true {
+                        Ok(())
+                    } else {
+                        Err(r["message"].as_str().unwrap_or("unknown error").to_owned())
+                    }
+                }
+                fn exited(&self) -> bool {
+                    // The supervisor keeps a stopped dir; once it is stale
+                    // (or gone) the session has ended.
+                    !self.dir.is_dir() || session::is_stale(self.dir)
                 }
             }
-            if stopped {
-                let _ = hisn::sessionmeta::set_state(&dir, hisn::sessionmeta::State::Stopped);
-                eprintln!("session {} stopped", a.session);
-                Ok(ExitCode::SUCCESS)
-            } else {
-                // Timeout: the session did not exit. Do NOT write Stopped —
-                // the state stays Stopping, and we report the failure.
-                eprintln!("session {} stop sent (timeout waiting for exit)", a.session);
-                Ok(ExitCode::from(1))
+            let target = Client {
+                session: &a.session,
+                dir: &dir,
+            };
+            let write_state = |st: hisn::sessionmeta::State| {
+                if dir.is_dir() {
+                    hisn::sessionmeta::set_state(&dir, st)
+                } else {
+                    // Already removed by its own supervisor: nothing to record.
+                    Ok(())
+                }
+            };
+            match hisn::lifecycle::stop_and_keep(
+                &target,
+                &hisn::lifecycle::SystemClock,
+                hisn::lifecycle::StopPlan::CLIENT,
+                &write_state,
+                &|| {},
+            ) {
+                hisn::lifecycle::StopOutcome::Stopped if !dir.is_dir() => {
+                    // The session ended on its own before the supervisor saw
+                    // the stop (natural completion won the race): removed.
+                    eprintln!("session {} ended before the stop; not kept", a.session);
+                    Ok(ExitCode::SUCCESS)
+                }
+                hisn::lifecycle::StopOutcome::Stopped => {
+                    eprintln!("session {} stopped", a.session);
+                    Ok(ExitCode::SUCCESS)
+                }
+                hisn::lifecycle::StopOutcome::NotStarted(m) => {
+                    eprintln!(
+                        "session {} stop not sent: cannot record stopping: {m}",
+                        a.session
+                    );
+                    Ok(ExitCode::from(1))
+                }
+                hisn::lifecycle::StopOutcome::StoppedUnrecorded(m) => {
+                    eprintln!("session {} stopped; cannot record stopped: {m}", a.session);
+                    Ok(ExitCode::from(1))
+                }
+                hisn::lifecycle::StopOutcome::SignalFailed(m) => {
+                    eprintln!("session {} stop failed: {m}", a.session);
+                    Ok(ExitCode::from(1))
+                }
+                hisn::lifecycle::StopOutcome::Timeout => {
+                    // The session did not exit. Do NOT write Stopped — the
+                    // state stays Stopping, and we report the failure.
+                    eprintln!("session {} stop sent (timeout waiting for exit)", a.session);
+                    Ok(ExitCode::from(1))
+                }
             }
         }
         Command::Inspect(a) => {
@@ -375,6 +418,7 @@ fn ls(session_id: Option<&str>, json_out: bool, prune: bool, purge: bool) -> Res
                             .unwrap_or(Value::Null);
                         json!({
                             "id": n,
+                            "dir": p.display().to_string(),
                             "state": state,
                             "cwd": policy.as_ref().map(|p| p["cwd"].clone()).unwrap_or(Value::Null),
                             "hostname": policy.as_ref().map(|p| p["hostname"].clone()).unwrap_or(Value::Null),

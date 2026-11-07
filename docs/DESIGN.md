@@ -1546,7 +1546,19 @@ Idle = zero connected clients ∧ no running exec ∧ timeout elapsed. The
 session's main command does not count as activity; idle is defined by
 connected clients and running execs. Set `idle_timeout` only on sessions
 whose main command is a keeper (detached seats), not on foreground runs.
-`hisn stop` sets state stopped. `ls --prune` archives `grants.jsonl` and
+Idle time counts from the later of the last authorized request and the
+last client disconnect (the session start counts as activity). A
+connection counts as a client only once it sends a request line: the bare
+connect-and-close liveness probe of `hisn ls` is neither a client nor
+activity.
+`hisn stop` and idle expiry share one stop function
+(`lifecycle::stop_and_keep`): state `stopping` → SIGTERM → exit observed →
+state `stopped`; the supervisor keeps a dir whose state is `stopping` or
+`stopped` when the session ends. On idle expiry the audit gets
+`op:"lease", stage:"expired"` (client null, reason idle) first, `hisn run`
+prints `hisn: session <name|id> stopped: idle for <d> (idle_timeout <d>)`
+on stderr and exits 143. `hisn ls --json` carries each session's `dir`.
+`ls --prune` archives `grants.jsonl` and
 the final `session.json` to `$XDG_STATE_HOME/hisn/audit/<id>.jsonl` (0600)
 before removing; `--purge` skips archival.
 

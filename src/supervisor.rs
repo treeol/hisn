@@ -235,7 +235,7 @@ impl Shared {
     /// than the persisted lease value (throttled to 10 s writes).
     pub fn last_activity_secs(&self) -> i64 {
         self.last_activity_secs
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 0.4.0 F2 fix: are there any connected control clients? Counted by
@@ -243,7 +243,7 @@ impl Shared {
     /// until the serve_conn thread exits.
     pub fn has_connected_clients(&self) -> bool {
         self.connected_clients
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .load(std::sync::atomic::Ordering::SeqCst)
             > 0
     }
 
@@ -256,13 +256,20 @@ impl Shared {
     /// F2 fix: a control client connected (serve_conn thread started).
     pub fn connect_client(&self) {
         self.connected_clients
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// F2 fix: a control client disconnected (serve_conn thread exited).
+    /// The disconnect is the client's last activity: idle time counts from
+    /// here, not from its (possibly much earlier) request.
     pub fn disconnect_client(&self) {
+        if self.idle_timeout_s.is_some() {
+            let now = crate::lifecycle::Clock::now_secs(&crate::lifecycle::SystemClock);
+            self.last_activity_secs
+                .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+        }
         self.connected_clients
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Update `last_activity` in `session.json` (0.4.0 step 5, F5), rate-limited
@@ -276,7 +283,7 @@ impl Shared {
         let now_secs = crate::session::parse_rfc3339_secs(&now).unwrap_or(0);
         // F2 fix: update the in-memory clock on every request (not rate-limited).
         self.last_activity_secs
-            .store(now_secs, std::sync::atomic::Ordering::Relaxed);
+            .fetch_max(now_secs, std::sync::atomic::Ordering::SeqCst);
         let should_write = {
             let _ll = self.lease_lock.lock().expect("lease lock");
             let stored = self.lease_last_touch.lock().expect("lease ts");
@@ -1606,6 +1613,7 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         }
         return Err(e);
     }
+    let idle_timeout_s = policy.idle_timeout_s;
     let sdir = tmp.publish(&root)?;
     let _ = sessionmeta::set_state(&sdir.path, sessionmeta::State::Running);
     let result = run_session(
@@ -1628,12 +1636,25 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         &id,
         &declared_env,
     );
-    // 0.4.0 step 5: keep the dir as stopped if the session was stopped
+    // 0.4.0 step 5 / O3: keep the dir as stopped if the session was stopped
     // (hisn stop or idle expiry). Otherwise remove it (normal exit).
-    let stopped = sessionmeta::read(&sdir.path)
-        .map(|m| m.state == sessionmeta::State::Stopped)
-        .unwrap_or(false);
-    if !stopped {
+    let end = result.as_ref().ok().map(|e| {
+        crate::lifecycle::end_of_session(
+            &sdir.path,
+            name.as_deref().unwrap_or(&id),
+            idle_timeout_s,
+            e.idle_expired_after,
+            e.code,
+        )
+    });
+    let keep = match &end {
+        Some(e) => e.keep,
+        // A failed start: unchanged — keep only a dir already `stopped`.
+        None => {
+            sessionmeta::read(&sdir.path).is_some_and(|m| m.state == sessionmeta::State::Stopped)
+        }
+    };
+    if !keep {
         sdir.remove();
     }
     // Release the name when the session is removed (step 1b). A crashed
@@ -1642,7 +1663,86 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         let _lock = crate::registry::Lock::take(&reg_root, uid)?;
         let _ = crate::registry::release(&reg_root, n);
     }
-    result
+    result?;
+    let end = end.expect("end is computed for an Ok result");
+    if let Some(m) = &end.message {
+        eprintln!("{m}");
+    }
+    Ok(end.code)
+}
+
+/// How a session ended: the command's (or init's) code, and the idle time
+/// when the idle timer stopped it.
+struct SessionEnd {
+    code: i32,
+    idle_expired_after: Option<u64>,
+}
+
+/// The session's init as a [`crate::lifecycle::StopTarget`], held by a
+/// pidfd opened while init is our unreaped child: once `relay_and_wait`
+/// reaps it the pidfd refers to the dead process, so a reused pid is never
+/// signalled. Without pidfd support (pre-5.3 kernels) it falls back to the
+/// pid; init is then reaped only by `relay_and_wait`, after which the timer
+/// thread is joined, so the window is the reap-to-exit-check gap.
+struct InitTarget {
+    pid: i32,
+    pidfd: Option<OwnedFd>,
+}
+
+impl InitTarget {
+    fn new(pid: i32) -> Self {
+        Self {
+            pid,
+            pidfd: sys::pidfd_open(pid).ok(),
+        }
+    }
+}
+
+impl crate::lifecycle::StopTarget for InitTarget {
+    fn signal(&self, sig: i32) -> std::result::Result<(), String> {
+        match &self.pidfd {
+            Some(fd) => {
+                // SAFETY: plain syscall on our own pidfd.
+                let r = unsafe {
+                    libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd(), sig, 0usize, 0)
+                };
+                if r == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error().to_string())
+                }
+            }
+            None => sys::kill(self.pid, sig).map_err(|e| e.to_string()),
+        }
+    }
+
+    fn exited(&self) -> bool {
+        // A zombie still "exists" for signal 0; it is reaped promptly by
+        // relay_and_wait, so "exited" lags by at most one reap.
+        match &self.pidfd {
+            Some(fd) => !sys::pidfd_alive(fd.as_raw_fd()),
+            // SAFETY: signal 0 only checks for existence.
+            None => unsafe { libc::kill(self.pid, 0) != 0 },
+        }
+    }
+}
+
+impl crate::lifecycle::IdleSession for Shared {
+    fn has_connected_clients(&self) -> bool {
+        Shared::has_connected_clients(self)
+    }
+
+    fn has_running_execs(&self) -> bool {
+        Shared::has_running_execs(self)
+    }
+
+    fn last_activity_secs(&self) -> i64 {
+        Shared::last_activity_secs(self)
+    }
+
+    fn audit_lease_expired(&self) {
+        self.log("lease", "expired", None, None, Some("idle"), None);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1665,7 +1765,7 @@ fn run_session(
     ssh: Option<&profile::SshConfig>,
     session_id: &str,
     declared_env: &std::collections::BTreeMap<String, String>,
-) -> Result<i32> {
+) -> Result<SessionEnd> {
     sdir.write_resolved_policy(&policy.to_toml())?;
     // Write risk.json (the risk labels for this session, DESIGN §16).
     let risk_json = serde_json::to_string_pretty(&serde_json::json!({
@@ -1904,7 +2004,11 @@ fn run_session(
         members_lock: Mutex::new(Default::default()),
         lease_lock: Mutex::new(()),
         lease_last_touch: Mutex::new(None),
-        last_activity_secs: std::sync::atomic::AtomicI64::new(0),
+        // The session start is activity (as in session.json's lease): a seat
+        // nobody ever connects to expires too.
+        last_activity_secs: std::sync::atomic::AtomicI64::new(crate::lifecycle::Clock::now_secs(
+            &crate::lifecycle::SystemClock,
+        )),
     });
     // The only way to start `network = "host"` without abstract-socket
     // scoping is the explicit flag; it is audited (DESIGN §7, B1).
@@ -2085,85 +2189,30 @@ fn run_session(
     // client null / reason idle. This is the same path `hisn stop` uses.
     let idle_timer = if let Some(timeout_s) = policy.idle_timeout_s {
         let sh = Arc::clone(&shared);
-        let init_pid = pid;
-        let session_dir = shared.session_dir.clone();
+        // Opened here, on the supervisor thread, while init cannot have been
+        // reaped yet (only relay_and_wait below reaps it).
+        let target = InitTarget::new(pid);
         Some(thread::spawn(move || {
-            let interval = std::time::Duration::from_secs((timeout_s / 4).clamp(1, 30));
-            loop {
-                thread::sleep(interval);
-                // Check if init is still alive.
-                if unsafe { libc::kill(init_pid, 0) } != 0 {
-                    break; // init exited; stop the timer
-                }
-                // Check idle conditions.
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                let last = sh.last_activity_secs();
-                let has_clients = sh.has_connected_clients();
-                let has_execs = sh.has_running_execs();
-                // F2 (Mashūra): guard against backward clock — only fire
-                // when now_secs > last and the difference exceeds timeout.
-                if !has_clients
-                    && !has_execs
-                    && last > 0
-                    && now_secs > last
-                    && (now_secs - last) as u64 > timeout_s
-                {
-                    // F2 fix: route through the stop path, not a bare kill.
-                    // 1. state → Stopping (under the session_json_lock).
-                    {
-                        let _lock = sh.session_json_lock.lock().expect("session_json lock");
-                        let _ = crate::sessionmeta::set_state(
-                            &session_dir,
-                            crate::sessionmeta::State::Stopping,
-                        );
-                    }
-                    // 2. audit op lease / stage expired / client null / reason idle.
-                    sh.log("lease", "expired", None, None, Some("idle"), None);
-                    // 3. send SIGTERM to init.
-                    let _ = sys::kill(init_pid, libc::SIGTERM);
-                    // 4. wait for init to exit (poll up to 10 s), then SIGKILL.
-                    let mut exited = false;
-                    for _ in 0..100 {
-                        if unsafe { libc::kill(init_pid, 0) } != 0 {
-                            exited = true;
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    if !exited {
-                        let _ = sys::kill(init_pid, libc::SIGKILL);
-                        for _ in 0..50 {
-                            if unsafe { libc::kill(init_pid, 0) } != 0 {
-                                exited = true;
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                    }
-                    // 5. state → Stopped only if init is confirmed dead.
-                    if exited {
-                        let _lock = sh.session_json_lock.lock().expect("session_json lock");
-                        let _ = crate::sessionmeta::set_state(
-                            &session_dir,
-                            crate::sessionmeta::State::Stopped,
-                        );
-                    }
-                    break;
-                }
-                let _ = (has_clients, has_execs, now_secs, last);
-            }
+            let write_state = |state: crate::sessionmeta::State| {
+                let _lock = sh.session_json_lock.lock().expect("session_json lock");
+                crate::sessionmeta::set_state(&sh.session_dir, state)
+            };
+            crate::lifecycle::run_idle_timer(
+                &*sh,
+                &target,
+                &crate::lifecycle::SystemClock,
+                timeout_s,
+                crate::lifecycle::StopPlan::SUPERVISOR,
+                &write_state,
+            )
         }))
     } else {
         None
     };
     let code = relay_and_wait(pid, master, tty);
-    // The idle timer thread exits when init is killed.
-    if let Some(t) = idle_timer {
-        let _ = t.join();
-    }
+    // The idle timer thread exits when init is gone (by itself or because the
+    // timer stopped it); its result says whether this was an idle expiry.
+    let idle_expired_after = idle_timer.and_then(|t| t.join().ok().flatten());
 
     // Stop host services (DESIGN §17): signal + grace then KILL.
     // Check if the process is already gone before sleeping the full grace (P27).
@@ -2235,7 +2284,10 @@ fn run_session(
     control::drain(std::time::Duration::from_secs(2));
     // Cleanup order (DESIGN §10): close ns / mount fds first, then the dir.
     drop(shared);
-    Ok(code)
+    Ok(SessionEnd {
+        code,
+        idle_expired_after,
+    })
 }
 
 fn write_s_maps_and_unshare(uid: u32, gid: u32) -> Result<()> {
@@ -3003,51 +3055,5 @@ mod tests {
             vec![("/x".to_owned(), Mode::Rw), ("/y".to_owned(), Mode::Ro)]
         );
         assert!(p.roots.iter().any(|r| r.ends_with("hisn-1000")));
-    }
-
-    // F2 fix: the idle timer must not fire while a running exec is in the
-    // execs map. These tests use a fake clock to verify the predicate without
-    // needing real time or a real session.
-    #[test]
-    fn idle_timer_running_exec_prevents_fire() {
-        // A non-empty execs map means has_running_execs() returns true, so
-        // the idle predicate is false and the timer must not fire. We test
-        // the predicate directly: execs.is_empty() is the check.
-        let execs_empty = false; // simulates a non-empty execs map
-        let has_execs = !execs_empty;
-        let has_clients = false;
-        let idle = !has_clients && !has_execs;
-        assert!(!idle, "running exec must prevent idle fire");
-    }
-
-    #[test]
-    fn idle_timer_fires_only_after_exec_finishes() {
-        let execs_empty = true; // simulates an empty execs map
-        let has_execs = !execs_empty;
-        let has_clients = false;
-        let last_activity = 100;
-        let now = 103;
-        let timeout_s = 2u64;
-        let idle = !has_clients
-            && !has_execs
-            && last_activity > 0
-            && now > last_activity
-            && (now - last_activity) as u64 > timeout_s;
-        assert!(idle, "empty execs + no clients + time elapsed must fire");
-    }
-
-    #[test]
-    fn idle_timer_backward_clock_guard() {
-        let has_clients = false;
-        let has_execs = false;
-        let last_activity = 100;
-        let now = 50;
-        let timeout_s = 2u64;
-        let idle = !has_clients
-            && !has_execs
-            && last_activity > 0
-            && now > last_activity
-            && (now - last_activity) as u64 > timeout_s;
-        assert!(!idle, "backward clock must not fire");
     }
 }

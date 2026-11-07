@@ -12,6 +12,7 @@ pub mod execcli;
 pub mod grant;
 pub mod init;
 pub mod landlock;
+pub mod lifecycle;
 pub mod mounts;
 pub mod policy;
 pub mod profile;

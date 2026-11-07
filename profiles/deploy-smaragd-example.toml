@@ -6,7 +6,7 @@ version = "hisn-profile/v1"
 version = "hisn-policy/v1"
 session.cwd = "."
 session.network = "host"
-mounts.grantable_rw = ["/srv/out"]
+mounts.grantable_rw = ["/tmp/hisn-out"]   # example path: mkdir -p /tmp/hisn-out first (validate needs it to exist)
 
 [[forward]]
 name = "docker"

@@ -126,7 +126,7 @@ jobs:
           fi
           {
             echo
-            echo "The leak suite (L1-L45) passed on Ubuntu 22.04 and 24.04 x86_64 CI runners for this exact commit before these binaries were built; the aarch64 binary is built and started (\`--version\`) but has not been leak-tested. The glibc binaries (hisn-x86_64-linux-gnu, hisn-aarch64-linux-gnu) are dynamically linked and built natively on Ubuntu 22.04 (glibc 2.35 or newer required). The musl binary (hisn-x86_64-linux-musl) is statically linked. Verify with \`sha256sum -c SHA256SUMS\`. See README, \"Verifying a build\"."
+            echo "Leak suite: the portable subset runs in CI; host-only checks (user namespaces, rootfs, attach, leases) are verified on a real host before tagging — see the release notes for the host result. The aarch64 binary is built and started (\`--version\`) but has not been leak-tested. The glibc binaries (hisn-x86_64-linux-gnu, hisn-aarch64-linux-gnu) are dynamically linked and built natively on Ubuntu 22.04 (glibc 2.35 or newer required). The musl binary (hisn-x86_64-linux-musl) is statically linked. Verify with \`sha256sum -c SHA256SUMS\`. See README, \"Verifying a build\"."
           } >> notes.md
           cat notes.md
 

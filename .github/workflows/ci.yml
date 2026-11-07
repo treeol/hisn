@@ -53,6 +53,18 @@ jobs:
       - name: L8 comparator self-tests
         run: python3 tests/leak/test_l8.py
 
+      # The example profiles name a grantable_rw path that must exist (see the
+      # comment in each profile). Create it, then validate every profile.
+      - name: Build hisn and validate the example profiles
+        run: |
+          cargo build --locked
+          mkdir -p /tmp/hisn-out
+          ./target/debug/hisn profile validate profiles/*.toml
+
+      # The static musl binary is the release artefact; build it, not just lint it.
+      - name: cargo build (x86_64-unknown-linux-musl)
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+
       # Metadata check only; nothing is published.
       - name: cargo publish --dry-run
         run: cargo publish --dry-run --locked

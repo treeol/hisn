@@ -2,3 +2,7 @@ target/
 *.swp
 __pycache__/
 *.pyc
+# Working-process state, never part of the repo.
+.wakil/
+# Leak-suite and host-run output; committed logs are not kept (see CONTRIBUTING).
+docs/*.log

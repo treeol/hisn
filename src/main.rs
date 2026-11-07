@@ -278,16 +278,48 @@ fn ls(session_id: Option<&str>, json_out: bool, prune: bool) -> Result<ExitCode>
                     .iter()
                     .map(|(n, p, live)| {
                         let policy = read_session_policy(p);
+                        let meta = hisn::sessionmeta::read(p);
+                        let state = session_state_label(p, *live);
+                        let members: Vec<Value> = meta
+                            .as_ref()
+                            .map(|m| {
+                                m.members
+                                    .iter()
+                                    .map(|mem| {
+                                        json!({
+                                            "uid": mem.uid,
+                                            "label": mem.label,
+                                            "first_seen": mem.first_seen,
+                                            "last_seen": mem.last_seen,
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let lease = meta
+                            .as_ref()
+                            .and_then(|m| m.lease.as_ref())
+                            .map(|l| {
+                                json!({
+                                    "idle_timeout_s": l.idle_timeout_s,
+                                    "last_activity": l.last_activity,
+                                })
+                            })
+                            .unwrap_or(Value::Null);
                         json!({
                             "id": n,
-                            "state": if *live { "live" } else { "stale" },
+                            "state": state,
                             "cwd": policy.as_ref().map(|p| p["cwd"].clone()).unwrap_or(Value::Null),
                             "hostname": policy.as_ref().map(|p| p["hostname"].clone()).unwrap_or(Value::Null),
                             "network": policy.as_ref().map(|p| p["network"].clone()).unwrap_or(Value::Null),
+                            "name": meta.as_ref().and_then(|m| m.name.clone()).map(Value::String).unwrap_or(Value::Null),
+                            "rootfs": meta.as_ref().and_then(|m| m.rootfs.clone()).map(Value::String).unwrap_or(Value::Null),
                             "pid": Value::Null,
-                            "started": Value::Null,
+                            "started": meta.as_ref().map(|m| Value::String(m.created.ts.clone())).unwrap_or(Value::Null),
                             "execs": [],
                             "services": [],
+                            "members": members,
+                            "lease": lease,
                         })
                     })
                     .collect();
@@ -317,8 +349,18 @@ fn ls(session_id: Option<&str>, json_out: bool, prune: bool) -> Result<ExitCode>
                         .as_ref()
                         .map(|m| age_label(&m.created.ts))
                         .unwrap_or_else(|| "-".into());
-                    // CLIENTS and LEASE are filled in by steps 2 and 5.
-                    println!("{name}\t{n}\t{state}\t{cwd}\t{rootfs}\t{net}\t{age}\t-\t-");
+                    let clients = meta
+                        .as_ref()
+                        .map(|m| m.members.len().to_string())
+                        .unwrap_or_else(|| "0".into());
+                    let lease = meta
+                        .as_ref()
+                        .and_then(|m| m.lease.as_ref())
+                        .and_then(|l| l.idle_timeout_s.map(|s| format!("{s}s")))
+                        .unwrap_or_else(|| "-".into());
+                    println!(
+                        "{name}\t{n}\t{state}\t{cwd}\t{rootfs}\t{net}\t{age}\t{clients}\t{lease}"
+                    );
                 }
             }
             Ok(ExitCode::SUCCESS)

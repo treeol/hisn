@@ -321,6 +321,26 @@ pub fn rfc3339(secs: i64) -> String {
     )
 }
 
+/// Parse `YYYY-MM-DDTHH:MM:SSZ` (the form `rfc3339_now` writes) to epoch
+/// seconds. Returns `None` on any parse failure. Inverse of [`rfc3339`].
+pub fn parse_rfc3339_secs(ts: &str) -> Option<i64> {
+    let b = ts.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[10] != b'T' {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| ts.get(r)?.parse::<i64>().ok();
+    let (y, mo, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (h, mi, se) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    let y2 = if mo <= 2 { y - 1 } else { y };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + mi * 60 + se)
+}
+
 /// Is `path` a socket we can connect to (a live supervisor)?
 pub fn is_live(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path.join("control.sock")).is_ok()

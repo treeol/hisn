@@ -77,3 +77,6 @@ L50: getent resolves
 L51
 L51: names.json not readable from a session
 L51: names.lock not writable from a session
+L56
+L57
+L58

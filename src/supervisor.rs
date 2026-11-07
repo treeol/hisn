@@ -153,6 +153,11 @@ struct Shared {
     recycled_pids: Mutex<std::collections::BTreeSet<i32>>,
     /// In-sandbox services (DESIGN §19): name → state for `ls --json`.
     services: Mutex<std::collections::BTreeMap<String, ServiceState>>,
+    /// The session directory on the host (for `session.json` member writes).
+    session_dir: std::path::PathBuf,
+    /// Last `last_seen` timestamp written to `session.json` for the rate
+    /// limit (60 s). Keyed by uid. Protected by `members_lock`.
+    members_lock: Mutex<std::collections::BTreeMap<u32, String>>,
 }
 
 /// The state of an in-sandbox service for `ls --json` (DESIGN §19).
@@ -183,11 +188,30 @@ impl Shared {
         }
     }
 
-    /// Record a request's client in the in-memory members list. Persisting
-    /// `session.json` members is rate-limited and lands with the metadata
-    /// write (0.4.0 step 3, follow-up).
+    /// Record a request's client in the `session.json` members list
+    /// (append-only, with a 60 s `last_seen` rate limit).
     fn record_member(&self, client: &authz::ClientRecord) {
-        let _ = client;
+        let now = crate::session::rfc3339_now();
+        // Rate limit: only write if the stored last_seen for this uid is
+        // absent or more than 60 s old.
+        let should_write = {
+            let ml = self.members_lock.lock().expect("members lock");
+            match ml.get(&client.uid) {
+                None => true,
+                Some(stored) => {
+                    let stored_secs = crate::session::parse_rfc3339_secs(stored).unwrap_or(0);
+                    let now_secs = crate::session::parse_rfc3339_secs(&now).unwrap_or(0);
+                    now_secs - stored_secs >= 60
+                }
+            }
+        };
+        if !should_write {
+            return;
+        }
+        let _ =
+            crate::sessionmeta::record_member(&self.session_dir, client.uid, &client.label, &now);
+        let mut ml = self.members_lock.lock().expect("members lock");
+        ml.insert(client.uid, now);
     }
 
     /// Audit a line that carries the client record and the authz decision.
@@ -1686,6 +1710,8 @@ fn run_session(
         used_pids: Mutex::new(Default::default()),
         recycled_pids: Mutex::new(Default::default()),
         services: Mutex::new(Default::default()),
+        session_dir: sdir.path.clone(),
+        members_lock: Mutex::new(Default::default()),
     });
     // The only way to start `network = "host"` without abstract-socket
     // scoping is the explicit flag; it is audited (DESIGN §7, B1).

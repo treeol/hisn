@@ -10,7 +10,8 @@
 //! - `crashed`:  reported by `ls`, never written: dir present, supervisor
 //!   dead, state not `stopped` (what `session::is_stale` detects).
 //!
-//! `members` (append-only) and `lease` are filled in by later 0.4.0 steps.
+//! `members` (append-only, 0.4.0 step 3) and `lease` (step 5) are optional so
+//! old `session.json` files load unchanged when the fields are absent.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -57,6 +58,24 @@ pub struct Created {
     pub by: String,
 }
 
+/// A client that has attached or exec'd into the session. Append-only in
+/// `session.json`; `last_seen` is updated at most once per 60 s (step 3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Member {
+    pub uid: u32,
+    pub label: String,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+/// Lease state for idle expiry (step 5). Absent on sessions created before
+/// the lease field existed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Lease {
+    pub idle_timeout_s: Option<u64>,
+    pub last_activity: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionMeta {
     pub schema: String,
@@ -68,6 +87,10 @@ pub struct SessionMeta {
     pub rootfs: Option<String>,
     pub network: String,
     pub state: State,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<Member>,
+    #[serde(default, skip_serializing_if = "Option::is_none", skip_serializing)]
+    pub lease: Option<Lease>,
 }
 
 impl SessionMeta {
@@ -85,6 +108,8 @@ impl SessionMeta {
             rootfs: None,
             network: network.into(),
             state: State::Creating,
+            members: Vec::new(),
+            lease: None,
         }
     }
 
@@ -111,9 +136,35 @@ pub fn read(dir: &Path) -> Option<SessionMeta> {
 pub fn set_state(dir: &Path, state: State) -> std::io::Result<()> {
     let mut m = read(dir).ok_or_else(|| std::io::Error::other("session.json missing"))?;
     m.state = state;
+    rewrite(dir, &m)
+}
+
+/// Record a client in the members list. Append if unseen; otherwise update
+/// `last_seen` and `label`. The caller is responsible for the 60 s rate
+/// limit — this function always writes if called.
+pub fn record_member(dir: &Path, uid: u32, label: &str, now: &str) -> std::io::Result<()> {
+    let mut m = read(dir).ok_or_else(|| std::io::Error::other("session.json missing"))?;
+    if let Some(mem) = m.members.iter_mut().find(|mem| mem.uid == uid) {
+        mem.last_seen = now.to_owned();
+        if mem.label != label {
+            mem.label = label.to_owned();
+        }
+    } else {
+        m.members.push(Member {
+            uid,
+            label: label.to_owned(),
+            first_seen: now.to_owned(),
+            last_seen: now.to_owned(),
+        });
+    }
+    rewrite(dir, &m)
+}
+
+/// Atomically rewrite `session.json` (write temp, fsync, rename).
+fn rewrite(dir: &Path, m: &SessionMeta) -> std::io::Result<()> {
     let tmp = dir.join(".session.json.tmp");
     let _ = fs::remove_file(&tmp);
-    let body = serde_json::to_string_pretty(&m).map_err(std::io::Error::other)?;
+    let body = serde_json::to_string_pretty(m).map_err(std::io::Error::other)?;
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -157,5 +208,48 @@ mod tests {
     fn state_names_are_the_documented_set() {
         assert_eq!(State::Creating.as_str(), "creating");
         assert_eq!(State::Crashed.as_str(), "crashed");
+    }
+
+    #[test]
+    fn record_member_appends_and_updates() {
+        let d = std::env::temp_dir().join(format!("hisn-member-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let m = SessionMeta::new("abc", Some("nm"), owner(), "/w", "host");
+        m.write_to(&d).unwrap();
+        // No members initially.
+        assert!(read(&d).unwrap().members.is_empty());
+        // First client: appended.
+        record_member(&d, 1000, "local", "2026-11-07T12:00:00Z").unwrap();
+        let m1 = read(&d).unwrap();
+        assert_eq!(m1.members.len(), 1);
+        assert_eq!(m1.members[0].uid, 1000);
+        assert_eq!(m1.members[0].label, "local");
+        assert_eq!(m1.members[0].first_seen, "2026-11-07T12:00:00Z");
+        // Same uid: updated, not appended.
+        record_member(&d, 1000, "local", "2026-11-07T12:01:00Z").unwrap();
+        let m2 = read(&d).unwrap();
+        assert_eq!(m2.members.len(), 1);
+        assert_eq!(m2.members[0].last_seen, "2026-11-07T12:01:00Z");
+        // Different uid: appended.
+        record_member(&d, 1001, "uid:1001", "2026-11-07T12:02:00Z").unwrap();
+        let m3 = read(&d).unwrap();
+        assert_eq!(m3.members.len(), 2);
+        assert_eq!(m3.members[1].uid, 1001);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn old_json_without_members_loads() {
+        let d = std::env::temp_dir().join(format!("hisn-old-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        // Write a session.json without members or lease (as 0.3 wrote it).
+        let old = r#"{"schema":"hisn-session/v1","id":"abc","name":"nm","owner":{"uid":1000,"label":"local","client_id":"c1"},"created":{"ts":"2026-11-07T12:00:00Z","by":"local"},"cwd":"/w","rootfs":null,"network":"host","state":"running"}"#;
+        fs::write(d.join(FILE), old).unwrap();
+        let m = read(&d).unwrap();
+        assert_eq!(m.members, Vec::new());
+        assert_eq!(m.lease, None);
+        fs::remove_dir_all(&d).unwrap();
     }
 }

@@ -19,6 +19,7 @@ pub mod rootfs_import;
 pub mod rootfs_store;
 pub mod seccomp;
 pub mod session;
+pub mod sessionmeta;
 pub mod sig;
 pub mod ssh_agent;
 pub mod supervisor;

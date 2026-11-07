@@ -102,6 +102,10 @@ pub struct RunArgs {
     /// Session id (default: random).
     #[arg(long)]
     pub session_id: Option<String>,
+    /// Human name for the session (unique per user; letters, digits, '.',
+    /// '_', '-', no leading '.'). Use it with --session everywhere.
+    #[arg(long)]
+    pub name: Option<String>,
     /// Network mode override.
     #[arg(long, value_enum)]
     pub network: Option<NetworkArg>,

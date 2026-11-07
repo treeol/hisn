@@ -47,6 +47,14 @@ pub fn pick_root(roots: &[PathBuf]) -> PathBuf {
         .unwrap_or_else(|| roots.last().cloned().expect("at least one root"))
 }
 
+/// Label for the local client: the login name, or "local" if none resolves.
+pub fn local_label() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "local".into())
+}
+
 pub fn random_id() -> io::Result<String> {
     use std::io::Read;
     let mut b = [0u8; 6];
@@ -102,6 +110,41 @@ impl SessionDir {
         Ok(Self {
             id: id.into(),
             path,
+        })
+    }
+
+    /// Create `<root>/.tmp-<id>` (0700). The session is not visible to
+    /// `find_session`/`list_sessions` until `publish` renames it to `<id>`.
+    pub fn create_tmp(root: &Path, uid: u32, id: &str) -> Result<Self, SessionError> {
+        if !is_valid_session_id(id) {
+            return Err(SessionError::BadId(id.into()));
+        }
+        ensure_root(root, uid)?;
+        let path = root.join(format!(".tmp-{id}"));
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(SessionError::Exists(id.into()));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(Self {
+            id: id.into(),
+            path,
+        })
+    }
+
+    /// Atomically publish a `.tmp-<id>` directory as `<id>`. Fails if the
+    /// final name already exists (never replaces a live session).
+    pub fn publish(self, root: &Path) -> Result<Self, SessionError> {
+        let final_path = root.join(&self.id);
+        if fs::symlink_metadata(&final_path).is_ok() {
+            return Err(SessionError::Exists(self.id.clone()));
+        }
+        fs::rename(&self.path, &final_path)?;
+        Ok(Self {
+            id: self.id.clone(),
+            path: final_path,
         })
     }
 
@@ -585,6 +628,48 @@ mod tests {
         // Second write fails (create_new).
         assert!(s.write_supervisor_pid(my_pid).is_err());
         assert_eq!(fs::metadata(s.pid_path()).unwrap().mode() & 0o777, 0o600);
+    }
+
+    /// Step 1b: a `.tmp-<id>` directory is never a session. It must not be
+    /// listed or found, even though its name is a valid id shape.
+    #[test]
+    fn tmp_publication_dir_is_invisible_until_published() {
+        let root = std::env::temp_dir().join(format!("hisn-pub-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let uid = fs::metadata(&root).unwrap().uid();
+        let tmp = SessionDir::create_tmp(&root, uid, "pubid").unwrap();
+        assert!(tmp.path.ends_with(".tmp-pubid"));
+        // Crash injection: the tmp dir exists, nothing is published.
+        assert!(list_sessions(std::slice::from_ref(&root)).is_empty());
+        assert!(find_session(std::slice::from_ref(&root), "pubid").is_err());
+        // Publication makes it visible under the final id.
+        let done = tmp.publish(&root).unwrap();
+        assert!(done.path.ends_with("pubid"));
+        assert_eq!(list_sessions(std::slice::from_ref(&root)).len(), 1);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Publication never replaces a session already at the final name.
+    #[test]
+    fn publish_refuses_existing_final_name() {
+        let root = std::env::temp_dir().join(format!("hisn-pub2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let uid = fs::metadata(&root).unwrap().uid();
+        fs::create_dir(root.join("taken")).unwrap();
+        let tmp = SessionDir::create_tmp(&root, uid, "taken").unwrap();
+        assert!(matches!(tmp.publish(&root), Err(SessionError::Exists(_))));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A leading '.' is refused as a session id (reserved for `.tmp-`).
+    #[test]
+    fn dot_prefixed_ids_are_refused() {
+        assert!(!is_valid_session_id(".tmp-x"));
+        assert!(is_valid_session_id("ab12cd"));
     }
 
     #[test]

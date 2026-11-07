@@ -38,6 +38,7 @@ use crate::mounts::{self, HostFacts};
 use crate::policy::{Network, Overrides, Policy, ResolvedPolicy, is_valid_session_id};
 use crate::profile::{self, Profile as ProfileDoc};
 use crate::session::{self, Audit, SessionDir};
+use crate::sessionmeta;
 use crate::{seccomp, sig, sys};
 
 // ---------------------------------------------------------------- R5 decision
@@ -1206,7 +1207,57 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
             bail!("session {id} already exists");
         }
     }
-    let sdir = SessionDir::create(&root, uid, &id)?;
+    // 0.4.0 step 1b: reserve the name (per-user registry, /tmp root), build
+    // the session in `.tmp-<id>`, then publish it with one rename. A failure
+    // before publication removes the tmp dir and releases the name.
+    let reg_root = crate::registry::registry_root(uid);
+    let name = args.name.clone();
+    if let Some(n) = &name {
+        let _lock = crate::registry::Lock::take(&reg_root, uid)?;
+        crate::registry::reserve(&reg_root, &prep.roots, n, &id).map_err(anyhow::Error::from)?;
+    }
+    let tmp = match SessionDir::create_tmp(&root, uid, &id) {
+        Ok(t) => t,
+        Err(e) => {
+            if let Some(n) = &name {
+                let _lock = crate::registry::Lock::take(&reg_root, uid)?;
+                let _ = crate::registry::release(&reg_root, n);
+            }
+            return Err(e.into());
+        }
+    };
+    let owner = sessionmeta::Owner {
+        uid,
+        label: crate::session::local_label(),
+        client_id: String::new(),
+    };
+    let prepared = (|| -> Result<()> {
+        if let Some(n) = &name {
+            crate::registry::write_name_file(&tmp.path, n)?;
+        }
+        sessionmeta::SessionMeta::new(
+            &id,
+            name.as_deref(),
+            owner,
+            &policy.cwd.to_string_lossy(),
+            match policy.network {
+                Network::None => "none",
+                Network::Host => "host",
+            },
+        )
+        .write_to(&tmp.path)?;
+        Ok(())
+    })();
+    if let Err(e) = prepared {
+        tmp.remove();
+        if let Some(n) = &name {
+            let _lock = crate::registry::Lock::take(&reg_root, uid)?;
+            let _ = crate::registry::release(&reg_root, n);
+        }
+        return Err(e);
+    }
+    let sdir = tmp.publish(&root)?;
+    let _ = sessionmeta::set_state(&sdir.path, sessionmeta::State::Running);
     let result = run_session(
         &args,
         policy,
@@ -1227,6 +1278,12 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         &id,
     );
     sdir.remove();
+    // Release the name when the session is removed (step 1b). A crashed
+    // session keeps its name until `ls --prune` (step 1c) repairs the index.
+    if let Some(n) = &name {
+        let _lock = crate::registry::Lock::take(&reg_root, uid)?;
+        let _ = crate::registry::release(&reg_root, n);
+    }
     result
 }
 
@@ -2447,6 +2504,7 @@ mod tests {
             profile: None,
             cwd: Some(cwd.clone()),
             session_id: None,
+            name: None,
             network: Some(crate::cli::NetworkArg::Host),
             allow_host_abstract_sockets: false,
             quiet_risk: false,

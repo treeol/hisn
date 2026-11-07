@@ -287,10 +287,11 @@ pub fn is_valid_hostname(s: &str) -> bool {
 
 /// Session ids become directory names: `[A-Za-z0-9._-]{1,64}`, not `.`/`..`.
 pub fn is_valid_session_id(s: &str) -> bool {
+    // A leading '.' is reserved for in-progress `.tmp-<id>` publication
+    // directories (0.4.0), so no session id may begin with one.
     !s.is_empty()
         && s.len() <= 64
-        && s != "."
-        && s != ".."
+        && !s.starts_with('.')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }

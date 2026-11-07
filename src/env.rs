@@ -180,6 +180,36 @@ mod tests {
     }
 
     #[test]
+    fn run_env_composition_keeps_env_pass_and_declared() {
+        // 0.4.0 L4 regression: the main command started by `hisn run` must
+        // see the policy's env.pass variables AND the --env declared keys,
+        // in the same composition run_session uses: scrub base (which folds
+        // env_pass and env_set) < declared < computed (computed are inside
+        // the scrub base). Precedence is asserted too: a declared key beats
+        // the scrub base, computed names are never overridable.
+        // HOST has no X; env_pass forwards only what the host actually set,
+        // so use a host that has it (as the leak harness sets
+        // HISN_LEAK_PASSED on the `hisn run` invocation).
+        let host_x: Vec<(&str, &str)> = HOST
+            .iter()
+            .copied()
+            .chain(std::iter::once(("X", "x")))
+            .collect();
+        let e = scrub(&pol(&["X"], &[]), host_x, "alice", visible);
+        assert_eq!(e.vars["X"], "x");
+        // The exec_rules/base_env step: declared keys are inserted on top.
+        let mut base = e.vars.clone();
+        for (k, v) in [("Y", "declared"), ("X", "overridden")] {
+            base.insert(k.into(), v.into());
+        }
+        assert_eq!(base["X"], "overridden", "declared wins over scrub base");
+        assert_eq!(base["Y"], "declared");
+        // Computed names stay computed.
+        assert_eq!(base["HOME"], "/run/hisn/home");
+        assert_eq!(base["USER"], "alice");
+    }
+
+    #[test]
     fn host_secrets_not_in_pass_are_absent() {
         let e = scrub(&pol(&["GOFLAGS"], &[]), HOST, "alice", visible);
         for gone in [

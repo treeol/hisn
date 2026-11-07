@@ -101,18 +101,25 @@ start_session() {
   local name=$1 cwd=$2 pol=$3
   shift 3
   S_LOG="$WORK/$name.log"
-  # The extra arguments are kept for both branches. `--detach` is tested on
-  # the first extra argument (set -u safe: the loop never reads an unset $1).
+  # The extra arguments are scanned for `--detach` (set -u safe; the loop
+  # never reads an unset positional). Extra arguments other than --detach are
+  # forwarded to `hisn run` in BOTH branches.
   local detach=0 a
   for a in "$@"; do
     [ "$a" = "--detach" ] && detach=1
+  done
+  # Drop --detach from the forwarded args: `hisn run --detach` takes no
+  # command, and the flag itself is added explicitly in that branch.
+  local fwd=()
+  for a in "$@"; do
+    [ "$a" = "--detach" ] || fwd+=("$a")
   done
   # --detach: start the session with no command (a detached seat). The
   # caller then uses `hisn exec` to run commands in it.
   if [ "$detach" -eq 1 ]; then
     HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
       HISN_LEAK_PASSED=visible-ok \
-      "$HISN" run --policy "$pol" --session-id "$name" --detach \
+      "$HISN" run --policy "$pol" --session-id "$name" --detach "${fwd[@]+"${fwd[@]}"}" \
       </dev/null >"$S_LOG.out" 2>"$S_LOG" &
   else
     HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
@@ -1630,7 +1637,10 @@ start_profile_session() {
   local name=$1 cwd=$2 prof=$3
   shift 3
   S_LOG="$WORK/$name.log"
-  HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 \
+  # HISN_LEAK_PASSED is set like start_session so env.pass assertions on a
+  # profile session work (SSH_AUTH_SOCK is deliberately NOT overridden —
+  # L45 hands the session a real throwaway agent).
+  HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 HISN_LEAK_PASSED=visible-ok \
     "$HISN" run --profile "$prof" --session-id "$name" "$@" -- "$cwd/leakprobe" loop "$cwd/ctl" \
     </dev/null >"$S_LOG.out" 2>"$S_LOG" &
   S_PID=$!

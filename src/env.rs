@@ -48,6 +48,32 @@ pub fn looks_secret(name: &str) -> bool {
     SECRETISH.iter().any(|s| up.contains(s))
 }
 
+/// Compose the session environment from the scrub base, the SSH agent
+/// injection and the declared `--env` snapshot (0.4.0 step 4). This is the
+/// single composition used for BOTH the main command (`InitConfig.env`)
+/// and every exec/attach (`ExecRules.base_env`) — one function, so the run
+/// path and the exec path cannot drift apart.
+///
+/// Precedence, lowest to highest: scrub base (which folds `env_pass`,
+/// `env_set` and the computed names) < declared `--env` keys. Computed
+/// names in `declared` cannot occur: `run()` refuses them at parse time
+/// (`is_computed`), which is the actual guard — the composition itself
+/// would overwrite; keep both.
+pub fn compose_session_env(
+    scrub: ScrubbedEnv,
+    ssh_sock: Option<&str>,
+    declared: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut vars = scrub.vars;
+    if let Some(sock) = ssh_sock {
+        vars.insert("SSH_AUTH_SOCK".into(), sock.to_owned());
+    }
+    for (k, v) in declared {
+        vars.insert(k.clone(), v.clone());
+    }
+    vars
+}
+
 /// Keep `PATH` entries that point into a tree mounted in the sandbox
 /// (`visible(path)`); fall back to [`DEFAULT_PATH`] if none survive.
 pub fn filter_path(host_path: Option<&str>, visible: impl Fn(&Path) -> bool) -> String {
@@ -181,32 +207,57 @@ mod tests {
 
     #[test]
     fn run_env_composition_keeps_env_pass_and_declared() {
-        // 0.4.0 L4 regression: the main command started by `hisn run` must
-        // see the policy's env.pass variables AND the --env declared keys,
-        // in the same composition run_session uses: scrub base (which folds
-        // env_pass and env_set) < declared < computed (computed are inside
-        // the scrub base). Precedence is asserted too: a declared key beats
-        // the scrub base, computed names are never overridable.
-        // HOST has no X; env_pass forwards only what the host actually set,
-        // so use a host that has it (as the leak harness sets
-        // HISN_LEAK_PASSED on the `hisn run` invocation).
+        // Locks env::compose_session_env - the ONE composition used for both
+        // the main command (InitConfig.env) and every exec/attach
+        // (ExecRules.base_env) - so the run path and the exec path cannot
+        // drift apart. Precedence: scrub base (env_pass, env_set, computed)
+        // < SSH_AUTH_SOCK < declared --env keys.
         let host_x: Vec<(&str, &str)> = HOST
             .iter()
             .copied()
-            .chain(std::iter::once(("X", "x")))
+            .chain(std::iter::once(("X", "host-x")))
+            .chain(std::iter::once(("KEEP", "keep")))
             .collect();
-        let e = scrub(&pol(&["X"], &[]), host_x, "alice", visible);
-        assert_eq!(e.vars["X"], "x");
-        // The exec_rules/base_env step: declared keys are inserted on top.
-        let mut base = e.vars.clone();
-        for (k, v) in [("Y", "declared"), ("X", "overridden")] {
-            base.insert(k.into(), v.into());
+        // env_pass = [X, KEEP], env_set = {LIT: "lit", SETX: "set-x"}.
+        let e = scrub(
+            &pol(&["X", "KEEP"], &[("LIT", "lit"), ("SETX", "set-x")]),
+            host_x,
+            "alice",
+            visible,
+        );
+        assert_eq!(e.vars["X"], "host-x");
+        assert_eq!(e.vars["KEEP"], "keep");
+        let declared = BTreeMap::from([
+            ("Y".to_string(), "declared".to_string()),
+            ("X".to_string(), "overridden".to_string()),
+            ("LIT".to_string(), "declared-lit".to_string()),
+        ]);
+        let env = compose_session_env(e, Some("/run/ssh-agent.sock"), &declared);
+        // Declared beats both env_pass pass-through and env_set literals.
+        assert_eq!(env["X"], "overridden");
+        assert_eq!(env["LIT"], "declared-lit");
+        // An untouched env_pass key survives alongside the declared keys.
+        assert_eq!(env["KEEP"], "keep");
+        assert_eq!(env["SETX"], "set-x");
+        assert_eq!(env["Y"], "declared");
+        // The SSH injection is present and beats the host's SSH_AUTH_SOCK
+        // (which scrub would have excluded anyway).
+        assert_eq!(env["SSH_AUTH_SOCK"], "/run/ssh-agent.sock");
+        // Computed names stay computed (scrub step 4).
+        assert_eq!(env["HOME"], SANDBOX_HOME);
+        assert_eq!(env["USER"], "alice");
+        // The production guard for computed names: run() refuses to declare
+        // them (is_computed) because compose_session_env itself would
+        // overwrite - demonstrated so the guard is understood to be
+        // load-bearing.
+        for computed in ["HOME", "USER", "LOGNAME", "PIP_CACHE_DIR"] {
+            assert!(is_computed(computed), "{computed} must be computed");
         }
-        assert_eq!(base["X"], "overridden", "declared wins over scrub base");
-        assert_eq!(base["Y"], "declared");
-        // Computed names stay computed.
-        assert_eq!(base["HOME"], "/run/hisn/home");
-        assert_eq!(base["USER"], "alice");
+        let bad = BTreeMap::from([("HOME".to_string(), "/evil".to_string())]);
+        let e2 = scrub(&pol(&[], &[]), HOST, "alice", visible);
+        let env2 = compose_session_env(e2, None, &bad);
+        assert_eq!(env2["HOME"], "/evil");
+        // And that is exactly why run() refuses computed declarations.
     }
 
     #[test]

@@ -1706,7 +1706,7 @@ fn run_session(
             .any(|t| p.starts_with(t))
             || p.starts_with(&policy.cwd)
     };
-    let mut scrub = senv::scrub(
+    let scrub = senv::scrub(
         &policy,
         host_env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         username,
@@ -1720,6 +1720,7 @@ fn run_session(
     // and SSH_AUTH_SOCK is set in the scrubbed env.
     let mut ssh_proxy_listener: Option<UnixListener> = None;
     let ssh_agent_expose = "/run/ssh-agent.sock";
+    let mut ssh_sock_expose: Option<&str> = None;
     if let Some(ssh_cfg) = ssh
         && ssh_cfg.agent
     {
@@ -1730,26 +1731,24 @@ fn run_session(
         ssh_proxy_listener = Some(
             crate::ssh_agent::bind_proxy_socket(&proxy_socket_path).context("ssh-agent proxy")?,
         );
-        // Inject SSH_AUTH_SOCK into the scrubbed env. The proxy socket is
-        // forwarded into the sandbox at ssh_agent_expose after init is ready.
-        scrub
-            .vars
-            .insert("SSH_AUTH_SOCK".into(), ssh_agent_expose.to_string());
+        // The proxy socket is forwarded into the sandbox at
+        // ssh_agent_expose after init is ready; SSH_AUTH_SOCK is injected
+        // into the session env by compose_session_env below.
+        ssh_sock_expose = Some(ssh_agent_expose);
     }
 
     for n in &scrub.secretish_passed {
         eprintln!("hisn: warning: env.pass forwards {n}, which looks like a secret");
     }
 
-    // 0.4.0 step 4: the session env snapshot is applied on top of the
-    // scrub base, below computed vars (scrub already has computed vars;
-    // declared_env cannot name computed names — checked at run).
-    for (k, v) in declared_env {
-        scrub.vars.insert(k.clone(), v.clone());
-    }
+    // 0.4.0 step 4: ONE composition for the main command and every
+    // exec/attach (env::compose_session_env, unit-tested): scrub base
+    // (env_pass, env_set, computed) < SSH_AUTH_SOCK < declared --env keys.
+    // Computed names cannot appear in declared_env — run() refuses them.
+    let session_env = crate::env::compose_session_env(scrub, ssh_sock_expose, declared_env);
     let exec_rules = ExecRules {
         env_pass: policy.env_pass.clone(),
-        base_env: scrub.vars.clone(),
+        base_env: session_env.clone(),
         default_cwd: policy.cwd.display().to_string(),
         declared_env: declared_env.keys().cloned().collect(),
     };
@@ -1768,7 +1767,7 @@ fn run_session(
         seccomp: seccomp_progs,
         root_dir,
         argv: args.command.clone(),
-        env: scrub.vars,
+        env: session_env,
         use_pty: tty,
         detach: args.detach,
         uid,

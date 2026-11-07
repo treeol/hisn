@@ -1,6 +1,6 @@
 # ADR 0013 — Session `resolv.conf` precedence for `network = "host"` (0.3.3)
 
-Status: accepted. Date: 2026-11-06. Context: 0.3.3 review (commits
+Status: accepted. Date: 2026-11-06. Origin: the 0.3.3 review (commits
 `4ee66fc`, `0afadf3`); code in `src/mounts.rs` (`build_resolv_conf_ordered`,
 `read_image_resolv_conf`).
 

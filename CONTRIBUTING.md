@@ -10,12 +10,13 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test                       # unit tests
 python3 tests/leak/test_l8.py    # leak-comparator self-tests
-hisn profile validate profiles/*.toml   # examples; needs /tmp/hisn-out (see the profile comments)
+for f in profiles/*.toml; do target/debug/hisn profile validate "$f" || exit 1; done   # needs /tmp/hisn-out
 make leaktest                    # the leak suite; needs unprivileged user namespaces
 ```
 
 `make lint` and `make test` run the first four. CI runs the same, plus clippy
-for aarch64 and musl, a musl build, and the example-profile check.
+for aarch64 and musl, a musl build, the example-profile check, and
+`cargo publish --dry-run`.
 
 ## Changes that need a host leak log
 

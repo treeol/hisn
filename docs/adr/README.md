@@ -19,7 +19,7 @@ note in the same file.
 | [0009](0009-persistent-home.md) | accepted | `[home] persist` binds a host directory as the session `$HOME`. |
 | [0010](0010-rootfs-and-import.md) | accepted | A read-only rootfs replaces the host toolchain dirs; `hisn rootfs import` publishes it atomically. |
 | [0011](0011-ssh-agent-t1.md) | accepted | SSH agent T1 is a filtering proxy: it signs but never adds, removes or extracts keys. |
-| [0012](0012-ro-src-dst-mounts.md) | accepted | `mounts.ro` accepts `src:dst` read-only binds, with `/etc` sources refused. |
+| [0012](0012-ro-src-dst-mounts.md) | accepted | `mounts.ro` accepts `src:dst` read-only binds; a `src` under `/etc` is refused. |
 | [0013](0013-rootfs-resolver-precedence.md) | accepted | On `network = "host"`, `resolv.conf` comes from the host first and the rootfs file is the last resort. |
 
 Status `proposed` means the record was written as a design and has not been

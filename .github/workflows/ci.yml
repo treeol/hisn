@@ -59,7 +59,8 @@ jobs:
         run: |
           cargo build --locked
           mkdir -p /tmp/hisn-out
-          ./target/debug/hisn profile validate profiles/*.toml
+          # profile validate takes one file: check each one, fail on the first error.
+          for f in profiles/*.toml; do ./target/debug/hisn profile validate "$f" >/dev/null || { echo "::error::$f failed validation"; exit 1; }; done
 
       # The static musl binary is the release artefact; build it, not just lint it.
       - name: cargo build (x86_64-unknown-linux-musl)

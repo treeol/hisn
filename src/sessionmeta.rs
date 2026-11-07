@@ -146,16 +146,18 @@ pub fn set_state(dir: &Path, state: State) -> std::io::Result<()> {
     rewrite(dir, &m)
 }
 
-/// Record a client in the members list. Append if unseen; otherwise update
-/// `last_seen` and `label`. The caller is responsible for the 60 s rate
-/// limit — this function always writes if called.
+/// Record a client in the members list. Append if (uid, label) unseen;
+/// otherwise update `last_seen`. F8: members are keyed by (uid, label),
+/// not uid alone — two clients with the same uid but different labels
+/// are two members. The caller is responsible for the 60 s rate limit.
 pub fn record_member(dir: &Path, uid: u32, label: &str, now: &str) -> std::io::Result<()> {
     let mut m = read(dir).ok_or_else(|| std::io::Error::other("session.json missing"))?;
-    if let Some(mem) = m.members.iter_mut().find(|mem| mem.uid == uid) {
+    if let Some(mem) = m
+        .members
+        .iter_mut()
+        .find(|mem| mem.uid == uid && mem.label == label)
+    {
         mem.last_seen = now.to_owned();
-        if mem.label != label {
-            mem.label = label.to_owned();
-        }
     } else {
         m.members.push(Member {
             uid,
@@ -353,6 +355,29 @@ mod tests {
             back.lease.as_ref().unwrap().last_activity.as_deref(),
             Some("2026-11-07T12:00:05Z")
         );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn two_labels_same_uid_are_two_members() {
+        // F8: members are keyed by (uid, label), not uid alone.
+        let d = std::env::temp_dir().join(format!("hisn-f8-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let m = SessionMeta::new("abc", None, owner(), "/w", "none");
+        m.write_to(&d).unwrap();
+        record_member(&d, 1000, "local", "2026-11-07T12:00:00Z").unwrap();
+        record_member(&d, 1000, "wakil@rubin", "2026-11-07T12:00:01Z").unwrap();
+        let back = read(&d).unwrap();
+        assert_eq!(
+            back.members.len(),
+            2,
+            "two labels same uid should be two members"
+        );
+        assert_eq!(back.members[0].uid, 1000);
+        assert_eq!(back.members[0].label, "local");
+        assert_eq!(back.members[1].uid, 1000);
+        assert_eq!(back.members[1].label, "wakil@rubin");
         fs::remove_dir_all(&d).unwrap();
     }
 }

@@ -107,20 +107,33 @@ start_session() {
   for a in "$@"; do
     [ "$a" = "--detach" ] && detach=1
   done
-  HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
-    HISN_LEAK_PASSED=visible-ok
   # --detach: start the session with no command (a detached seat). The
   # caller then uses `hisn exec` to run commands in it.
   if [ "$detach" -eq 1 ]; then
-    "$HISN" run --policy "$pol" --session-id "$name" --detach \
+    HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
+      HISN_LEAK_PASSED=visible-ok \
+      "$HISN" run --policy "$pol" --session-id "$name" --detach \
       </dev/null >"$S_LOG.out" 2>"$S_LOG" &
   else
-    "$HISN" run --policy "$pol" --session-id "$name" "$@" -- "$cwd/leakprobe" loop "$cwd/ctl" \
+    HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
+      HISN_LEAK_PASSED=visible-ok \
+      "$HISN" run --policy "$pol" --session-id "$name" "$@" -- "$cwd/leakprobe" loop "$cwd/ctl" \
       </dev/null >"$S_LOG.out" 2>"$S_LOG" &
   fi
   S_PID=$!
   SESSIONS+=("$S_PID")
   local i
+  if [ "$detach" -eq 1 ]; then
+    # A detached session runs no leakprobe: there is no ready file. Wait
+    # for the session to appear in hisn ls --json instead.
+    for i in $(seq 1 150); do
+      "$HISN" ls --json 2>/dev/null | grep -q "\"$name\"" && return 0
+      kill -0 "$S_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+    echo "session $name did not appear; hisn said:"; sed 's/^/    /' "$S_LOG"
+    return 1
+  fi
   for i in $(seq 1 150); do
     [ -e "$cwd/ctl/ready" ] && return 0
     kill -0 "$S_PID" 2>/dev/null || break
@@ -2438,15 +2451,19 @@ fi
 # record (peer pid in the `pid_peer` field).
 L58_AUDIT="$WORK/main-audit.jsonl"
 # Trigger an R5 refusal from inside the session (peer in sandbox pidns).
+# NOTE: an exec'd `hisn ls` cannot actually reach the control socket — the
+# runtime dir is not mounted inside the sandbox (L11) and /tmp is private,
+# so the in-sandbox client finds no session dir and never connects. The exec
+# below still exercises the path (and documents the reachability); a real
+# R5 refusal needs a peer in the sandbox pidns, which unprivileged tooling
+# cannot produce (the L14 weak note covers R5 by unit tests).
 if needs_host; then
   L58_CWD=$(new_cwd l58)
   L58_POL="$WORK/l58.toml"
   write_policy "$L58_POL" "$L58_CWD"
   if start_session l58-$$ "$L58_CWD" "$L58_POL"; then
-    # From inside the session, `hisn ls` connects to the control socket.
-    # The peer is the supervisor's child (in the sandbox pidns), so R5
-    # refuses it with an `auth`/`refused` line.
-    timeout 10 "$HISN" exec --no-tty --session l58-$$ -- hisn ls >/dev/null 2>&1 || true
+    timeout 10 "$HISN" exec --no-tty --session l58-$$ -- env XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" "$HISN" ls --json >/dev/null 2>&1 || true
+    timeout 10 "$HISN" exec --no-tty --session l58-$$ -- env XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" "$HISN" inspect --session "l58-$$" >/dev/null 2>&1 || true
     end_session "$L58_CWD" "$S_PID"
   fi
   rm -rf "$L58_CWD"
@@ -2455,10 +2472,10 @@ if [ -f "$L58_AUDIT" ]; then
   if grep -q '"op": *"auth"' "$L58_AUDIT" 2>/dev/null || grep -q '"auth"' "$L58_AUDIT" 2>/dev/null; then
     pass "L58 R5 refusal audit line present"
   else
-    # No auth refusal in the audit — this is OK if no R5 check was tripped.
-    # The R5 mechanism is exercised by L42; L58 only verifies the audit
-    # line format when a refusal happens.
-    skip "L58 R5 refusal audit line present" "no auth line in audit (no R5 refusal happened)"
+    # No auth refusal in the audit — the in-sandbox client cannot reach the
+    # socket (by design, L11), so no R5 refusal is expected. R5 itself is
+    # covered by unit tests (see the L14 weak note).
+    skip "L58 R5 refusal audit line present" "no auth line in audit (an in-sandbox peer cannot reach the control socket; R5 covered by unit tests)"
   fi
 else
   skip "L58 R5 refusal audit line present" "no audit file"
@@ -2546,23 +2563,29 @@ fi
 if start_session l52-$$ "$L52_CWD" "$L52_POL" --name "l52n$$"; then
   L52_SOCK="$RUNTIME_ROOT/l52-$$/control.sock"
   if [ -S "$L52_SOCK" ]; then
+    # Build the request exactly as the real client does (attach.rs
+    # build_request: tty:true + attach:true, one pty slave fd via SCM_RIGHTS).
+    # A tty exec expects exactly 1 stdio descriptor; a raw request without
+    # fds is refused with E_BAD_REQUEST.
     L52_ATTACH_RESP=$(python3 -c "
-import socket, json
+import socket, pty, json
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.settimeout(5)
 s.connect('$L52_SOCK')
-req = json.dumps({'op':'exec','argv':['true'],'cwd':None,'env':{},'tty':False,'attach':True})
-s.send((req + '\n').encode())
+m, sl = pty.openpty()
+req = json.dumps({'op':'exec','argv':[],'cwd':None,'env':{},'tty':True,'attach':True,'client':None})
+socket.send_fds(s, [(req + chr(10)).encode()], [sl])
 try:
     resp = s.recv(4096).decode()
-except:
-    resp = ''
+except Exception as e:
+    resp = 'ERR:' + str(e)
 print(resp)
 s.close()
-" 2>/dev/null || true)
+" 2>&1)
+    L52_MSG=$(printf '%s' "$L52_ATTACH_RESP" | tr -d '\n' | head -c 200)
     case "$L52_ATTACH_RESP" in
-      *"ok"*|*"pid"*) pass "L52 attach protocol field accepted (exec with attach:true)" ;;
-      *) skip "L52 attach protocol field" "no result [$L52_ATTACH_RESP]" ;;
+      *'"ok"'*|*'"pid"'*) pass "L52 attach protocol field accepted (exec with attach:true)" ;;
+      *) skip "L52 attach protocol field" "response [$L52_MSG]" ;;
     esac
   else
     skip "L52 attach protocol field" "no control socket at $L52_SOCK"
@@ -2618,7 +2641,7 @@ if needs_host; then
     kill -TERM "$S_PID" 2>/dev/null
     reap_bounded "$S_PID" 30 "L54 session exit"
   else
-    skip "L54 two attaches share pid namespace" "session did not start"
+    skip "L54 two attaches share pid namespace" "session did not start: $(head -c 300 "$WORK/l54-$$.log" 2>/dev/null)"
   fi
   rm -rf "$L54_CWD"
 
@@ -2645,7 +2668,7 @@ if needs_host; then
       pass "L55 attach shell killed on disconnect"
     fi
   else
-    skip "L55 attach shell killed on disconnect" "session did not start"
+    skip "L55 attach shell killed on disconnect" "session did not start: $(head -c 300 "$WORK/l55-$$.log" 2>/dev/null)"
   fi
   rm -rf "$L55_CWD"
 else
@@ -2691,16 +2714,23 @@ L61EOF
     # Kill the holding exec so the session becomes idle.
     kill "$L61_EXEC_PID" 2>/dev/null
     wait "$L61_EXEC_PID" 2>/dev/null
-    # Wait past the idle timeout for the session to stop itself.
+    # Wait past the idle timeout for the session to stop ITSELF. A stopped
+    # session is kept by design (O3), so the check is the state label in
+    # hisn ls --json, not absence from the listing.
     L61_DEADLINE=$(( $(date +%s) + 15 ))
     while [ $(date +%s) -lt "$L61_DEADLINE" ]; do
-      "$HISN" ls --json 2>/dev/null | grep -q "l61-$$" || break
+      L61_STATE=$("$HISN" ls --json 2>/dev/null | tr -d ' ' | grep '"id":"l61-$$"' -A4 | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p' | head -1)
+      [ "$L61_STATE" = "stopped" ] && break
+      [ -z "$L61_STATE" ] && break
       sleep 1
     done
-    if ! "$HISN" ls --json 2>/dev/null | grep -q "l61-$$"; then
-      pass "L61 idle session stops after timeout"
+    L61_STATE=$("$HISN" ls --json 2>/dev/null | tr -d ' ' | grep '"id":"l61-$$"' -A4 | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p' | head -1)
+    if [ "$L61_STATE" = "stopped" ]; then
+      pass "L61 idle session stops itself (kept as stopped)"
+    elif [ -z "$L61_STATE" ]; then
+      fail "L61 idle session stops itself (kept as stopped)" "session gone from ls (dir should be kept as stopped)"
     else
-      fail "L61 idle session stops after timeout" "session still listed after exec ended + timeout"
+      fail "L61 idle session stops itself (kept as stopped)" "state is [$L61_STATE] after timeout"
     fi
     # The session dir stays as stopped; the audit has a lease/expired line.
     L61_AUDIT="$RUNTIME_ROOT/l61-$$/grants.jsonl"

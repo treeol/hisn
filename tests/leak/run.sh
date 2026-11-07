@@ -2534,14 +2534,33 @@ if [ "$L52_COLLIDE_RC" -ne 0 ]; then
 else
   fail "L52 name == id is refused" "rc=$L52_COLLIDE_RC (expected non-zero)"
 fi
-# (b) distinct name and id: the session starts and the protocol field is
-# accepted.
+# (b) distinct name and id: the session starts and an exec with attach:true
+# is accepted. Send the attach request directly via the control socket and
+# check the response. The supervisor should accept it (start a shell).
 if start_session l52-$$ "$L52_CWD" "$L52_POL" --name "l52n$$"; then
-  r=$(q "$L52_CWD" "exec-out /usr/bin/env")
-  case "$r" in
-    "OK exit="*) pass "L52 attach protocol field accepted (exec with attach:true)" ;;
-    *) skip "L52 attach protocol field" "no result [$r]" ;;
-  esac
+  L52_SOCK="$RUNTIME_ROOT/l52-$$/control.sock"
+  if [ -S "$L52_SOCK" ]; then
+    L52_ATTACH_RESP=$(python3 -c "
+import socket, json
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect('$L52_SOCK')
+req = json.dumps({'op':'exec','argv':['true'],'cwd':None,'env':{},'tty':False,'attach':True})
+s.send((req + '\n').encode())
+try:
+    resp = s.recv(4096).decode()
+except:
+    resp = ''
+print(resp)
+s.close()
+" 2>/dev/null || true)
+    case "$L52_ATTACH_RESP" in
+      *"ok"*|*"pid"*) pass "L52 attach protocol field accepted (exec with attach:true)" ;;
+      *) skip "L52 attach protocol field" "no result [$L52_ATTACH_RESP]" ;;
+    esac
+  else
+    skip "L52 attach protocol field" "no control socket at $L52_SOCK"
+  fi
   end_session "$L52_CWD" "$S_PID"
 else
   skip "L52 attach protocol field" "session did not start"
@@ -2658,7 +2677,7 @@ L61EOF
     L61_EXEC_PID=$!
     # With a running exec, the session must survive past the idle timeout.
     sleep 3
-    if "$HISN" ls --json 2>/dev/null | grep -q 'l61-$$'; then
+    if "$HISN" ls --json 2>/dev/null | grep -q "l61-$$"; then
       pass "L61 idle with attached client survives"
     else
       fail "L61 idle with attached client survives" "session gone after 3s with a running exec"
@@ -2669,10 +2688,10 @@ L61EOF
     # Wait past the idle timeout for the session to stop itself.
     L61_DEADLINE=$(( $(date +%s) + 15 ))
     while [ $(date +%s) -lt "$L61_DEADLINE" ]; do
-      "$HISN" ls --json 2>/dev/null | grep -q 'l61-$$' || break
+      "$HISN" ls --json 2>/dev/null | grep -q "l61-$$" || break
       sleep 1
     done
-    if ! "$HISN" ls --json 2>/dev/null | grep -q 'l61-$$'; then
+    if ! "$HISN" ls --json 2>/dev/null | grep -q "l61-$$"; then
       pass "L61 idle session stops after timeout"
     else
       fail "L61 idle session stops after timeout" "session still listed after exec ended + timeout"

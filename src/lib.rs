@@ -13,6 +13,7 @@ pub mod landlock;
 pub mod mounts;
 pub mod policy;
 pub mod profile;
+pub mod registry;
 pub mod rootfs;
 pub mod rootfs_import;
 pub mod rootfs_store;

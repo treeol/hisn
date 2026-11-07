@@ -257,20 +257,29 @@ fn open_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
+/// How long the pump keeps draining after the exit line has been seen. Bounds
+/// a background grandchild that holds the pipe open (the program's exit is
+/// already known by then); the pipes still reach EOF sooner in the normal case.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Copy the `--no-tty` pipes to the caller's stdout and stderr until both reach
-/// EOF, or until `stop` is set and a final poll finds nothing more (a background
-/// grandchild may hold a pipe open; the program's exit is already known then).
+/// EOF, or until `stop` has been set for `STOP_GRACE` (a background grandchild
+/// may hold a pipe open; the program's exit is already known then).
 fn pump_pipes(pipes: [OwnedFd; 2], stop: &std::sync::atomic::AtomicBool) {
     let [out, err] = pipes;
     let mut open: Vec<(OwnedFd, i32)> = vec![(out, 1i32), (err, 2i32)];
     let mut buf = vec![0u8; 16384];
-    let mut drained_after_stop = false;
+    // Once `stop` is set, keep reading until EOF or until a poll goes idle
+    // for `STOP_IDLE`. A single empty poll is NOT drained: the program may
+    // still be writing the rest of its output (0.4.0 L4 regression: one
+    // 16 KiB pass dropped the remainder of a large `env` listing).
+    let mut stop_seen_at: Option<std::time::Instant> = None;
     while !open.is_empty() {
         if stop.load(std::sync::atomic::Ordering::SeqCst) {
-            if drained_after_stop {
+            let t0 = *stop_seen_at.get_or_insert_with(std::time::Instant::now);
+            if t0.elapsed() > STOP_GRACE {
                 break;
             }
-            drained_after_stop = true;
         }
         let mut pfds: Vec<libc::pollfd> = open
             .iter()
@@ -589,6 +598,48 @@ mod tests {
             build_request(&a).unwrap(),
             json!({"op":"exec","argv":["ls"],"cwd":null,"env":{},"tty":false})
         );
+    }
+
+    #[test]
+    fn pump_delivers_everything_written_before_stop() {
+        // Regression (0.4.0 L4): output the program wrote before exiting may
+        // still sit in the pipe when the exit line arrives and `stop` is set.
+        // The pump must drain it, not stop after one pass. Writes ~256 KiB
+        // (well above a 64 KiB pipe buffer) into the stdout pipe from a
+        // writer thread, sets `stop` early, and checks the byte count that
+        // reaches fd 1 via a temp file.
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let payload = vec![b'x'; 256 * 1024];
+        let (out_r, out_w) = open_pipe().unwrap();
+        let (err_r, err_w) = open_pipe().unwrap();
+        drop(err_w);
+        let dir = tempfile::tempdir().unwrap();
+        let sink = std::fs::File::create(dir.path().join("out")).unwrap();
+        let sink_fd = sink.as_raw_fd();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let writer = std::thread::spawn(move || {
+            let mut w = std::fs::File::from(out_w);
+            use std::io::Write;
+            let _ = w.write_all(&payload);
+        });
+        // Set stop before the writer has finished: the pump must still
+        // deliver everything already written and not stop after one pass.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stop2.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Run the pump with fd 1 redirected to the sink (write_all_fd targets
+        // fd 1 and 2 by number).
+        let saved = unsafe { libc::dup(1) };
+        unsafe { libc::dup2(sink_fd, 1) };
+        pump_pipes([out_r, err_r], &stop);
+        unsafe {
+            libc::dup2(saved, 1);
+            libc::close(saved);
+        }
+        writer.join().unwrap();
+        let got = std::fs::metadata(dir.path().join("out")).unwrap().len();
+        assert_eq!(got, 256 * 1024, "pump lost output written before stop");
     }
 
     #[test]

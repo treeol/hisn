@@ -689,6 +689,58 @@ mod tests {
     }
 
     #[test]
+    fn large_response_is_delivered_byte_for_byte_with_connection_accounting() {
+        // Regression (0.4.0 L4): a response larger than one pipe buffer must
+        // arrive intact while the connection accounting (connect/disconnect)
+        // is active. The payload is ~256 KiB, far above the 64 KiB pipe
+        // buffer, so a writer that stops early or a count that closes the
+        // socket early shows up as truncation.
+        use std::sync::atomic::{AtomicU64, Ordering as O};
+        struct Counting {
+            open: AtomicU64,
+            payload: String,
+        }
+        impl Handler for Counting {
+            fn authorize(&self, _: &UnixStream) -> Result<(), String> {
+                Ok(())
+            }
+            fn connect(&self) {
+                self.open.fetch_add(1, O::SeqCst);
+            }
+            fn disconnect(&self) {
+                self.open.fetch_sub(1, O::SeqCst);
+            }
+            fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream) -> Value {
+                ok(json!({ "env": self.payload }))
+            }
+        }
+        let payload = "PIP_CACHE_DIR=/run/hisn\n".repeat(10_000); // ~250 KiB
+        let h = Arc::new(Counting {
+            open: AtomicU64::new(0),
+            payload: payload.clone(),
+        });
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("big.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let hh: Arc<dyn Handler> = h.clone();
+        thread::spawn(move || serve(l, hh));
+        for _ in 0..3 {
+            let got = request(&sock, &json!({"op":"list"})).unwrap();
+            assert_eq!(
+                got["env"].as_str().unwrap(),
+                payload,
+                "response truncated or altered"
+            );
+        }
+        // Every serve_conn thread must have run its disconnect guard.
+        let t0 = Instant::now();
+        while h.open.load(O::SeqCst) != 0 && t0.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(h.open.load(O::SeqCst), 0, "connection count leaked");
+    }
+
+    #[test]
     fn drain_waits_for_a_slow_response_to_be_written() {
         struct Slow;
         impl Handler for Slow {

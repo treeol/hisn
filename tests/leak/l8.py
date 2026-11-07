@@ -4,6 +4,12 @@
   l8.py json-get FILE KEY            print a top-level JSON string value
   l8.py json-ok  FILE                exit 0 iff {"ok": true}
   l8.py json-has FILE KEY VALUE      exit 0 iff top-level KEY == VALUE
+  l8.py ls-field ID FIELD < LS.json  print FIELD of session ID (hisn-ls/v2);
+                                     empty if not listed / null
+  l8.py attach-ok < RESPONSE         exit 0 iff the first line is
+                                     {"ok": true, "exec_id": "e-N", ...}
+  l8.py audit-has FILE OP STAGE      exit 0 iff a grants.jsonl line has
+                                     op == OP and stage == STAGE
   l8.py l8 INSPECT.json PLAN.json HOST_MOUNTINFO [GRANT_PATH:MODE ...]
                                      L8: sandbox mount table == plan, typed
 
@@ -127,6 +133,49 @@ def l8(inspect_file, plan_file, host_mi_file, grants):
     return 0
 
 
+def ls_field(doc_text, want, field):
+    """FIELD of session WANT in an `ls --json` document ("" if absent)."""
+    try:
+        doc = json.loads(doc_text)
+    except ValueError:
+        return ""
+    for s in doc.get("sessions", []):
+        if s.get("id") == want:
+            v = s.get(field)
+            return "" if v is None else str(v)
+    return ""
+
+
+def attach_ok(resp_text):
+    """True iff the first response line is ok:true with an e-N exec_id."""
+    first = resp_text.split("\n", 1)[0]
+    try:
+        r = json.loads(first)
+    except ValueError:
+        return False
+    eid = r.get("exec_id")
+    return r.get("ok") is True and isinstance(eid, str) and eid.startswith("e-")
+
+
+def audit_has(path, op, stage):
+    """True iff an audit line in PATH has op == OP and stage == STAGE."""
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("op") == op and e.get("stage") == stage:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else ""
     if cmd == "json-get":
@@ -137,6 +186,13 @@ def main(argv):
         return 0 if load_json(argv[2]).get("ok") is True else 1
     if cmd == "json-has":
         return 0 if str(load_json(argv[2]).get(argv[3])) == argv[4] else 1
+    if cmd == "ls-field":
+        print(ls_field(sys.stdin.read(), argv[2], argv[3]))
+        return 0
+    if cmd == "attach-ok":
+        return 0 if attach_ok(sys.stdin.read()) else 1
+    if cmd == "audit-has":
+        return 0 if audit_has(argv[2], argv[3], argv[4]) else 1
     if cmd == "l8":
         return l8(argv[2], argv[3], argv[4], argv[5:])
     print(__doc__)

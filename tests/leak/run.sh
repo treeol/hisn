@@ -48,6 +48,14 @@ lacks() { # lacks NAME HAYSTACK NEEDLE
 [ -x "$HISN" ] || { echo "leaktest NOT RUN: $HISN is not executable (run 'make build')"; exit 77; }
 [ -x "$PROBE_SRC" ] || { echo "leaktest NOT RUN: probe $PROBE_SRC missing (cargo build --release --example leakprobe)"; exit 77; }
 command -v python3 >/dev/null || { echo "leaktest NOT RUN: python3 is required"; exit 77; }
+# Harness guard: `$$` inside single quotes is never expanded (the 0.4.0 L61
+# state check matched the literal "l61-$$" and always came back empty). Any
+# single-quoted string containing `$$` in this file is a harness bug.
+if DOLLAR_HITS=$(grep -nE "'[^']*\\\$\\\$[^']*'" "${BASH_SOURCE[0]}"); then
+  echo "leaktest NOT RUN: single-quoted \$\$ in $(basename "${BASH_SOURCE[0]}") (never expanded):"
+  printf '%s\n' "$DOLLAR_HITS" | sed 's/^/    /'
+  exit 1
+fi
 if ! CHECK_OUT=$("$HISN" check 2>&1); then
   echo "leaktest NOT RUN: 'hisn check' reports this host cannot run sessions:"
   printf '%s\n' "$CHECK_OUT" | sed 's/^/    /'
@@ -175,6 +183,21 @@ hisn_json() { # hisn_json OUTFILE args... ; stdout of hisn into OUTFILE
   timeout 20 "$HISN" "$@" >"$out" 2>"$out.err"
 }
 
+# ls_field ID FIELD: one field of session ID from `hisn ls --json` (parsed as
+# JSON, never grepped); empty when the session is not listed.
+ls_field() {
+  "$HISN" ls --json 2>/dev/null | $PY ls-field "$1" "$2"
+}
+
+# session_dir ID: the session dir as hisn reports it (`dir` in ls --json),
+# never a root assumed by the harness. Falls back to $RUNTIME_ROOT/ID only
+# for a dir that ls cannot see (e.g. after the supervisor removed it).
+session_dir() {
+  local d
+  d=$(ls_field "$1" dir)
+  printf '%s\n' "${d:-$RUNTIME_ROOT/$1}"
+}
+
 # reap_bounded PID SECS LABEL: wait for a background child, but never forever.
 # On timeout: FAIL, print the process table (DIAG lines) so a hang on a CI
 # runner is diagnosable from the log, SIGKILL the child, and return 1.
@@ -221,6 +244,15 @@ if ! start_session main-$$ "$CWD" "$POL" --grant "$WORK/g_ro:ro"; then
   exit 1
 fi
 MAIN_PID=$S_PID
+# The runtime root as hisn uses it (the parent of a live session's `dir` in
+# ls --json), not the harness's guess: every later absence check and the
+# cleanup trap use this. hisn picks one root for all sessions (pick_root).
+MAIN_DIR=$(ls_field "main-$$" dir)
+if [ -n "$MAIN_DIR" ]; then
+  RUNTIME_ROOT=$(dirname "$MAIN_DIR")
+else
+  fail "runtime root from ls --json" "main-$$ has no dir in hisn ls --json; keeping guess $RUNTIME_ROOT"
+fi
 
 # ---- L1: nothing outside the allowlist exists
 for p in /home /root /tankz /var /etc/shadow /etc/ssh "$HOME/.ssh" "$HOME/.aws"; do
@@ -377,7 +409,7 @@ $PY json-has "$WORK/revoke_again.json" error E_NOT_GRANTED && pass "L6 double re
 
 # Save the main session's audit log before end_session removes the dir.
 # L57/L58 check this copy; the session dir is gone after end_session.
-cp "$RUNTIME_ROOT/main-$$/grants.jsonl" "$WORK/main-audit.jsonl" 2>/dev/null || true
+cp "$(session_dir main-$$)/grants.jsonl" "$WORK/main-audit.jsonl" 2>/dev/null || true
 
 end_session "$CWD" "$MAIN_PID"
 sleep 0.3
@@ -419,7 +451,7 @@ mkdir -p "$WORK/g_rw/hard"
 if start_session hard-$$ "$CH" "$WORK/H.toml"; then
   HP=$S_PID
   hisn_json "$WORK/hg.json" grant --session hard-$$ --rw "$WORK/g_rw/hard"
-  $PY json-ok "$WORK/hg.json" 2>/dev/null || fail "L13 hard: grant" "stdout=[$(cat "$WORK/hg.json")] stderr=[$(cat "$WORK/hg.json.err")] supervisor-stderr=[$(cat "$S_LOG")] audit=[$(cat "$RUNTIME_ROOT/hard-$$/grants.jsonl" 2>&1 | tail -5)]"
+  $PY json-ok "$WORK/hg.json" 2>/dev/null || fail "L13 hard: grant" "stdout=[$(cat "$WORK/hg.json")] stderr=[$(cat "$WORK/hg.json.err")] supervisor-stderr=[$(cat "$S_LOG")] audit=[$(cat "$(session_dir hard-$$)/grants.jsonl" 2>&1 | tail -5)]"
   q "$CH" hold-queued "$WORK/g_rw/hard/queued" >/dev/null
   hisn_json "$WORK/hr.json" revoke --session hard-$$ --hard "$WORK/g_rw/hard"
   $PY json-has "$WORK/hr.json" guarantee hard 2>/dev/null && pass "L13 hard revoke reports guarantee=hard" || fail "L13 hard guarantee" "stdout=[$(cat "$WORK/hr.json")] stderr=[$(cat "$WORK/hr.json.err")] supervisor-stderr=[$(cat "$S_LOG")]"
@@ -1564,7 +1596,7 @@ print('OK')
   reap_bounded "$L31_PID" 30 "L31 session exit after kill"
   sleep 0.5
   # The service died with the session.
-  if [ ! -S "$L31_CWD/.wakil/kvr.sock" ] || ! kill -0 $(cat "$RUNTIME_ROOT/l31-$$/supervisor.pid" 2>/dev/null) 2>/dev/null; then
+  if [ ! -S "$L31_CWD/.wakil/kvr.sock" ] || ! kill -0 $(cat "$(session_dir l31-$$)/supervisor.pid" 2>/dev/null) 2>/dev/null; then
     pass "L31 service: dies with the session"
   else
     # The socket file may linger (it was created on cwd, a rw bind); the
@@ -2046,7 +2078,7 @@ if command -v ssh-agent >/dev/null 2>&1 && command -v ssh-add >/dev/null 2>&1 \
     L45_PROFILE="$WORK/L45-profile.toml"
     write_profile "$L45_PROFILE" "$L45_CWD" '[ssh]' 'agent = true' "keys = [\"$L45_FP1\"]"
     if start_profile_session l45-$$ "$L45_CWD" "$L45_PROFILE"; then
-      L45_PROXY_SOCKET="$RUNTIME_ROOT/l45-$$/ssh-agent.sock"
+      L45_PROXY_SOCKET="$(session_dir l45-$$)/ssh-agent.sock"
       if [ -S "$L45_PROXY_SOCKET" ]; then
         pass "L45 proxy socket exists during the session"
       else
@@ -2404,7 +2436,7 @@ L56_CWD=$(new_cwd l56)
 L56_POL="$WORK/l56.toml"
 write_policy "$L56_POL" "$L56_CWD"
 if start_session l56-$$ "$L56_CWD" "$L56_POL"; then
-  L56_SOCK="$RUNTIME_ROOT/l56-$$/control.sock"
+  L56_SOCK="$(session_dir l56-$$)/control.sock"
   if sudo -n -u "#$(( $(id -u) + 1 ))" true 2>/dev/null; then
     OTHER_UID=$(( $(id -u) + 1 ))
     r=$(sudo -n -u "#$OTHER_UID" python3 -c "
@@ -2571,7 +2603,7 @@ fi
 # is accepted. Send the attach request directly via the control socket and
 # check the response. The supervisor should accept it (start a shell).
 if start_session l52-$$ "$L52_CWD" "$L52_POL" --name "l52n$$"; then
-  L52_SOCK="$RUNTIME_ROOT/l52-$$/control.sock"
+  L52_SOCK="$(session_dir l52-$$)/control.sock"
   if [ -S "$L52_SOCK" ]; then
     # Build the request exactly as the real client does (attach.rs
     # build_request: tty:true + attach:true, one pty slave fd via SCM_RIGHTS).
@@ -2585,18 +2617,37 @@ s.connect('$L52_SOCK')
 m, sl = pty.openpty()
 req = json.dumps({'op':'exec','argv':[],'cwd':None,'env':{},'tty':True,'attach':True,'client':None})
 socket.send_fds(s, [(req + chr(10)).encode()], [sl])
+# Read the whole first line: the supervisor writes it in several pieces
+# (writeln! on an unbuffered socket), so one recv() may return a fragment.
+buf = b''
 try:
-    resp = s.recv(4096).decode()
+    while b'\n' not in buf:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    resp = buf.decode()
 except Exception as e:
-    resp = 'ERR:' + str(e)
+    resp = 'ERR:' + str(e) + ' after [' + buf.decode(errors='replace') + ']'
 print(resp)
 s.close()
 " 2>&1)
     L52_MSG=$(printf '%s' "$L52_ATTACH_RESP" | tr -d '\n' | head -c 200)
-    case "$L52_ATTACH_RESP" in
-      *'"ok"'*|*'"pid"'*) pass "L52 attach protocol field accepted (exec with attach:true)" ;;
-      *) skip "L52 attach protocol field" "response [$L52_MSG]" ;;
-    esac
+    # The first response line is JSON: {"ok":true,"pid":..,"exec_id":"e-N"}.
+    L52_EID=$(printf '%s\n' "$L52_ATTACH_RESP" | $PY attach-ok && echo yes)
+    if [ "$L52_EID" = "yes" ]; then
+      pass "L52 attach protocol field accepted (exec with attach:true -> ok + exec_id)"
+    else
+      fail "L52 attach protocol field" "response not ok:true with an exec_id: [$L52_MSG]"
+    fi
+    # The audit marks it as an attach: the exec op's request line is logged
+    # with op "attach" (supervisor do_exec: op = attach when attach:true).
+    L52_AUDIT="$(dirname "$L52_SOCK")/grants.jsonl"
+    if $PY audit-has "$L52_AUDIT" attach request; then
+      pass "L52 audit records the attach (op attach, stage request)"
+    else
+      fail "L52 audit records the attach" "no op=attach request line in $L52_AUDIT: [$(tail -3 "$L52_AUDIT" 2>&1 | head -c 300)]"
+    fi
   else
     skip "L52 attach protocol field" "no control socket at $L52_SOCK"
   fi
@@ -2640,13 +2691,27 @@ if needs_host; then
   L54_POL="$WORK/l54.toml"
   write_policy "$L54_POL" "$L54_CWD"
   if start_session l54-$$ "$L54_CWD" "$L54_POL" --detach; then
-    p1=$(timeout 30 "$HISN" exec --session l54-$$ -- "$L54_CWD/leakprobe" pids </dev/null 2>&1)
+    # Hold the first exec open (a sleep inside it) while the second one
+    # lists the pid namespace: a peer must see the other's process.
+    timeout 40 "$HISN" exec --no-tty --session l54-$$ -- sh -c "echo SLEEPPID \$\$; exec sleep 30" \
+      </dev/null >"$WORK/l54-first.out" 2>&1 &
+    L54_FIRST=$!
+    L54_SPID=""
+    for _ in $(seq 1 50); do
+      L54_SPID=$(sed -n 's/^SLEEPPID \([0-9][0-9]*\)$/\1/p' "$WORK/l54-first.out" 2>/dev/null | head -1)
+      [ -n "$L54_SPID" ] && break
+      sleep 0.1
+    done
     p2=$(timeout 30 "$HISN" exec --session l54-$$ -- "$L54_CWD/leakprobe" pids </dev/null 2>&1)
-    if printf '%s' "$p1" | grep -q ',1,' && printf '%s' "$p2" | grep -q ',1,'; then
-      pass "L54 two attaches share pid namespace (both see pid 1)"
+    if [ -z "$L54_SPID" ]; then
+      fail "L54 two attaches share pid namespace" "first exec printed no pid: [$(head -c 200 "$WORK/l54-first.out")]"
+    elif printf '%s' "$p2" | grep -q "^OK " && printf ',%s,' "${p2#OK }" | grep -q ",$L54_SPID,"; then
+      pass "L54 two attaches share pid namespace (second sees the first's sleep pid $L54_SPID)"
     else
-      fail "L54 two attaches share pid namespace" "pids=[$p1] vs [$p2]"
+      fail "L54 two attaches share pid namespace" "first's sleep pid $L54_SPID not in second's pids [$p2]"
     fi
+    kill "$L54_FIRST" 2>/dev/null
+    wait "$L54_FIRST" 2>/dev/null
     hisn_json "$WORK/l54kill.json" kill --session l54-$$ --signal TERM
     kill -TERM "$S_PID" 2>/dev/null
     reap_bounded "$S_PID" 30 "L54 session exit"
@@ -2716,38 +2781,49 @@ L61EOF
     L61_EXEC_PID=$!
     # With a running exec, the session must survive past the idle timeout.
     sleep 3
-    if "$HISN" ls --json 2>/dev/null | grep -q "l61-$$"; then
+    if [ -n "$(ls_field "l61-$$" state)" ]; then
       pass "L61 idle with attached client survives"
     else
       fail "L61 idle with attached client survives" "session gone after 3s with a running exec"
     fi
+    # The session dir as hisn reports it (ls --json `dir`), read while the
+    # session is listed; the audit is checked there after the stop.
+    L61_DIR=$(session_dir "l61-$$")
     # Kill the holding exec so the session becomes idle.
     kill "$L61_EXEC_PID" 2>/dev/null
     wait "$L61_EXEC_PID" 2>/dev/null
     # Wait past the idle timeout for the session to stop ITSELF. A stopped
     # session is kept by design (O3), so the check is the state label in
-    # hisn ls --json, not absence from the listing.
+    # hisn ls --json (parsed as JSON), not absence from the listing.
     L61_DEADLINE=$(( $(date +%s) + 15 ))
-    while [ $(date +%s) -lt "$L61_DEADLINE" ]; do
-      L61_STATE=$("$HISN" ls --json 2>/dev/null | tr -d ' ' | grep '"id":"l61-$$"' -A4 | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p' | head -1)
+    while [ "$(date +%s)" -lt "$L61_DEADLINE" ]; do
+      L61_STATE=$(ls_field "l61-$$" state)
       [ "$L61_STATE" = "stopped" ] && break
       [ -z "$L61_STATE" ] && break
       sleep 1
     done
-    L61_STATE=$("$HISN" ls --json 2>/dev/null | tr -d ' ' | grep '"id":"l61-$$"' -A4 | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p' | head -1)
+    L61_STATE=$(ls_field "l61-$$" state)
     if [ "$L61_STATE" = "stopped" ]; then
       pass "L61 idle session stops itself (kept as stopped)"
     elif [ -z "$L61_STATE" ]; then
-      fail "L61 idle session stops itself (kept as stopped)" "session gone from ls (dir should be kept as stopped)"
+      fail "L61 idle session stops itself (kept as stopped)" "session gone from ls (dir should be kept as stopped; $L61_DIR exists: $([ -d "$L61_DIR" ] && echo yes || echo no))"
     else
       fail "L61 idle session stops itself (kept as stopped)" "state is [$L61_STATE] after timeout"
     fi
     # The session dir stays as stopped; the audit has a lease/expired line.
-    L61_AUDIT="$RUNTIME_ROOT/l61-$$/grants.jsonl"
-    if [ -f "$L61_AUDIT" ] && grep -q 'lease.*expired\|expired.*lease\|"lease"' "$L61_AUDIT" 2>/dev/null; then
+    L61_AUDIT="$L61_DIR/grants.jsonl"
+    if $PY audit-has "$L61_AUDIT" lease expired; then
       pass "L61 lease/expired audit line present"
     else
-      fail "L61 lease/expired audit line present" "no lease/expired line in $L61_AUDIT"
+      fail "L61 lease/expired audit line present" "no op=lease stage=expired line in $L61_AUDIT"
+    fi
+    # The foreground run exits 143 with the idle message (product F2/O3).
+    reap_bounded "$S_PID" 15 "L61 run exit after idle stop"
+    wait "$S_PID" 2>/dev/null
+    if grep -q "hisn: session l61-$$ stopped: idle for .* (idle_timeout 2s)" "$S_LOG" 2>/dev/null; then
+      pass "L61 run reports the idle stop on stderr"
+    else
+      fail "L61 run reports the idle stop on stderr" "stderr: [$(grep -v sethostname "$S_LOG" 2>/dev/null | head -c 300)]"
     fi
     # Clean up the stopped session dir if still present.
     "$HISN" ls --prune 2>/dev/null

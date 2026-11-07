@@ -113,5 +113,41 @@ class L8(unittest.TestCase):
             self.assertEqual(l8.l8(p, p, p, []), 1)
 
 
+class HarnessHelpers(unittest.TestCase):
+    """0.4.0 L52/L61: JSON-parsed checks instead of greps."""
+
+    LS = json.dumps({"schema": "hisn-ls/v2", "sessions": [
+        {"id": "l61-42", "state": "stopped", "dir": "/tmp/hisn-1000/l61-42"},
+        {"id": "l61-4", "state": "running", "dir": None},
+    ]})
+
+    def test_ls_field_matches_the_exact_id(self):
+        self.assertEqual(l8.ls_field(self.LS, "l61-42", "state"), "stopped")
+        self.assertEqual(l8.ls_field(self.LS, "l61-4", "state"), "running")
+        self.assertEqual(l8.ls_field(self.LS, "l61-42", "dir"), "/tmp/hisn-1000/l61-42")
+        self.assertEqual(l8.ls_field(self.LS, "l61-4", "dir"), "")
+        self.assertEqual(l8.ls_field(self.LS, "l61-$$", "state"), "")
+        self.assertEqual(l8.ls_field("not json", "l61-42", "state"), "")
+
+    def test_attach_ok_needs_ok_true_and_an_exec_id(self):
+        self.assertTrue(l8.attach_ok('{"exec_id":"e-1","ok":true,"pid":3}\n{"exit":{}}'))
+        self.assertFalse(l8.attach_ok('{"ok":true,"pid":3}'))
+        self.assertFalse(l8.attach_ok('{"exec_id":"e-1","ok":false}'))
+        self.assertFalse(l8.attach_ok('{"error":"E_BAD_REQUEST","ok":false}'))
+        self.assertFalse(l8.attach_ok("ERR:timed out"))
+
+    def test_audit_has_parses_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "grants.jsonl")
+            with open(p, "w") as f:
+                f.write('{"op":"attach","stage":"request","path":"/bin/sh"}\n')
+                f.write("\n")
+                f.write('{"op":"lease","stage":"expired","result":"idle"}\n')
+            self.assertTrue(l8.audit_has(p, "attach", "request"))
+            self.assertTrue(l8.audit_has(p, "lease", "expired"))
+            self.assertFalse(l8.audit_has(p, "lease", "request"))
+            self.assertFalse(l8.audit_has(os.path.join(d, "missing"), "lease", "expired"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

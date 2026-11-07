@@ -101,11 +101,17 @@ start_session() {
   local name=$1 cwd=$2 pol=$3
   shift 3
   S_LOG="$WORK/$name.log"
+  # The extra arguments are kept for both branches. `--detach` is tested on
+  # the first extra argument (set -u safe: the loop never reads an unset $1).
+  local detach=0 a
+  for a in "$@"; do
+    [ "$a" = "--detach" ] && detach=1
+  done
   HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
     HISN_LEAK_PASSED=visible-ok
   # --detach: start the session with no command (a detached seat). The
   # caller then uses `hisn exec` to run commands in it.
-  if [ "$1" = "--detach" ]; then
+  if [ "$detach" -eq 1 ]; then
     "$HISN" run --policy "$pol" --session-id "$name" --detach \
       </dev/null >"$S_LOG.out" 2>"$S_LOG" &
   else

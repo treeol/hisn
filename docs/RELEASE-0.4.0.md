@@ -43,6 +43,16 @@ function and a policy source — nothing else.
 - `ls --prune` archives `grants.jsonl` + `session.json` to `$XDG_STATE_HOME/hisn/audit/<id>.jsonl` (0600)
 - `--purge` skips archival
 
+## Fix round (Mashūra review)
+- **F1**: `Request` gains an optional `client` field (`ClientField { label, label_source, req_id }`). The supervisor builds `ClientRecord` from SO_PEERCRED + the client-supplied fields. A `client` object containing `uid` is refused (`deny_unknown_fields`).
+- **F2**: idle timer thread (wakes every `min(timeout/4, 30 s)`, guards against backward clock, no timer when `idle_timeout` is unset).
+- **F3**: `XDG_STATE_HOME/hisn` added to the persist-home refuse set; archive writes compact JSON (not pretty), uses `create_new(true)` + rename, checks dir ownership and mode.
+- **F4**: stop sets `stopping` → sends TERM → waits for exit → sets `stopped`. Timeout returns failure without writing `stopped`.
+- **F5**: `touch_lease` is a no-op when `idle_timeout` is unset; `session_json_lock` serialises all rewrites.
+- **F6**: `parse_duration` rejects non-ASCII and empty input without panicking; uses `checked_mul`.
+- **F7**: detach shuts down the write side (triggers TERM→KILL), reads the exit line with a 5 s timeout; SIGWINCH forwarded.
+- **F8**: members keyed by `(uid, label)`, not uid alone.
+
 ## What's NOT in 0.4.0
 - No daemon, no network listener, no public service. SSH is the only remote transport.
 - No `--detach` for attach.
@@ -62,6 +72,6 @@ function and a policy source — nothing else.
 ## Gate
 - `cargo fmt --check` ✓
 - `cargo clippy --all-targets -- -D warnings` ✓
-- `cargo test --lib` ✓ (354 pass, 2 fail = known sandbox-only)
+- `cargo test --lib` ✓ (361 pass, 2 fail = known sandbox-only)
 - `python3 tests/leak/test_l8.py` ✓
 - `make leaktest` — HOST only (needs user namespaces)

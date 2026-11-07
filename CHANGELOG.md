@@ -7,6 +7,14 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Repository cleanup (no code change): process documents (plans, patches,
+  host-run logs, the verification record) are removed from the tree; their
+  decisions are in `docs/adr/`. The policy schema is regenerated from the
+  struct (adds `landlock`, `shm`, `shm_size`, `tmp_size`). Example profiles use
+  `/tmp/hisn-out` as `grantable_rw`, so they validate on a fresh host. CI builds
+  the musl binary and validates the example profiles.
+
 ## [0.3.3] - 2026-11-06
 
 ### Fixed

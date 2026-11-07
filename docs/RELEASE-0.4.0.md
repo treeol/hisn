@@ -72,6 +72,19 @@ function and a policy source — nothing else.
 ## Gate
 - `cargo fmt --check` ✓
 - `cargo clippy --all-targets -- -D warnings` ✓
-- `cargo test --lib` ✓ (361 pass, 2 fail = known sandbox-only)
+- `cargo test --lib` ✓ (364 pass, 2 fail = known sandbox-only)
 - `python3 tests/leak/test_l8.py` ✓
 - `make leaktest` — HOST only (needs user namespaces)
+
+## Fix round (post-review)
+
+### F2 — idle timer regression (rubin)
+- `connected_clients: AtomicU64` tracks real control connections (not the execs map proxy)
+- `last_activity_secs: AtomicI64` in-memory clock (not the rate-limited persisted lease)
+- Idle stop path: `Stopping` → audit → SIGTERM → 10 s poll → SIGKILL → 5 s poll → `Stopped` only if dead
+- State writes hold `session_json_lock`
+- Unit tests for the idle predicate (running exec prevents fire, fires after finish, backward clock guard)
+
+### Harness fixes
+- L54/L55: `--detach` starts a detached session (no command); attaches run as execs
+- L58: triggers an R5 refusal from inside the session via `hisn exec -- hisn ls`

@@ -208,7 +208,7 @@ pub fn run(args: ExecArgs) -> Result<i32> {
     // - --no-tty: stdin is /dev/null, stdout and stderr are client-owned pipes
     //   whose read ends the client copies to its own fd 1 and 2.
     let line = format!("{req}\n");
-    let mut relay_pipes: Option<[OwnedFd; 2]> = None;
+    let mut relay_pipes: Option<[(OwnedFd, RawFd); 2]> = None;
     if let Some(s) = &slave {
         sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), &[s.as_raw_fd()])
             .context("sending request")?;
@@ -221,7 +221,7 @@ pub fn run(args: ExecArgs) -> Result<i32> {
         // The client's write ends close now: the read ends see EOF exactly
         // when the sandbox's side has closed.
         drop((stdin, out_w, err_w));
-        relay_pipes = Some([out_r, err_r]);
+        relay_pipes = Some([(out_r, 1), (err_r, 2)]);
     } else {
         sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), &[0, 1, 2])
             .context("sending request")?;
@@ -257,27 +257,27 @@ fn open_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
-/// How long the pump keeps draining after the exit line has been seen. Bounds
-/// a background grandchild that holds the pipe open (the program's exit is
-/// already known by then); the pipes still reach EOF sooner in the normal case.
+/// Idle window for the pump after the exit line has been seen: it stops once
+/// the pipes have been silent for this long. Data arriving resets the window,
+/// so output that is still flowing (or still pending in the pipe) is never
+/// cut off by a wall-clock deadline. Bounds a background grandchild that holds
+/// a pipe open: it cannot keep the client alive by writing nothing.
 const STOP_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Copy the `--no-tty` pipes to the caller's stdout and stderr until both reach
-/// EOF, or until `stop` has been set for `STOP_GRACE` (a background grandchild
-/// may hold a pipe open; the program's exit is already known then).
-fn pump_pipes(pipes: [OwnedFd; 2], stop: &std::sync::atomic::AtomicBool) {
-    let [out, err] = pipes;
-    let mut open: Vec<(OwnedFd, i32)> = vec![(out, 1i32), (err, 2i32)];
+/// Copy the `--no-tty` pipes to the destination descriptors until both reach
+/// EOF, or until they have been idle for `STOP_GRACE` after `stop` was set.
+/// `dests` are `(read end, write fd)` pairs; the write fds are not closed.
+fn pump_pipes(pipes: [(OwnedFd, RawFd); 2], stop: &std::sync::atomic::AtomicBool) {
+    let mut open: Vec<(OwnedFd, RawFd)> = pipes.into_iter().collect();
     let mut buf = vec![0u8; 16384];
-    // Once `stop` is set, keep reading until EOF or until a poll goes idle
-    // for `STOP_IDLE`. A single empty poll is NOT drained: the program may
-    // still be writing the rest of its output (0.4.0 L4 regression: one
-    // 16 KiB pass dropped the remainder of a large `env` listing).
-    let mut stop_seen_at: Option<std::time::Instant> = None;
+    // Idle clock: starts once `stop` is seen; reset on every read that returns
+    // data. A single empty poll is not enough to stop (0.4.0 L4 regression:
+    // one 16 KiB pass dropped the rest of a large `env` listing).
+    let mut idle_since: Option<std::time::Instant> = None;
     while !open.is_empty() {
         if stop.load(std::sync::atomic::Ordering::SeqCst) {
-            let t0 = *stop_seen_at.get_or_insert_with(std::time::Instant::now);
-            if t0.elapsed() > STOP_GRACE {
+            let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() > STOP_GRACE {
                 break;
             }
         }
@@ -307,9 +307,19 @@ fn pump_pipes(pipes: [OwnedFd; 2], stop: &std::sync::atomic::AtomicBool) {
                 let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
                 if n > 0 {
                     write_all_fd(open[i].1, &buf[..n as usize]);
-                } else if n == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN)
-                {
-                    closed = true;
+                    // Data arrived: the pipe is not idle, restart the window.
+                    if idle_since.is_some() {
+                        idle_since = Some(std::time::Instant::now());
+                    }
+                } else if n == 0 {
+                    closed = true; // EOF
+                } else {
+                    // A transient error (EINTR, EAGAIN) keeps the pipe; only
+                    // a terminal error closes it.
+                    let e = io::Error::last_os_error().raw_os_error();
+                    if e != Some(libc::EINTR) && e != Some(libc::EAGAIN) {
+                        closed = true;
+                    }
                 }
             }
             if closed {
@@ -320,7 +330,6 @@ fn pump_pipes(pipes: [OwnedFd; 2], stop: &std::sync::atomic::AtomicBool) {
             }
         }
     }
-    let _ = io::stdout().flush();
 }
 
 /// Everything after the request is sent: responses, pty relay, signals.
@@ -601,45 +610,58 @@ mod tests {
     }
 
     #[test]
-    fn pump_delivers_everything_written_before_stop() {
-        // Regression (0.4.0 L4): output the program wrote before exiting may
+    fn pump_delivers_exact_backlog_written_before_stop() {
+        // Regression (0.4.0 L4): output the program wrote before exiting can
         // still sit in the pipe when the exit line arrives and `stop` is set.
-        // The pump must drain it, not stop after one pass. Writes ~256 KiB
-        // (well above a 64 KiB pipe buffer) into the stdout pipe from a
-        // writer thread, sets `stop` early, and checks the byte count that
-        // reaches fd 1 via a temp file.
+        // Here the writer has finished and closed its end BEFORE `stop` is
+        // set, so the whole ~256 KiB (well above one 16 KiB read and above a
+        // typical 64 KiB pipe buffer) is pre-exit backlog. Every byte must
+        // reach the destination, on both streams, exactly.
+        //
+        // The destinations are temp files passed by fd, so the test never
+        // touches the process's fd 1 (the harness writes there).
+        use std::io::{Read, Seek, SeekFrom, Write};
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
-        let payload = vec![b'x'; 256 * 1024];
+        let out_payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let err_payload: Vec<u8> = b"stderr line\n".repeat(1000);
+        let out_write = out_payload.clone();
+        let err_write = err_payload.clone();
         let (out_r, out_w) = open_pipe().unwrap();
         let (err_r, err_w) = open_pipe().unwrap();
-        drop(err_w);
-        let dir = tempfile::tempdir().unwrap();
-        let sink = std::fs::File::create(dir.path().join("out")).unwrap();
-        let sink_fd = sink.as_raw_fd();
+        // The writer runs on its own thread: 256 KiB cannot fit in the pipe
+        // until the pump drains it. When the writer finishes and closes its
+        // end — the program "exits" — it sets `stop`, as the exit line does in
+        // production. The pump therefore runs while data is still flowing.
         let stop = Arc::new(AtomicBool::new(false));
-        let stop2 = stop.clone();
+        let stop_w = stop.clone();
         let writer = std::thread::spawn(move || {
             let mut w = std::fs::File::from(out_w);
-            use std::io::Write;
-            let _ = w.write_all(&payload);
+            w.write_all(&out_write).unwrap();
+            let mut w = std::fs::File::from(err_w);
+            w.write_all(&err_write).unwrap();
+            stop_w.store(true, std::sync::atomic::Ordering::SeqCst);
         });
-        // Set stop before the writer has finished: the pump must still
-        // deliver everything already written and not stop after one pass.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        stop2.store(true, std::sync::atomic::Ordering::SeqCst);
-        // Run the pump with fd 1 redirected to the sink (write_all_fd targets
-        // fd 1 and 2 by number).
-        let saved = unsafe { libc::dup(1) };
-        unsafe { libc::dup2(sink_fd, 1) };
-        pump_pipes([out_r, err_r], &stop);
-        unsafe {
-            libc::dup2(saved, 1);
-            libc::close(saved);
-        }
+        let dir = tempfile::tempdir().unwrap();
+        // Open read+write: the test reads the sink back to assert exact bytes.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(true);
+        let mut out_sink = opts.open(dir.path().join("out")).unwrap();
+        let mut err_sink = opts.open(dir.path().join("err")).unwrap();
+        pump_pipes(
+            [(out_r, out_sink.as_raw_fd()), (err_r, err_sink.as_raw_fd())],
+            &stop,
+        );
         writer.join().unwrap();
-        let got = std::fs::metadata(dir.path().join("out")).unwrap().len();
-        assert_eq!(got, 256 * 1024, "pump lost output written before stop");
+        out_sink.seek(SeekFrom::Start(0)).unwrap();
+        err_sink.seek(SeekFrom::Start(0)).unwrap();
+        let mut got_out = Vec::new();
+        out_sink.read_to_end(&mut got_out).unwrap();
+        let mut got_err = Vec::new();
+        err_sink.read_to_end(&mut got_err).unwrap();
+        assert_eq!(got_out.len(), out_payload.len(), "stdout length");
+        assert!(got_out == out_payload, "stdout bytes differ");
+        assert_eq!(got_err, err_payload, "stderr bytes differ");
     }
 
     #[test]

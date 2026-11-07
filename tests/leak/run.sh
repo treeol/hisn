@@ -102,9 +102,16 @@ start_session() {
   shift 3
   S_LOG="$WORK/$name.log"
   HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
-    HISN_LEAK_PASSED=visible-ok \
+    HISN_LEAK_PASSED=visible-ok
+  # --detach: start the session with no command (a detached seat). The
+  # caller then uses `hisn exec` to run commands in it.
+  if [ "$1" = "--detach" ]; then
+    "$HISN" run --policy "$pol" --session-id "$name" --detach \
+      </dev/null >"$S_LOG.out" 2>"$S_LOG" &
+  else
     "$HISN" run --policy "$pol" --session-id "$name" "$@" -- "$cwd/leakprobe" loop "$cwd/ctl" \
-    </dev/null >"$S_LOG.out" 2>"$S_LOG" &
+      </dev/null >"$S_LOG.out" 2>"$S_LOG" &
+  fi
   S_PID=$!
   SESSIONS+=("$S_PID")
   local i
@@ -2419,14 +2426,25 @@ fi
 
 # ================================================ L58: R5 refusal records client as refused (0.4.0)
 # The R5 peer check (authorize_peer) writes an `auth` op line with `refused`
-# when a peer fails the namespace check. That line must carry the client
-# record (uid/pid in the existing `pid_peer` field). We verify by checking
-# that a refused auth line exists in the audit log after a known-good
-# session has run (the main session may have produced refused lines if
-# any probe tripped the R5 check). This is a presence check: the auth
-# refusal mechanism is already tested by the existing R5 tests (L42).
-# L58 checks that the refused line carries the peer pid (client record).
+# when a peer fails the namespace check. From inside a session, run `hisn ls`
+# via exec: the control socket is reachable but the peer is in the sandbox
+# pidns, so R5 refuses it. The refused audit line must carry the client
+# record (peer pid in the `pid_peer` field).
 L58_AUDIT="$WORK/main-audit.jsonl"
+# Trigger an R5 refusal from inside the session (peer in sandbox pidns).
+if needs_host; then
+  L58_CWD=$(new_cwd l58)
+  L58_POL="$WORK/l58.toml"
+  write_policy "$L58_POL" "$L58_CWD"
+  if start_session l58-$$ "$L58_CWD" "$L58_POL"; then
+    # From inside the session, `hisn ls` connects to the control socket.
+    # The peer is the supervisor's child (in the sandbox pidns), so R5
+    # refuses it with an `auth`/`refused` line.
+    timeout 10 "$HISN" exec --no-tty --session l58-$$ -- hisn ls >/dev/null 2>&1 || true
+    end_session "$L58_CWD" "$S_PID"
+  fi
+  rm -rf "$L58_CWD"
+fi
 if [ -f "$L58_AUDIT" ]; then
   if grep -q '"op": *"auth"' "$L58_AUDIT" 2>/dev/null || grep -q '"auth"' "$L58_AUDIT" 2>/dev/null; then
     pass "L58 R5 refusal audit line present"

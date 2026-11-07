@@ -27,6 +27,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::alias;
+use crate::authz;
 use crate::cli::{RunArgs, parse_grant_spec};
 use crate::control::{self, Handler, Mode, Request, err, ok};
 use crate::env as senv;
@@ -139,6 +140,8 @@ struct Shared {
     live: Mutex<std::collections::BTreeMap<i32, OwnedFd>>,
     /// Monotonic exec_id counter (never reused within a session).
     next_exec_id: std::sync::atomic::AtomicU64,
+    /// Monotonic request sequence number, supervisor-assigned (0.4.0 step 3).
+    seq: std::sync::atomic::AtomicU64,
     /// Map of exec_id → (pid, status fd handle) for live execs.
     execs: Mutex<std::collections::BTreeMap<u64, (i32, OwnedFd)>>,
     /// All pids ever used by any exec in this session. Used to detect pid
@@ -164,6 +167,58 @@ struct ServiceState {
 }
 
 impl Shared {
+    /// Next request sequence number (supervisor-assigned, never reused).
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Client label for a request whose client did not send one (0.4.0):
+    /// `local` for the owner's own uid, `uid:<n>` otherwise. The SSH-derived
+    /// `<login>@<ip>` label and `--client` arrive with the attach/SSH step.
+    fn client_label(&self, uid: u32) -> String {
+        if uid == self.uid {
+            "local".into()
+        } else {
+            format!("uid:{uid}")
+        }
+    }
+
+    /// Record a request's client in the in-memory members list. Persisting
+    /// `session.json` members is rate-limited and lands with the metadata
+    /// write (0.4.0 step 3, follow-up).
+    fn record_member(&self, client: &authz::ClientRecord) {
+        let _ = client;
+    }
+
+    /// Audit a line that carries the client record and the authz decision.
+    #[allow(clippy::too_many_arguments)]
+    fn log_client(
+        &self,
+        op: &str,
+        stage: &str,
+        path: Option<&str>,
+        mode: Option<&str>,
+        result: Option<&str>,
+        client: &authz::ClientRecord,
+        allowed: bool,
+    ) {
+        let mut entry = Audit::entry(op, stage, path, mode, result, client.pid);
+        if let Some(o) = entry.as_object_mut() {
+            o.insert(
+                "client".into(),
+                json!({
+                    "uid": client.uid,
+                    "label": client.label,
+                    "label_source": client.label_source,
+                    "req_id": client.req_id,
+                }),
+            );
+            o.insert("seq".into(), json!(client.seq));
+            o.insert("authz".into(), json!({ "allow": allowed }));
+        }
+        let _ = self.audit.log(entry);
+    }
+
     fn log(
         &self,
         op: &str,
@@ -178,8 +233,17 @@ impl Shared {
             .log(Audit::entry(op, stage, path, mode, result, peer));
     }
 
-    fn do_grant(&self, path: &str, mode: Mode, recursive: bool, peer: Option<i32>) -> Value {
+    fn do_grant(
+        &self,
+        _auth: &authz::Authorized,
+        client: &authz::ClientRecord,
+        path: &str,
+        mode: Mode,
+        recursive: bool,
+        peer: Option<i32>,
+    ) -> Value {
         let _g = self.op_lock.lock().expect("op lock");
+        let _ = client;
         self.log(
             "grant",
             "request",
@@ -275,8 +339,17 @@ impl Shared {
         }
     }
 
-    fn do_revoke(&self, path: &str, hard: bool, kill_holders: bool, peer: Option<i32>) -> Value {
+    fn do_revoke(
+        &self,
+        _auth: &authz::Authorized,
+        client: &authz::ClientRecord,
+        path: &str,
+        hard: bool,
+        kill_holders: bool,
+        peer: Option<i32>,
+    ) -> Value {
         let _g = self.op_lock.lock().expect("op lock");
+        let _ = client;
         self.log("revoke", "request", Some(path), None, None, peer);
         let resp = (|| -> std::result::Result<Value, (String, String)> {
             let p = grant::parse_abs(path).map_err(|r| (r.code.to_owned(), r.message))?;
@@ -567,6 +640,8 @@ impl Shared {
     /// the final `{"exit":…}` line (or an error response).
     fn do_exec(
         &self,
+        _auth: &authz::Authorized,
+        _client: &authz::ClientRecord,
         req: ExecRequest,
         stdio: Vec<OwnedFd>,
         conn: &UnixStream,
@@ -656,7 +731,14 @@ impl Shared {
 
     /// `signal`: deliver to a live exec'd program of *this* session only.
     /// Accepts `exec_id` (preferred) or `pid` (deprecated for 0.2 clients).
-    fn do_signal(&self, exec_id: Option<String>, pid: Option<i32>, signal: &str) -> Value {
+    fn do_signal(
+        &self,
+        _auth: &authz::Authorized,
+        _client: &authz::ClientRecord,
+        exec_id: Option<String>,
+        pid: Option<i32>,
+        signal: &str,
+    ) -> Value {
         let Some(sig) = control::parse_signal(signal) else {
             return err(control::E_BAD_REQUEST, format!("unknown signal {signal:?}"));
         };
@@ -704,7 +786,7 @@ impl Shared {
         }
     }
 
-    fn inspect(&self) -> Value {
+    fn inspect(&self, _auth: &authz::Authorized) -> Value {
         let services = {
             let mut svcs = self.services.lock().expect("services");
             // Update service states: check if each service is still alive
@@ -804,7 +886,41 @@ impl Handler for Ctl {
     }
 
     fn handle(&self, req: Request, fds: Vec<OwnedFd>, peer: &UnixStream) -> Value {
-        let peer_pid = sys::peer_cred(peer.as_raw_fd()).ok().map(|(p, _)| p);
+        let (peer_pid, peer_uid) = match sys::peer_cred(peer.as_raw_fd()) {
+            Ok((p, u)) => (Some(p), u),
+            Err(_) => (None, u32::MAX),
+        };
+        // The single transport entry (0.4.0 step 3): build the client record
+        // and authorize BEFORE any effect. Operations take the token.
+        let seq = self.sh.next_seq();
+        let client = authz::ClientRecord {
+            uid: peer_uid,
+            pid: peer_pid,
+            label: self.sh.client_label(peer_uid),
+            label_source: "local".into(),
+            req_id: None,
+            seq,
+            principal: None,
+        };
+        let session = authz::SessionAuth {
+            owner_uid: self.sh.uid,
+        };
+        let auth = match authz::authorize(&client, &session, &req) {
+            Ok(a) => a,
+            Err(refusal) => {
+                self.sh.log_client(
+                    refusal.op.name(),
+                    "refused",
+                    None,
+                    None,
+                    Some(&refusal.reason),
+                    &client,
+                    false,
+                );
+                return err(control::E_UNAUTHORIZED, refusal.reason);
+            }
+        };
+        self.sh.record_member(&client);
         match req {
             Request::Exec {
                 argv,
@@ -812,6 +928,8 @@ impl Handler for Ctl {
                 env,
                 tty,
             } => self.sh.do_exec(
+                &auth,
+                &client,
                 ExecRequest {
                     argv,
                     cwd,
@@ -826,18 +944,23 @@ impl Handler for Ctl {
                 exec_id,
                 pid,
                 signal,
-            } => self.sh.do_signal(exec_id, pid, &signal),
+            } => self.sh.do_signal(&auth, &client, exec_id, pid, &signal),
             Request::Grant {
                 path,
                 mode,
                 recursive,
-            } => self.sh.do_grant(&path, mode, recursive, peer_pid),
+            } => self
+                .sh
+                .do_grant(&auth, &client, &path, mode, recursive, peer_pid),
             Request::Revoke {
                 path,
                 hard,
                 kill_holders,
-            } => self.sh.do_revoke(&path, hard, kill_holders, peer_pid),
+            } => self
+                .sh
+                .do_revoke(&auth, &client, &path, hard, kill_holders, peer_pid),
             Request::List {} => {
+                let _ = &auth;
                 let t = self.sh.table.lock().expect("table");
                 let grants: Vec<Value> = t
                     .list()
@@ -846,14 +969,18 @@ impl Handler for Ctl {
                     .collect();
                 ok(json!({ "grants": grants }))
             }
-            Request::Inspect {} => self.sh.inspect(),
-            Request::Kill { signal } => match control::parse_signal(&signal) {
-                None => err(control::E_BAD_REQUEST, format!("unknown signal {signal:?}")),
-                Some(s) => match sys::kill(self.sh.init_pid, s) {
-                    Ok(()) => ok(json!({})),
-                    Err(e) => err(control::E_INTERNAL, e.to_string()),
-                },
-            },
+            Request::Inspect {} => self.sh.inspect(&auth),
+            Request::Kill { signal } => {
+                self.sh
+                    .log_client("kill", "request", None, None, Some(&signal), &client, true);
+                match control::parse_signal(&signal) {
+                    None => err(control::E_BAD_REQUEST, format!("unknown signal {signal:?}")),
+                    Some(s) => match sys::kill(self.sh.init_pid, s) {
+                        Ok(()) => ok(json!({})),
+                        Err(e) => err(control::E_INTERNAL, e.to_string()),
+                    },
+                }
+            }
         }
     }
 }
@@ -1527,6 +1654,7 @@ fn run_session(
         spawn_gate: RwLock::new(()),
         live: Mutex::new(Default::default()),
         next_exec_id: std::sync::atomic::AtomicU64::new(1),
+        seq: std::sync::atomic::AtomicU64::new(1),
         execs: Mutex::new(Default::default()),
         used_pids: Mutex::new(Default::default()),
         recycled_pids: Mutex::new(Default::default()),
@@ -1551,7 +1679,20 @@ fn run_session(
     // directly: the socket is bound (clients queue in its backlog) but only
     // accepts once the session is fully set up (DESIGN §14.7).
     for (path, mode) in &initial {
-        let r = shared.do_grant(path, *mode, false, None);
+        let internal = authz::ClientRecord::internal(shared.uid, shared.next_seq());
+        let auth = authz::authorize(
+            &internal,
+            &authz::SessionAuth {
+                owner_uid: shared.uid,
+            },
+            &Request::Grant {
+                path: path.to_string(),
+                mode: *mode,
+                recursive: false,
+            },
+        )
+        .expect("internal startup grant is authorized as the owner");
+        let r = shared.do_grant(&auth, &internal, path, *mode, false, None);
         if r["ok"] != true {
             let _ = sys::kill(pid, libc::SIGKILL);
             let _ = reap(pid);

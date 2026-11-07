@@ -33,6 +33,8 @@ pub const E_EXISTS: &str = "E_EXISTS";
 pub const E_NOT_GRANTED: &str = "E_NOT_GRANTED";
 pub const E_HELD: &str = "E_HELD";
 pub const E_INTERNAL: &str = "E_INTERNAL";
+/// The authorization seam refused the request (0.4.0, src/authz.rs).
+pub const E_UNAUTHORIZED: &str = "E_UNAUTHORIZED";
 /// The program could not be started (confinement failed, not found, not executable).
 pub const E_EXEC: &str = "E_EXEC";
 

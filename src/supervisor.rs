@@ -240,17 +240,16 @@ impl Shared {
         path: &str,
         mode: Mode,
         recursive: bool,
-        peer: Option<i32>,
     ) -> Value {
         let _g = self.op_lock.lock().expect("op lock");
-        let _ = client;
-        self.log(
+        self.log_client(
             "grant",
             "request",
             Some(path),
             Some(mode.as_str()),
             None,
-            peer,
+            client,
+            true,
         );
         let resp = (|| -> std::result::Result<Value, (String, String)> {
             let p = grant::parse_abs(path).map_err(|r| (r.code.to_owned(), r.message))?;
@@ -315,24 +314,26 @@ impl Shared {
         })();
         match resp {
             Ok(v) => {
-                self.log(
+                self.log_client(
                     "grant",
                     "result",
                     Some(path),
                     Some(mode.as_str()),
                     Some("ok"),
-                    None,
+                    client,
+                    true,
                 );
                 v
             }
             Err((code, msg)) => {
-                self.log(
+                self.log_client(
                     "grant",
                     "result",
                     Some(path),
                     Some(mode.as_str()),
                     Some(&code),
-                    None,
+                    client,
+                    true,
                 );
                 err(&code, msg)
             }
@@ -346,11 +347,10 @@ impl Shared {
         path: &str,
         hard: bool,
         kill_holders: bool,
-        peer: Option<i32>,
     ) -> Value {
         let _g = self.op_lock.lock().expect("op lock");
         let _ = client;
-        self.log("revoke", "request", Some(path), None, None, peer);
+        self.log_client("revoke", "request", Some(path), None, None, client, true);
         let resp = (|| -> std::result::Result<Value, (String, String)> {
             let p = grant::parse_abs(path).map_err(|r| (r.code.to_owned(), r.message))?;
             let mount_id = {
@@ -405,11 +405,27 @@ impl Shared {
         })();
         match resp {
             Ok(v) => {
-                self.log("revoke", "result", Some(path), None, Some("ok"), None);
+                self.log_client(
+                    "revoke",
+                    "result",
+                    Some(path),
+                    None,
+                    Some("ok"),
+                    client,
+                    true,
+                );
                 v
             }
             Err((code, msg)) => {
-                self.log("revoke", "result", Some(path), None, Some(&code), None);
+                self.log_client(
+                    "revoke",
+                    "result",
+                    Some(path),
+                    None,
+                    Some(&code),
+                    client,
+                    true,
+                );
                 err(&code, msg)
             }
         }
@@ -641,16 +657,23 @@ impl Shared {
     fn do_exec(
         &self,
         _auth: &authz::Authorized,
-        _client: &authz::ClientRecord,
+        client: &authz::ClientRecord,
         req: ExecRequest,
         stdio: Vec<OwnedFd>,
         conn: &UnixStream,
-        peer: Option<i32>,
     ) -> Value {
         let argv0 = req.argv.first().cloned().unwrap_or_default();
-        self.log("exec", "request", Some(&argv0), None, None, peer);
+        self.log_client("exec", "request", Some(&argv0), None, None, client, true);
         let fail = |code: &str, msg: String| {
-            self.log("exec", "result", Some(&argv0), None, Some(code), None);
+            self.log_client(
+                "exec",
+                "result",
+                Some(&argv0),
+                None,
+                Some(code),
+                client,
+                true,
+            );
             err(code, msg)
         };
         let spec = match exec::validate(
@@ -725,7 +748,15 @@ impl Shared {
             ),
             exec::Outcome::Lost => ("lost", json!({ "exit": { "lost": true } })),
         };
-        self.log("exec", "result", Some(&argv0), None, Some(res), None);
+        self.log_client(
+            "exec",
+            "result",
+            Some(&argv0),
+            None,
+            Some(res),
+            client,
+            true,
+        );
         line
     }
 
@@ -734,11 +765,12 @@ impl Shared {
     fn do_signal(
         &self,
         _auth: &authz::Authorized,
-        _client: &authz::ClientRecord,
+        client: &authz::ClientRecord,
         exec_id: Option<String>,
         pid: Option<i32>,
         signal: &str,
     ) -> Value {
+        self.log_client("signal", "request", None, None, Some(signal), client, true);
         let Some(sig) = control::parse_signal(signal) else {
             return err(control::E_BAD_REQUEST, format!("unknown signal {signal:?}"));
         };
@@ -938,7 +970,6 @@ impl Handler for Ctl {
                 },
                 fds,
                 peer,
-                peer_pid,
             ),
             Request::Signal {
                 exec_id,
@@ -949,16 +980,12 @@ impl Handler for Ctl {
                 path,
                 mode,
                 recursive,
-            } => self
-                .sh
-                .do_grant(&auth, &client, &path, mode, recursive, peer_pid),
+            } => self.sh.do_grant(&auth, &client, &path, mode, recursive),
             Request::Revoke {
                 path,
                 hard,
                 kill_holders,
-            } => self
-                .sh
-                .do_revoke(&auth, &client, &path, hard, kill_holders, peer_pid),
+            } => self.sh.do_revoke(&auth, &client, &path, hard, kill_holders),
             Request::List {} => {
                 let _ = &auth;
                 let t = self.sh.table.lock().expect("table");
@@ -1692,7 +1719,7 @@ fn run_session(
             },
         )
         .expect("internal startup grant is authorized as the owner");
-        let r = shared.do_grant(&auth, &internal, path, *mode, false, None);
+        let r = shared.do_grant(&auth, &internal, path, *mode, false);
         if r["ok"] != true {
             let _ = sys::kill(pid, libc::SIGKILL);
             let _ = reap(pid);

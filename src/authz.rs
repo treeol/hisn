@@ -101,6 +101,13 @@ impl Op {
 }
 
 /// Proof that `authorize` allowed this request. Constructible only here.
+///
+/// Forging one outside this module does not compile (the private field has no
+/// public constructor):
+///
+/// ```compile_fail
+/// let _ = hisn::authz::Authorized { op: hisn::authz::Op::List, role: "x", _private: () };
+/// ```
 #[derive(Debug)]
 pub struct Authorized {
     op: Op,

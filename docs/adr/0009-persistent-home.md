@@ -1,6 +1,6 @@
 # ADR 0009 — Persistent `$HOME` (0.3.2)
 
-Status: accepted. Date: 2026-11-04. Context: `docs/PLAN-0.3.2.md §1`.
+Status: accepted. Date: 2026-11-04. Origin: the 0.3.2 planning document (§1), removed from the tree; this record stands alone.
 
 ## Decision
 

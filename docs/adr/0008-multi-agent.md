@@ -1,6 +1,6 @@
 # ADR 0008 — Multi-agent: discovery in 0.3, leases in 0.4
 
-Status: proposed. Date: 2026-11-02. Context: `docs/PLAN-0.3.md §7`.
+Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§7), removed from the tree; this record stands alone.
 
 ## Decision
 

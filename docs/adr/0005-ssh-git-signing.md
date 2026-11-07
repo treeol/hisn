@@ -1,6 +1,6 @@
 # ADR 0005 — SSH / git signing: T0 host-git / T1 proxy / T2 socket
 
-Status: proposed. Date: 2026-11-02. Context: `docs/PLAN-0.3.md §4b`.
+Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§4b), removed from the tree; this record stands alone.
 
 ## Decision
 

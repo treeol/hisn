@@ -1,6 +1,6 @@
 # ADR 0001 — Profiles as an envelope around `hisn-policy/v1`
 
-Status: proposed. Date: 2026-11-02. Context: `docs/PLAN-0.3.md §1`.
+Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§1), removed from the tree; this record stands alone.
 
 ## Decision
 

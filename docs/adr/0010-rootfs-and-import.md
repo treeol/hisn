@@ -1,6 +1,6 @@
 # ADR 0010 — Read-only rootfs and import tool (0.3.2)
 
-Status: accepted. Date: 2026-11-04. Context: `docs/PLAN-0.3.2.md §2`.
+Status: accepted. Date: 2026-11-04. Origin: the 0.3.2 planning document (§2), removed from the tree; this record stands alone.
 
 ## Decision
 
@@ -63,6 +63,11 @@ clear error.
 - Symlinks are stored as-is (they resolve inside the mounted tree).
 - Device nodes and fifos are skipped and counted in the manifest.
 - Refuse to overwrite an existing name without `--replace`.
+- With `--replace` the old tree is moved aside (`.old-<name>-…`), the new tree
+  is renamed in, and the old tree is removed only afterwards. If the rename of
+  the new tree fails, the old tree is restored; if that also fails, the error
+  names the `.old-*` path. A replace never deletes the old tree before the new
+  one is in place.
 - Atomic publication: extract to a staging dir, then `rename` to the final
   name. A failed import leaves no partial store entry.
 

@@ -1,6 +1,6 @@
 # ADR 0006 — Risk disclosure
 
-Status: proposed. Date: 2026-11-02. Context: `docs/PLAN-0.3.md §5`.
+Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§5), removed from the tree; this record stands alone.
 
 ## Decision
 

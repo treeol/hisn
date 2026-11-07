@@ -1,6 +1,6 @@
 # ADR 0003 — Host-side services and socket forwarding
 
-Status: proposed. Date: 2026-11-02. Context: `docs/PLAN-0.3.md §3`.
+Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§3), removed from the tree; this record stands alone.
 
 ## Decision
 

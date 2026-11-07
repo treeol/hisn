@@ -1,6 +1,6 @@
 # ADR 0007 — Recipes
 
-Status: proposed. Date: 2026-11-02. Context: `docs/PLAN-0.3.md §6`.
+Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§6), removed from the tree; this record stands alone.
 
 ## Decision
 

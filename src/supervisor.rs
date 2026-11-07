@@ -2068,7 +2068,14 @@ fn run_session(
                 let last = sh.last_activity_secs();
                 let has_clients = sh.has_connected_clients();
                 let has_execs = sh.has_running_execs();
-                if !has_clients && !has_execs && last > 0 && (now_secs - last) as u64 > timeout_s {
+                // F2 (Mashūra): guard against backward clock — only fire
+                // when now_secs > last and the difference exceeds timeout.
+                if !has_clients
+                    && !has_execs
+                    && last > 0
+                    && now_secs > last
+                    && (now_secs - last) as u64 > timeout_s
+                {
                     // Idle: stop the session.
                     sh.log("lease", "expired", None, None, Some("idle"), None);
                     let _ = sys::kill(init_pid, libc::SIGTERM);

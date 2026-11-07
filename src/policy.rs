@@ -328,9 +328,9 @@ pub fn parse_duration(s: &str) -> Option<u64> {
     let n: u64 = num.parse().ok()?;
     match unit {
         "s" => Some(n),
-        "m" => Some(n * 60),
-        "h" => Some(n * 3600),
-        "d" => Some(n * 86400),
+        "m" => n.checked_mul(60),
+        "h" => n.checked_mul(3600),
+        "d" => n.checked_mul(86400),
         _ => None,
     }
 }

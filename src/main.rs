@@ -177,7 +177,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::from(1));
             }
             // Wait for the session to become stale (supervisor exited).
-            // Poll up to 30 seconds; the session dir is kept as "stopped".
+            // Poll up to 30 s; the session dir is kept as "stopped".
             let mut stopped = false;
             for _ in 0..300 {
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -186,13 +186,16 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     break;
                 }
             }
-            let _ = hisn::sessionmeta::set_state(&dir, hisn::sessionmeta::State::Stopped);
             if stopped {
+                let _ = hisn::sessionmeta::set_state(&dir, hisn::sessionmeta::State::Stopped);
                 eprintln!("session {} stopped", a.session);
+                Ok(ExitCode::SUCCESS)
             } else {
+                // Timeout: the session did not exit. Do NOT write Stopped —
+                // the state stays Stopping, and we report the failure.
                 eprintln!("session {} stop sent (timeout waiting for exit)", a.session);
+                Ok(ExitCode::from(1))
             }
-            Ok(ExitCode::SUCCESS)
         }
         Command::Inspect(a) => {
             let r = supervisor::client_request(&a.session, &json!({"op":"inspect"}))?;
@@ -572,8 +575,14 @@ fn archive_session(dir: &Path, id: &str, uid: u32) -> Result<(), anyhow::Error> 
         }
     }
     if let Ok(session) = std::fs::read_to_string(dir.join("session.json")) {
+        // F3 (Mashūra BLOCKING): re-serialize as compact JSON so the
+        // archive record stays on one line (JSONL).
+        let compact = serde_json::from_str::<serde_json::Value>(&session)
+            .ok()
+            .and_then(|v| serde_json::to_string(&v).ok())
+            .unwrap_or(session);
         archive
-            .write_all(format!("{{\"source\":\"session\",\"line\":{session}}}\n").as_bytes())
+            .write_all(format!("{{\"source\":\"session\",\"line\":{compact}}}\n").as_bytes())
             .map_err(|e| anyhow!("write session archive: {e}"))?;
     }
     archive

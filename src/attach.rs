@@ -189,12 +189,15 @@ fn relay_with_detach(mut conn: &UnixStream, master: OwnedFd) -> Result<Finish> {
                 for &b in data {
                     if in_detach {
                         if b == b'd' {
-                            // F7: detach — drop the connection (the shell
-                            // receives TERM→KILL) and read the exit line.
-                            // Reset the SIGWINCH handler before returning.
+                            // F7: detach — shut down the write side of
+                            // the connection so the supervisor sees EOF
+                            // and cancels the exec (TERM→KILL). Then
+                            // read the exit line with a timeout.
                             unsafe {
                                 let _ = libc::signal(libc::SIGWINCH, libc::SIG_DFL);
                             }
+                            use std::net::Shutdown;
+                            let _ = conn.shutdown(Shutdown::Write);
                             return read_exit_after_detach(conn);
                         }
                         out.push(0x1d);

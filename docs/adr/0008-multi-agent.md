@@ -2,6 +2,13 @@
 
 Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§7), removed from the tree; this record stands alone.
 
+> **Correction (2026-11-07):** `hisn attach` did not ship in 0.3. The
+> 0.3 implementation shipped named sessions and session discovery
+> (`hisn run --name`, `hisn ls`, `--session name|id`) but not the
+> interactive attach command. `hisn attach` ships in 0.4.0 (step 2) as an
+> exec with `tty: true` and `attach: true` — the control-protocol
+> addition that the 0.3 plan intended but did not implement.
+
 ## Decision
 
 0.3 ships the **discovery** half of multi-agent; the **lease** half moves to

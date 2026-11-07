@@ -7,6 +7,32 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added — 0.4.0 (seats)
+- **Named sessions:** `hisn run --name <name>` (unique per user); `--session`
+  accepts a name or id everywhere; `hisn ls` shows NAME, ID, STATE, CWD,
+  ROOTFS, NET, AGE, CLIENTS, LEASE. A per-user index in the `/tmp/hisn-$UID`
+  root is authoritative; a fallback scan repairs it (ADR 0014).
+- **Attach:** `hisn attach --session <name|id>` — an interactive shell
+  ($SHELL from the env snapshot, else /bin/sh) in the session cwd. Multiple
+  attaches are peers. The detach key Ctrl-] d closes the client; the shell
+  is killed on disconnect (no --detach in 0.4.0) (ADR 0015).
+- **Client identity and the authorization seam:** every control request
+  carries a `ClientRecord` (uid, pid, label, req_id, seq, principal). One
+  `authorize()` function gates every op; in 0.4.0 it allows iff
+  `uid == owner.uid`. The `Authorized` token cannot be forged outside the
+  `authz` module. Every audit line carries `client`, `seq`, `authz`.
+  Members are append-only in `session.json` (ADR 0016).
+- **Session env snapshot:** `--env K=V` at run declares a session env;
+  precedence: scrub < declared < computed; a request naming a declared key
+  gets `E_ENV_LOCKED` (ADR 0017).
+- **Leases, stop, archival:** `[session] idle_timeout` (duration string,
+  default none). `hisn stop --session X` sets state stopped and keeps the
+  dir. `ls --prune` archives `grants.jsonl` + `session.json` to
+  `$XDG_STATE_HOME/hisn/audit/<id>.jsonl` (0600) before removing; `--purge`
+  skips archival (ADR 0019).
+- **Lifecycle state:** `session.json` carries `state ∈ {creating, running,
+  stopping, stopped, crashed}`.
+
 ### Changed
 - Repository cleanup (no code change): process documents (plans, patches,
   host-run logs, the verification record) are removed from the tree; their

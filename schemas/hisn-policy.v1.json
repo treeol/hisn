@@ -48,7 +48,8 @@
         "network": "none",
         "shm": false,
         "shm_size": 64,
-        "tmp_size": 1024
+        "tmp_size": 1024,
+        "idle_timeout": null
       }
     },
     "version": {
@@ -231,6 +232,10 @@
           "format": "uint64",
           "default": 1024,
           "minimum": 0
+        },
+        "idle_timeout": {
+          "description": "Idle timeout after which a session with zero clients and no running exec stops itself. A duration string like \"30m\", \"2h\", \"1d\", or a bare number of seconds. None = never.",
+          "type": ["string", "null"]
         }
       },
       "additionalProperties": false

@@ -1487,3 +1487,66 @@ the service, not mounted by the supervisor).
 service sees the same root). 2 (same seccomp — the service is exec'd through
 the same chain). 3 (the service is in the pid ns and dies with it — `restart =
 "none"` means no out-of-band restart). 5 (annotation only).
+
+## 20. Seats: named sessions, attach, client identity, env snapshot, leases (v0.4.0)
+
+0.4.0 adds "seats": a hisn session is a place several clients join, locally
+or over SSH, with equal access (uid == owner). The client record, the
+authorization seam, the members list and the audit fields exist from 0.4.0
+so a later role model changes one function and a policy source — nothing
+else.
+
+### Named sessions (`hisn run --name <name>`)
+
+A name is unique per user (rootfs name rules; may not equal an existing
+id). The per-user index (`names.json`, `names.lock`) lives in the
+`/tmp/hisn-$UID` root. `--session` accepts a name or id everywhere. `hisn
+ls` shows NAME, ID, STATE, CWD, ROOTFS, NET, AGE, CLIENTS, LEASE.
+
+### Lifecycle
+
+`session.json` carries `state ∈ {creating, running, stopping, stopped,
+crashed}`. `creating` = the `.tmp-<id>` dir before rename; `crashed` =
+dir present, supervisor dead, state not `stopped` (what `is_stale`
+detects). `ls --prune` archives and removes stopped and crashed dirs.
+
+### Attach (`hisn attach --session <name|id>`)
+
+An exec with `tty: true` and `attach: true` (the only protocol addition;
+`deny_unknown_fields` stays). The supervisor starts the session's shell
+(`$SHELL` from the env snapshot, else `/bin/sh`) in the session cwd.
+Multiple attaches are peers (same pid namespace). The detach key Ctrl-] d
+closes the client (the shell is killed on disconnect — no `--detach` in
+0.4.0).
+
+### Client identity and the authorization seam
+
+Every control request carries a `ClientRecord` (uid, pid from
+`SO_PEERCRED`; label from `--client`, else SSH-derived, else "local";
+req_id; seq; principal reserved). One function, `authorize(client, meta,
+req)`, gates every op. In 0.4.0 it allows iff `client.uid == owner.uid`.
+The `Authorized` token has a private field — it cannot be forged outside
+`authz`. The R5 peer check stays separate and per-line. Every audit line
+carries `client`, `seq`, `authz`. Members are append-only in
+`session.json`.
+
+### Session env snapshot (`--env K=V`)
+
+The env the creating client declares at `run --env` is stored as
+`env.declared` in `session.json` (secret-looking values redacted on disk).
+Precedence per exec/attach: scrub base < declared < computed. A request
+may only add names in `env_pass` not already declared; a request naming a
+declared key gets `E_ENV_LOCKED`.
+
+### Leases, stop, archival
+
+`[session] idle_timeout` (duration string, default none = never).
+`last_activity` is updated on authorized requests (rate-limited to 10 s).
+Idle = zero clients ∧ no exec ∧ timeout elapsed. `hisn stop` sets state
+stopped. `ls --prune` archives `grants.jsonl` and the final `session.json`
+to `$XDG_STATE_HOME/hisn/audit/<id>.jsonl` (0600) before removing; `--purge`
+skips archival.
+
+**Invariants touched:** 2 (same seccomp — attach is an exec through the
+same chain). 3 (the session env snapshot is built from the scrub base,
+never from the host). 5 (annotation only).

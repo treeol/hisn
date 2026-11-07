@@ -47,6 +47,16 @@ hisn run --profile base -- make test                    # with a profile (built-
 `hisn run` passes stdio through unchanged and allocates a pty inside the sandbox
 when stdin is a terminal. It exits with the command's status.
 
+### Seats (0.4.0): named sessions and attach
+
+```sh
+hisn run --name myproj --profile base -- make test      # a named session
+hisn ls                                                  # NAME ID STATE CWD ROOTFS NET AGE CLIENTS LEASE
+hisn attach --session myproj                             # attach an interactive shell
+ssh -t smaragd hisn attach --session myproj              # attach from another machine
+hisn stop --session myproj                               # stop (keeps the dir; prune archives)
+```
+
 | Exit code | Meaning |
 |---|---|
 | `0`-`124` | the command's own status (a command that itself exits 125-127 is indistinguishable from the cases below) |

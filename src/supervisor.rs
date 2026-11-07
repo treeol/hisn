@@ -214,6 +214,30 @@ impl Shared {
         ml.insert(client.uid, now);
     }
 
+    /// Update `last_activity` in `session.json` (0.4.0 step 5), rate-limited
+    /// to once per 10 s. Called on every authorized request.
+    fn touch_lease(&self) {
+        let now = crate::session::rfc3339_now();
+        let now_secs = crate::session::parse_rfc3339_secs(&now).unwrap_or(0);
+        let should_write = {
+            let ml = self.members_lock.lock().expect("members lock");
+            match ml.get(&u32::MAX) {
+                // u32::MAX is the "lease" key in the members_lock map.
+                None => true,
+                Some(stored) => {
+                    let stored_secs = crate::session::parse_rfc3339_secs(stored).unwrap_or(0);
+                    now_secs - stored_secs >= 10
+                }
+            }
+        };
+        if !should_write {
+            return;
+        }
+        let _ = crate::sessionmeta::touch_lease(&self.session_dir, &now);
+        let mut ml = self.members_lock.lock().expect("members lock");
+        ml.insert(u32::MAX, now);
+    }
+
     /// Audit a line that carries the client record and the authz decision.
     #[allow(clippy::too_many_arguments)]
     fn log_client(
@@ -972,6 +996,7 @@ impl Handler for Ctl {
             }
         };
         self.sh.record_member(&client);
+        self.sh.touch_lease();
         match req {
             Request::Exec {
                 argv,
@@ -1480,6 +1505,12 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
             },
         );
         meta.env_declared = declared_env_disk.clone();
+        if let Some(timeout) = policy.idle_timeout_s {
+            meta.lease = Some(sessionmeta::Lease {
+                idle_timeout_s: Some(timeout),
+                last_activity: Some(session::rfc3339_now()),
+            });
+        }
         meta.write_to(&tmp.path)?;
         Ok(())
     })();
@@ -2737,6 +2768,7 @@ mod tests {
             tmp_size: 1024,
             rootfs: None,
             nameservers: None,
+            idle_timeout_s: None,
         }
     }
 

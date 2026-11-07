@@ -2514,6 +2514,19 @@ skip "L53 attach env excludes host env" "HOST test: run on rubin/smaragd"
 skip "L54 two attaches share pid namespace" "HOST test: run on rubin/smaragd"
 skip "L55 attach shell killed on disconnect" "HOST test: run on rubin/smaragd"
 
+# ================================================ L61: idle session with attached client survives (0.4.0, HOST)
+# A session with an idle_timeout and an attached client must not be stopped.
+# A session with zero clients and no exec past the timeout stops itself.
+# HOST test: the leak suite cannot start a pty-based attach; verify on host.
+skip "L61 idle with attached client survives" "HOST test: run on rubin/smaragd"
+
+# ================================================ L72: archive unreadable from inside a session (0.4.0, HOST)
+# The audit archive at $XDG_STATE_HOME/hisn/audit/<id>.jsonl must be
+# unreadable from inside a session, even when $XDG_STATE_HOME is under an
+# exposed path. HOST test: the leak suite cannot set $XDG_STATE_HOME under
+# an exposed path; verify on host.
+skip "L72 archive unreadable from inside a session" "HOST test: run on rubin/smaragd"
+
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.
 MANIFEST="$HERE/MANIFEST"

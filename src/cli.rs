@@ -38,6 +38,9 @@ pub enum Command {
     Attach(AttachArgs),
     /// Signal the sandbox of a session.
     Kill(KillArgs),
+    /// Stop a session: set state stopped, keep the dir, audit the stop
+    /// (0.4.0 step 5). The session's shell and execs are terminated.
+    Stop(StopArgs),
     /// Report host capabilities required by hisn.
     Check(CheckArgs),
     /// Policy utilities.
@@ -258,6 +261,9 @@ pub struct LsArgs {
     /// Remove stale session directories (no live supervisor).
     #[arg(long)]
     pub prune: bool,
+    /// Remove stale session directories without archiving (0.4.0 step 5).
+    #[arg(long)]
+    pub purge: bool,
 }
 
 #[derive(Debug, Args)]
@@ -266,6 +272,13 @@ pub struct KillArgs {
     pub session: String,
     #[arg(long, default_value = "TERM")]
     pub signal: String,
+}
+
+#[derive(Debug, Args)]
+pub struct StopArgs {
+    /// Session name or id.
+    #[arg(long)]
+    pub session: String,
 }
 
 #[derive(Debug, Args)]

@@ -90,7 +90,7 @@ pub struct SessionMeta {
     pub state: State,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<Member>,
-    #[serde(default, skip_serializing_if = "Option::is_none", skip_serializing)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<Lease>,
     /// Session env snapshot: keys declared at `run --env K=V` (0.4.0 step 4).
     /// Values matching `looks_secret` are stored as `"<redacted>"` on disk;
@@ -163,6 +163,15 @@ pub fn record_member(dir: &Path, uid: u32, label: &str, now: &str) -> std::io::R
             first_seen: now.to_owned(),
             last_seen: now.to_owned(),
         });
+    }
+    rewrite(dir, &m)
+}
+
+/// Update `last_activity` in the lease (0.4.0 step 5).
+pub fn touch_lease(dir: &Path, now: &str) -> std::io::Result<()> {
+    let mut m = read(dir).ok_or_else(|| std::io::Error::other("session.json missing"))?;
+    if let Some(lease) = m.lease.as_mut() {
+        lease.last_activity = Some(now.to_owned());
     }
     rewrite(dir, &m)
 }
@@ -257,6 +266,46 @@ mod tests {
         let m = read(&d).unwrap();
         assert_eq!(m.members, Vec::new());
         assert_eq!(m.lease, None);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn lease_roundtrip_and_touch() {
+        let d = std::env::temp_dir().join(format!("hisn-lease-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let mut m = SessionMeta::new("abc", Some("nm"), owner(), "/w", "host");
+        m.lease = Some(Lease {
+            idle_timeout_s: Some(300),
+            last_activity: Some("2026-11-07T12:00:00Z".into()),
+        });
+        m.write_to(&d).unwrap();
+        let back = read(&d).unwrap();
+        assert_eq!(back.lease.as_ref().unwrap().idle_timeout_s, Some(300));
+        // touch_lease updates last_activity.
+        touch_lease(&d, "2026-11-07T12:01:00Z").unwrap();
+        let m2 = read(&d).unwrap();
+        assert_eq!(
+            m2.lease.as_ref().unwrap().last_activity.as_deref(),
+            Some("2026-11-07T12:01:00Z")
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn env_declared_roundtrip() {
+        let d = std::env::temp_dir().join(format!("hisn-env-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let mut m = SessionMeta::new("abc", None, owner(), "/w", "none");
+        m.env_declared.insert("GOFLAGS".into(), "-mod=mod".into());
+        m.env_declared
+            .insert("SECRET_TOKEN".into(), "<redacted>".into());
+        m.write_to(&d).unwrap();
+        let back = read(&d).unwrap();
+        assert_eq!(back.env_declared.len(), 2);
+        assert_eq!(back.env_declared["GOFLAGS"], "-mod=mod");
+        assert_eq!(back.env_declared["SECRET_TOKEN"], "<redacted>");
         fs::remove_dir_all(&d).unwrap();
     }
 }

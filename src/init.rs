@@ -730,6 +730,7 @@ mod tests {
                     tmp_size: 1024,
                     rootfs: None,
                     nameservers: None,
+                    idle_timeout_s: None,
                 };
                 let ok = set_rlimits(&p).is_ok() && {
                     let mut l: libc::rlimit = std::mem::zeroed();

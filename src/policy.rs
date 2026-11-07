@@ -60,6 +60,11 @@ pub struct Session {
     pub shm_size: u64,
     /// /tmp size in MiB (default 1024; range 16..=65536).
     pub tmp_size: u64,
+    /// 0.4.0: idle timeout after which a session with zero clients and no
+    /// running exec stops itself. A duration string like "30m", "2h",
+    /// "1d", or a bare number of seconds. `None` (default) = never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout: Option<String>,
 }
 
 impl Default for Session {
@@ -72,6 +77,7 @@ impl Default for Session {
             shm: false,
             shm_size: 64,
             tmp_size: 1024,
+            idle_timeout: None,
         }
     }
 }
@@ -255,6 +261,9 @@ pub struct ResolvedPolicy {
     /// resolver list when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nameservers: Option<Vec<String>>,
+    /// 0.4.0: `[session] idle_timeout` parsed to seconds. `None` = never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_s: Option<u64>,
 }
 
 /// CLI flags that take precedence over the policy file.
@@ -294,6 +303,28 @@ pub fn is_valid_session_id(s: &str) -> bool {
         && !s.starts_with('.')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Parse a duration string ("30s", "10m", "2h", "1d", or a bare number of
+/// seconds) to seconds. Returns `None` on parse failure.
+pub fn parse_duration(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Bare number = seconds.
+    if let Ok(n) = s.parse::<u64>() {
+        return Some(n);
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let n: u64 = num.parse().ok()?;
+    match unit {
+        "s" => Some(n),
+        "m" => Some(n * 60),
+        "h" => Some(n * 3600),
+        "d" => Some(n * 86400),
+        _ => None,
+    }
 }
 
 fn is_valid_syscall_name(s: &str) -> bool {
@@ -608,6 +639,11 @@ impl Policy {
             tmp_size: self.session.tmp_size,
             rootfs,
             nameservers: overrides.nameservers.clone(),
+            idle_timeout_s: self
+                .session
+                .idle_timeout
+                .as_deref()
+                .and_then(parse_duration),
         })
     }
 
@@ -1412,5 +1448,23 @@ scoped = ["bogus"]
             ..Default::default()
         };
         assert!(pol.resolve(&cwd, &ov2, &[]).is_ok());
+    }
+
+    #[test]
+    fn parse_duration_valid() {
+        assert_eq!(parse_duration("30"), Some(30));
+        assert_eq!(parse_duration("30s"), Some(30));
+        assert_eq!(parse_duration("10m"), Some(600));
+        assert_eq!(parse_duration("2h"), Some(7200));
+        assert_eq!(parse_duration("1d"), Some(86400));
+        assert_eq!(parse_duration("  5m  "), Some(300));
+    }
+
+    #[test]
+    fn parse_duration_invalid() {
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("abc"), None);
+        assert_eq!(parse_duration("3x"), None);
+        assert_eq!(parse_duration("-5"), None);
     }
 }

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use serde_json::{Value, json};
 
@@ -149,6 +149,26 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 supervisor::client_request(&a.session, &json!({"op":"kill","signal":a.signal}))?;
             print_response(&r)
         }
+        Command::Stop(a) => {
+            // 0.4.0 step 5: stop a session. Set state to stopped, audit it,
+            // and send SIGTERM to the sandbox. The dir is kept as stopped.
+            let uid = rustix::process::getuid().as_raw();
+            let roots =
+                session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
+            let reg_root = hisn::registry::registry_root(uid);
+            let id = session::resolve_session_arg(&roots, &reg_root, &a.session)?;
+            let dir = session::find_session(&roots, &id)?;
+            if session::is_stale(&dir) {
+                eprintln!("session {} is not running (stale)", a.session);
+                return Ok(ExitCode::SUCCESS);
+            }
+            // Audit the stop (the supervisor logs it when it receives the kill).
+            let _ = supervisor::client_request(&a.session, &json!({"op":"kill","signal":"TERM"}));
+            // Set state to stopped in session.json.
+            let _ = hisn::sessionmeta::set_state(&dir, hisn::sessionmeta::State::Stopped);
+            eprintln!("session {} stopped", a.session);
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Inspect(a) => {
             let r = supervisor::client_request(&a.session, &json!({"op":"inspect"}))?;
             if a.json || r["ok"] != true {
@@ -161,7 +181,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Command::Ls(a) => ls(a.session.as_deref(), a.json, a.prune),
+        Command::Ls(a) => ls(a.session.as_deref(), a.json, a.prune, a.purge),
         Command::Rootfs { command } => match command {
             RootfsCommand::Import(args) => rootfs_import(args),
             RootfsCommand::List => {
@@ -220,7 +240,7 @@ fn print_response(r: &Value) -> Result<ExitCode> {
     })
 }
 
-fn ls(session_id: Option<&str>, json_out: bool, prune: bool) -> Result<ExitCode> {
+fn ls(session_id: Option<&str>, json_out: bool, prune: bool, purge: bool) -> Result<ExitCode> {
     let uid = rustix::process::getuid().as_raw();
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     match session_id {
@@ -241,15 +261,33 @@ fn ls(session_id: Option<&str>, json_out: bool, prune: bool) -> Result<ExitCode>
         }
         None => {
             let sessions = session::list_sessions(&roots);
-            if prune {
+            if prune || purge {
                 for (n, p) in &sessions {
                     // Check twice 300 ms apart to avoid racing a live session
                     // mid-shutdown.
                     if session::is_stale(p) {
                         std::thread::sleep(std::time::Duration::from_millis(300));
                         if session::is_stale(p) {
+                            if purge {
+                                // --purge: skip archival, just remove.
+                                match session::remove_safe(p, uid) {
+                                    Ok(()) => eprintln!("{n} stale; purged (no archive)"),
+                                    Err(e) => {
+                                        tracing::warn!("purge {n}: removal refused: {e}");
+                                        eprintln!("{n} stale; removal refused: {e}");
+                                    }
+                                }
+                                continue;
+                            }
+                            // 0.4.0 step 5: archive grants.jsonl and the
+                            // final session.json before removing the dir.
+                            if let Err(e) = archive_session(p, n, uid) {
+                                tracing::warn!("prune {n}: archive failed: {e}");
+                                eprintln!("{n} stale; archive failed: {e} (not removed)");
+                                continue;
+                            }
                             match session::remove_safe(p, uid) {
-                                Ok(()) => eprintln!("{n} stale; removed"),
+                                Ok(()) => eprintln!("{n} stale; archived and removed"),
                                 Err(e) => {
                                     tracing::warn!("prune {n}: removal refused: {e}");
                                     eprintln!("{n} stale; removal refused: {e}");
@@ -447,6 +485,49 @@ fn rootfs_import(args: hisn::cli::ImportArgs) -> Result<ExitCode> {
         m.name, m.files, m.skipped, m.size_bytes
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// 0.4.0 step 5: archive `grants.jsonl` and the final `session.json` from
+/// `dir` into `$XDG_STATE_HOME/hisn/audit/<id>.jsonl` (0600, dir 0700) before
+/// removing a stopped or crashed session. Aborts on archive write failure.
+fn archive_session(dir: &Path, id: &str, uid: u32) -> Result<(), anyhow::Error> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+    let state_home = std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| format!("/home/uid-{uid}"));
+            PathBuf::from(home).join(".local").join("state")
+        });
+    let audit_dir = state_home.join("hisn").join("audit");
+    std::fs::create_dir_all(&audit_dir).map_err(|e| anyhow!("create audit dir: {e}"))?;
+    let _ = std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700));
+    let archive_path = audit_dir.join(format!("{id}.jsonl"));
+    let mut archive = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(&archive_path)
+        .map_err(|e| anyhow!("open archive: {e}"))?;
+    if let Ok(grants) = std::fs::read_to_string(dir.join("grants.jsonl")) {
+        for line in grants.lines() {
+            if !line.is_empty() {
+                archive
+                    .write_all(format!("{{\"source\":\"grants\",\"line\":{line}}}\n").as_bytes())
+                    .map_err(|e| anyhow!("write grants archive: {e}"))?;
+            }
+        }
+    }
+    if let Ok(session) = std::fs::read_to_string(dir.join("session.json")) {
+        archive
+            .write_all(format!("{{\"source\":\"session\",\"line\":{session}}}\n").as_bytes())
+            .map_err(|e| anyhow!("write session archive: {e}"))?;
+    }
+    archive
+        .sync_all()
+        .map_err(|e| anyhow!("sync archive: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

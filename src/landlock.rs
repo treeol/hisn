@@ -160,6 +160,7 @@ mod tests {
             tmp_size: 1024,
             rootfs: None,
             nameservers: None,
+            idle_timeout_s: None,
         }
     }
 

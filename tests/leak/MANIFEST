@@ -4,6 +4,11 @@
 # This catches a test that was silently dropped from the suite.
 #
 # Format: one id per line, comments and blank lines ignored.
+#
+# HOST tests: ids marked HOST in the test comments (L53–L55, L56, L61, L72)
+# run on a host where 'hisn check' passes (user namespaces usable) and skip
+# in CI (where hisn check fails and the suite exits at preflight). The
+# needs_host() helper gates them on capability, not on an env var or hostname.
 L1
 L1c
 L2

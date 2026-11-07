@@ -103,10 +103,9 @@ namespaces, Landlock and seccomp. On Ubuntu 24.04 AppArmor restricts
 unprivileged user namespaces by default
 (`kernel.apparmor_restrict_unprivileged_userns`); `hisn check` shows the value.
 
-The release binaries are dynamically linked glibc builds (glibc 2.35 or newer).
-The ioctl casts that blocked musl were fixed in 0.2.1 (OPEN-POINTS P22), but a
-musl build has not been verified to compile or been leak-tested, so no static
-binary is published.
+The glibc release binaries are dynamically linked (glibc 2.35 or newer). CI also
+builds a static musl binary (`hisn-x86_64-linux-musl`), which the release
+workflow attaches; it is compiled in CI and has not been leak-tested separately.
 
 ## Usage
 
@@ -205,8 +204,9 @@ nameservers = ["192.168.1.111"]   # optional (0.3.3): DNS resolvers for network 
 built from the host's `/etc/resolv.conf` (non-loopback `nameserver` lines plus
 its `search`/`options`). When the host file lists only a loopback stub
 (systemd-resolved's `127.0.0.53`), the upstreams are taken from
-`/run/systemd/resolve/resolv.conf`. Loopback addresses are never passed into
-the session. If no usable resolver remains, the launch fails with
+`/run/systemd/resolve/resolv.conf`. A rootfs's own file is the last resort. The
+full order is in [ADR 0013](docs/adr/0013-rootfs-resolver-precedence.md).
+Loopback addresses are never passed into the session. If no usable resolver remains, the launch fails with
 `no usable DNS resolver …`; hisn never writes an empty resolv.conf. `[net]
 nameservers` replaces this derivation entirely and is rejected at
 `hisn profile validate` if it is empty, not an IP, or loopback.
@@ -318,7 +318,8 @@ does not filter network traffic, and it does not use cgroups. See the
 [roadmap](docs/ROADMAP.md).
 
 The reasoning behind each decision is in [docs/DESIGN.md](docs/DESIGN.md);
-known limits are tracked in [docs/OPEN-POINTS.md](docs/OPEN-POINTS.md). To
+known limits are tracked in [docs/OPEN-POINTS.md](docs/OPEN-POINTS.md) and
+the decisions behind them are in the [ADR index](docs/adr/README.md). To
 report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Verifying a build
@@ -338,29 +339,29 @@ make leaktest              # builds release + the probe, runs the leak suite
 make leaktest-log          # same, saved to docs/leaktest-host-YYYY-MM-DD.log with a header
 ```
 
+`HISN_TEST_ROOTFS` points the suite at a rootfs tree (for example one made with
+`hisn rootfs import`). Without it the rootfs checks (L43, L46, L50) skip; with
+it they run against that tree, so the tree must be a real, readable rootfs.
+
 The leak suite needs a host that allows unprivileged user namespaces; without
 one it refuses to run (exit 77) and reports nothing. `SKIP` and `WEAK` lines are
 never counted as passes. `WEAK` means a check passed without the fixture that
 would make it meaningful. On kernels with Landlock ABI below 6, L23 and L24
-skip.
+skip. Logs from a host run are not kept in the repository; see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 To check a downloaded binary, run `sha256sum -c SHA256SUMS`, then
 `hisn --version` and `hisn check`.
 
 ## Status
 
-hisn 0.3.1 is maintained by one person. The leak suite was last recorded on a
-Fedora x86_64 host at commit `809da11`: **216 passed, 0 failed, 1 skipped
-(L12, needs write access to `/etc`), 1 weak (L14 R5)**
-([log](docs/leaktest-host-2026-11-03.log)).
-CI runs the suite on Ubuntu 22.04 and 24.04 (x86_64) and builds a release only
-after it passes. aarch64 is cross-checked by clippy and has not been
-leak-tested. [docs/VERIFICATION.txt](docs/VERIFICATION.txt) lists what was run,
-where, and with which log; anything without a log is recorded as "not run".
+hisn 0.3.3 is maintained by one person. CI runs the leak suite on Ubuntu 22.04
+and 24.04 (x86_64) and builds a release only after it passes. aarch64 is
+cross-checked by clippy and has not been leak-tested. Release notes list what
+each release was verified against; see [CHANGELOG.md](CHANGELOG.md).
 
-**Next:** 0.3b (ssh T1, recipes, threat-model leak tests) and 0.4 (Docker T1/T3,
-leases, egress proxy) are planned in
-[docs/PLAN-0.3.md](docs/PLAN-0.3.md).
+Not yet built: ssh T1 recipes and threat-model leak tests, and Docker T1/T3,
+leases and an egress proxy (see [ROADMAP](docs/ROADMAP.md)).
 
 ## Documentation
 
@@ -368,9 +369,10 @@ leases, egress proxy) are planned in
 |---|---|
 | [DESIGN](docs/DESIGN.md) | how it works and why |
 | [POLICY-SPEC](docs/POLICY-SPEC.md) | policy format, control protocol, OCI mapping |
-| [ROADMAP](docs/ROADMAP.md), [PLAN-0.3](docs/PLAN-0.3.md) | where it is going |
+| [ADR index](docs/adr/README.md) | decisions and their reasons, one per record |
+| [ROADMAP](docs/ROADMAP.md) | where it is going |
 | [WAKIL-INTEGRATION](docs/WAKIL-INTEGRATION.md) | driving hisn from an agent runtime |
-| [OPEN-POINTS](docs/OPEN-POINTS.md), [VERIFICATION](docs/VERIFICATION.txt) | known limits; what was run and where |
+| [OPEN-POINTS](docs/OPEN-POINTS.md) | known limits and open questions |
 | [CHANGELOG](CHANGELOG.md), [SECURITY](SECURITY.md), [CONTRIBUTING](CONTRIBUTING.md) | project |
 
 ## License

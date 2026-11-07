@@ -7,7 +7,7 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
-## [0.3.3]
+## [0.3.3] - 2026-11-06
 
 ### Fixed
 - **Session DNS on systemd-resolved hosts.** The session's `/etc/resolv.conf`
@@ -52,7 +52,7 @@ All notable changes to hisn are recorded here. The format follows
   conflicts are refused at validate, not only at session start.
 - Leak tests L47–L49 (`src:dst` mount, validate refusals, symlinked source).
 
-## [0.3.2]
+## [0.3.2] - 2026-11-05
 
 Hardening before the tag (same version):
 - `rootfs import` moved to `rootfs_import`: streaming `tar` crate extraction with
@@ -118,7 +118,7 @@ Hardening before the tag (same version):
   after teardown; without `keys=`: both keys listed, add/remove still fail
   (skip if ssh-agent or ssh-add not found).
 
-## [0.3.1]
+## [0.3.1] - 2026-11-03
 
 ### Fixed
 - L17 signal race (7b162c7, 809da11): the control thread left `SIGCHLD`,
@@ -128,10 +128,10 @@ Hardening before the tag (same version):
   The control thread now blocks them. 7b162c7 also made the L29 test and
   `profiles/docker-socket.toml` use `network = "none"` (host mode needs
   Landlock ABI >= 6, absent on ubuntu-22.04).
-- Verification rows for CI and the host run: see `docs/VERIFICATION.txt`.
+- Verification rows for CI and the host run: see `docs/VERIFICATION.txt` (removed from the tree after 0.3.3; the release tags carry it).
   The 0.3.0 tag points at afdccd0 and does not contain these fixes.
 
-## [0.3.0]
+## [0.3.0] - 2026-11-03
 
 ### Added
 - **Profiles** (`hisn-profile/v1`): an envelope around `hisn-policy/v1` that
@@ -196,7 +196,7 @@ Hardening before the tag (same version):
   invisible), L37 (host_service: socket at expose, connect works, host process
   gone after session end), L41 (service readiness timeout → fail closed).
 
-## [0.2.2]
+## [0.2.2] - 2026-11-02
 
 ### Fixed
 - **User name inside the sandbox.** 0.2.1 took the name for `/etc/passwd` and
@@ -222,7 +222,7 @@ Hardening before the tag (same version):
   user, also for a session started under `env -i`); unit tests for the lookup
   and fallback, stub generation and the computed names.
 
-## [0.2.1]
+## [0.2.1] - 2026-11-02
 
 ### Added
 - **`/dev/shm`** (`session.shm`, default `false`): optional tmpfs at `/dev/shm`
@@ -270,7 +270,7 @@ Hardening before the tag (same version):
   on root-tmpfs renames; stop a continuous stream of spawns from starving a
   hard revoke.
 
-## [0.2.0]
+## [0.2.0] - 2026-11-01
 
 First release.
 
@@ -301,7 +301,7 @@ First release.
 - **Leak suite** (`make leaktest`, L1-L24): one `PASS|FAIL|SKIP|WEAK` line per
   check and a `RESULT:` line; non-zero exit on any FAIL. `make leaktest-log`
   writes a dated log with a header (commit, tree state, date, host, kernel,
-  hisn version). `docs/VERIFICATION.txt` records what was run, where.
+  hisn version). `docs/VERIFICATION.txt` recorded what was run, where (removed from the tree after 0.3.3).
 - Documentation: DESIGN, POLICY-SPEC, OPEN-POINTS, ROADMAP, WAKIL-INTEGRATION.
 
 ### Changed

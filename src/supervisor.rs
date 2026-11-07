@@ -214,6 +214,28 @@ impl Shared {
         ml.insert(client.uid, now);
     }
 
+    /// 0.4.0 F2: last activity time in epoch seconds (for the idle timer).
+    pub fn last_activity_secs(&self) -> i64 {
+        let meta = crate::sessionmeta::read(&self.session_dir);
+        meta.as_ref()
+            .and_then(|m| m.lease.as_ref())
+            .and_then(|l| l.last_activity.as_deref())
+            .and_then(crate::session::parse_rfc3339_secs)
+            .unwrap_or(0)
+    }
+
+    /// 0.4.0 F2: are there any connected clients? (Counted by the control
+    /// thread's accepted connections — for now, the execs map is the proxy:
+    /// a running exec means a client is attached.)
+    pub fn has_connected_clients(&self) -> bool {
+        !self.execs.lock().expect("execs").is_empty()
+    }
+
+    /// 0.4.0 F2: are there any running execs?
+    pub fn has_running_execs(&self) -> bool {
+        !self.execs.lock().expect("execs").is_empty()
+    }
+
     /// Update `last_activity` in `session.json` (0.4.0 step 5), rate-limited
     /// to once per 10 s. Called on every authorized request.
     fn touch_lease(&self) {
@@ -2005,7 +2027,47 @@ fn run_session(
     }
 
     // ---- 7. relay + wait
+    // 0.4.0 F2: idle timer. When idle_timeout is set, a background thread
+    // wakes every min(idle_timeout/4, 30 s) and checks:
+    //   idle = zero connected clients ∧ no exec running ∧ now − last_activity > idle_timeout.
+    // If idle, it sends SIGTERM to init and audits lease/expired.
+    let idle_timer = if let Some(timeout_s) = policy.idle_timeout_s {
+        let sh = Arc::clone(&shared);
+        let init_pid = pid;
+        Some(thread::spawn(move || {
+            let interval = std::time::Duration::from_secs((timeout_s / 4).clamp(1, 30));
+            let timeout = std::time::Duration::from_secs(timeout_s);
+            loop {
+                thread::sleep(interval);
+                // Check if init is still alive.
+                if unsafe { libc::kill(init_pid, 0) } != 0 {
+                    break; // init exited; stop the timer
+                }
+                // Check idle conditions.
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let last = sh.last_activity_secs();
+                let has_clients = sh.has_connected_clients();
+                let has_execs = sh.has_running_execs();
+                if !has_clients && !has_execs && last > 0 && (now_secs - last) as u64 > timeout_s {
+                    // Idle: stop the session.
+                    sh.log("lease", "expired", None, None, Some("idle"), None);
+                    let _ = sys::kill(init_pid, libc::SIGTERM);
+                    break;
+                }
+                let _ = (timeout, has_clients, has_execs, now_secs, last);
+            }
+        }))
+    } else {
+        None
+    };
     let code = relay_and_wait(pid, master, tty);
+    // The idle timer thread exits when init is killed.
+    if let Some(t) = idle_timer {
+        let _ = t.join();
+    }
 
     // Stop host services (DESIGN §17): signal + grace then KILL.
     // Check if the process is already gone before sleeping the full grace (P27).

@@ -186,3 +186,84 @@ fn detached_supervisor_does_not_hold_parent_pipes_open() {
         "session {name} is not running after run --detach (fd leak may have killed it)"
     );
 }
+
+#[test]
+fn detached_supervisor_prints_risk_lines_on_parent_stderr() {
+    if !userns_available() {
+        eprintln!(
+            "SKIP detach_pipes risk: unprivileged user namespaces unavailable (HOST evidence needed)"
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path().join("cwd");
+    std::fs::create_dir(&cwd).expect("cwd");
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).expect("home");
+    // --home-persist generates a "home-persist" RISK line on stderr.
+    let policy = write_policy(tmp.path(), &cwd);
+    let home = tmp.path().join("home");
+
+    let name = format!("dpr-{}", std::process::id());
+    let _cleanup = Cleanup(name.clone());
+
+    let mut child = Command::new(hisn())
+        .args(["run", "--name", &name, "--detach", "--home-persist"])
+        .arg(&home)
+        .args(["--policy"])
+        .arg(&policy)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run --detach");
+
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let stderr = child.stderr.take().expect("stderr pipe");
+    let stdout_fd = stdout.as_raw_fd();
+    let stderr_fd = stderr.as_raw_fd();
+    std::mem::forget(stdout);
+    std::mem::forget(stderr);
+
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "run --detach failed: {status}");
+
+    let (stdout_bytes, stdout_eof) = read_pipe_deadline(stdout_fd, Duration::from_secs(10));
+    let (stderr_bytes, stderr_eof) = read_pipe_deadline(stderr_fd, Duration::from_secs(10));
+
+    // SAFETY: both fds are valid pipe read ends we own.
+    unsafe {
+        libc::close(stdout_fd);
+        libc::close(stderr_fd);
+    }
+
+    assert!(stdout_eof, "stdout pipe did not reach EOF");
+    assert!(stderr_eof, "stderr pipe did not reach EOF");
+
+    let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+    let stdout_text = String::from_utf8_lossy(&stdout_bytes);
+
+    // The RISK line must appear on the parent's stderr.
+    assert!(
+        stderr_text.contains("RISK"),
+        "no RISK line on stderr: {stderr_text:?}"
+    );
+    // The ready line must appear on the parent's stdout.
+    assert!(
+        stdout_text.contains("ready"),
+        "no ready line on stdout: {stdout_text:?}"
+    );
+
+    // The session must still be running.
+    let t0 = Instant::now();
+    while session_state(&name).as_deref() != Some("running")
+        && t0.elapsed() < Duration::from_secs(5)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        session_state(&name),
+        Some("running".into()),
+        "session {name} is not running after run --detach"
+    );
+}

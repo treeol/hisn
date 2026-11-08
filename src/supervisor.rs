@@ -1694,9 +1694,68 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
     run_supervisor(args, allow_host_abstract, verbose)
 }
 
+/// Compute risk entries from the effective configuration (profile + CLI
+/// overrides). Extracted so `run_detached` can print RISK lines in the
+/// parent before forking (the child's stderr is /dev/null).
+fn compute_risk_entries(args: &RunArgs) -> Result<Vec<profile::RiskEntry>> {
+    if args.profile.is_some() {
+        let prof = match &args.profile {
+            Some(spec) => {
+                let (path, _) = profile::resolve_profile_path(spec)?;
+                ProfileDoc::load(&path)?
+            }
+            None => unreachable!("profile is Some"),
+        };
+        Ok(profile::compute_risks(&prof))
+    } else if args.home_persist.is_some() || args.rootfs_path.is_some() {
+        let synth = ProfileDoc {
+            version: profile::PROFILE_VERSION.to_string(),
+            policy: Policy::default(),
+            home: args.home_persist.as_ref().map(|p| profile::HomeConfig {
+                persist: Some(p.clone()),
+            }),
+            rootfs: args.rootfs_path.as_ref().map(|p| profile::RootfsConfig {
+                name: None,
+                path: Some(p.to_string_lossy().into_owned()),
+            }),
+            net: None,
+            ssh: None,
+            services: Vec::new(),
+            forwards: Vec::new(),
+            host_services: Vec::new(),
+            docker: None,
+        };
+        Ok(profile::compute_risks(&synth))
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// Print RISK lines to stderr (one per widening capability), unless
+/// `--quiet-risk`. Also prints "RISK: none" at -v when there are none.
+fn print_risk_lines(risk_entries: &[profile::RiskEntry], verbose: u8) {
+    let lines = profile::format_risk_lines(risk_entries);
+    for line in &lines {
+        eprintln!("{line}");
+    }
+    if lines.is_empty() && verbose > 0 {
+        eprintln!("RISK: none");
+    }
+}
+
 /// Fork a supervisor for a `--detach` session, wait for readiness, print the
 /// ready line, and return without waiting for the session to end.
 fn run_detached(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32> {
+    // Print RISK lines in the parent before forking: the child's stderr is
+    // /dev/null (closed by close_all_except + reopen) until redirect_stdio_to_log
+    // replaces it with supervisor.log, so RISK lines printed in the child would
+    // never reach the parent's caller. (non-detached prints them in
+    // run_supervisor_inner as before.)
+    if !args.quiet_risk {
+        let risk_entries = compute_risk_entries(&args)?;
+        print_risk_lines(&risk_entries, verbose);
+    }
+
     // A pipe the child writes to when it is ready (the control socket accepts);
     // errors before readiness are reported through it too.
     let (read_fd, write_fd) = pipe_cloexec()?;
@@ -1957,49 +2016,13 @@ fn run_supervisor_inner(
     // already carries [home], [rootfs], [ssh]). When --home-persist or
     // --rootfs-path are given without a profile, build a synthetic Profile
     // from the CLI overrides so the RISK line is still printed.
-    let risk_entries = if args.profile.is_some() {
-        let prof = match &args.profile {
-            Some(spec) => {
-                let (path, _) = profile::resolve_profile_path(spec)?;
-                ProfileDoc::load(&path)?
-            }
-            None => unreachable!("profile is Some"),
-        };
-        profile::compute_risks(&prof)
-    } else if args.home_persist.is_some() || args.rootfs_path.is_some() {
-        // Build a synthetic profile from the CLI overrides so the RISK
-        // line is printed even without --profile.
-        let synth = ProfileDoc {
-            version: profile::PROFILE_VERSION.to_string(),
-            policy: Policy::default(),
-            home: args.home_persist.as_ref().map(|p| profile::HomeConfig {
-                persist: Some(p.clone()),
-            }),
-            rootfs: args.rootfs_path.as_ref().map(|p| profile::RootfsConfig {
-                name: None,
-                path: Some(p.to_string_lossy().into_owned()),
-            }),
-            net: None,
-            ssh: None,
-            services: Vec::new(),
-            forwards: Vec::new(),
-            host_services: Vec::new(),
-            docker: None,
-        };
-        profile::compute_risks(&synth)
-    } else {
-        Vec::new()
-    };
+    let risk_entries = compute_risk_entries(&args)?;
 
     // Print RISK lines on start (one per widening capability), unless --quiet-risk.
-    if !args.quiet_risk {
-        let lines = profile::format_risk_lines(&risk_entries);
-        for line in &lines {
-            eprintln!("{line}");
-        }
-        if lines.is_empty() && verbose > 0 {
-            eprintln!("RISK: none");
-        }
+    // Under --detach the parent prints them before forking (the child's stderr
+    // is /dev/null until redirect_stdio_to_log), so skip here in that case.
+    if !args.quiet_risk && !args.detach {
+        print_risk_lines(&risk_entries, verbose);
     }
 
     // Preflight: fail early with a readable report instead of an EPERM.

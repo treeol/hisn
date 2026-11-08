@@ -32,6 +32,28 @@ change; a `SKIP` or `WEAK` needs its reason stated.
 Logs are not committed to the repository. They are evidence attached to a
 change, not part of the tree.
 
+### Start path and control-connection lifecycle
+
+A change to the session start path (`run`, `run_detached`,
+`run_supervisor_inner`, the ready report and the exit status of a failed start)
+or to the control-connection lifecycle (`serve_conn`, `ClientGuard`, the
+`connect`/`disconnect` pairing, `ConnRegistry`, the idle predicate) also needs a
+host leak run before its step is marked done. Unit tests do not cover these:
+the 0.4.1 regressions that reached a host (a start failure exiting 1 instead of
+125, and a control connection counted but never removed, which kept the session
+from going idle) passed `cargo test` and were caught only by `make leaktest`.
+
+Run the suite on the host (rubin) against the commit under review, and attach the
+log as above:
+
+```sh
+make leaktest-log
+```
+
+The unit tests for these paths (the start-failure exit table, the connection
+pairing and the idle predicate with a fake clock) are required as well; they
+catch the class early but do not replace the host run.
+
 ## Decisions: ADRs
 
 A decision that changes how hisn works, or that a future reader would otherwise

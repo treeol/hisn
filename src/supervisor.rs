@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use crate::alias;
 use crate::authz;
 use crate::cli::{RunArgs, parse_grant_spec};
-use crate::control::{self, Handler, Mode, Request, err, ok};
+use crate::control::{self, ConnId, Handler, Mode, Request, err, ok};
 use crate::env as senv;
 use crate::exec::{self, ExecClient, ExecContext, ExecRules, NsFds};
 use crate::grant::{self, Grant, GrantTable, HelperClient, Holder, HolderKind, Rules};
@@ -151,13 +151,10 @@ struct Shared {
     /// Pids that have been reused by a later exec. A `signal` by such a
     /// pid is rejected — the client must use `exec_id`.
     recycled_pids: Mutex<std::collections::BTreeSet<i32>>,
-    /// F2 fix: count of connected control clients (accepted connections that
-    /// have not yet disconnected). The idle timer treats this as "activity".
-    connected_clients: std::sync::atomic::AtomicU64,
-    /// 0.4.1 step 3: per-connection client records, keyed by the connection's
-    /// fd. A live attach shows up here (and under `execs`); `ls --json`
-    /// reports `clients` from this map. Entries are removed on disconnect.
-    clients: Mutex<std::collections::BTreeMap<i32, ClientInfo>>,
+    /// 0.4.1 R2: the live control connections (the client count and the
+    /// `clients[]` records). The idle timer treats a non-empty registry as
+    /// activity. Keyed by [`ConnId`]; see [`ConnRegistry`].
+    conns: Mutex<ConnRegistry>,
     /// 0.4.1 step 3: live execs for `ls --json` (`execs`), keyed by exec_id.
     /// Includes attaches (`attach: true`) and ordinary execs, with pid, argv0,
     /// tty and attach flag. Removed when the exec finishes.
@@ -181,6 +178,48 @@ struct Shared {
     /// request, not rate-limited). The idle timer reads this instead of
     /// the persisted lease value, which is throttled to 10 s writes.
     last_activity_secs: std::sync::atomic::AtomicI64,
+}
+
+/// 0.4.1 R2: the live control connections. The client count and the per-
+/// connection records are one map, so the count cannot drift from the records:
+/// `connected()` is the map's length. Keyed by [`ConnId`] (never reused), so a
+/// disconnect removes exactly the record its connect added.
+#[derive(Default)]
+struct ConnRegistry {
+    clients: std::collections::BTreeMap<ConnId, ClientInfo>,
+}
+
+impl ConnRegistry {
+    /// A connection sent its first request line: it is a client from now on.
+    /// Returns `false` (and changes nothing) if it was already registered.
+    fn connect(&mut self, id: ConnId, info: ClientInfo) -> bool {
+        if self.clients.contains_key(&id) {
+            return false;
+        }
+        self.clients.insert(id, info);
+        true
+    }
+
+    /// The connection closed. Returns `true` if it was registered (exactly
+    /// one disconnect per connect; a second is a no-op).
+    fn disconnect(&mut self, id: ConnId) -> bool {
+        self.clients.remove(&id).is_some()
+    }
+
+    /// Refine a registered connection's record with its request's identity.
+    fn update(&mut self, id: ConnId, label: &str, label_source: &str, uid: u32, pid: Option<i32>) {
+        if let Some(ci) = self.clients.get_mut(&id) {
+            ci.uid = uid;
+            ci.pid = pid;
+            ci.label = label.to_owned();
+            ci.label_source = label_source.to_owned();
+        }
+    }
+
+    /// Number of connected clients.
+    fn connected(&self) -> usize {
+        self.clients.len()
+    }
 }
 
 /// 0.4.1 step 3: a live control connection's client record, for `ls --json`
@@ -270,9 +309,7 @@ impl Shared {
     /// the `connected_clients` atomic — a client is "connected" from accept
     /// until the serve_conn thread exits.
     pub fn has_connected_clients(&self) -> bool {
-        self.connected_clients
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0
+        self.conns.lock().expect("conns").connected() > 0
     }
 
     /// 0.4.0 F2 fix: are there any running execs? (Any entry in the execs
@@ -288,9 +325,7 @@ impl Shared {
     pub fn idle_snapshot(&self) -> (bool, bool, i64) {
         let _g = self.lease_lock.lock().expect("lease lock");
         (
-            self.connected_clients
-                .load(std::sync::atomic::Ordering::SeqCst)
-                > 0,
+            self.conns.lock().expect("conns").connected() > 0,
             !self.execs.lock().expect("execs").is_empty(),
             self.last_activity_secs
                 .load(std::sync::atomic::Ordering::SeqCst),
@@ -310,10 +345,10 @@ impl Shared {
     /// step 3: records the connection so `ls --json` can list live clients.
     /// The client record is refined when the connection's first request is
     /// handled (`handle` calls `update_client` with the real label).
-    pub fn connect_client(&self, conn: RawFd) {
+    pub fn connect_client(&self, conn: ConnId) {
         let now = crate::session::rfc3339_now();
         self.admit(|| {
-            self.clients.lock().expect("clients").insert(
+            self.conns.lock().expect("conns").connect(
                 conn,
                 ClientInfo {
                     uid: self.uid,
@@ -323,34 +358,33 @@ impl Shared {
                     connected_since: now,
                 },
             );
-            self.connected_clients
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
     }
 
     /// 0.4.1 step 3: refine a connected client's record with the request-built
     /// `ClientRecord` (the label/label_source only arrive with a request line).
-    fn update_client(&self, conn: RawFd, client: &authz::ClientRecord) {
-        if let Some(ci) = self.clients.lock().expect("clients").get_mut(&conn) {
-            ci.uid = client.uid;
-            ci.pid = client.pid;
-            ci.label = client.label.clone();
-            ci.label_source = client.label_source.clone();
-        }
+    fn update_client(&self, conn: ConnId, client: &authz::ClientRecord) {
+        self.conns.lock().expect("conns").update(
+            conn,
+            &client.label,
+            &client.label_source,
+            client.uid,
+            client.pid,
+        );
     }
 
     /// F2 fix: a control client disconnected (serve_conn thread exited).
     /// The disconnect is the client's last activity: idle time counts from
     /// here, not from its (possibly much earlier) request.
-    pub fn disconnect_client(&self, conn: RawFd) {
-        self.clients.lock().expect("clients").remove(&conn);
-        if self.idle_timeout_s.is_some() {
+    pub fn disconnect_client(&self, conn: ConnId) {
+        // Remove the record and bump activity in one place. A disconnect
+        // without a registered connect is a no-op (never a negative count).
+        let removed = self.conns.lock().expect("conns").disconnect(conn);
+        if removed && self.idle_timeout_s.is_some() {
             let now = crate::lifecycle::Clock::now_secs(&crate::lifecycle::SystemClock);
             self.last_activity_secs
                 .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
         }
-        self.connected_clients
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Update `last_activity` in `session.json` (0.4.0 step 5, F5), rate-limited
@@ -1028,9 +1062,10 @@ impl Shared {
     /// client with no requests yet is still listed (label "connected").
     fn session_info(&self, _auth: &authz::Authorized) -> Value {
         let clients: Vec<Value> = self
-            .clients
+            .conns
             .lock()
-            .expect("clients")
+            .expect("conns")
+            .clients
             .values()
             .map(|c| {
                 json!({
@@ -1177,15 +1212,15 @@ impl Handler for Ctl {
         decision
     }
 
-    fn connect(&self, conn: RawFd) {
+    fn connect(&self, conn: ConnId) {
         self.sh.connect_client(conn);
     }
 
-    fn disconnect(&self, conn: RawFd) {
+    fn disconnect(&self, conn: ConnId) {
         self.sh.disconnect_client(conn);
     }
 
-    fn handle(&self, req: Request, fds: Vec<OwnedFd>, peer: &UnixStream) -> Value {
+    fn handle(&self, req: Request, fds: Vec<OwnedFd>, peer: &UnixStream, conn: ConnId) -> Value {
         let (peer_pid, peer_uid) = match sys::peer_cred(peer.as_raw_fd()) {
             Ok((p, u)) => (Some(p), u),
             Err(_) => (None, u32::MAX),
@@ -1236,7 +1271,7 @@ impl Handler for Ctl {
         };
         self.sh.record_member(&client);
         self.sh.touch_lease();
-        self.sh.update_client(peer.as_raw_fd(), &client);
+        self.sh.update_client(conn, &client);
         match req {
             Request::Exec {
                 argv,
@@ -2414,8 +2449,7 @@ fn run_session(
         execs: Mutex::new(Default::default()),
         used_pids: Mutex::new(Default::default()),
         recycled_pids: Mutex::new(Default::default()),
-        connected_clients: std::sync::atomic::AtomicU64::new(0),
-        clients: Mutex::new(Default::default()),
+        conns: Mutex::new(ConnRegistry::default()),
         exec_info: Mutex::new(Default::default()),
         services: Mutex::new(Default::default()),
         session_dir: sdir.path.clone(),
@@ -3244,6 +3278,18 @@ pub fn client_request(session_arg: &str, req: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use super::{ClientInfo, ConnRegistry};
+
+    fn info() -> ClientInfo {
+        ClientInfo {
+            uid: 1000,
+            pid: None,
+            label: "connected".into(),
+            label_source: "none".into(),
+            connected_since: "2026-11-08T00:00:00Z".into(),
+        }
+    }
+
     #[test]
     fn every_start_failure_exits_125_with_or_without_detach() {
         // 0.4.1 R1: a failed start exits 125 (EXIT_START_FAILED), never 1.
@@ -3290,6 +3336,101 @@ mod tests {
             parse_ready_report("ready abc123"),
             ReadyReport::Ready(_)
         ));
+    }
+
+    #[test]
+    fn connect_then_close_returns_to_zero_with_and_without_a_request() {
+        // 0.4.1 R2: N connections that close (with or without a request) must
+        // leave the registry empty; the count never goes negative or sticks.
+        let mut r = ConnRegistry::default();
+        for id in 1..=200u64 {
+            assert!(r.connect(id, info()));
+            if id % 2 == 0 {
+                r.update(id, "local", "none", 1000, Some(4242));
+            }
+            assert_eq!(r.connected(), 1);
+            assert!(r.disconnect(id));
+            assert_eq!(r.connected(), 0, "count stuck after connection {id}");
+        }
+        assert!(r.clients.is_empty());
+    }
+
+    #[test]
+    fn idle_fires_with_a_fake_clock_once_every_connection_is_gone() {
+        // 0.4.1 R2 (L61): connections that came and went must not keep the
+        // session alive. Drive the registry through connect/close (with and
+        // without a request), then ask the production idle predicate with a
+        // fake clock: it must hold while a client is connected and fire only
+        // after the timeout once the count is back to zero.
+        use crate::lifecycle::idle_due;
+        const TIMEOUT: u64 = 30;
+        let mut r = ConnRegistry::default();
+        let mut last_activity: i64 = 1_000;
+        for id in 1..=50u64 {
+            assert!(r.connect(id, info()));
+            if id % 2 == 0 {
+                r.update(id, "local", "none", 1000, Some(1));
+            }
+            // A connected client is never idle, however long it has been.
+            assert!(!idle_due(
+                r.connected() > 0,
+                false,
+                last_activity,
+                1_000_000,
+                TIMEOUT
+            ));
+            assert!(r.disconnect(id));
+            // The disconnect is the last activity (the supervisor bumps it).
+            last_activity = 1_000 + id as i64;
+        }
+        assert_eq!(r.connected(), 0);
+        let closed_at = last_activity;
+        // Zero clients, no execs: not yet idle inside the window...
+        assert!(!idle_due(false, false, closed_at, closed_at + 10, TIMEOUT));
+        // ...and idle once the timeout has elapsed from the last disconnect.
+        assert!(idle_due(
+            false,
+            false,
+            closed_at,
+            closed_at + TIMEOUT as i64 + 1,
+            TIMEOUT
+        ));
+    }
+
+    #[test]
+    fn a_second_disconnect_for_the_same_connection_is_a_noop() {
+        // Exactly one disconnect per connect: a duplicate must not drive the
+        // count negative or remove a later connection's record.
+        let mut r = ConnRegistry::default();
+        assert!(r.connect(7, info()));
+        assert!(r.disconnect(7));
+        assert!(!r.disconnect(7));
+        assert_eq!(r.connected(), 0);
+    }
+
+    #[test]
+    fn a_duplicate_connect_does_not_double_count() {
+        let mut r = ConnRegistry::default();
+        assert!(r.connect(3, info()));
+        assert!(!r.connect(3, info()));
+        assert_eq!(r.connected(), 1);
+        assert!(r.disconnect(3));
+        assert_eq!(r.connected(), 0);
+    }
+
+    #[test]
+    fn a_reused_fd_number_cannot_mis_pair_connections() {
+        // The original bug: the kernel reuses a closed fd number, so a record
+        // keyed by fd was replaced by the next connection and the wrong close
+        // removed it. With ConnId, each connection owns its own record.
+        let mut r = ConnRegistry::default();
+        assert!(r.connect(10, info())); // fd 3, connection 10
+        assert!(r.connect(11, info())); // fd 3 reused, connection 11
+        assert_eq!(r.connected(), 2, "a reused fd replaced a live record");
+        assert!(r.disconnect(10));
+        assert_eq!(r.connected(), 1, "closing 10 removed 11's record");
+        assert!(r.disconnect(11));
+        assert_eq!(r.connected(), 0);
     }
 
     #[test]

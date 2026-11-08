@@ -10,7 +10,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -255,24 +255,34 @@ pub fn signal_name(n: i32) -> String {
         .map_or_else(|| n.to_string(), |(name, _)| (*name).to_owned())
 }
 
+/// A control connection's identity, unique for the life of the process.
+///
+/// Not the fd: the kernel reuses a closed descriptor number immediately, so a
+/// record keyed by fd could be replaced by a later connection and then removed
+/// (or left behind) by the wrong disconnect. A sequence number is never reused.
+pub type ConnId = u64;
+
+/// Source of [`ConnId`]s.
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Operations behind the socket. Implemented by the supervisor.
 pub trait Handler: Send + Sync + 'static {
     /// Decide whether this peer may talk to the socket (R5). Called on accept
     /// and again before every request. `Err` closes the connection.
     fn authorize(&self, peer: &UnixStream) -> Result<(), String>;
     /// F2 fix: a client connected (serve_conn thread started, after authorize).
-    /// `conn` is the connection's fd, which identifies the connection for
-    /// `disconnect` and for per-connection client records (0.4.1 step 3).
-    fn connect(&self, _conn: RawFd) {}
-    /// F2 fix: a client disconnected (serve_conn thread exited).
-    fn disconnect(&self, _conn: RawFd) {}
+    /// Called once per connection, on its first request line only.
+    fn connect(&self, _conn: ConnId) {}
+    /// F2 fix: a client disconnected (serve_conn thread exited). Called exactly
+    /// once for every `connect`, on every close path (EOF, error, misuse).
+    fn disconnect(&self, _conn: ConnId) {}
     /// Handle one request and return its (final) response line. `fds` are the
     /// descriptors that arrived with the request: the server only lets them
     /// through on the *first* request line of a connection and only for
     /// `exec`, so every other handler can assume `fds` is empty. A handler may
     /// write intermediate response lines to `conn` before returning the final
     /// one (`exec`: `{"ok":true,"pid":N}`, later `{"exit":…}`).
-    fn handle(&self, req: Request, fds: Vec<OwnedFd>, conn: &UnixStream) -> Value;
+    fn handle(&self, req: Request, fds: Vec<OwnedFd>, conn: &UnixStream, id: ConnId) -> Value;
 }
 
 /// One request line plus the descriptors that arrived with it.
@@ -414,7 +424,7 @@ pub fn drain(timeout: Duration) -> bool {
 /// even if `serve_conn` returns early (EOF, error, misuse).
 struct ClientGuard<'a> {
     handler: &'a dyn Handler,
-    conn: RawFd,
+    conn: ConnId,
 }
 
 impl Drop for ClientGuard<'_> {
@@ -431,7 +441,7 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
     // line: a bare connect-and-close (`hisn ls` liveness probe, is_stale) is
     // neither a connected client nor activity — counting it made every `ls`
     // poll reset the idle timer (0.4.0 L61).
-    let conn_fd = stream.as_raw_fd();
+    let id: ConnId = NEXT_CONN_ID.fetch_add(1, Ordering::SeqCst);
     let mut _guard: Option<ClientGuard> = None;
     let mut reader = FdLineReader::new(stream.as_raw_fd());
     let mut out = &stream;
@@ -443,10 +453,10 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
         };
         lines += 1;
         if _guard.is_none() {
-            h.connect(conn_fd);
+            h.connect(id);
             _guard = Some(ClientGuard {
                 handler: h,
-                conn: conn_fd,
+                conn: id,
             });
         }
         if h.authorize(&stream).is_err() {
@@ -472,7 +482,7 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
                     );
                     return; // `fds` dropped: every received descriptor is closed
                 }
-                h.handle(req, fds, &stream)
+                h.handle(req, fds, &stream, id)
             }
             // Unknown op / bad JSON closes the connection (POLICY-SPEC §7).
             Err(m) => {
@@ -658,7 +668,7 @@ mod tests {
                 Err("denied".into())
             }
         }
-        fn handle(&self, req: Request, _: Vec<OwnedFd>, _: &UnixStream) -> Value {
+        fn handle(&self, req: Request, _: Vec<OwnedFd>, _: &UnixStream, _: ConnId) -> Value {
             self.seen.lock().unwrap().push(req.op_name().to_owned());
             match req {
                 Request::List { .. } => ok(json!({"grants": []})),
@@ -728,13 +738,13 @@ mod tests {
             fn authorize(&self, _: &UnixStream) -> Result<(), String> {
                 Ok(())
             }
-            fn connect(&self, _: RawFd) {
+            fn connect(&self, _: ConnId) {
                 self.open.fetch_add(1, O::SeqCst);
             }
-            fn disconnect(&self, _: RawFd) {
+            fn disconnect(&self, _: ConnId) {
                 self.open.fetch_sub(1, O::SeqCst);
             }
-            fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream) -> Value {
+            fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream, _: ConnId) -> Value {
                 ok(json!({ "env": self.payload }))
             }
         }
@@ -780,13 +790,13 @@ mod tests {
             fn authorize(&self, _: &UnixStream) -> Result<(), String> {
                 Ok(())
             }
-            fn connect(&self, _: RawFd) {
+            fn connect(&self, _: ConnId) {
                 self.connects.fetch_add(1, O::SeqCst);
             }
-            fn disconnect(&self, _: RawFd) {
+            fn disconnect(&self, _: ConnId) {
                 self.disconnects.fetch_add(1, O::SeqCst);
             }
-            fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream) -> Value {
+            fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream, _: ConnId) -> Value {
                 ok(json!({}))
             }
         }
@@ -810,13 +820,117 @@ mod tests {
     }
 
     #[test]
+    fn every_connect_has_exactly_one_disconnect_on_every_close_path() {
+        // 0.4.1 R2: the client count must return to zero once connections are
+        // gone, whatever the close path. Covers connect-then-close with and
+        // without a request, a request followed by a clean close, and a
+        // malformed line. Connection ids come from a counter, not the fd, so
+        // rapid reuse of a closed descriptor number cannot mis-pair them.
+        use std::collections::BTreeSet;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicI64, Ordering as O};
+        #[derive(Default)]
+        struct Tracking {
+            live: Mutex<BTreeSet<ConnId>>,
+            seen: Mutex<Vec<ConnId>>,
+            violations: Mutex<Vec<String>>,
+            net: AtomicI64,
+        }
+        impl Handler for Tracking {
+            fn authorize(&self, _: &UnixStream) -> Result<(), String> {
+                Ok(())
+            }
+            // Record violations instead of panicking under the lock (a panic
+            // here would poison the mutex and mask the real failure).
+            fn connect(&self, c: ConnId) {
+                if !self.live.lock().unwrap().insert(c) {
+                    self.violations
+                        .lock()
+                        .unwrap()
+                        .push(format!("connect twice for {c}"));
+                }
+                self.seen.lock().unwrap().push(c);
+                self.net.fetch_add(1, O::SeqCst);
+            }
+            fn disconnect(&self, c: ConnId) {
+                if !self.live.lock().unwrap().remove(&c) {
+                    self.violations
+                        .lock()
+                        .unwrap()
+                        .push(format!("disconnect for {c} without a matching connect"));
+                }
+                self.net.fetch_sub(1, O::SeqCst);
+            }
+            fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream, _: ConnId) -> Value {
+                ok(json!({}))
+            }
+        }
+        let h = Arc::new(Tracking::default());
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("close-paths.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let hh: Arc<dyn Handler> = h.clone();
+        thread::spawn(move || serve(l, hh));
+
+        const N: usize = 40;
+        // (a) connect-then-close, no request: never a client.
+        for _ in 0..N {
+            drop(UnixStream::connect(&sock).unwrap());
+        }
+        // (b) request then close (the fd is reused by the next connect).
+        for _ in 0..N {
+            request(&sock, &json!({"op":"list"})).unwrap();
+        }
+        // (c) a malformed first line: it arrived as a line, so the connection
+        // is connected for the duration of its reply, then disconnected.
+        for _ in 0..N {
+            let mut s = UnixStream::connect(&sock).unwrap();
+            let _ = writeln!(s, "not json");
+            let mut r = BufReader::new(s);
+            let _ = read_line_limited(&mut r);
+        }
+        // (d) request, then the client vanishes without reading the response.
+        for _ in 0..N {
+            let mut s = UnixStream::connect(&sock).unwrap();
+            let _ = writeln!(s, r#"{{"op":"list"}}"#);
+            drop(s);
+        }
+
+        // Settle, then take ONE snapshot of the authoritative set and assert
+        // on that snapshot only. Re-reading the mutex inside an assertion
+        // message can observe a later state than the one that was checked.
+        let t0 = Instant::now();
+        let (live_now, net_now) = loop {
+            let live: Vec<ConnId> = h.live.lock().unwrap().iter().copied().collect();
+            let net = h.net.load(O::SeqCst);
+            if (live.is_empty() && net == 0) || t0.elapsed() > Duration::from_secs(5) {
+                break (live, net);
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        let violations = h.violations.lock().unwrap().clone();
+        assert!(violations.is_empty(), "pairing violated: {violations:?}");
+        assert!(
+            live_now.is_empty(),
+            "connections left registered: {live_now:?}"
+        );
+        assert_eq!(net_now, 0, "client count did not return to zero");
+        // Bare connects (a) are never counted. The request-carrying cases can
+        // legitimately arrive as EOF before their line is read in (d), so the
+        // exact number is not fixed; every counted connection is paired.
+        let seen = h.seen.lock().unwrap().len();
+        assert!(seen <= 3 * N, "more clients than lines sent: {seen}");
+        assert!(seen >= 2 * N, "requests were not counted: {seen}");
+    }
+
+    #[test]
     fn drain_waits_for_a_slow_response_to_be_written() {
         struct Slow;
         impl Handler for Slow {
             fn authorize(&self, _: &UnixStream) -> Result<(), String> {
                 Ok(())
             }
-            fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream) -> Value {
+            fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream, _: ConnId) -> Value {
                 thread::sleep(Duration::from_millis(150));
                 ok(json!({"late": true}))
             }
@@ -924,7 +1038,7 @@ mod tests {
         fn authorize(&self, _: &UnixStream) -> Result<(), String> {
             Ok(())
         }
-        fn handle(&self, req: Request, fds: Vec<OwnedFd>, conn: &UnixStream) -> Value {
+        fn handle(&self, req: Request, fds: Vec<OwnedFd>, conn: &UnixStream, _: ConnId) -> Value {
             self.got
                 .lock()
                 .unwrap()

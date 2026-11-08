@@ -1716,6 +1716,45 @@ fn run_detached(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result
         drop(read_fd);
         // SAFETY: setsid in the forked child.
         unsafe { libc::setsid() };
+        // Close every inherited fd except the ready pipe write end. Without
+        // this the child keeps the parent's stdout/stderr pipe ends open for
+        // the session's lifetime, so a parent that holds those pipes (e.g.
+        // Wakil's exec) never sees EOF ("WaitDelay expired before I/O
+        // complete"). Fds 0–2 (the parent's stdin/stdout/stderr) are reopened
+        // from /dev/null so eprintln! works before redirect_stdio_to_log
+        // replaces them with supervisor.log. If --ready-fd N is also passed,
+        // keep that fd too (run_session writes to it later).
+        let mut keep = vec![write_fd.as_raw_fd()];
+        if let Some(rfd) = args.ready_fd {
+            keep.push(rfd);
+        }
+        sys::close_all_except(&keep);
+        // Reopen fds 0–2 from /dev/null: close_all_except left them as the
+        // inherited parent pipes (it starts at 3).
+        // SAFETY: close and reopen 0/1/2 from /dev/null. This is the fork
+        // child, before threads.
+        unsafe {
+            let _ = libc::close(0);
+            let _ = libc::close(1);
+            let _ = libc::close(2);
+            let r = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+            if r > 0 {
+                libc::dup2(r, 0);
+                libc::close(r);
+            }
+            let w = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+            if w >= 0 {
+                if w != 1 {
+                    libc::dup2(w, 1);
+                    libc::close(w);
+                }
+                let w2 = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+                if w2 >= 0 && w2 != 2 {
+                    libc::dup2(w2, 2);
+                    libc::close(w2);
+                }
+            }
+        }
         let code =
             match run_supervisor_with_ready(args, allow_host_abstract, verbose, Some(write_fd)) {
                 Ok(c) => c,
@@ -1845,13 +1884,29 @@ fn run_supervisor_with_ready(
     verbose: u8,
     ready_fd: Option<OwnedFd>,
 ) -> Result<i32> {
-    let r = run_supervisor_inner(args, allow_host_abstract, verbose, ready_fd.as_ref());
-    if let (Err(e), Some(fd)) = (&r, &ready_fd) {
-        // Report the failure to the parent's ready wait, then keep the error.
+    // Dup the fd so the error path can write to it without consuming the
+    // OwnedFd (which is moved into run_supervisor_inner). The dup is closed
+    // here on both paths: on error after writing, on success after the
+    // supervisor returns (it already dropped the original via `drop(fd)`).
+    let fd_for_error = ready_fd.as_ref().map(|f| {
+        // SAFETY: duplicate the fd; the dup is closed below on both paths.
+        unsafe { libc::dup(f.as_raw_fd()) }
+    });
+    let r = run_supervisor_inner(args, allow_host_abstract, verbose, ready_fd);
+    if let (Err(e), Some(dup)) = (&r, fd_for_error)
+        && dup >= 0
+    {
         use std::io::Write;
-        let mut f = unsafe { std::fs::File::from_raw_fd(std::os::fd::AsRawFd::as_raw_fd(fd)) };
+        let mut f = unsafe { std::fs::File::from_raw_fd(dup) };
         let _ = writeln!(f, "error {e:#}");
-        let _ = f.into_raw_fd(); // fd is still owned by ready_fd
+        // File::drop closes the fd (from_raw_fd took ownership).
+    } else if let Some(dup) = fd_for_error
+        && dup >= 0
+    {
+        // Success path: the supervisor already closed the original via
+        // `drop(fd)`. Close the dup so the pipe reaches EOF.
+        // SAFETY: the dup is a valid fd we own.
+        unsafe { libc::close(dup) };
     }
     r
 }
@@ -1861,7 +1916,7 @@ fn run_supervisor_inner(
     args: RunArgs,
     allow_host_abstract: bool,
     verbose: u8,
-    ready_fd: Option<&OwnedFd>,
+    ready_fd: Option<OwnedFd>,
 ) -> Result<i32> {
     let (uid, gid, username) = getids(verbose);
     let prep = prepare(&args, uid)?;
@@ -2244,7 +2299,7 @@ fn run_session(
     ssh: Option<&profile::SshConfig>,
     session_id: &str,
     declared_env: &std::collections::BTreeMap<String, String>,
-    ready_fd: Option<&OwnedFd>,
+    ready_fd: Option<OwnedFd>,
 ) -> Result<SessionEnd> {
     sdir.write_resolved_policy(&policy.to_toml())?;
     // Write risk.json (the risk labels for this session, DESIGN §16).
@@ -2674,17 +2729,21 @@ fn run_session(
     // 0.4.1 step 4: a `--detach` child reports readiness through the pipe and
     // redirects its stdio to <session-dir>/supervisor.log (0600). The log is
     // opened from the supervisor (owner uid) after the dir exists, so both the
-    // ownership and the mode are hisn's.
+    // ownership and the mode are hisn's. The ready pipe write end is closed
+    // right after the ready line so the parent's read sees EOF.
     if let Some(fd) = ready_fd {
         use std::io::Write;
-        let mut f = unsafe { std::fs::File::from_raw_fd(std::os::fd::AsRawFd::as_raw_fd(fd)) };
+        let raw = fd.as_raw_fd();
+        let mut f = unsafe { std::fs::File::from_raw_fd(raw) };
         let _ = writeln!(f, "ready {session_id}");
-        let _ = f.into_raw_fd(); // fd is still owned by ready_fd
+        let _ = f.into_raw_fd(); // do not close via File; OwnedFd closes it
         // Redirect stdout/stderr to the session log. stdin stays as inherited
         // (the child is detached; nothing reads it).
         if let Err(e) = redirect_stdio_to_log(&sdir.path) {
             tracing::warn!("detach: cannot redirect stdio to supervisor.log: {e}");
         }
+        // Close the ready pipe write end so the parent's read sees EOF.
+        drop(fd);
     }
 
     // ---- 7. relay + wait

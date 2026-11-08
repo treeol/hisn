@@ -99,9 +99,9 @@ fn observer_queries_do_not_change_clients_or_stop_the_session() {
     let name = format!("obs-{}", std::process::id());
     let _cleanup = Cleanup(name.clone());
 
-    // Not `output()`: the detached supervisor keeps the ready pipe's write end
-    // open for its lifetime, so capturing pipes would block until the session
-    // ends. Send stdio to a file and wait only for the `hisn run` process.
+    // `hisn run --detach` now closes inherited fds in the child and the
+    // ready pipe write end after the ready line, so capturing pipes would
+    // be safe. Stdio::null keeps the test simple and matches the leak suite.
     let errlog = tmp.path().join("run.err");
     let started = Command::new(hisn())
         .args(["run", "--name", &name, "--detach", "--policy"])

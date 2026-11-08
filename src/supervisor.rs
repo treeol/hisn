@@ -1601,6 +1601,12 @@ pub fn open_fd_count() -> io::Result<usize> {
     Ok(fs::read_dir("/proc/self/fd")?.count())
 }
 
+/// Exit status of `hisn run` when the session fails to start (before "ready"):
+/// a refused profile, a missing risk_ack, a home/persist refusal, a service
+/// readiness timeout. The suite and the docs both name 125 (`EXIT_INTERNAL`).
+/// A started session passes its command's own status through instead.
+pub const EXIT_START_FAILED: i32 = 125;
+
 /// Exit code of `hisn run`.
 pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32> {
     // 0.4.1 step 4: `hisn run --detach` returns as soon as the session is
@@ -1644,7 +1650,7 @@ fn run_detached(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result
                     // The child has no ready channel contract beyond writing; the
                     // parent already holds the error via EOF if this fails early.
                     eprintln!("hisn: {e:#}");
-                    125
+                    EXIT_START_FAILED
                 }
             };
         // SAFETY: _exit ends the child without running the parent's atexit.
@@ -1689,7 +1695,15 @@ fn run_detached(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result
         // SAFETY: reap our own child.
         unsafe { libc::waitpid(pid, &mut status, 0) };
     }
-    Ok(1)
+    Ok(start_failure_exit())
+}
+
+/// The exit status of a detached `run` that did not reach "ready". Every
+/// start failure, however it arrives, is [`EXIT_START_FAILED`]: this is the
+/// single place the parent maps a failed start to a status (0.4.1 R1). Pure;
+/// unit-tested over each start-failure kind.
+fn start_failure_exit() -> i32 {
+    EXIT_START_FAILED
 }
 
 /// The first line the detached child writes on the ready pipe.
@@ -3230,6 +3244,54 @@ pub fn client_request(session_arg: &str, req: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_start_failure_exits_125_with_or_without_detach() {
+        // 0.4.1 R1: a failed start exits 125 (EXIT_START_FAILED), never 1.
+        // Table over the start-failure kinds the leak suite checks: profile
+        // refusal (L26), missing risk_ack (L29), home/persist refusal (L42 R5),
+        // service readiness timeout (L41), and a supervisor that dies before
+        // reporting. Each arrives as a ready-pipe line; the parent maps every
+        // non-ready outcome through start_failure_exit().
+        use super::{EXIT_START_FAILED, ReadyReport, parse_ready_report, start_failure_exit};
+        let kinds = [
+            (
+                "untrusted profile",
+                "error E_PROFILE_UNTRUSTED: profile under cwd",
+            ),
+            (
+                "missing risk_ack",
+                "error E_RISK_ACK_REQUIRED: docker-socket",
+            ),
+            ("home.persist refusal", "error E_HOME_PERSIST: refused"),
+            (
+                "service readiness timeout",
+                "error service never-ready: readiness timeout (15s)",
+            ),
+            ("supervisor died before reporting", ""),
+            ("unparseable report", "gibberish"),
+        ];
+        for (kind, line) in kinds {
+            let report = parse_ready_report(line);
+            assert!(
+                matches!(report, ReadyReport::Error(_)),
+                "{kind}: a failed start must not parse as ready"
+            );
+            assert_eq!(
+                start_failure_exit(),
+                125,
+                "{kind}: a failed start must exit 125, not {}",
+                start_failure_exit()
+            );
+        }
+        // The child's own failure branch and the parent share the constant.
+        assert_eq!(EXIT_START_FAILED, 125, "EXIT_START_FAILED must stay 125");
+        // A session that reports ready is not a start failure.
+        assert!(matches!(
+            parse_ready_report("ready abc123"),
+            ReadyReport::Ready(_)
+        ));
+    }
+
     #[test]
     fn ready_report_is_parsed_from_the_first_line() {
         use super::{ReadyReport, parse_ready_report};

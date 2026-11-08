@@ -822,6 +822,60 @@ pub fn pidfd_alive(pidfd: RawFd) -> bool {
     unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd, 0, 0usize, 0) == 0 }
 }
 
+/// 0.4.1 step 2: wait until `pidfd` becomes readable, i.e. the process behind
+/// it exits. Polls in small slices (1 ms) so a short life is observed promptly
+/// without a fixed 100 ms delay; bounded by `timeout`. Returns true when it
+/// exited, false on timeout.
+pub fn wait_pidfd_exit(pidfd: RawFd, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let mut p = [libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: poll on our own pidfd.
+        let r = unsafe { libc::poll(p.as_mut_ptr(), 1, 1) };
+        if r > 0 || !pidfd_alive(pidfd) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
+/// 0.4.1 step 2: wait until `cond` is true, checking immediately and then on
+/// an exponential backoff that starts at `initial` and is capped at `max`,
+/// until `timeout` elapses. This is the shared event-wait used on the
+/// readiness and stop paths: a condition that is already true costs one
+/// check, and a slow one is re-checked every `max` at worst — never a fixed
+/// 100 ms interval. Returns `true` if `cond` became true.
+pub fn wait_until(
+    timeout: std::time::Duration,
+    initial: std::time::Duration,
+    max: std::time::Duration,
+    mut cond: impl FnMut() -> bool,
+) -> bool {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + timeout;
+    let initial = initial.max(Duration::from_millis(1));
+    let max = max.max(initial);
+    let mut delay = initial;
+    loop {
+        if cond() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        std::thread::sleep(delay.min(remaining));
+        delay = (delay * 2).min(max);
+    }
+}
+
 /// Starttime (field 22 of `/proc/<pid>/stat`, the 20th field after the `)`)
 /// — identifies a specific process instance across pid reuse.
 pub fn stat_starttime(pid: i32) -> io::Result<u64> {

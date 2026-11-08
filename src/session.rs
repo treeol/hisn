@@ -346,6 +346,59 @@ pub fn is_live(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path.join("control.sock")).is_ok()
 }
 
+/// 0.4.1 step 2: wait until a session's control socket accepts a connection.
+/// Readiness is defined as *the socket accepts* — the same condition
+/// `is_live`/`is_stale` use. Polling uses an exponential backoff that starts
+/// at 1 ms and is capped at 20 ms, so a session that is already up costs one
+/// ~1 ms probe and a slow-starting one is re-probed every 20 ms at worst.
+/// There is deliberately no fixed 100 ms sleep: a session that becomes ready
+/// in 6 ms is observed in ~7 ms, not ~100 ms.
+///
+/// `ENOENT` (socket not created yet) and `ECONNREFUSED` (bound but the accept
+/// loop has not started) both mean "not ready yet". Any other connect error
+/// (`EACCES`, …) is a hard failure and returns immediately.
+pub fn wait_control_socket(
+    socket: &Path,
+    timeout: std::time::Duration,
+) -> Result<(), SessionError> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_millis(1);
+    loop {
+        match std::os::unix::net::UnixStream::connect(socket) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let code = e.raw_os_error();
+                if !matches!(code, Some(libc::ENOENT) | Some(libc::ECONNREFUSED)) {
+                    return Err(SessionError::Io(e));
+                }
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "control socket {} not ready within {timeout:?}",
+                    socket.display()
+                ),
+            )));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        std::thread::sleep(delay.min(remaining));
+        delay = (delay * 2).min(Duration::from_millis(20));
+    }
+}
+
+/// Read `supervisor.pid` as `(pid, starttime)`. `None` if missing or malformed.
+pub fn read_supervisor_pid(path: &Path) -> Option<(i32, u64)> {
+    let s = fs::read_to_string(path.join("supervisor.pid")).ok()?;
+    let (pid_str, start_str) = s.trim().split_once(' ')?;
+    let pid: i32 = pid_str.parse().ok()?;
+    let start: u64 = start_str.parse().ok()?;
+    (pid > 0 && start > 0).then_some((pid, start))
+}
+
 /// Is a session directory stale? `stale` = the socket refuses **and** the
 /// supervisor pid is gone or has a different starttime. Socket errors other
 /// than `ECONNREFUSED`/`ENOENT` mean **not stale** (a busy live session must

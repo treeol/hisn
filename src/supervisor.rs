@@ -1725,6 +1725,11 @@ impl crate::lifecycle::StopTarget for InitTarget {
             None => unsafe { libc::kill(self.pid, 0) != 0 },
         }
     }
+
+    fn exit_fd(&self) -> Option<std::os::fd::RawFd> {
+        // 0.4.1 step 2: a pidfd makes the idle-expiry stop wait event-driven.
+        self.pidfd.as_ref().map(std::os::fd::AsRawFd::as_raw_fd)
+    }
 }
 
 impl crate::lifecycle::IdleSession for Shared {
@@ -2478,26 +2483,28 @@ fn wait_service_readiness(s: &profile::Service, timeout_secs: u64) -> Result<()>
         }
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        if std::time::Instant::now() > deadline {
-            return Err(anyhow!(
-                "service {}: readiness timeout ({}s)",
-                s.name,
-                timeout_secs
-            ));
-        }
-        // ready.socket: stat the path from the supervisor (userns S). This
-        // works for paths under cwd (a rw bind visible from S) and under
-        // mounts.ro/rw. It does not work for paths on the sandbox's private
-        // tmpfs (/tmp, /run, $HOME); the service must declare its socket
-        // under cwd for readiness to be checkable.
-        if let Some(sock) = &ready.socket
-            && let Ok(meta) = fs::symlink_metadata(sock)
-            && meta.file_type().is_socket()
-        {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    // 0.4.1 step 2: event wait instead of a fixed 100 ms poll. `ready.socket`
+    // is stat'ed from the supervisor (userns S); that works for paths under
+    // cwd and mounts.ro/rw, not for the sandbox's private tmpfs.
+    let ready_fn = || {
+        ready
+            .socket
+            .as_ref()
+            .is_some_and(|sock| fs::symlink_metadata(sock).is_ok_and(|m| m.file_type().is_socket()))
+    };
+    if sys::wait_until(
+        deadline.saturating_duration_since(std::time::Instant::now()),
+        std::time::Duration::from_millis(1),
+        std::time::Duration::from_millis(20),
+        ready_fn,
+    ) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "service {}: readiness timeout ({}s)",
+            s.name,
+            timeout_secs
+        ))
     }
 }
 
@@ -2574,19 +2581,21 @@ fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()> {
         }
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        if std::time::Instant::now() > deadline {
-            return Err(anyhow!(
-                "host_service {}: readiness timeout ({}s)",
-                h.name,
-                timeout_secs
-            ));
-        }
-        let ready_result = check_readiness(ready, &h.socket);
-        if ready_result {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    // 0.4.1 step 2: event wait instead of a fixed 100 ms poll.
+    let ready_fn = || check_readiness(ready, &h.socket);
+    if sys::wait_until(
+        deadline.saturating_duration_since(std::time::Instant::now()),
+        std::time::Duration::from_millis(1),
+        std::time::Duration::from_millis(20),
+        ready_fn,
+    ) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "host_service {}: readiness timeout ({}s)",
+            h.name,
+            timeout_secs
+        ))
     }
 }
 

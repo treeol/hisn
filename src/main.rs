@@ -168,6 +168,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             struct Client<'a> {
                 session: &'a str,
                 dir: &'a Path,
+                /// 0.4.1 step 2: a pidfd on the session's supervisor, when it
+                /// can be opened and still matches supervisor.pid's starttime.
+                /// The stop wait blocks on it instead of polling every 100 ms.
+                pidfd: Option<std::os::fd::OwnedFd>,
             }
             impl hisn::lifecycle::StopTarget for Client<'_> {
                 fn signal(&self, _sig: i32) -> Result<(), String> {
@@ -187,10 +191,25 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     // (or gone) the session has ended.
                     !self.dir.is_dir() || session::is_stale(self.dir)
                 }
+                fn exit_fd(&self) -> Option<std::os::fd::RawFd> {
+                    self.pidfd.as_ref().map(std::os::fd::AsRawFd::as_raw_fd)
+                }
             }
+            // A pidfd on the supervisor gives an event-driven exit wait. It is
+            // only used when the recorded pid's starttime still matches, so a
+            // reused pid is never watched.
+            let supervisor_pidfd = session::read_supervisor_pid(&dir).and_then(|(pid, start)| {
+                let fd = hisn::sys::pidfd_open(pid).ok()?;
+                if hisn::sys::stat_starttime(pid).ok() == Some(start) {
+                    Some(fd)
+                } else {
+                    None
+                }
+            });
             let target = Client {
                 session: &a.session,
                 dir: &dir,
+                pidfd: supervisor_pidfd,
             };
             let write_state = |st: hisn::sessionmeta::State| {
                 if dir.is_dir() {

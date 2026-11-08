@@ -12,7 +12,7 @@
 //! with a fake clock.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::sessionmeta::{self, State};
 
@@ -48,6 +48,14 @@ pub trait StopTarget {
     fn signal(&self, sig: i32) -> Result<(), String>;
     /// Has the session exited?
     fn exited(&self) -> bool;
+    /// An fd that becomes readable when the target exits (a pidfd), when one
+    /// can be opened. 0.4.1 step 2: the stop wait blocks on this so an exit is
+    /// observed the instant it happens instead of at the next poll boundary.
+    /// `None` (a target that cannot provide one) means the wait falls back to
+    /// an exponential-backoff poll — never a fixed 100 ms.
+    fn exit_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
 }
 
 /// How long [`stop_and_keep`] waits at each step.
@@ -57,8 +65,13 @@ pub struct StopPlan {
     pub term_wait: Duration,
     /// Wait after a `SIGKILL` escalation; `None` = no escalation.
     pub kill_wait: Option<Duration>,
-    /// Poll interval while waiting.
+    /// Initial poll interval; the fallback wait backs off exponentially from
+    /// here up to [`StopPlan::poll_max`]. 0.4.1 step 2: 1 ms initial, so a
+    /// session that exits 2 ms after TERM is observed within ~2 ms, not at a
+    /// fixed 100 ms boundary.
     pub poll: Duration,
+    /// Cap on the backoff interval.
+    pub poll_max: Duration,
 }
 
 impl StopPlan {
@@ -66,13 +79,15 @@ impl StopPlan {
     pub const SUPERVISOR: StopPlan = StopPlan {
         term_wait: Duration::from_secs(10),
         kill_wait: Some(Duration::from_secs(5)),
-        poll: Duration::from_millis(100),
+        poll: Duration::from_millis(1),
+        poll_max: Duration::from_millis(20),
     };
     /// The `hisn stop` plan: 30 s TERM, no escalation (unchanged from F4).
     pub const CLIENT: StopPlan = StopPlan {
         term_wait: Duration::from_secs(30),
         kill_wait: None,
-        poll: Duration::from_millis(100),
+        poll: Duration::from_millis(1),
+        poll_max: Duration::from_millis(20),
     };
 }
 
@@ -121,20 +136,64 @@ pub fn stop_and_keep(
         }
         return StopOutcome::SignalFailed(e);
     }
-    if wait_exit(target, clock, plan.term_wait, plan.poll) {
+    if wait_exit(target, clock, plan.term_wait, plan.poll, plan.poll_max) {
         return finish();
     }
     if let Some(kill_wait) = plan.kill_wait {
         let _ = target.signal(libc::SIGKILL);
-        if wait_exit(target, clock, kill_wait, plan.poll) {
+        if wait_exit(target, clock, kill_wait, plan.poll, plan.poll_max) {
             return finish();
         }
     }
     StopOutcome::Timeout
 }
 
-fn wait_exit(target: &dyn StopTarget, clock: &dyn Clock, total: Duration, poll: Duration) -> bool {
+/// Wait for `target` to exit, up to `total`. Event-driven: when the target
+/// supplies an `exit_fd` (a pidfd) the wait blocks on it and returns the moment
+/// it becomes readable, with the wall-clock deadline as the bound. Otherwise it
+/// polls with an exponential backoff starting at `poll` and capped at
+/// `poll_max` — never a fixed interval.
+fn wait_exit(
+    target: &dyn StopTarget,
+    clock: &dyn Clock,
+    total: Duration,
+    poll: Duration,
+    poll_max: Duration,
+) -> bool {
+    if target.exited() {
+        return true;
+    }
+    if let Some(fd) = target.exit_fd() {
+        let deadline = Instant::now() + total;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let mut pfd = [libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            // SAFETY: poll on an fd we own, valid pollfd array.
+            let r = unsafe { libc::poll(pfd.as_mut_ptr(), 1, ms) };
+            if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue; // re-check the deadline and the fd
+            }
+            // A pidfd becomes readable exactly when the process exits (it is
+            // the exit event), so a positive return is authoritative even when
+            // the process is a zombie not yet reaped by its parent. Fall back
+            // to the target's own `exited()` on timeout/error.
+            if r > 0 || target.exited() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+    // No pidfd: exponential-backoff poll, floored at 1 ms, capped at poll_max.
     let poll = poll.max(Duration::from_millis(1));
+    let poll_max = poll_max.max(poll);
+    let mut delay = poll;
     let mut waited = Duration::ZERO;
     loop {
         if target.exited() {
@@ -143,8 +202,10 @@ fn wait_exit(target: &dyn StopTarget, clock: &dyn Clock, total: Duration, poll: 
         if waited >= total {
             return false;
         }
-        clock.sleep(poll);
-        waited += poll;
+        let step = delay.min(total - waited);
+        clock.sleep(step);
+        waited += step;
+        delay = (delay * 2).min(poll_max);
     }
 }
 
@@ -559,6 +620,59 @@ mod tests {
         let r = run_idle_timer(&Never, &init, &clock, 2, StopPlan::SUPERVISOR, &write);
         assert_eq!(r, None);
         assert!(init.signals.borrow().is_empty());
+    }
+
+    /// 0.4.1 step 2: a stop's *fallback* wait (no pidfd) must back off, never
+    /// sleep a fixed interval. The real pidfd-driven timing is covered by
+    /// tests/latency.rs; here the growth of the sleeps is checked dry.
+    #[test]
+    fn backoff_wait_grows_and_is_capped() {
+        struct NeverExit;
+        impl StopTarget for NeverExit {
+            fn signal(&self, _: i32) -> Result<(), String> {
+                Ok(())
+            }
+            fn exited(&self) -> bool {
+                false
+            }
+        }
+        struct SleepLog {
+            slept: RefCell<Vec<Duration>>,
+        }
+        impl Clock for SleepLog {
+            fn now_secs(&self) -> i64 {
+                0
+            }
+            fn sleep(&self, d: Duration) {
+                self.slept.borrow_mut().push(d);
+            }
+        }
+        let clock = SleepLog {
+            slept: RefCell::new(Vec::new()),
+        };
+        let write = |_: State| Ok(());
+        let plan = StopPlan {
+            term_wait: Duration::from_millis(60),
+            kill_wait: None,
+            poll: Duration::from_millis(1),
+            poll_max: Duration::from_millis(20),
+        };
+        let r = stop_and_keep(&NeverExit, &clock, plan, &write, &|| {});
+        assert_eq!(r, StopOutcome::Timeout);
+        let slept = clock.slept.borrow();
+        assert!(!slept.is_empty(), "a timeout must have slept");
+        assert!(
+            slept.iter().all(|d| *d <= Duration::from_millis(20)),
+            "a sleep exceeded the backoff cap: {slept:?}"
+        );
+        assert!(
+            slept.len() >= 3 && slept[1] > slept[0],
+            "the fallback did not back off: {slept:?}"
+        );
+        assert!(
+            !slept.iter().any(|d| *d == Duration::from_millis(100)),
+            "a fixed 100 ms sleep remains: {slept:?}"
+        );
     }
 
     #[test]

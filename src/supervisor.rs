@@ -281,24 +281,51 @@ impl Shared {
         !self.execs.lock().expect("execs").is_empty()
     }
 
+    /// 0.4.1 step 7: the idle predicate input, read under `lease_lock` so an
+    /// admission (a new client or exec) cannot interleave between the reads and
+    /// the stop decision. `admit()` takes the same lock, so a request admitted
+    /// during the check is seen by it.
+    pub fn idle_snapshot(&self) -> (bool, bool, i64) {
+        let _g = self.lease_lock.lock().expect("lease lock");
+        (
+            self.connected_clients
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0,
+            !self.execs.lock().expect("execs").is_empty(),
+            self.last_activity_secs
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// 0.4.1 step 7: admission marker. A client connect or an exec registration
+    /// takes `lease_lock`, so it is serialised against an in-progress idle
+    /// check: an exec admitted during the check cannot be stopped under it.
+    /// Returns the closure's value.
+    fn admit<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _g = self.lease_lock.lock().expect("lease lock");
+        f()
+    }
+
     /// F2 fix: a control client connected (serve_conn thread started). 0.4.1
     /// step 3: records the connection so `ls --json` can list live clients.
     /// The client record is refined when the connection's first request is
     /// handled (`handle` calls `update_client` with the real label).
     pub fn connect_client(&self, conn: RawFd) {
         let now = crate::session::rfc3339_now();
-        self.clients.lock().expect("clients").insert(
-            conn,
-            ClientInfo {
-                uid: self.uid,
-                pid: None,
-                label: "connected".into(),
-                label_source: "none".into(),
-                connected_since: now,
-            },
-        );
-        self.connected_clients
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.admit(|| {
+            self.clients.lock().expect("clients").insert(
+                conn,
+                ClientInfo {
+                    uid: self.uid,
+                    pid: None,
+                    label: "connected".into(),
+                    label_source: "none".into(),
+                    connected_since: now,
+                },
+            );
+            self.connected_clients
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
     }
 
     /// 0.4.1 step 3: refine a connected client's record with the request-built
@@ -864,37 +891,43 @@ impl Shared {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // 0.4.1 step 3: record the live exec for `ls --json` `execs[]`
         // (attaches included). Removed when the exec finishes, below.
-        self.exec_info.lock().expect("exec_info").insert(
-            exec_id,
-            ExecInfo {
-                pid: sp.pid,
-                argv0: argv0.clone(),
-                tty: req.tty,
-                attach: req.attach,
-            },
-        );
-        let registered = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3)
-            .ok()
-            .map(|h| {
-                // Check if this pid was used by a previous exec (even a
-                // finished one). If so, mark it as recycled so `signal`
-                // by pid is rejected for the new exec.
-                {
-                    let mut used = self.used_pids.lock().expect("used_pids");
-                    if used.contains(&sp.pid) {
-                        self.recycled_pids.lock().expect("recycled").insert(sp.pid);
+        // 0.4.1 step 7: registration is admission — it takes the lease lock so
+        // an idle check in flight cannot miss this exec and stop the session.
+        self.admit(|| {
+            self.exec_info.lock().expect("exec_info").insert(
+                exec_id,
+                ExecInfo {
+                    pid: sp.pid,
+                    argv0: argv0.clone(),
+                    tty: req.tty,
+                    attach: req.attach,
+                },
+            );
+        });
+        let registered = self.admit(|| {
+            sys::dup_cloexec_min(sp.status.as_raw_fd(), 3)
+                .ok()
+                .map(|h| {
+                    // Check if this pid was used by a previous exec (even a
+                    // finished one). If so, mark it as recycled so `signal`
+                    // by pid is rejected for the new exec.
+                    {
+                        let mut used = self.used_pids.lock().expect("used_pids");
+                        if used.contains(&sp.pid) {
+                            self.recycled_pids.lock().expect("recycled").insert(sp.pid);
+                        }
+                        used.insert(sp.pid);
                     }
-                    used.insert(sp.pid);
-                }
-                self.live.lock().expect("live").insert(sp.pid, h);
-                if let Ok(dup) = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3) {
-                    self.execs
-                        .lock()
-                        .expect("execs")
-                        .insert(exec_id, (sp.pid, dup));
-                }
-                sp.pid
-            });
+                    self.live.lock().expect("live").insert(sp.pid, h);
+                    if let Ok(dup) = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3) {
+                        self.execs
+                            .lock()
+                            .expect("execs")
+                            .insert(exec_id, (sp.pid, dup));
+                    }
+                    sp.pid
+                })
+        });
         let mut w = conn;
         let started = writeln!(
             w,
@@ -1078,11 +1111,12 @@ impl Shared {
                 })
                 .collect::<Vec<_>>()
         };
+        let policy_redacted = redact_env_set(&self.resolved_toml);
         match fs::read_to_string(format!("/proc/{}/mountinfo", self.init_pid)) {
             Ok(mi) => ok(json!({
                 "schema": "hisn-inspect/v1",
                 "mountinfo": mi,
-                "policy": self.resolved_toml,
+                "policy": policy_redacted,
                 "risk": self.risk.iter().map(|e| json!({
                     "capability": e.capability,
                     "label": e.label.kebab(),
@@ -1534,6 +1568,49 @@ fn static_rules(plan: &[mounts::MountOp], policy: &ResolvedPolicy, roots: &[Path
         .map(|o| o.target.clone())
         .collect();
     rules
+}
+
+/// 0.4.1 step 7: `hisn inspect` must not echo a secret-shaped `env.set` value.
+/// The resolved policy is TOML; this rewrites any `[env] set`-table line whose
+/// key looks secret (per `env::looks_secret`) to a `<redacted>` value. The TOML
+/// is machine-generated by `ResolvedPolicy::to_toml`, so a line-oriented
+/// rewrite of the `set` table is safe: a value containing a newline cannot
+/// occur (it is emitted as a TOML basic string). Pure; unit-tested.
+pub fn redact_env_set(toml: &str) -> String {
+    let mut out = String::with_capacity(toml.len());
+    let mut in_set = false;
+    for line in toml.lines() {
+        let trimmed = line.trim_end();
+        if trimmed == "[env.set]" || trimmed == "[env.set] ".trim() {
+            in_set = true;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        // Any other section header ends the set table.
+        if trimmed.starts_with('[') {
+            in_set = false;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_set
+            && let Some((key, _)) = line.split_once('=')
+            && crate::env::looks_secret(key.trim().trim_matches('"'))
+        {
+            out.push_str(&format!("{} = \"<redacted>\"", key.trim_end()));
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // `lines()` drops a trailing newline; the TOML generator writes one, so
+    // only append if the input ended with a newline and the output lost it.
+    if !toml.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 /// Number of descriptors this process has open (includes the one used to
@@ -2068,6 +2145,10 @@ impl crate::lifecycle::IdleSession for Shared {
         Shared::last_activity_secs(self)
     }
 
+    fn idle_snapshot(&self) -> (bool, bool, i64) {
+        Shared::idle_snapshot(self)
+    }
+
     fn audit_lease_expired(&self) {
         self.log("lease", "expired", None, None, Some("idle"), None);
     }
@@ -2128,7 +2209,18 @@ fn run_session(
     let ll = landlock::plan(&policy, &initial_rw);
     let seccomp_progs = seccomp::build(&policy.extra_deny)?;
 
-    let host_env: Vec<(String, String)> = std::env::vars().collect();
+    // 0.4.1 step 7: read the host env with `vars_os` — `env::vars()` panics on a
+    // non-UTF-8 name/value, and the host env is untrusted. Non-UTF-8 entries
+    // are converted lossily; the scrub allowlist then decides what reaches the
+    // child, so a lossy value cannot leak an unvetted name.
+    let host_env: Vec<(String, String)> = std::env::vars_os()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
     let visible = |p: &Path| {
         mounts::expected_targets(&plan)
             .iter()
@@ -3302,6 +3394,36 @@ mod tests {
                 ours: 1000
             })
         );
+    }
+
+    #[test]
+    fn env_set_redaction_hides_secret_shaped_values() {
+        use super::redact_env_set;
+        // Real serialized shape from `ResolvedPolicy::to_toml`: an `[env.set]`
+        // table with `key = "value"` lines.
+        let toml = "version = \"hisn-policy/v1\"\n\
+                    [env]\n\
+                    pass = [\"GOFLAGS\"]\n\
+                    \n\
+                    [env.set]\n\
+                    GOFLAGS = \"-mod=mod\"\n\
+                    GITHUB_TOKEN = \"ghp_secret\"\n\
+                    MY_PASSWORD = \"hunter2\"\n";
+        let out = redact_env_set(toml);
+        assert!(out.contains("GOFLAGS = \"-mod=mod\""), "{out}");
+        assert!(
+            out.contains("GITHUB_TOKEN = \"<redacted>\""),
+            "token value must be redacted: {out}"
+        );
+        assert!(
+            out.contains("MY_PASSWORD = \"<redacted>\""),
+            "password value must be redacted: {out}"
+        );
+        assert!(!out.contains("ghp_secret"));
+        assert!(!out.contains("hunter2"));
+        // A policy with no secret-shaped keys is byte-identical.
+        let clean = "version = \"hisn-policy/v1\"\n[env.set]\nGOFLAGS = \"-mod=mod\"\n";
+        assert_eq!(redact_env_set(clean), clean);
     }
 
     #[test]

@@ -169,13 +169,18 @@ pub fn record_member(dir: &Path, uid: u32, label: &str, now: &str) -> std::io::R
     rewrite(dir, &m)
 }
 
-/// Update `last_activity` in the lease (0.4.0 step 5).
+/// Update `last_activity` in the lease (0.4.0 step 5). No-op (no write at all)
+/// when the session has no lease: 0.4.1 step 7 verifies that a session without
+/// `idle_timeout` never rewrites `session.json` for a lease touch.
 pub fn touch_lease(dir: &Path, now: &str) -> std::io::Result<()> {
     let mut m = read(dir).ok_or_else(|| std::io::Error::other("session.json missing"))?;
-    if let Some(lease) = m.lease.as_mut() {
-        lease.last_activity = Some(now.to_owned());
+    match m.lease.as_mut() {
+        Some(lease) => {
+            lease.last_activity = Some(now.to_owned());
+            rewrite(dir, &m)
+        }
+        None => Ok(()),
     }
-    rewrite(dir, &m)
 }
 
 /// Atomically rewrite `session.json` (write temp, fsync, rename).
@@ -320,9 +325,11 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         let m = SessionMeta::new("abc", None, owner(), "/w", "none");
         m.write_to(&d).unwrap();
-        // touch_lease on a session without a lease sets last_activity if
-        // the lease exists; here lease is None, so it stays None.
+        // 0.4.1 step 7: no lease ⇒ no rewrite at all (session.json unchanged).
+        let before = fs::read(d.join(FILE)).unwrap();
         touch_lease(&d, "2026-11-07T12:00:00Z").unwrap();
+        let after = fs::read(d.join(FILE)).unwrap();
+        assert_eq!(before, after, "session.json rewritten without a lease");
         let back = read(&d).unwrap();
         assert_eq!(
             back.lease, None,

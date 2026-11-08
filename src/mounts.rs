@@ -68,13 +68,24 @@ pub struct HostFacts {
 /// loopback stub on such hosts).
 pub const RESOLVED_UPSTREAM_FILE: &str = "/run/systemd/resolve/resolv.conf";
 
-/// Is this nameserver address a loopback address (127.0.0.0/8 or ::1)? A
-/// loopback resolver is unreachable from the session's network namespace, so it
-/// is never passed into the session.
+/// Is this nameserver address a loopback or otherwise-unusable address
+/// (127.0.0.0/8, ::1, the IPv4-mapped `::ffff:127.0.0.0/8`, or `0.0.0.0`)?
+/// Such a resolver is unreachable or meaningless from the session's network
+/// namespace, so it is never passed into the session.
 pub fn is_loopback_ns(addr: &str) -> bool {
     match addr.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
-        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Ok(std::net::IpAddr::V4(v4)) => {
+            // 0.4.1 step 7: `0.0.0.0` is not routable as a nameserver.
+            v4.is_loopback() || v4.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            // 0.4.1 step 7: an IPv4-mapped address (::ffff:127.0.0.1) must be
+            // treated as its IPv4 self, not as a plain v6 address.
+            v6.to_ipv4_mapped().map_or_else(
+                || v6.is_loopback() || v6.is_unspecified(),
+                |v4| v4.is_loopback() || v4.is_unspecified(),
+            )
+        }
         // Unparsable: keep out of the session (never pass what we cannot vouch for).
         Err(_) => true,
     }
@@ -168,8 +179,19 @@ pub fn build_resolv_conf_ordered(
     override_ns: Option<&[String]>,
 ) -> Result<String, String> {
     if let Some(ns) = override_ns {
+        // 0.4.1 step 7: the builder refuses an empty or loopback-only override
+        // itself (validate already does, but inspect/other callers must fail
+        // closed too), never writing an empty or useless resolv.conf.
+        let usable: Vec<&String> = ns.iter().filter(|a| !is_loopback_ns(a)).collect();
+        if usable.is_empty() {
+            return Err(
+                "no usable DNS resolver: the [net] nameservers override is empty or \
+                 loopback-only"
+                    .to_owned(),
+            );
+        }
         let mut out = String::new();
-        for a in ns {
+        for a in usable {
             out.push_str(&format!("nameserver {a}\n"));
         }
         return Ok(out);
@@ -1258,13 +1280,35 @@ mod tests {
 
     #[test]
     fn loopback_addresses_are_recognised() {
-        for a in ["127.0.0.1", "127.8.9.10", "::1"] {
+        for a in [
+            "127.0.0.1",
+            "127.8.9.10",
+            "::1",
+            "::ffff:127.0.0.1",
+            "0.0.0.0",
+            "::ffff:0.0.0.0",
+            "::",
+        ] {
             assert!(is_loopback_ns(a), "{a}");
         }
-        for a in ["10.0.0.1", "2001:db8::1", "1.1.1.1"] {
+        for a in ["10.0.0.1", "2001:db8::1", "1.1.1.1", "::ffff:8.8.8.8"] {
             assert!(!is_loopback_ns(a), "{a}");
         }
         assert!(is_loopback_ns("not-an-ip"), "unparsable is kept out");
+    }
+
+    #[test]
+    fn resolv_override_refuses_empty_and_loopback_only() {
+        // 0.4.1 step 7: the builder refuses an empty or loopback-only override.
+        assert!(build_resolv_conf(None, None, Some(&[])).is_err());
+        assert!(build_resolv_conf(None, None, Some(&["127.0.0.1".into()])).is_err());
+        assert!(build_resolv_conf(None, None, Some(&["::ffff:127.0.0.1".into()])).is_err());
+        assert!(build_resolv_conf(None, None, Some(&["0.0.0.0".into()])).is_err());
+        // A usable override (even mixed with a loopback entry) is written, with
+        // the unusable entry dropped.
+        let out =
+            build_resolv_conf(None, None, Some(&["127.0.0.1".into(), "1.1.1.1".into()])).unwrap();
+        assert_eq!(out, "nameserver 1.1.1.1\n");
     }
 
     fn bind_pol(ro: Vec<crate::policy::RoBind>) -> ResolvedPolicy {

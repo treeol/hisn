@@ -251,6 +251,17 @@ pub trait IdleSession {
     fn has_running_execs(&self) -> bool;
     /// Last activity in epoch seconds (in memory, not rate-limited).
     fn last_activity_secs(&self) -> i64;
+    /// 0.4.1 step 7: the three values above, read atomically with respect to
+    /// admission, so a client/exec admitted during the check is not missed.
+    /// The default reads them one by one (fine for the fakes); a real session
+    /// overrides it to hold the admission lock across all three reads.
+    fn idle_snapshot(&self) -> (bool, bool, i64) {
+        (
+            self.has_connected_clients(),
+            self.has_running_execs(),
+            self.last_activity_secs(),
+        )
+    }
     /// Audit `op:"lease", stage:"expired"`, client null, reason idle.
     fn audit_lease_expired(&self);
 }
@@ -277,10 +288,10 @@ pub fn run_idle_timer(
         // Order matters: a disconnect bumps last_activity BEFORE it drops the
         // client count, so reading the counts first and the activity second
         // never pairs "zero clients" with an activity older than the
-        // disconnect (Mashūra round 21, reader A).
-        let has_clients = sess.has_connected_clients();
-        let has_execs = sess.has_running_execs();
-        let last = sess.last_activity_secs();
+        // disconnect (Mashūra round 21, reader A). 0.4.1 step 7: the three
+        // reads come from one atomic snapshot so admission during the check is
+        // seen.
+        let (has_clients, has_execs, last) = sess.idle_snapshot();
         let now = clock.now_secs();
         if idle_due(has_clients, has_execs, last, now, timeout_s) {
             let outcome = stop_and_keep(target, clock, plan, write_state, &|| {

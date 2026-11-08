@@ -45,12 +45,21 @@ pub fn build_request(args: &ExecArgs) -> Result<Value> {
         let (k, v) = parse_env_spec(spec).map_err(|e| anyhow!(e))?;
         env.insert(k, v);
     }
+    let client = if args.client.is_some() {
+        Some(json!({
+            "label": args.client,
+            "label_source": "flag",
+        }))
+    } else {
+        None
+    };
     Ok(json!({
         "op": "exec",
         "argv": args.command,
         "cwd": args.cwd,
         "env": env,
         "tty": args.tty,
+        "client": client,
     }))
 }
 
@@ -498,12 +507,12 @@ mod tests {
         ]);
         assert_eq!(
             build_request(&a).unwrap(),
-            json!({"op":"exec","argv":["sh","-c","x y"],"cwd":"/w","env":{"A":"1"},"tty":true})
+            json!({"op":"exec","argv":["sh","-c","x y"],"cwd":"/w","env":{"A":"1"},"tty":true,"client":null})
         );
         let b = exec_args(&["hisn", "exec", "--session", "s", "--", "ls"]);
         assert_eq!(
             build_request(&b).unwrap(),
-            json!({"op":"exec","argv":["ls"],"cwd":null,"env":{},"tty":false})
+            json!({"op":"exec","argv":["ls"],"cwd":null,"env":{},"tty":false,"client":null})
         );
         let bad = exec_args(&[
             "hisn",
@@ -516,6 +525,24 @@ mod tests {
             "ls",
         ]);
         assert!(build_request(&bad).is_err());
+
+        // 0.4.1 step 6: `exec --client LABEL` sets the client record in the
+        // request (same shape as attach).
+        let c = exec_args(&[
+            "hisn",
+            "exec",
+            "--session",
+            "s",
+            "--client",
+            "rubin-wakil",
+            "--",
+            "ls",
+        ]);
+        assert_eq!(
+            build_request(&c).unwrap(),
+            json!({"op":"exec","argv":["ls"],"cwd":null,"env":{},"tty":false,
+                   "client":{"label":"rubin-wakil","label_source":"flag"}})
+        );
     }
 
     #[test]
@@ -605,7 +632,7 @@ mod tests {
         assert!(a.no_tty && !a.tty);
         assert_eq!(
             build_request(&a).unwrap(),
-            json!({"op":"exec","argv":["ls"],"cwd":null,"env":{},"tty":false})
+            json!({"op":"exec","argv":["ls"],"cwd":null,"env":{},"tty":false,"client":null})
         );
     }
 

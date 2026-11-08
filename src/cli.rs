@@ -136,6 +136,12 @@ pub struct RunArgs {
     /// cache vars) are refused. Repeatable.
     #[arg(long = "env", value_name = "K=V")]
     pub env: Vec<String>,
+    /// Read session env from a file of `KEY=VALUE` lines (blank lines and lines
+    /// starting with `#` are ignored). Values are validated exactly like
+    /// `--env`; use this (not `--env K=V`) for secret-shaped values so they do
+    /// not appear in `/proc/<pid>/cmdline` (0.4.1). Repeatable.
+    #[arg(long = "env-file", value_name = "PATH")]
+    pub env_files: Vec<PathBuf>,
     /// Start the session without a command: PID 1 only reaps, and the
     /// session lives until `hisn kill` / SIGTERM. Use `hisn exec` to run things in it.
     #[arg(long)]
@@ -189,6 +195,10 @@ pub struct ExecArgs {
     /// sandbox never receives a descriptor for the caller's terminal.
     #[arg(long = "no-tty", conflicts_with = "tty")]
     pub no_tty: bool,
+    /// Label for this client in the audit log (default: derived from SSH or
+    /// "local"). Same as `hisn attach --client` (0.4.1).
+    #[arg(long)]
+    pub client: Option<String>,
     /// Command and arguments.
     #[arg(last = true, required = true, value_name = "CMD")]
     pub command: Vec<String>,
@@ -213,6 +223,24 @@ pub fn parse_env_spec(spec: &str) -> Result<(String, String), String> {
         Some((k, v)) if !k.is_empty() => Ok((k.to_owned(), v.to_owned())),
         _ => Err(format!("expected K=V, got {spec:?}")),
     }
+}
+
+/// Parse a `--env-file` body into `K=V` pairs. Blank lines and lines whose
+/// first non-space character is `#` are ignored. Each other line must be a
+/// `K=V` (validated exactly like `--env`). Returns an error naming the line
+/// number on a bad line.
+pub fn parse_env_file(body: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for (i, raw) in body.lines().enumerate() {
+        let line = raw.trim_end_matches(['\r', '\n']);
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let (k, v) = parse_env_spec(line).map_err(|e| format!("line {}: {e}", i + 1))?;
+        out.push((k, v));
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Args)]
@@ -446,6 +474,25 @@ mod tests {
         assert_eq!(parse_env_spec("A=b=c").unwrap(), ("A".into(), "b=c".into()));
         assert!(parse_env_spec("=x").is_err());
         assert!(parse_env_spec("nothing").is_err());
+    }
+
+    #[test]
+    fn env_file_parses_lines_and_skips_comments() {
+        // 0.4.1 step 6: KEY=VALUE lines; blank lines and '#' comments ignored;
+        // a bad line names its number.
+        let body = "# a comment\n\nGOFLAGS=-mod=mod\nTOKEN=secret\n  # indented comment\nX=a=b\n";
+        let got = parse_env_file(body).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("GOFLAGS".to_string(), "-mod=mod".to_string()),
+                ("TOKEN".to_string(), "secret".to_string()),
+                ("X".to_string(), "a=b".to_string()),
+            ]
+        );
+        assert!(parse_env_file("").unwrap().is_empty());
+        let e = parse_env_file("A=1\nnot-a-pair\n").unwrap_err();
+        assert!(e.contains("line 2"), "{e}");
     }
 
     #[test]

@@ -177,8 +177,17 @@ pub fn reserve(
         }
         i
     });
-    if idx.names.contains_key(name) {
-        return Err(RegistryError::Taken(name.into()));
+    // 0.4.1 step 6: a name is taken only while the session directory it maps
+    // to still exists. A stopped session's dir is kept (so its name stays
+    // taken), but once `ls --prune` removes the dir the name is reusable —
+    // even if the index still holds a stale entry (dropped here, rewritten
+    // below).
+    if let Some(existing_id) = idx.names.get(name).cloned() {
+        let dir_present = roots.iter().any(|r| r.join(&existing_id).is_dir());
+        if dir_present {
+            return Err(RegistryError::Taken(name.into()));
+        }
+        idx.names.remove(name);
     }
     idx.names.insert(name.into(), id.into());
     write_index(reg_root, &idx)?;
@@ -271,13 +280,36 @@ mod tests {
     #[test]
     fn duplicate_name_is_refused() {
         let reg = tmp("reg");
-        let roots = vec![tmp("r1")];
+        let r1 = tmp("r1");
+        let roots = vec![r1.clone()];
         let _l = Lock::take(&reg, uid()).unwrap();
         reserve(&reg, &roots, "alpha", "id1").unwrap();
+        // 0.4.1 step 6: a name is taken while its session dir exists.
+        mk_session(&r1, "id1", Some("alpha"));
         assert!(matches!(
             reserve(&reg, &roots, "alpha", "id2"),
             Err(RegistryError::Taken(_))
         ));
+    }
+
+    #[test]
+    fn name_is_reusable_after_the_dir_is_removed() {
+        // 0.4.1 step 6: once `ls --prune` removes the session dir, its name is
+        // free again, even though the index still maps it (the stale entry is
+        // dropped on the next reserve).
+        let reg = tmp("reg");
+        let r1 = tmp("r1");
+        let roots = vec![r1.clone()];
+        {
+            let _l = Lock::take(&reg, uid()).unwrap();
+            reserve(&reg, &roots, "seat", "oldid").unwrap();
+            mk_session(&r1, "oldid", Some("seat"));
+        }
+        // The dir goes away (prune), the index entry remains stale.
+        fs::remove_dir_all(r1.join("oldid")).unwrap();
+        let _l = Lock::take(&reg, uid()).unwrap();
+        reserve(&reg, &roots, "seat", "newid").unwrap();
+        assert_eq!(resolve_name(&reg, &roots, "seat").as_deref(), Some("newid"));
     }
 
     #[test]
@@ -346,19 +378,24 @@ mod tests {
     }
 
     /// Two runtime roots (two XDG_RUNTIME_DIR values) must share one index,
-    /// so a name cannot be taken twice by sessions in different roots.
+    /// so a name cannot be taken twice by sessions in different roots. The
+    /// shared fallback root (`/tmp/hisn-$UID`) is visible to both.
     #[test]
     fn names_race_across_roots() {
         let reg = tmp("reg");
         let xdg_a = tmp("xdgA");
         let xdg_b = tmp("xdgB");
-        let roots_a = runtime_roots_for(&xdg_a);
-        let roots_b = runtime_roots_for(&xdg_b);
+        let fb = tmp("fallback");
+        let roots_a = vec![xdg_a.join("hisn"), fb.clone()];
+        let roots_b = vec![xdg_b.join("hisn"), fb.clone()];
+        // The real `run` order: reserve the name, then publish the dir. The
+        // session lives in the shared fallback root.
         {
             let _l = Lock::take(&reg, uid()).unwrap();
             reserve(&reg, &roots_a, "shared", "ida").unwrap();
         }
-        // The second root sees the same index, so the same name is refused.
+        mk_session(&fb, "ida", Some("shared"));
+        // The second root sees the same dir, so the same name is refused.
         let _l = Lock::take(&reg, uid()).unwrap();
         assert!(matches!(
             reserve(&reg, &roots_b, "shared", "idb"),
@@ -368,10 +405,6 @@ mod tests {
             resolve_name(&reg, &roots_b, "shared").as_deref(),
             Some("ida")
         );
-    }
-
-    fn runtime_roots_for(xdg: &Path) -> Vec<PathBuf> {
-        vec![xdg.join("hisn")]
     }
 
     /// Crash injection between reservation and session publication: a name

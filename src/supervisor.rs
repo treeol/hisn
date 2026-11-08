@@ -1868,15 +1868,28 @@ fn run_supervisor_inner(
     // names (HOME, USER, LOGNAME, cache vars) are refused at run with the
     // same error exec gives. Secret-looking values are stored on disk as
     // "<redacted>"; the real values go into the exec base_env.
+    // 0.4.1 step 6: --env-file PATH adds KEY=VALUE lines (validated the same
+    // way); it is the documented way to pass secret-shaped values, since they
+    // never appear in /proc/<pid>/cmdline.
+    let mut env_pairs: Vec<(String, String)> = Vec::new();
+    for pair in &args.env {
+        match pair.split_once('=') {
+            Some((k, v)) if !k.is_empty() => env_pairs.push((k.to_owned(), v.to_owned())),
+            _ => bail!("--env {pair:?}: expected K=V"),
+        }
+    }
+    for path in &args.env_files {
+        let body = std::fs::read_to_string(path)
+            .with_context(|| format!("--env-file {}", path.display()))?;
+        let pairs = crate::cli::parse_env_file(&body)
+            .map_err(|e| anyhow!("--env-file {}: {e}", path.display()))?;
+        env_pairs.extend(pairs);
+    }
     let mut declared_env: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     let mut declared_env_disk: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    for pair in &args.env {
-        let (k, v) = match pair.split_once('=') {
-            Some((k, v)) if !k.is_empty() => (k.to_owned(), v.to_owned()),
-            _ => bail!("--env {pair:?}: expected K=V"),
-        };
+    for (k, v) in env_pairs {
         if crate::env::is_computed(&k) {
             bail!("--env {k}: computed name (HOME, USER, LOGNAME, cache vars) cannot be declared");
         }
@@ -3411,6 +3424,7 @@ mod tests {
             ready_fd: None,
             command: vec!["true".into()],
             env: vec![],
+            env_files: vec![],
         };
         let p = prepare(&args, 1000).unwrap();
         assert_eq!(p.policy.cwd, cwd);

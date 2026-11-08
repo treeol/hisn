@@ -159,7 +159,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let id = session::resolve_session_arg(&roots, &reg_root, &a.session)?;
             let dir = session::find_session(&roots, &id)?;
             if session::is_stale(&dir) {
-                eprintln!("session {} is not running (stale)", a.session);
+                // 0.4.1 step 6: a session that is not live is not "stopped" by
+                // this command. Report it accurately and exit 0 (nothing to
+                // do, not an error), never claiming to have stopped it.
+                let label = match hisn::sessionmeta::read(&dir).map(|m| m.state) {
+                    Some(hisn::sessionmeta::State::Stopped) => "already stopped",
+                    _ => "crashed, no supervisor",
+                };
+                eprintln!("session {}: {label}", a.session);
                 return Ok(ExitCode::SUCCESS);
             }
             // F4: state becomes "stopping" when the kill is sent, "stopped"

@@ -58,9 +58,10 @@ host (`scrub_argv_overwrites_cmdline`, `proc_self_mem_is_not_writable_after_appl
   wait no longer poll on a fixed ~100 ms interval. Readiness polls the control
   socket with an exponential backoff starting at 1 ms and capped at 20 ms (a
   nonblocking connect, so a stalled listener never blocks the waiter); stop
-  waits on the supervisor's pidfd. Measured in `tests/latency.rs`: a socket that
-  appears after 8 ms is observed in ~15 µs once ready (one probe); a stop is
-  observed in ~82 µs.
+  waits on the supervisor's pidfd. Asserted in `tests/latency.rs`: a socket that
+  appears after 8 ms is observed ready in under 60 ms, an already-ready socket
+  in under 30 ms, and a stop in under 80 ms. The bounds are loose on purpose;
+  the point is that no fixed ~100 ms floor remains.
 - **Environment is read with `vars_os()`** where the host env is read, so a
   non-UTF-8 host variable no longer panics the supervisor.
 - **`hisn inspect` redacts `[env.set]` values whose name matches

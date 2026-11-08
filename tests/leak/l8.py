@@ -8,6 +8,8 @@
                                      empty if not listed / null
   l8.py ls-count ID FIELD < LS.json  print the length of the array FIELD of
                                      session ID (0 if absent/null/non-array)
+  l8.py ls-client-fields ID < LS.json  print `label=L pid=N` of the first client
+                                     of session ID, or `none`
   l8.py attach-ok < RESPONSE         exit 0 iff the first line is
                                      {"ok": true, "exec_id": "e-N", ...}
   l8.py audit-has FILE OP STAGE      exit 0 iff a grants.jsonl line has
@@ -135,17 +137,42 @@ def l8(inspect_file, plan_file, host_mi_file, grants):
     return 0
 
 
+def find_session(doc, want):
+    """The session WANT, matched by name or by id (the `--session` argument may
+    be either). None if absent."""
+    for s in doc.get("sessions", []):
+        if want in (s.get("name"), s.get("id")):
+            return s
+    return None
+
+
 def ls_field(doc_text, want, field):
     """FIELD of session WANT in an `ls --json` document ("" if absent)."""
     try:
         doc = json.loads(doc_text)
     except ValueError:
         return ""
-    for s in doc.get("sessions", []):
-        if s.get("id") == want:
-            v = s.get(field)
-            return "" if v is None else str(v)
-    return ""
+    s = find_session(doc, want)
+    if s is None:
+        return ""
+    v = s.get(field)
+    return "" if v is None else str(v)
+
+
+def ls_client_fields(doc_text, want):
+    """`label=<label> pid=<pid>` of the first client of session WANT, or
+    `none` when it has no client. Used by L74 to check that a client record
+    carries its identity rather than an empty placeholder."""
+    try:
+        doc = json.loads(doc_text)
+    except ValueError:
+        return "none"
+    s = find_session(doc, want)
+    if s is None or not isinstance(s.get("clients"), list) or not s["clients"]:
+        return "none"
+    c = s["clients"][0]
+    pid = c.get("pid")
+    return "label=%s pid=%s" % (c.get("label", ""), "" if pid is None else pid)
 
 
 def ls_count(doc_text, want, field):
@@ -157,10 +184,10 @@ def ls_count(doc_text, want, field):
         doc = json.loads(doc_text)
     except ValueError:
         return 0
-    for s in doc.get("sessions", []):
-        if s.get("id") == want:
-            v = s.get(field)
-            return len(v) if isinstance(v, list) else 0
+    s = find_session(doc, want)
+    if s is not None:
+        v = s.get(field)
+        return len(v) if isinstance(v, list) else 0
     return 0
 
 
@@ -209,6 +236,9 @@ def main(argv):
         return 0
     if cmd == "ls-count":
         print(ls_count(sys.stdin.read(), argv[2], argv[3]))
+        return 0
+    if cmd == "ls-client-fields":
+        print(ls_client_fields(sys.stdin.read(), argv[2]))
         return 0
     if cmd == "attach-ok":
         return 0 if attach_ok(sys.stdin.read()) else 1

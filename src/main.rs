@@ -553,6 +553,9 @@ fn live_session_view(session: &str) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
 /// 0.4.1 step 3: one session's `hisn-ls/v2` JSON object. The v1 fields are
 /// kept unchanged; `clients`, live `execs` (with `attach`), `services`,
 /// `rootfs`, `members` and `lease` are additive v2 fields.
+///
+/// `clients`: connections that have sent at least one admitted request;
+/// observers (ls, inspect, sessioninfo) and probes are never listed.
 #[allow(clippy::too_many_arguments)]
 fn session_v2_json(
     id: &str,

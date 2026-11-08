@@ -2939,38 +2939,37 @@ fi
 # ================================================ L74: ls --json clients (0.4.1, HOST)
 # `ls --json` reports `clients` (the live control connections) and lists an
 # attach under `execs` with attach:true. For a stopped session, CLIENTS is 0
-# and `clients` is []. A held-open control connection counts as one client.
+# and `clients` is []. Per 0.4.1 a connection is a client only after its first
+# admitted request, and observers (ls, inspect, sessioninfo) never count, so
+# the held client here is a real `exec`, not a bare control connection.
 if needs_host; then
   L74_CWD=$(new_cwd l74)
   L74_POL="$WORK/l74.toml"
   write_policy "$L74_POL" "$L74_CWD"
   if start_session l74-$$ "$L74_CWD" "$L74_POL" --detach; then
-    # Open a control connection and keep it open (a live client). Use python
-    # to hold the socket so the count stays 1 while we query.
-    L74_SOCK="$(session_dir l74-$$)/control.sock"
-    python3 - "$L74_SOCK" <<'PY' &
-import socket, sys, time
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(5)
-s.connect(sys.argv[1])
-# A request line makes it a counted client (a bare connect is not).
-s.sendall(b'{"op":"list"}\n')
-s.recv(4096)
-time.sleep(6)
-PY
+    # Hold a real client: a background exec. Its connection is admitted by its
+    # first request and stays connected while the command runs.
+    "$HISN" exec --no-tty --session l74-$$ -- sleep 30 </dev/null >/dev/null 2>&1 &
     L74_HOLDER=$!
-    # Wait for the holder to register as a client.
+    # Wait for the exec to register as a client.
     L74_N=0
     for _ in $(seq 1 50); do
       L74_N=$("$HISN" ls --json 2>/dev/null | $PY ls-count "l74-$$" clients)
       [ "$L74_N" -ge 1 ] 2>/dev/null && break
       sleep 0.1
     done
-    if [ "$L74_N" -ge 1 ] 2>/dev/null; then
+    if [ "$L74_N" -eq 1 ] 2>/dev/null; then
       pass "L74 ls --json clients matches live connections"
     else
-      fail "L74 ls --json clients matches live connections" "clients=$L74_N while a control connection is held open"
+      fail "L74 ls --json clients matches live connections" "clients=$L74_N while an exec client is connected"
     fi
+    # The record carries the client's label and a real pid.
+    L74_REC=$("$HISN" ls --json 2>/dev/null | $PY ls-client-fields "l74-$$")
+    case "$L74_REC" in
+      label=?*\ pid=[1-9]*) pass "L74 clients[] record has label and pid" ;;
+      *) fail "L74 clients[] record has label and pid" "record=[$L74_REC]" ;;
+    esac
+    # Stop the client: kill the exec and reap it.
     kill "$L74_HOLDER" 2>/dev/null
     wait "$L74_HOLDER" 2>/dev/null
     # After the client goes, the count drops.

@@ -142,6 +142,31 @@ class HarnessHelpers(unittest.TestCase):
         self.assertEqual(l8.ls_count(self.LS, "nope", "clients"), 0)
         self.assertEqual(l8.ls_count("not json", "l61-4", "clients"), 0)
 
+    def test_lookup_by_name_not_only_id(self):
+        # The harness passes the session NAME (`--session l74-$$`). A lookup
+        # matching only `id` read 0 for every named session, so every L74
+        # count check was checking the wrong key. Both must resolve.
+        doc = json.dumps({"schema": "hisn-ls/v2", "sessions": [
+            {"id": "608c461c7d79", "name": "l74-42", "state": "running",
+             "clients": [{"uid": 1000, "pid": 4242, "label": "local"}],
+             "execs": []},
+        ]})
+        self.assertEqual(l8.ls_count(doc, "l74-42", "clients"), 1)
+        self.assertEqual(l8.ls_count(doc, "608c461c7d79", "clients"), 1)
+        self.assertEqual(l8.ls_field(doc, "l74-42", "state"), "running")
+        self.assertEqual(l8.ls_field(doc, "l74-43", "state"), "")
+
+    def test_ls_client_fields_reports_label_and_pid(self):
+        doc = json.dumps({"sessions": [
+            {"id": "a1", "name": "l74-7", "state": "running",
+             "clients": [{"uid": 1000, "pid": 4242, "label": "local"}]},
+            {"id": "b2", "name": "idle-1", "state": "running", "clients": []},
+        ]})
+        self.assertEqual(l8.ls_client_fields(doc, "l74-7"), "label=local pid=4242")
+        self.assertEqual(l8.ls_client_fields(doc, "idle-1"), "none")
+        self.assertEqual(l8.ls_client_fields(doc, "absent"), "none")
+        self.assertEqual(l8.ls_client_fields("not json", "l74-7"), "none")
+
     def test_attach_ok_needs_ok_true_and_an_exec_id(self):
         self.assertTrue(l8.attach_ok('{"exec_id":"e-1","ok":true,"pid":3}\n{"exit":{}}'))
         self.assertFalse(l8.attach_ok('{"ok":true,"pid":3}'))

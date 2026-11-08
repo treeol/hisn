@@ -1585,6 +1585,16 @@ never from the host). 5 (annotation only).
   populated. A new `sessioninfo` control op supplies the live per-session view
   (the on-disk `session.json` cannot). For a stopped/crashed session `clients`
   is `[]` and CLIENTS 0. The schema name stays `hisn-ls/v2`.
+- **What counts as a client (0.4.1 R2).** `clients` lists connections that have
+  sent at least one *admitted* request: an authorized exec, attach, grant,
+  revoke, signal, or kill/stop. *Observers* (`ls`, `inspect`, the `sessioninfo`
+  query) and *probes* (a bare connect that sends no request, the readiness
+  check, `is_stale`) are never listed, never create a member, and never touch
+  the lease or the idle clock, on the request or on disconnect. A connection is
+  removed from `clients` the moment it closes, on every close path. A refused
+  request does not make its connection a client. A disconnect bumps
+  `last_activity` only for a connection that was counted, so observer traffic
+  cannot keep an idle session alive.
 - **Prune scope.** `ls --prune --name-prefix P` prunes only stopped/crashed
   sessions named `P*`; an unnamed session never matches. `--prune --dry-run`
   lists candidates and removes nothing. A stopped session keeps its dir (and

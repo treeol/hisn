@@ -1,7 +1,9 @@
 # hisn — design
 
-Status: current as of hisn 0.3.3. §1–§14 describe the sandbox core (0.2 exec
-included); §15–§19 describe the 0.3 orchestration layer. The decisions behind
+Status: current as of hisn 0.4.1. §1–§14 describe the sandbox core (0.2 exec
+included); §15–§19 describe the 0.3 orchestration layer; §20 and §20.1 describe
+named sessions, attach, leases and the 0.4.1 changes. The session lifecycle in
+one place is [sessions.md](sessions.md). The decisions behind
 each part are in [`docs/adr/`](adr/README.md). Binding input: `docs/BRIEF.md`
 (the DO NOT ALTER block there always wins). §12 records where working the
 design through forced a refinement from the brief.
@@ -9,7 +11,7 @@ design through forced a refinement from the brief.
 Items marked **[HOST-VERIFY]** cannot be exercised in an unprivileged build
 environment (user namespaces and the mount API are blocked there) and must be
 confirmed by `make leaktest` on a real host. The leak suite is the acceptance
-test for the isolation claims; see the README, "Verifying a build".
+test for the isolation claims; see the README, "Development".
 
 ## 1. Goals and non-goals
 
@@ -342,6 +344,11 @@ block on a slow user-database backend, which 0.2.1 never queried.
 
 ## 9. Control socket, session dir, and what must never be mounted
 
+> Superseded in 0.4.0 by §20 for the session directory contents: it also holds
+> `session.json` (state, owner, members, lease) and `supervisor.pid`
+> (`<pid> <starttime>`), and `--name` sessions are indexed in `names.json`. The
+> path and mode rules below still hold. See [sessions.md](sessions.md).
+
 `<session-dir>` is `$XDG_RUNTIME_DIR/hisn/<id>` (fallback
 `/tmp/hisn-$UID/<id>`), mode 0700, created with `mkdirat`+`O_NOFOLLOW`, parent
 verified (owner = uid, mode 0700, not a symlink). `control.sock` is 0600.
@@ -586,6 +593,11 @@ cancellation: `TERM`, then `KILL` after 5 s.
 CLI: `hisn exec --session ID [--cwd DIR] [--env K=V]... [--tty] -- CMD…`
 passes stdio through, exits with the program's code (`128+sig` if signalled;
 `125` hisn error, `126`/`127` as for `run`) and prints nothing of its own.
+
+> Superseded in 0.4.1 by §20.1 for `--detach`: the call now returns once the
+> session is ready (prints `<id> <name|-> ready`, exit 0) instead of staying in
+> the foreground. The no-command behaviour below is unchanged.
+
 `hisn run --detach` starts a session with **no command**: init finishes setup,
 then only sleeps and reaps until `SIGTERM/SIGINT/SIGHUP`, then exits 0.
 
@@ -921,6 +933,37 @@ none of the new tables (`[[services]]`, `[[host_services]]`, `[[forward]]`,
 `[docker]`, `[ssh]`, `[[risk]]`) yields byte-for-byte the 0.2 mount plan —
 the same `mounts::plan` output as a bare policy at the same `[policy]`
 values (L25 asserts this).
+
+### Profile tables added in 0.3.2 and 0.3.3
+
+All optional; absent means the 0.3.1 behaviour. ADR 0009 (`[home]`), ADR 0010
+(`[rootfs]`), ADR 0011 (`[ssh]`) and ADR 0013 (`[net]`) give the reasoning.
+
+```toml
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+# … inner policy …
+
+[home]
+persist = "/home/user/.cache/wakil/home/proj"   # persistent $HOME (survives sessions)
+
+[rootfs]
+name = "go-dev"            # from the rootfs store ($XDG_DATA_HOME/hisn/rootfs/<name>/)
+# or
+path = "/path/to/rootfs"   # a directory directly
+
+[ssh]
+agent = true               # filtering proxy (T1: sign but never add/remove/extract)
+keys = ["SHA256:…"]       # fingerprint allowlist (absent = all keys)
+
+[net]
+nameservers = ["192.168.1.111"]   # DNS resolvers for network = "host"
+```
+
+`hisn run --home-persist PATH` and `--rootfs-path DIR` override `[home] persist`
+and `[rootfs] path`. A rootfs is imported with
+`hisn rootfs import NAME --from-tar FILE` or `--from-image IMAGE` (ADR 0010).
 
 ### CLI
 

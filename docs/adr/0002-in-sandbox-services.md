@@ -2,6 +2,8 @@
 
 Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§2), removed from the tree; this record stands alone.
 
+Gap: `[[services]]` shipped in 0.3.0 (`src/profile.rs`, `src/supervisor.rs`), but `ready.tcp` and `ready.command` are not in the `[[services]]` schema; only `ready.socket` is (CHANGELOG 0.3.0).
+
 ## Decision
 
 A `[[services]]` entry starts a long-lived process **inside the sandbox**

@@ -1,57 +1,61 @@
 # hisn roadmap
 
-## v0 (this repo)
+## Done
 
-Policy → rootfs/mounts → init (pivot_root, caps, NNP) → seccomp → Landlock →
-env scrub → supervisor + unix control socket → grant/revoke → CLI → pty
-passthrough. Linux x86_64 + aarch64. Acceptance: leak tests L1–L14 on a real
-host (`make leaktest`).
+- **0.2.x**: `exec` into a running session and `run --detach`. The control ops
+  `exec` and `signal`, the helper chain with confinement re-applied on every
+  exec (DESIGN §14), leak tests L15 to L20. See [CHANGELOG](../CHANGELOG.md).
+- **0.3.0**: profiles (`hisn-profile/v1`), risk labels, socket forwarding,
+  host-side and in-sandbox services, Docker T2, named sessions. See the
+  [CHANGELOG](../CHANGELOG.md) entry for 0.3.0.
+- **0.3.1 to 0.3.3**: persistent `$HOME`, read-only rootfs and `hisn rootfs
+  import`, SSH agent T1, `src:dst` read-only mounts, resolver derivation for
+  `network = "host"`, `exec --no-tty`. See the [CHANGELOG](../CHANGELOG.md).
+- **0.4.0**: seats. Named sessions, `attach`, client identity and the
+  authorization seam, session env snapshot, leases, `stop`, archival on prune.
+  See [releases/v0.4.0.md](releases/v0.4.0.md).
+- **0.4.1**: `run --detach` returns, event-driven start and stop, live `clients`
+  and `execs` in `ls --json`, `ls --prune --name-prefix` and `--dry-run`,
+  `run --env-file`, `exec --client`. See [releases/v0.4.1.md](releases/v0.4.1.md).
 
-Known v0 limits are tracked in `docs/OPEN-POINTS.md` (e.g. single-id uid map,
-no egress filtering, no cgroups).
+## Planned, not yet scheduled
 
-## v0.2 (done, this repo)
+- **Egress proxy.** A `network = "proxy"` mode: the sandbox gets a network
+  namespace whose only route is a forwarder to a host-side proxy that enforces
+  a hostname allowlist (CONNECT and DNS by name) and audits every request.
+  Not implemented; today hisn offers only `network = "none"` and `"host"`.
+- **cgroup v2 limits.** Memory, pids and cpu through a delegated cgroup subtree,
+  falling back to rlimits with a warning. `hisn check` already reports whether
+  cgroup v2 is mounted. Not implemented; today only `setrlimit` limits apply.
+- **Attach pty allocated inside the session.** `ttyname()` fails inside an
+  attach because the pty is allocated on the host `devpts` while the session
+  has a private one. The chosen approach is to allocate the attach's pty inside
+  the session and hand the master back to the client over the control socket,
+  as `init::open_pty` already does for the main command. It changes the
+  protocol in `exec.rs` (a descriptor travels sandbox to supervisor to client
+  for the first time) and has to be verified on a host with L76, L10 and L8
+  and with fd-leak checks. See DESIGN §20.1.
 
-`exec` into a running session: control ops `exec` + `signal`, the helper
-chain C→D→W→P with confinement re-applied on every exec (DESIGN §14), and
-`hisn run --detach` for a session that is only exec'd into. Leak tests
-L15-L20.
+Other candidates: a 65536-id mapping through `newuidmap` with a launcher stage
+(DESIGN D4); `/dev/pts` options; a shared-subtree grant fallback (DESIGN §10)
+if `move_mount` into the user namespace is not permitted on some kernels.
+Known limits of the current design are in [OPEN-POINTS](OPEN-POINTS.md).
 
-## v0.x candidates
+## Ideas
 
-* 65536-id mapping via `newuidmap` using a launcher stage (DESIGN D4);
-* `/dev/shm`, `/dev/pts` options;
-* shared-subtree grant fallback (DESIGN §10) if `move_mount` into U is not
-  permitted on some kernels.
+None of these is implemented.
 
-## v1
-
-1. **E2B-shaped HTTP API** over a unix socket (`hisn serve --socket PATH`):
-   sandboxes = sessions; create/kill/list; `commands.run` **wraps the v0.2
-   `exec` control op** (same confinement, same helper chain — it must not
-   reimplement exec), `files.read|write|list`, `filesystem` watch is out of
-   scope. The v0 JSON control socket stays the internal transport.
-2. **MCP server** (`hisn mcp`, stdio): tools `exec`, `read_file`, `write_file`,
-   `grant`, `revoke` (+ `list_grants`). `exec` **wraps the v0.2 control op**;
-   `read_file`/`write_file` operate through the sandbox's view only. `read_file`/`write_file` operate
-   through the sandbox's view only (path must be visible in the session), so
-   an MCP client cannot use them to bypass grants.
-3. **Egress proxy with allowlist:** `network = "proxy"`; the sandbox gets a net
-   ns whose only route is a unix-socket/loopback forwarder to a host-side
-   proxy enforcing a hostname allowlist (CONNECT + DNS by name), audit-logged.
-4. **cgroup v2 limits:** memory, pids, cpu via a delegated cgroup subtree
-   (systemd user slice or pre-delegated); falls back to rlimits with a
-   warning. `hisn check` already reports cgroup v2.
-
-## v2
-
-**OCI runtime-spec conformance:** `hisn` consumable as an OCI runtime
-(`create/start/kill/delete/state`) for bundles that fit the model, and able to
-export a policy as `config.json` using the mapping table in POLICY-SPEC §8,
-with Landlock/dynamic grants as annotated extensions. Images/registries remain
-out of scope (bundle rootfs only).
+- **`hisn serve`**: an HTTP API over a unix socket with sandboxes as sessions
+  and a `commands.run` that wraps the `exec` control op without reimplementing
+  it.
+- **`hisn mcp`**: an MCP server over stdio with `exec`, `read_file`,
+  `write_file`, `grant`, `revoke` and `list_grants`. File access would go
+  through the sandbox's own view so a client could not use it to bypass grants.
+- **OCI runtime conformance**: hisn consumable as an OCI runtime for bundles
+  that fit the model, and able to export a policy as `config.json` using the
+  mapping in POLICY-SPEC §8. Images and registries stay out of scope.
 
 ## Explicitly never
 
-Daemon, setuid helper, root requirement, macOS support (v0), image
+A daemon, a setuid helper, a root requirement, macOS support, and image
 distribution.

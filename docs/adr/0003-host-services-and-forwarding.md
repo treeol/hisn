@@ -1,6 +1,8 @@
 # ADR 0003 — Host-side services and socket forwarding
 
-Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§3), removed from the tree; this record stands alone.
+Status: accepted. Date: 2026-11-02. Origin: the 0.3 planning document (§3), removed from the tree; this record stands alone.
+
+Implemented in 0.3.0 (`src/profile.rs`, `src/supervisor.rs`; CHANGELOG 0.3.0, "Socket forwarding" and "Host-side services").
 
 ## Decision
 

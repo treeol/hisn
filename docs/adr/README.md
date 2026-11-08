@@ -10,8 +10,8 @@ note in the same file.
 |---|---|---|
 | [0001](0001-profiles.md) | proposed | Profiles are an envelope around `hisn-policy/v1`, not a new policy format. |
 | [0002](0002-in-sandbox-services.md) | proposed | `[[services]]` run inside the sandbox through the normal exec path. |
-| [0003](0003-host-services-and-forwarding.md) | proposed | Host-side services and socket forwarding, with explicit risk labels. |
-| [0004](0004-docker-access.md) | proposed | Docker access comes in three tiers: T1 proxy, T2 socket, T3 nested userns. |
+| [0003](0003-host-services-and-forwarding.md) | accepted | Host-side services and socket forwarding, with explicit risk labels. |
+| [0004](0004-docker-access.md) | accepted | Docker access comes in three tiers: T1 proxy, T2 socket, T3 nested userns. |
 | [0005](0005-ssh-git-signing.md) | proposed | SSH and git signing: host git (T0), filtering agent proxy (T1), socket (T2). |
 | [0006](0006-risk-disclosure.md) | proposed | Every capability that widens the boundary carries a risk label and is disclosed. |
 | [0007](0007-recipes.md) | proposed | Recipes are named, reviewable profile fragments. |
@@ -25,9 +25,10 @@ note in the same file.
 | [0015](0015-attach-disconnect.md) | accepted | Attach is an exec with tty+attach:true; the default is cancel on disconnect (no --detach in 0.4.0). |
 | [0016](0016-client-identity-and-authz-seam.md) | accepted | Every request carries a client record; one authorize() function gates every op (equal access in 0.4.0, roles later). |
 | [0017](0017-session-env-snapshot.md) | accepted | `--env K=V` at run declares a session env snapshot; precedence: scrub < declared < computed; E_ENV_LOCKED. |
-| [0018](0018-egress-default-deny.md) | draft | Egress proxy default: 0.4.1 audit-all, 0.4.2 deny-all (staged). |
+| 0018 | draft, not in the tree | Egress proxy default (draft; the proxy is planned, not yet scheduled). |
 | [0019](0019-leases-and-idle.md) | accepted | Leases: idle_timeout from the policy; idle = zero clients ∧ no exec ∧ timeout elapsed; stop keeps the dir; prune archives first. |
 
-Status `proposed` means the record was written as a design and has not been
-reviewed to acceptance; the behaviour it describes is in `DESIGN.md` where it
-shipped.
+Status `proposed` means the record was written as a design and is not fully
+matched by what shipped; the line under its status names the gap. An `accepted`
+record carries a line naming the version and module that implement it. The
+behaviour that shipped is in `DESIGN.md`.

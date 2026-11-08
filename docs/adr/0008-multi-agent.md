@@ -2,6 +2,8 @@
 
 Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§7), removed from the tree; this record stands alone.
 
+Gap: session names, attach, client identity and leases shipped in 0.4.0 under ADR 0014, 0015, 0016 and 0019, which supersede this record. Per-client grant/signal policy and `hisn request` are not implemented.
+
 > **Correction (2026-11-07):** `hisn attach` did not ship in 0.3. The
 > 0.3 implementation shipped named sessions and session discovery
 > (`hisn run --name`, `hisn ls`, `--session name|id`) but not the

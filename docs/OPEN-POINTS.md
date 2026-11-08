@@ -1,3 +1,5 @@
+> Historical: review logs and limits from 0.2 to 0.3a. Items marked fixed are not re-verified here; for current behaviour see [DESIGN.md](DESIGN.md) and the [CHANGELOG](../CHANGELOG.md).
+
 # Open points
 
 Non-blocking findings and known limits. Blocking findings from review rounds

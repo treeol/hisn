@@ -2,6 +2,8 @@
 
 Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§1), removed from the tree; this record stands alone.
 
+Gap: shipped in 0.3.0 (`src/profile.rs`) as an envelope around `hisn-policy/v1`, but the built-in profiles named in this record (`go`, `rust`, `node`, `python`, `zig`) were not shipped; only `base` and `wakil` are.
+
 ## Decision
 
 A **profile** is an envelope around `hisn-policy/v1`, not a v2. A profile

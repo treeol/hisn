@@ -2,6 +2,8 @@
 
 Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§5), removed from the tree; this record stands alone.
 
+Gap: shipped in 0.3.0 (`src/profile.rs`, `RiskLabel`), but the code also has a `trust` label that this record does not list, and `[ssh] tier` mappings here do not match the shipped `[ssh]` table.
+
 ## Decision
 
 Every profile capability that widens the boundary carries a **fixed risk

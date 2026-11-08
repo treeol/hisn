@@ -2,6 +2,8 @@
 
 Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§6), removed from the tree; this record stands alone.
 
+Gap: only `profiles/base.toml`, `wakil.toml`, `docker-socket.toml` and the two `*-example.toml` files exist in the tree; the other recipes in the table (git-identity, git-config, ssh-proxy, toolchains, kvr) were not shipped under those names.
+
 ## Decision
 
 Each recipe is a profile shipped in `profiles/` with a matching leak test

@@ -38,6 +38,11 @@ err := cmd.Run()                // *exec.ExitError.ExitCode() == command's code
   a start failure prints the supervisor's error lines and exits non-zero.
   Pass secret-shaped values with `--env-file PATH` (KEY=VALUE lines) so they do
   not appear in `/proc/<pid>/cmdline`.
+  A failed start exits 125 with or without `--detach`. Label Wakil's
+  connections with `--client LABEL` on `exec` and `attach`; the label appears in
+  the audit log and in `hisn ls --json` `clients[]`. The `hisn-ls/v2` schema,
+  the `sessioninfo` op, exit codes and observer rules are described once in
+  [sessions.md](sessions.md#driving-hisn-from-a-program).
 * Cancellation: `ctx` cancel → SIGTERM to `hisn`, which forwards to the
   command's process group; after a grace period `hisn kill --session ID
   --signal KILL`.

@@ -1,6 +1,8 @@
 # ADR 0004 — Docker access: T1 proxy / T2 socket / T3 nested userns
 
-Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§4), removed from the tree; this record stands alone.
+Status: accepted. Date: 2026-11-02. Origin: the 0.3 planning document (§4), removed from the tree; this record stands alone.
+
+Implemented in 0.3.0 (`src/profile.rs`; CHANGELOG 0.3.0, "Docker T2"). T2 only, as this record says; T1 and T3 are not implemented.
 
 ## 0.3 ships T2 only; T1 and T3 are 0.4
 

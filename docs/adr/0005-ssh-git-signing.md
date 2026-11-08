@@ -2,6 +2,8 @@
 
 Status: proposed. Date: 2026-11-02. Origin: the 0.3 planning document (§4b), removed from the tree; this record stands alone.
 
+Gap: the shipped SSH agent proxy is `[ssh] agent = true` with `keys = [...]` (0.3.2, `src/ssh_agent.rs`, ADR 0011), not the `[ssh] tier` / `allow_keys` / `hisn-agent-proxy` shape described here. ADR 0011 describes what shipped.
+
 ## Decision
 
 Three tiers for ssh / git signing from inside a hisn sandbox, mirroring Docker

@@ -1,3 +1,5 @@
+> Historical: the original build brief, kept for its invariants. DESIGN.md records where the implementation deviates; current behaviour is in [DESIGN.md](DESIGN.md) and [sessions.md](sessions.md).
+
 # hisn — build brief (authoritative)
 
 Saved verbatim-in-substance from the user's brief so later sessions have the

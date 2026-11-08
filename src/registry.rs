@@ -177,29 +177,30 @@ pub fn reserve(
         }
         i
     });
-    // 0.4.1 step 6: a name is taken only while the session directory it maps
-    // to still exists. A stopped session's dir is kept (so its name stays
-    // taken), but once `ls --prune` removes the dir the name is reusable —
-    // even if the index still holds a stale entry (dropped here, rewritten
-    // below).
-    if let Some(existing_id) = idx.names.get(name).cloned() {
-        let dir_present = roots.iter().any(|r| r.join(&existing_id).is_dir());
-        if dir_present {
-            return Err(RegistryError::Taken(name.into()));
-        }
-        idx.names.remove(name);
+    // A name is taken while the index maps it. The index is repaired by
+    // `ls --prune` (which drops entries whose session dir is gone), so a name
+    // becomes reusable only after the session dir is removed — a stopped
+    // session's dir is kept, so its name stays taken (0.4.1 step 6). This
+    // index-based check is also race-free across concurrent `run`s, which a
+    // directory-existence check (the dir is published later) is not.
+    if idx.names.contains_key(name) {
+        return Err(RegistryError::Taken(name.into()));
     }
     idx.names.insert(name.into(), id.into());
     write_index(reg_root, &idx)?;
     Ok(())
 }
 
-/// Drop a name from the index. Caller holds the lock. Missing names are ok.
-pub fn release(reg_root: &Path, name: &str) -> io::Result<()> {
+/// Drop a name from the index, but only if it still maps to `id`. Caller
+/// holds the lock. Missing names and a name that now maps to a different id
+/// are no-ops: a late cleanup from an older session must never delete a newer
+/// session's name mapping (0.4.1 step 6).
+pub fn release(reg_root: &Path, name: &str, id: &str) -> io::Result<()> {
     let Some(mut idx) = read_index(reg_root) else {
         return Ok(());
     };
-    if idx.names.remove(name).is_some() {
+    if idx.names.get(name).map(String::as_str) == Some(id) {
+        idx.names.remove(name);
         write_index(reg_root, &idx)?;
     }
     Ok(())
@@ -293,22 +294,34 @@ mod tests {
     }
 
     #[test]
-    fn name_is_reusable_after_the_dir_is_removed() {
-        // 0.4.1 step 6: once `ls --prune` removes the session dir, its name is
-        // free again, even though the index still maps it (the stale entry is
-        // dropped on the next reserve).
+    fn name_is_reusable_after_prune_repairs_the_index() {
+        // 0.4.1 step 6: a stopped session keeps its dir (and its name). `ls
+        // --prune` removes the dir and repairs the index (drops the entry);
+        // only then is the name free. `reserve` itself keeps the index entry
+        // while the dir exists.
         let reg = tmp("reg");
         let r1 = tmp("r1");
         let roots = vec![r1.clone()];
         {
             let _l = Lock::take(&reg, uid()).unwrap();
             reserve(&reg, &roots, "seat", "oldid").unwrap();
-            mk_session(&r1, "oldid", Some("seat"));
         }
-        // The dir goes away (prune), the index entry remains stale.
+        mk_session(&r1, "oldid", Some("seat"));
+        // Still taken while the dir exists.
+        {
+            let _l = Lock::take(&reg, uid()).unwrap();
+            assert!(matches!(
+                reserve(&reg, &roots, "seat", "newid"),
+                Err(RegistryError::Taken(_))
+            ));
+        }
+        // Prune removes the dir; repair drops the stale index entry.
         fs::remove_dir_all(r1.join("oldid")).unwrap();
-        let _l = Lock::take(&reg, uid()).unwrap();
-        reserve(&reg, &roots, "seat", "newid").unwrap();
+        {
+            let _l = Lock::take(&reg, uid()).unwrap();
+            repair(&reg, &roots).unwrap();
+            reserve(&reg, &roots, "seat", "newid").unwrap();
+        }
         assert_eq!(resolve_name(&reg, &roots, "seat").as_deref(), Some("newid"));
     }
 
@@ -368,13 +381,19 @@ mod tests {
     }
 
     #[test]
-    fn release_drops_name() {
+    fn release_drops_name_only_when_it_still_maps_to_the_id() {
         let reg = tmp("reg");
         let roots = vec![tmp("r1")];
         let _l = Lock::take(&reg, uid()).unwrap();
         reserve(&reg, &roots, "gone", "idx").unwrap();
-        release(&reg, "gone").unwrap();
+        // A release naming a different id must be a no-op.
+        release(&reg, "gone", "other").unwrap();
+        assert!(read_index(&reg).unwrap().names.contains_key("gone"));
+        // The matching release drops it.
+        release(&reg, "gone", "idx").unwrap();
         assert!(!read_index(&reg).unwrap().names.contains_key("gone"));
+        // A missing name is a no-op.
+        release(&reg, "absent", "idx").unwrap();
     }
 
     /// Two runtime roots (two XDG_RUNTIME_DIR values) must share one index,

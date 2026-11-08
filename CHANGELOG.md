@@ -7,6 +7,89 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-08
+
+0.4.1 closes four of the 0.4.0 known issues (a returning `--detach`, `ls --json`
+clients/execs, CLIENTS zeroed on a stopped session, secret-safe env passing)
+and removes the fixed ~100 ms latency floors on the session-ready and stop
+paths. One 0.4.0 known issue — `ttyname()` inside an attach — is **not** closed
+here; it needs a host to verify (see below).
+
+**Host evidence:** the build sandbox blocks user namespaces, so `cargo test`
+(unit) and the `test_l8.py` self-test run here; the leak suite (L1–L75) and the
+`--detach`/attach host steps are **not run here** and must be run on rubin (see
+"Host verification"). Two unit tests fail only in this sandbox and pass on a
+host (`scrub_argv_overwrites_cmdline`, `proc_self_mem_is_not_writable_after_apply`).
+
+### Added
+- **`hisn ls --prune --name-prefix <prefix>`**: prune only stopped/crashed
+  sessions whose name starts with `<prefix>`. An unnamed session never matches a
+  prefix. `--prune` without the flag keeps 0.4.0 behaviour.
+- **`hisn ls --prune --dry-run`**: list the sessions that would be pruned,
+  removing nothing.
+- **`hisn ls --json` completes `hisn-ls/v2`** (additive): `clients` is the array
+  of live control connections (uid, pid, label, label_source, connected_since);
+  a live attach appears under `execs` with `attach: true`; `services` and
+  `rootfs` are populated. For a stopped/crashed session `clients` is `[]` and
+  CLIENTS is 0. A live session's client/exec list is read from the supervisor
+  (a new `sessioninfo` control op); the schema name stays `hisn-ls/v2`.
+- **`hisn run --detach` returns.** The parent forks the supervisor (`setsid`,
+  stdio to `<session-dir>/supervisor.log` mode 0600), waits until the control
+  socket accepts, prints `<id> <name|-> ready` on stdout and exits 0. A start
+  failure prints the supervisor's first error lines and exits non-zero. Without
+  `--detach` nothing changes.
+- **`hisn exec --client LABEL`**: the same client-label flag as `attach`.
+- **`hisn run --env-file PATH`**: read `KEY=VALUE` lines (blank lines and `#`
+  comments ignored; validated exactly like `--env`). This is the documented way
+  to pass secret-shaped values, so they do not appear in `/proc/<pid>/cmdline`.
+- **`hisn stop` on an already-stopped session** says `already stopped` and on a
+  crashed one `crashed, no supervisor`, exiting 0 without claiming to have
+  stopped it.
+- Leak tests **L73** (`ls --prune --name-prefix`), **L74** (`ls --json`
+  clients), **L75** (`run --detach` returns).
+- **Host verification for 0.4.1** (rubin): `cargo test --release`;
+  `HISN_TEST_ROOTFS="$(hisn rootfs path wakil-dev)" make leaktest`;
+  `hisn run --name t --detach` (returns `<id> t ready`);
+  `hisn attach --session t` then `tty` and `tmux new -d -s t && tmux ls`;
+  `hisn ls --json` (clients); `hisn ls --prune --name-prefix wakil-`.
+
+### Changed
+- **Event-driven session wait.** `hisn run`'s readiness wait and the `hisn stop`
+  wait no longer poll on a fixed ~100 ms interval. Readiness polls the control
+  socket with an exponential backoff starting at 1 ms and capped at 20 ms (a
+  nonblocking connect, so a stalled listener never blocks the waiter); stop
+  waits on the supervisor's pidfd. Measured in `tests/latency.rs`: a socket that
+  appears after 8 ms is observed in ~15 µs once ready (one probe); a stop is
+  observed in ~82 µs.
+- **Environment is read with `vars_os()`** where the host env is read, so a
+  non-UTF-8 host variable no longer panics the supervisor.
+- **`hisn inspect` redacts `[env.set]` values whose name matches
+  `looks_secret`** (`*TOKEN*`, `*SECRET*`, `*KEY*`, `*PASSWORD*`).
+- A `[net] nameservers` override that is empty or loopback-only is refused by
+  the resolver builder itself, not only at `hisn profile validate`.
+  `is_loopback_ns` now also rejects `0.0.0.0` and the IPv4-mapped
+  `::ffff:127.0.0.0/8` (and `::ffff:0.0.0.0`, `::`).
+- A **stopped session keeps its name**; the name becomes reusable once
+  `hisn ls --prune` removes the directory and repairs the index. `reserve`
+  checks the index (race-free across concurrent `run`s), and `release` drops a
+  name only if it still maps to the releasing session's id.
+- `touch_lease` writes `session.json` only when the session has a lease
+  (`idle_timeout` set); admission (a new client or exec) and the idle check
+  share the lease lock, so an exec admitted during the idle check is not stopped
+  under it.
+
+### Known issues (0.4.1)
+- **`ttyname()` inside an attach is still not fixed.** The client's pty slave is
+  allocated on the host `devpts`, and the session has its own private `devpts`
+  instance; the kernel refuses mounting a second, non-`newinstance` devpts in
+  the session's user namespace, and devpts cannot carry an arbitrary node to
+  bind onto, so the only fix that preserves the `/dev` contents guarantee is to
+  allocate the attach's pty **inside** the session (as init already does for the
+  main command) and hand the **master** back to the client over the control
+  socket — a protocol change that must be verified on a host (L76, with L10/L8
+  staying green). Not shipped in 0.4.1; the L76 host step is listed below.
+- L56 and L58 remain host-only / documented checks.
+
 ## [0.4.0] - 2026-11-07
 
 0.4.0 adds seats: a hisn session is a named place that several clients join,

@@ -1565,3 +1565,49 @@ before removing; `--purge` skips archival.
 **Invariants touched:** 2 (same seccomp — attach is an exec through the
 same chain). 3 (the session env snapshot is built from the scrub base,
 never from the host). 5 (annotation only).
+
+### 20.1 0.4.1 changes
+
+- **`hisn run --detach` returns.** The parent forks a supervisor child
+  (`setsid`; stdio redirected to `<session-dir>/supervisor.log`, mode 0600),
+  waits until the control socket accepts, prints `<id> <name|-> ready` and
+  exits 0. A start failure prints the supervisor's first error lines and exits
+  non-zero. Without `--detach` nothing changes. The readiness wait is
+  event-driven: a nonblocking connect re-probed with exponential backoff
+  starting at 1 ms and capped at 20 ms — no fixed interval.
+- **Stop wait is event-driven.** `lifecycle::stop_and_keep` waits on the
+  target's pidfd when one is available (`StopTarget::exit_fd`); only the
+  fallback (no pidfd) uses a bounded exponential backoff. No fixed ~100 ms poll
+  remains on the readiness or stop path.
+- **`ls --json` completes `hisn-ls/v2`.** `clients` is the live control
+  connections (uid, pid, label, label_source, connected_since); a live attach
+  appears under `execs` with `attach: true`; `services` and `rootfs` are
+  populated. A new `sessioninfo` control op supplies the live per-session view
+  (the on-disk `session.json` cannot). For a stopped/crashed session `clients`
+  is `[]` and CLIENTS 0. The schema name stays `hisn-ls/v2`.
+- **Prune scope.** `ls --prune --name-prefix P` prunes only stopped/crashed
+  sessions named `P*`; an unnamed session never matches. `--prune --dry-run`
+  lists candidates and removes nothing. A stopped session keeps its dir (and
+  its name); the name becomes reusable once `ls --prune` removes the dir and
+  repairs the index. `reserve` checks the index (race-free across concurrent
+  `run`s, unlike a dir-existence check — the dir is published after reserve);
+  `release` drops a name only if it still maps to the releasing session's id.
+- **Secret-safe env passing.** `run --env-file PATH` reads `KEY=VALUE` lines
+  (validated like `--env`) so a secret-shaped value never lands in
+  `/proc/<pid>/cmdline`. `hisn inspect` redacts `[env.set]` values whose name
+  matches `looks_secret`. The host env is read with `vars_os()`.
+- **Admission and idle share the lease lock.** A client connect and an exec
+  registration take `lease_lock`, the same lock the idle check holds while it
+  reads its three inputs, so an exec admitted during the idle check is not
+  stopped under it.
+- **Resolver guards.** `[net] nameservers` that is empty or loopback-only is
+  refused by `build_resolv_conf` itself; `is_loopback_ns` also rejects
+  `0.0.0.0`, `::`, and the IPv4-mapped `::ffff:127.0.0.0/8`/`::ffff:0.0.0.0`.
+- **Known issue carried forward:** `ttyname()` inside an attach still fails.
+  The attach's pty is allocated on the host `devpts`; the session has a private
+  `devpts` and the kernel refuses a second non-`newinstance` devpts in the
+  session userns, and devpts cannot carry an arbitrary node to bind onto. The
+  isolation-preserving fix is to allocate the attach's pty **inside** the
+  session (as init does for the main command) and hand the master back to the
+  client over the control socket — a protocol change to be verified on a host
+  (L76, with L10/L8 green). Not shipped in 0.4.1.

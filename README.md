@@ -47,14 +47,18 @@ hisn run --profile base -- make test                    # with a profile (built-
 `hisn run` passes stdio through unchanged and allocates a pty inside the sandbox
 when stdin is a terminal. It exits with the command's status.
 
-### Seats (0.4.0): named sessions and attach
+### Seats (0.4.0/0.4.1): named sessions and attach
 
 ```sh
 hisn run --name myproj --profile base -- make test      # a named session
+hisn run --name seat --detach                           # returns "<id> seat ready" once ready (0.4.1)
 hisn ls                                                  # NAME ID STATE CWD ROOTFS NET AGE CLIENTS LEASE
+hisn ls --json                                           # clients[] and execs[] are live (0.4.1)
 hisn attach --session myproj                             # attach an interactive shell
 ssh -t smaragd hisn attach --session myproj              # attach from another machine
 hisn stop --session myproj                               # stop (keeps the dir; prune archives)
+hisn ls --prune --name-prefix wakil-                     # prune only wakil-* sessions (0.4.1)
+hisn run --name s --env-file ./seat.env --detach         # pass secret-shaped values off argv (0.4.1)
 ```
 
 | Exit code | Meaning |
@@ -135,8 +139,9 @@ runtime hands a sandboxed process more access, or runs further commands in it.
 
 ```sh
 hisn run --session-id agent1 --detach &      # a session with no command of its own
-
+# 0.4.1: without `&` it returns "<id> - ready" once ready.
 hisn exec   --session agent1 -- ls -la                  # another command, same confinement
+hisn exec   --session agent1 --client wakil@rubin -- ls # label this client in the audit (0.4.1)
 hisn exec   --session agent1 --tty -- bash              # interactive, on its own pty
 hisn exec   --session agent1 --no-tty -- make test      # non-interactive: no pty, stdin /dev/null (0.3.3)
 hisn grant  --session agent1 /srv/reference             # read-only, gone with the session
@@ -156,8 +161,10 @@ same grants.
 
 ```sh
 hisn ls                  # all your sessions
-hisn ls --json           # same, as versioned JSON
+hisn ls --json           # same, as versioned JSON (clients[] and execs[] are live, 0.4.1)
 hisn ls --prune          # remove session directories whose supervisor has died
+hisn ls --prune --name-prefix wakil-   # prune only wakil-* sessions (0.4.1)
+hisn ls --prune --dry-run              # list what would be pruned, remove nothing (0.4.1)
 hisn kill --session X    # on a stale session: removes the directory, exits 0
 ```
 

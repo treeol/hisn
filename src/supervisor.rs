@@ -16,7 +16,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -1544,6 +1544,179 @@ pub fn open_fd_count() -> io::Result<usize> {
 
 /// Exit code of `hisn run`.
 pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32> {
+    // 0.4.1 step 4: `hisn run --detach` returns as soon as the session is
+    // ready. The parent forks a supervisor child (setsid, stdio to
+    // <session-dir>/supervisor.log 0600), waits for the control socket to
+    // accept (step 2's event wait), prints "<id> <name|-> ready" and exits 0.
+    // Without --detach the process becomes the supervisor and blocks until the
+    // session ends, exactly as before.
+    if args.detach {
+        return run_detached(args, allow_host_abstract, verbose);
+    }
+    run_supervisor(args, allow_host_abstract, verbose)
+}
+
+/// Fork a supervisor for a `--detach` session, wait for readiness, print the
+/// ready line, and return without waiting for the session to end.
+fn run_detached(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32> {
+    // A pipe the child writes to when it is ready (the control socket accepts);
+    // errors before readiness are reported through it too.
+    let (read_fd, write_fd) = pipe_cloexec()?;
+    // The child echoes the session id it created in its ready line (which may
+    // be random when --session-id is absent), so the parent does not need to
+    // resolve it.
+
+    // SAFETY: fork before any threads exist (the supervisor starts them later).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error()).context("fork supervisor");
+    }
+    if pid == 0 {
+        // Child: become a session leader, detach from the terminal. The child
+        // runs the supervisor; it redirects its own stdio to the session log
+        // once the session dir exists and reports readiness on `write_fd`.
+        drop(read_fd);
+        // SAFETY: setsid in the forked child.
+        unsafe { libc::setsid() };
+        let code =
+            match run_supervisor_with_ready(args, allow_host_abstract, verbose, Some(write_fd)) {
+                Ok(c) => c,
+                Err(e) => {
+                    // The child has no ready channel contract beyond writing; the
+                    // parent already holds the error via EOF if this fails early.
+                    eprintln!("hisn: {e:#}");
+                    125
+                }
+            };
+        // SAFETY: _exit ends the child without running the parent's atexit.
+        unsafe { libc::_exit(code.clamp(0, 255)) };
+    }
+    // Parent: close the write end so the read end sees EOF if the child dies.
+    drop(write_fd);
+    // Read exactly the first line ("ready <id>" or "error ..."): the child may
+    // keep the pipe open for its lifetime, so reading to EOF would block.
+    let report = {
+        use std::io::BufRead;
+        // SAFETY: read_fd is a fresh read end we own.
+        let f = unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) };
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(f).read_line(&mut line);
+        line
+    };
+    // Reap the child if it exited (a failed start).
+    let mut status = 0;
+    // SAFETY: waitpid on our own child, non-blocking.
+    let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    let exited = reaped == pid;
+    match parse_ready_report(report.trim_end()) {
+        ReadyReport::Ready(id) => {
+            let name = args.name.as_deref().unwrap_or("-");
+            println!("{id} {name} ready");
+            return Ok(0);
+        }
+        ReadyReport::Error(msg) => {
+            if msg.is_empty() {
+                eprintln!("hisn: session failed to start (supervisor exited before reporting)");
+            } else {
+                eprintln!("hisn: session failed to start: {msg}");
+            }
+        }
+    }
+    if !exited {
+        // Still alive but never reported readiness: kill it so a half-started
+        // session does not linger.
+        // SAFETY: kill on our own child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        // SAFETY: reap our own child.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+    }
+    Ok(1)
+}
+
+/// The first line the detached child writes on the ready pipe.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadyReport {
+    /// The session id (the child echoes the id it created).
+    Ready(String),
+    /// A start failure's message (possibly empty).
+    Error(String),
+}
+
+/// Parse the first line the detached child writes. Pure; unit-tested.
+fn parse_ready_report(line: &str) -> ReadyReport {
+    if let Some(id) = line.strip_prefix("ready ") {
+        ReadyReport::Ready(id.trim().to_owned())
+    } else if let Some(msg) = line.strip_prefix("error ") {
+        ReadyReport::Error(msg.trim().to_owned())
+    } else if line.is_empty() {
+        ReadyReport::Error(String::new())
+    } else {
+        ReadyReport::Error(line.to_owned())
+    }
+}
+
+fn run_supervisor(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32> {
+    run_supervisor_with_ready(args, allow_host_abstract, verbose, None)
+}
+
+/// A CLOEXEC pipe as `(read, write)`.
+fn pipe_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe2 writes two descriptors into the array we own.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both are fresh descriptors owned by nobody else.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// 0.4.1 step 4: point the (detached) supervisor's stdout and stderr at
+/// `<session-dir>/supervisor.log`, mode 0600, so it has somewhere to write
+/// once the parent has returned. The file is opened by the supervisor (owner
+/// uid) with O_NOFOLLOW|O_CREAT|O_APPEND and dup2'ed over fds 1 and 2.
+fn redirect_stdio_to_log(session_dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let log_path = session_dir.join("supervisor.log");
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&log_path)?;
+    let fd = f.as_raw_fd();
+    // SAFETY: dup2 onto our own stdout/stderr; both target fds are valid.
+    if unsafe { libc::dup2(fd, 1) } < 0 || unsafe { libc::dup2(fd, 2) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The child side of [`run_detached`]: report a start failure through the ready
+/// pipe so the parent can print it, then run the supervisor body.
+fn run_supervisor_with_ready(
+    args: RunArgs,
+    allow_host_abstract: bool,
+    verbose: u8,
+    ready_fd: Option<OwnedFd>,
+) -> Result<i32> {
+    let r = run_supervisor_inner(args, allow_host_abstract, verbose, ready_fd.as_ref());
+    if let (Err(e), Some(fd)) = (&r, &ready_fd) {
+        // Report the failure to the parent's ready wait, then keep the error.
+        use std::io::Write;
+        let mut f = unsafe { std::fs::File::from_raw_fd(std::os::fd::AsRawFd::as_raw_fd(fd)) };
+        let _ = writeln!(f, "error {e:#}");
+        let _ = f.into_raw_fd(); // fd is still owned by ready_fd
+    }
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_supervisor_inner(
+    args: RunArgs,
+    allow_host_abstract: bool,
+    verbose: u8,
+    ready_fd: Option<&OwnedFd>,
+) -> Result<i32> {
     let (uid, gid, username) = getids(verbose);
     let prep = prepare(&args, uid)?;
     let policy = prep.policy;
@@ -1771,6 +1944,7 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
         prep.ssh.as_ref(),
         &id,
         &declared_env,
+        ready_fd,
     );
     // 0.4.0 step 5 / O3: keep the dir as stopped if the session was stopped
     // (hisn stop or idle expiry). Otherwise remove it (normal exit).
@@ -1906,6 +2080,7 @@ fn run_session(
     ssh: Option<&profile::SshConfig>,
     session_id: &str,
     declared_env: &std::collections::BTreeMap<String, String>,
+    ready_fd: Option<&OwnedFd>,
 ) -> Result<SessionEnd> {
     sdir.write_resolved_policy(&policy.to_toml())?;
     // Write risk.json (the risk labels for this session, DESIGN §16).
@@ -2320,6 +2495,22 @@ fn run_session(
         let f = unsafe { std::fs::File::from_raw_fd(fd) };
         let _ = std::io::Write::write_all(&mut &f, b"ready\n");
         let _ = f.into_raw_fd(); // do not close; caller owns it
+    }
+
+    // 0.4.1 step 4: a `--detach` child reports readiness through the pipe and
+    // redirects its stdio to <session-dir>/supervisor.log (0600). The log is
+    // opened from the supervisor (owner uid) after the dir exists, so both the
+    // ownership and the mode are hisn's.
+    if let Some(fd) = ready_fd {
+        use std::io::Write;
+        let mut f = unsafe { std::fs::File::from_raw_fd(std::os::fd::AsRawFd::as_raw_fd(fd)) };
+        let _ = writeln!(f, "ready {session_id}");
+        let _ = f.into_raw_fd(); // fd is still owned by ready_fd
+        // Redirect stdout/stderr to the session log. stdin stays as inherited
+        // (the child is detached; nothing reads it).
+        if let Err(e) = redirect_stdio_to_log(&sdir.path) {
+            tracing::warn!("detach: cannot redirect stdio to supervisor.log: {e}");
+        }
     }
 
     // ---- 7. relay + wait
@@ -2951,6 +3142,33 @@ pub fn client_request(session_arg: &str, req: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ready_report_is_parsed_from_the_first_line() {
+        use super::{ReadyReport, parse_ready_report};
+        assert_eq!(
+            parse_ready_report("ready abc123"),
+            ReadyReport::Ready("abc123".into())
+        );
+        assert_eq!(
+            parse_ready_report("ready seat-a"),
+            ReadyReport::Ready("seat-a".into())
+        );
+        assert_eq!(
+            parse_ready_report("error cannot start: EPERM"),
+            ReadyReport::Error("cannot start: EPERM".into())
+        );
+        assert_eq!(parse_ready_report(""), ReadyReport::Error(String::new()));
+        // An unexpected line is treated as an error, never as readiness.
+        assert_eq!(
+            parse_ready_report("gibberish"),
+            ReadyReport::Error("gibberish".into())
+        );
+        assert_eq!(
+            parse_ready_report("ready"),
+            ReadyReport::Error("ready".into())
+        );
+    }
+
     #[test]
     fn username_comes_from_the_lookup_and_falls_back_with_a_reason() {
         let (n, why) = pick_username(Ok(Some("alice".into())));

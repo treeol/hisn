@@ -122,32 +122,48 @@ start_session() {
   for a in "$@"; do
     [ "$a" = "--detach" ] || fwd+=("$a")
   done
-  # --detach: start the session with no command (a detached seat). The
-  # caller then uses `hisn exec` to run commands in it.
+  # --detach: start the session with no command (a detached seat). 0.4.1 step 4:
+  # `hisn run --detach` now returns once the session is ready, so it is not
+  # backgrounded — the command itself returns "<id> <name|-> ready".
   if [ "$detach" -eq 1 ]; then
-    HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
+    if HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
       HISN_LEAK_PASSED=visible-ok \
       "$HISN" run --policy "$pol" --session-id "$name" --detach "${fwd[@]+"${fwd[@]}"}" \
-      </dev/null >"$S_LOG.out" 2>"$S_LOG" &
+      </dev/null >"$S_LOG.out" 2>"$S_LOG"; then
+      # The supervisor is a separate process now; the CLI pid is not it.
+      # Track no pid: cleanup uses `hisn stop`/`kill`, and the session dir.
+      S_PID=""
+    else
+      echo "detached session $name failed to start; hisn said:"; sed 's/^/    /' "$S_LOG"
+      return 1
+    fi
   else
     HISN_LEAK_SECRET=topsecret AWS_SECRET_ACCESS_KEY=hunter2 SSH_AUTH_SOCK=/host/agent \
       HISN_LEAK_PASSED=visible-ok \
       "$HISN" run --policy "$pol" --session-id "$name" "$@" -- "$cwd/leakprobe" loop "$cwd/ctl" \
       </dev/null >"$S_LOG.out" 2>"$S_LOG" &
+    S_PID=$!
+    SESSIONS+=("$S_PID")
   fi
-  S_PID=$!
-  SESSIONS+=("$S_PID")
   local i
   if [ "$detach" -eq 1 ]; then
-    # A detached session runs no leakprobe: there is no ready file. Wait
-    # for the session to appear in hisn ls --json instead.
-    for i in $(seq 1 150); do
-      "$HISN" ls --json 2>/dev/null | grep -q "\"$name\"" && return 0
-      kill -0 "$S_PID" 2>/dev/null || break
-      sleep 0.1
+    # 0.4.1 step 4: `hisn run --detach` already returned once the session was
+    # ready (it printed "<id> <name|-> ready" on stdout and exited 0). The id
+    # equals `$name` because --session-id was passed. Capture the supervisor
+    # pid so existing cleanup (`kill "$S_PID"`, `reap_bounded "$S_PID"`) keeps
+    # working; the supervisor is not a child of this shell, so `wait` is a
+    # no-op for it (end_session tolerates that).
+    for i in $(seq 1 50); do
+      local sdir
+      sdir=$(session_dir "$name")
+      if [ -f "$sdir/supervisor.pid" ]; then
+        S_PID=$(cut -d' ' -f1 <"$sdir/supervisor.pid")
+        break
+      fi
+      sleep 0.05
     done
-    echo "session $name did not appear; hisn said:"; sed 's/^/    /' "$S_LOG"
-    return 1
+    [ -n "$S_PID" ] && SESSIONS+=("$S_PID")
+    return 0
   fi
   for i in $(seq 1 150); do
     [ -e "$cwd/ctl/ready" ] && return 0
@@ -2986,6 +3002,65 @@ PY
   rm -rf "$L74_CWD"
 else
   skip "L74 ls --json clients" "hisn check failed (no userns)"
+fi
+
+# ================================================ L75: run --detach returns (0.4.1, HOST)
+# `hisn run --detach` returns within a second, prints "<id> <name|-> ready",
+# exits 0, the session is listed running, and <session-dir>/supervisor.log
+# exists with mode 0600.
+if needs_host; then
+  L75_CWD=$(new_cwd l75)
+  L75_POL="$WORK/l75.toml"
+  write_policy "$L75_POL" "$L75_CWD"
+  L75_ID="l75-$$"
+  L75_NAME="l75n$$"
+  L75_OUT="$WORK/l75.out"
+  L75_START=$(date +%s%N)
+  if timeout 20 "$HISN" run --policy "$L75_POL" --session-id "$L75_ID" --name "$L75_NAME" --detach \
+      </dev/null >"$L75_OUT" 2>"$WORK/l75.err"; then
+    L75_END=$(date +%s%N)
+    L75_MS=$(( (L75_END - L75_START) / 1000000 ))
+    # The ready line: "<id> <name> ready".
+    if grep -q "^$L75_ID $L75_NAME ready$" "$L75_OUT"; then
+      pass "L75 run --detach prints '<id> <name> ready'"
+    else
+      fail "L75 run --detach prints '<id> <name> ready'" "stdout: [$(cat "$L75_OUT")]"
+    fi
+    # Returns within 1 s.
+    if [ "$L75_MS" -lt 1000 ] 2>/dev/null; then
+      pass "L75 run --detach returns in under 1 s (${L75_MS}ms)"
+    else
+      fail "L75 run --detach returns in under 1 s" "took ${L75_MS}ms"
+    fi
+    # The session is listed running.
+    L75_STATE=$(ls_field "$L75_ID" state)
+    if [ "$L75_STATE" = "running" ]; then
+      pass "L75 detached session is listed running"
+    else
+      fail "L75 detached session is listed running" "state=[$L75_STATE]"
+    fi
+    # supervisor.log exists, 0600.
+    L75_DIR=$(session_dir "$L75_ID")
+    L75_LOG="$L75_DIR/supervisor.log"
+    if [ -f "$L75_LOG" ]; then
+      L75_MODE=$(stat -c '%a' "$L75_LOG" 2>/dev/null)
+      if [ "$L75_MODE" = "600" ]; then
+        pass "L75 supervisor.log exists with mode 0600"
+      else
+        fail "L75 supervisor.log exists with mode 0600" "mode=$L75_MODE"
+      fi
+    else
+      fail "L75 supervisor.log exists with mode 0600" "no $L75_LOG"
+    fi
+    # Clean up: stop the session (a detached supervisor is not our child).
+    "$HISN" stop --session "$L75_ID" >/dev/null 2>&1
+    "$HISN" ls --prune >/dev/null 2>&1
+  else
+    fail "L75 run --detach prints '<id> <name> ready'" "run --detach failed: [$(cat "$WORK/l75.err" 2>/dev/null | head -c 300)]"
+  fi
+  rm -rf "$L75_CWD"
+else
+  skip "L75 run --detach prints '<id> <name> ready'" "hisn check failed (no userns)"
 fi
 
 # Every id in MANIFEST must produce at least one line. A missing id means

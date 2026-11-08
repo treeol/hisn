@@ -264,6 +264,14 @@ pub struct LsArgs {
     /// Remove stale session directories without archiving (0.4.0 step 5).
     #[arg(long)]
     pub purge: bool,
+    /// With --prune: only prune stopped/crashed sessions whose name starts
+    /// with this prefix. Unnamed sessions never match a prefix (0.4.1).
+    #[arg(long, value_name = "PREFIX")]
+    pub name_prefix: Option<String>,
+    /// With --prune: list the sessions that would be pruned, removing nothing
+    /// (0.4.1).
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]

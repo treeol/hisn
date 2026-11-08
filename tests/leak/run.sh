@@ -2864,6 +2864,62 @@ else
   skip "L72 archive unreadable from inside a session" "hisn check failed (no userns)"
 fi
 
+# ================================================ L73: ls --prune --name-prefix (0.4.1, HOST)
+# Two stopped sessions with different names: a prefix removes exactly the one
+# whose name starts with it and leaves the other. An unnamed session is never
+# matched by a prefix.
+if needs_host; then
+  L73_PREFIX="l73pre-$$"
+  L73A_ID="l73a-$$"
+  L73A_NAME="$L73_PREFIX-keep"
+  L73B_ID="l73b-$$"
+  L73B_NAME="l73other-$$"
+  L73A_CWD=$(new_cwd l73a)
+  L73A_POL="$WORK/l73a.toml"
+  write_policy "$L73A_POL" "$L73A_CWD"
+  L73B_CWD=$(new_cwd l73b)
+  L73B_POL="$WORK/l73b.toml"
+  write_policy "$L73B_POL" "$L73B_CWD"
+  if start_session "$L73A_ID" "$L73A_CWD" "$L73A_POL" --detach --name "$L73A_NAME"; then
+    L73A_PID=$S_PID
+    if start_session "$L73B_ID" "$L73B_CWD" "$L73B_POL" --detach --name "$L73B_NAME"; then
+      L73B_PID=$S_PID
+      # Stop both: their dirs stay, state stopped (0.4.0 O3).
+      "$HISN" stop --session "$L73A_ID" >/dev/null 2>&1
+      "$HISN" stop --session "$L73B_ID" >/dev/null 2>&1
+      reap_bounded "$L73A_PID" 15 "L73 run exit after stop (a)"
+      reap_bounded "$L73B_PID" 15 "L73 run exit after stop (b)"
+      L73A_DIR=$(session_dir "$L73A_ID")
+      L73B_DIR=$(session_dir "$L73B_ID")
+      # dry-run lists without removing.
+      "$HISN" ls --prune --name-prefix "$L73_PREFIX" --dry-run >/dev/null 2>&1
+      if [ -d "$L73A_DIR" ] && [ -d "$L73B_DIR" ]; then
+        pass "L73 --prune --dry-run removes nothing"
+      else
+        fail "L73 --prune --dry-run removes nothing" "a dir was removed by dry-run (a:$([ -d "$L73A_DIR" ] && echo yes || echo no) b:$([ -d "$L73B_DIR" ] && echo yes || echo no))"
+      fi
+      # The prefix prunes only the matching session.
+      "$HISN" ls --prune --name-prefix "$L73_PREFIX" >/dev/null 2>&1
+      if [ -d "$L73B_DIR" ] && [ ! -d "$L73A_DIR" ]; then
+        pass "L73 --name-prefix prunes the matching stopped session only"
+      else
+        fail "L73 --name-prefix prunes the matching stopped session only" "after prune: a-kept=$([ -d "$L73A_DIR" ] && echo yes || echo no) b-kept=$([ -d "$L73B_DIR" ] && echo yes || echo no)"
+      fi
+      # A bare --prune (no prefix) still removes the rest: today's behaviour.
+      "$HISN" ls --prune >/dev/null 2>&1
+      [ -d "$L73B_DIR" ] && fail "L73 bare --prune removes unnamed/unmatched" "b still present" \
+        || pass "L73 bare --prune keeps 0.4.0 behaviour"
+    else
+      skip "L73 --prune --name-prefix" "named detached session B did not start"
+    fi
+  else
+    skip "L73 --prune --name-prefix" "named detached session A did not start"
+  fi
+  rm -rf "$L73A_CWD" "$L73B_CWD"
+else
+  skip "L73 --prune --name-prefix" "hisn check failed (no userns)"
+fi
+
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.
 MANIFEST="$HERE/MANIFEST"

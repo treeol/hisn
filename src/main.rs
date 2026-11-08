@@ -252,7 +252,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Command::Ls(a) => ls(a.session.as_deref(), a.json, a.prune, a.purge),
+        Command::Ls(a) => ls(
+            a.session.as_deref(),
+            a.json,
+            a.prune,
+            a.purge,
+            a.name_prefix.as_deref(),
+            a.dry_run,
+        ),
         Command::Rootfs { command } => match command {
             RootfsCommand::Import(args) => rootfs_import(args),
             RootfsCommand::List => {
@@ -311,7 +318,14 @@ fn print_response(r: &Value) -> Result<ExitCode> {
     })
 }
 
-fn ls(session_id: Option<&str>, json_out: bool, prune: bool, purge: bool) -> Result<ExitCode> {
+fn ls(
+    session_id: Option<&str>,
+    json_out: bool,
+    prune: bool,
+    purge: bool,
+    name_prefix: Option<&str>,
+    dry_run: bool,
+) -> Result<ExitCode> {
     let uid = rustix::process::getuid().as_raw();
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     match session_id {
@@ -332,41 +346,81 @@ fn ls(session_id: Option<&str>, json_out: bool, prune: bool, purge: bool) -> Res
         }
         None => {
             let sessions = session::list_sessions(&roots);
-            if prune || purge {
-                for (n, p) in &sessions {
+            if prune || purge || dry_run {
+                // 0.4.1 step 1: --name-prefix narrows the prune set to
+                // stopped/crashed sessions whose name starts with the prefix.
+                // An unnamed session never matches a prefix. Without the flag,
+                // every stale session is a candidate (0.4.0 behaviour).
+                // --dry-run lists the candidates and removes nothing.
+                let matches_prefix = |p: &Path| -> bool {
+                    prune_prefix_matches(session_name(p).as_deref(), name_prefix)
+                };
+                let candidates: Vec<(String, PathBuf)> = sessions
+                    .into_iter()
+                    .filter(|(n, p)| {
+                        if !matches_prefix(p) {
+                            tracing::info!("prune: {n} name does not match prefix; skipped");
+                            return false;
+                        }
+                        // A stopped/crashed session has no live supervisor.
+                        if !session::is_stale(p) {
+                            tracing::info!("prune: {n} not stale; skipped");
+                            return false;
+                        }
+                        true
+                    })
+                    .collect();
+
+                if dry_run {
+                    // No 300 ms re-check and no removal: this is a report.
+                    for (n, p) in &candidates {
+                        let name = session_name(p).unwrap_or_else(|| "-".into());
+                        println!("{n}\t{name}");
+                    }
+                    eprintln!(
+                        "would prune {} session(s){}",
+                        candidates.len(),
+                        name_prefix
+                            .map(|pre| format!(" with name prefix {pre:?}"))
+                            .unwrap_or_default()
+                    );
+                    return Ok(ExitCode::SUCCESS);
+                }
+
+                for (n, p) in &candidates {
                     // Check twice 300 ms apart to avoid racing a live session
                     // mid-shutdown.
-                    if session::is_stale(p) {
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                        if session::is_stale(p) {
-                            if purge {
-                                // --purge: skip archival, just remove.
-                                match session::remove_safe(p, uid) {
-                                    Ok(()) => eprintln!("{n} stale; purged (no archive)"),
-                                    Err(e) => {
-                                        tracing::warn!("purge {n}: removal refused: {e}");
-                                        eprintln!("{n} stale; removal refused: {e}");
-                                    }
-                                }
-                                continue;
-                            }
-                            // 0.4.0 step 5: archive grants.jsonl and the
-                            // final session.json before removing the dir.
-                            if let Err(e) = archive_session(p, n, uid) {
-                                tracing::warn!("prune {n}: archive failed: {e}");
-                                eprintln!("{n} stale; archive failed: {e} (not removed)");
-                                continue;
-                            }
-                            match session::remove_safe(p, uid) {
-                                Ok(()) => eprintln!("{n} stale; archived and removed"),
-                                Err(e) => {
-                                    tracing::warn!("prune {n}: removal refused: {e}");
-                                    eprintln!("{n} stale; removal refused: {e}");
-                                }
+                    if !session::is_stale(p) {
+                        continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    if !session::is_stale(p) {
+                        continue;
+                    }
+                    if purge {
+                        // --purge: skip archival, just remove.
+                        match session::remove_safe(p, uid) {
+                            Ok(()) => eprintln!("{n} stale; purged (no archive)"),
+                            Err(e) => {
+                                tracing::warn!("purge {n}: removal refused: {e}");
+                                eprintln!("{n} stale; removal refused: {e}");
                             }
                         }
-                    } else {
-                        tracing::info!("prune: {n} not stale; skipped");
+                        continue;
+                    }
+                    // 0.4.0 step 5: archive grants.jsonl and the
+                    // final session.json before removing the dir.
+                    if let Err(e) = archive_session(p, n, uid) {
+                        tracing::warn!("prune {n}: archive failed: {e}");
+                        eprintln!("{n} stale; archive failed: {e} (not removed)");
+                        continue;
+                    }
+                    match session::remove_safe(p, uid) {
+                        Ok(()) => eprintln!("{n} stale; archived and removed"),
+                        Err(e) => {
+                            tracing::warn!("prune {n}: removal refused: {e}");
+                            eprintln!("{n} stale; removal refused: {e}");
+                        }
                     }
                 }
                 // Reconcile the name index with what is on disk (step 1c).
@@ -476,6 +530,25 @@ fn ls(session_id: Option<&str>, json_out: bool, prune: bool, purge: bool) -> Res
             }
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// The session's `--name`, read from the authoritative `name` file (falling
+/// back to `session.json`'s `name`). `None` for an unnamed session.
+fn session_name(session_dir: &Path) -> Option<String> {
+    if let Some(n) = hisn::registry::name_of(session_dir) {
+        return Some(n);
+    }
+    hisn::sessionmeta::read(session_dir).and_then(|m| m.name)
+}
+
+/// 0.4.1 step 1: does a session with name `name` match a `--prune
+/// --name-prefix` filter? An unnamed session (`None`) never matches a prefix;
+/// with no prefix every session matches. Pure; unit-tested.
+fn prune_prefix_matches(name: Option<&str>, prefix: Option<&str>) -> bool {
+    match prefix {
+        None => true,
+        Some(pre) => name.is_some_and(|n| n.starts_with(pre)),
     }
 }
 
@@ -639,7 +712,24 @@ fn archive_session(dir: &Path, id: &str, uid: u32) -> Result<(), anyhow::Error> 
 
 #[cfg(test)]
 mod ls_tests {
-    use super::{archive_session, parse_rfc3339_secs};
+    use super::{archive_session, parse_rfc3339_secs, prune_prefix_matches};
+
+    #[test]
+    fn prune_prefix_filter_selects_named_sessions_only() {
+        // 0.4.1 step 1: --prune --name-prefix P keeps only sessions whose
+        // name starts with P. No prefix keeps everything; an unnamed
+        // session never matches a prefix.
+        assert!(prune_prefix_matches(Some("wakil-dev"), None));
+        assert!(prune_prefix_matches(None, None));
+        assert!(prune_prefix_matches(Some("wakil-dev"), Some("wakil-")));
+        assert!(prune_prefix_matches(Some("wakil"), Some("wakil")));
+        assert!(!prune_prefix_matches(Some("seat-a"), Some("wakil-")));
+        // Unnamed sessions are never matched by a prefix.
+        assert!(!prune_prefix_matches(None, Some("wakil-")));
+        // An empty prefix matches only a named session (some name).
+        assert!(prune_prefix_matches(Some("x"), Some("")));
+        assert!(!prune_prefix_matches(None, Some("")));
+    }
 
     /// Known values checked with `date -u -d ... +%s`.
     #[test]

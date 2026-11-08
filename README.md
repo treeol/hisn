@@ -1,4 +1,8 @@
-# hisn (حصن, "fortress")
+<p align="center">
+  <img src="assets/logo.png" alt="hisn logo" width="160">
+</p>
+
+# hisn
 
 hisn is a Linux sandbox for running agents and their tools in isolated, named, lease-managed sessions: a single binary, no daemon, no root.
 

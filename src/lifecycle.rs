@@ -166,8 +166,20 @@ fn wait_exit(
     if let Some(fd) = target.exit_fd() {
         let deadline = Instant::now() + total;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            if target.exited() {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            // Round the remaining time UP to the next millisecond so a
+            // fractional millisecond never becomes a 0 ms busy-spin.
+            let remaining_ms = deadline
+                .saturating_duration_since(now)
+                .as_millis()
+                .saturating_add(1);
+            let ms = remaining_ms.min(i32::MAX as u128) as i32;
             let mut pfd = [libc::pollfd {
                 fd,
                 events: libc::POLLIN,
@@ -175,18 +187,26 @@ fn wait_exit(
             }];
             // SAFETY: poll on an fd we own, valid pollfd array.
             let r = unsafe { libc::poll(pfd.as_mut_ptr(), 1, ms) };
-            if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue; // re-check the deadline and the fd
+            if r < 0 {
+                let e = std::io::Error::last_os_error().raw_os_error();
+                if e == Some(libc::EINTR) {
+                    continue; // re-check the deadline and the fd
+                }
+                // A persistent poll error (e.g. EBADF): stop using the fd and
+                // fall back to the bounded backoff poll rather than spin.
+                break;
             }
             // A pidfd becomes readable exactly when the process exits (it is
-            // the exit event), so a positive return is authoritative even when
-            // the process is a zombie not yet reaped by its parent. Fall back
-            // to the target's own `exited()` on timeout/error.
-            if r > 0 || target.exited() {
+            // the exit event), so POLLIN is authoritative even when the process
+            // is a zombie not yet reaped by its parent. POLLNVAL/POLLERR are
+            // *not* exit evidence; the authoritative `exited()` above decides.
+            if pfd[0].revents & libc::POLLIN != 0 {
                 return true;
             }
-            if Instant::now() >= deadline {
-                return false;
+            if pfd[0].revents & (libc::POLLNVAL | libc::POLLERR | libc::POLLHUP) != 0
+                && !target.exited()
+            {
+                break; // fd is unusable; use the fallback
             }
         }
     }

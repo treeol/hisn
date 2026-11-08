@@ -127,6 +127,12 @@ pub enum Request {
         #[serde(default)]
         client: Option<ClientField>,
     },
+    /// 0.4.1 step 3: report live clients and execs for `ls --json` (the
+    /// per-session view that the on-disk `session.json` cannot supply).
+    SessionInfo {
+        #[serde(default)]
+        client: Option<ClientField>,
+    },
 }
 
 /// The client-supplied identity fields (0.4.0 F1). The supervisor fills
@@ -151,6 +157,7 @@ impl Request {
             Request::Kill { .. } => "kill",
             Request::Exec { .. } => "exec",
             Request::Signal { .. } => "signal",
+            Request::SessionInfo { .. } => "sessioninfo",
         }
     }
 
@@ -170,7 +177,8 @@ impl Request {
             | Request::Inspect { client, .. }
             | Request::Kill { client, .. }
             | Request::Exec { client, .. }
-            | Request::Signal { client, .. } => client.as_ref(),
+            | Request::Signal { client, .. }
+            | Request::SessionInfo { client, .. } => client.as_ref(),
         }
     }
 }
@@ -253,9 +261,11 @@ pub trait Handler: Send + Sync + 'static {
     /// and again before every request. `Err` closes the connection.
     fn authorize(&self, peer: &UnixStream) -> Result<(), String>;
     /// F2 fix: a client connected (serve_conn thread started, after authorize).
-    fn connect(&self) {}
+    /// `conn` is the connection's fd, which identifies the connection for
+    /// `disconnect` and for per-connection client records (0.4.1 step 3).
+    fn connect(&self, _conn: RawFd) {}
     /// F2 fix: a client disconnected (serve_conn thread exited).
-    fn disconnect(&self) {}
+    fn disconnect(&self, _conn: RawFd) {}
     /// Handle one request and return its (final) response line. `fds` are the
     /// descriptors that arrived with the request: the server only lets them
     /// through on the *first* request line of a connection and only for
@@ -402,11 +412,14 @@ pub fn drain(timeout: Duration) -> bool {
 
 /// F2 fix: calls `disconnect` on drop so the connection count stays accurate
 /// even if `serve_conn` returns early (EOF, error, misuse).
-struct ClientGuard<'a>(&'a dyn Handler);
+struct ClientGuard<'a> {
+    handler: &'a dyn Handler,
+    conn: RawFd,
+}
 
 impl Drop for ClientGuard<'_> {
     fn drop(&mut self) {
-        self.0.disconnect();
+        self.handler.disconnect(self.conn);
     }
 }
 
@@ -418,6 +431,7 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
     // line: a bare connect-and-close (`hisn ls` liveness probe, is_stale) is
     // neither a connected client nor activity — counting it made every `ls`
     // poll reset the idle timer (0.4.0 L61).
+    let conn_fd = stream.as_raw_fd();
     let mut _guard: Option<ClientGuard> = None;
     let mut reader = FdLineReader::new(stream.as_raw_fd());
     let mut out = &stream;
@@ -429,8 +443,11 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
         };
         lines += 1;
         if _guard.is_none() {
-            h.connect();
-            _guard = Some(ClientGuard(h));
+            h.connect(conn_fd);
+            _guard = Some(ClientGuard {
+                handler: h,
+                conn: conn_fd,
+            });
         }
         if h.authorize(&stream).is_err() {
             return;
@@ -711,10 +728,10 @@ mod tests {
             fn authorize(&self, _: &UnixStream) -> Result<(), String> {
                 Ok(())
             }
-            fn connect(&self) {
+            fn connect(&self, _: RawFd) {
                 self.open.fetch_add(1, O::SeqCst);
             }
-            fn disconnect(&self) {
+            fn disconnect(&self, _: RawFd) {
                 self.open.fetch_sub(1, O::SeqCst);
             }
             fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream) -> Value {
@@ -763,10 +780,10 @@ mod tests {
             fn authorize(&self, _: &UnixStream) -> Result<(), String> {
                 Ok(())
             }
-            fn connect(&self) {
+            fn connect(&self, _: RawFd) {
                 self.connects.fetch_add(1, O::SeqCst);
             }
-            fn disconnect(&self) {
+            fn disconnect(&self, _: RawFd) {
                 self.disconnects.fetch_add(1, O::SeqCst);
             }
             fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream) -> Value {

@@ -20,17 +20,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// A listener that is bound (and then `listen(2)`ed) only after `delay` ms,
-/// standing in for a supervisor whose control socket appears shortly after it
-/// starts. Between bind and the accept loop starting, a connect gets
-/// ECONNREFUSED, which the wait treats as "not ready yet".
-fn late_listener(sockpath: std::path::PathBuf, delay: Duration) -> std::thread::JoinHandle<()> {
+/// A listener bound only after `delay` ms, standing in for a supervisor whose
+/// control socket appears shortly after it starts. It accepts until `stop`.
+fn late_listener(
+    sockpath: std::path::PathBuf,
+    delay: Duration,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         std::thread::sleep(delay);
         let listener = UnixListener::bind(&sockpath).expect("bind late listener");
-        // Keep it alive while the readiness probe connects.
-        std::thread::sleep(Duration::from_secs(5));
-        drop(listener);
+        listener.set_nonblocking(true).ok();
+        while !stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => drop(stream),
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
     })
 }
 
@@ -39,7 +45,8 @@ fn readiness_wait_observes_the_socket_without_a_fixed_100ms_floor() {
     let dir = tempfile::tempdir().expect("tempdir");
     let sockpath = dir.path().join("control.sock");
     let delay = Duration::from_millis(8);
-    let handle = late_listener(sockpath.clone(), delay);
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = late_listener(sockpath.clone(), delay, stop.clone());
 
     let started = Instant::now();
     session::wait_control_socket(&sockpath, Duration::from_secs(5)).expect("socket becomes ready");
@@ -53,7 +60,7 @@ fn readiness_wait_observes_the_socket_without_a_fixed_100ms_floor() {
         "readiness took {ready_elapsed:?} — still on a fixed-poll floor"
     );
 
-    // An already-bound socket is observed immediately (one ~1 ms probe).
+    // An already-bound socket is observed immediately (one probe).
     let started = Instant::now();
     session::wait_control_socket(&sockpath, Duration::from_secs(5)).expect("ready immediately");
     let already = started.elapsed();
@@ -63,6 +70,7 @@ fn readiness_wait_observes_the_socket_without_a_fixed_100ms_floor() {
         "already-ready socket took {already:?}"
     );
 
+    stop.store(true, Ordering::SeqCst);
     handle.join().ok();
 }
 

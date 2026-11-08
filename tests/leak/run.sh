@@ -2920,6 +2920,74 @@ else
   skip "L73 --prune --name-prefix" "hisn check failed (no userns)"
 fi
 
+# ================================================ L74: ls --json clients (0.4.1, HOST)
+# `ls --json` reports `clients` (the live control connections) and lists an
+# attach under `execs` with attach:true. For a stopped session, CLIENTS is 0
+# and `clients` is []. A held-open control connection counts as one client.
+if needs_host; then
+  L74_CWD=$(new_cwd l74)
+  L74_POL="$WORK/l74.toml"
+  write_policy "$L74_POL" "$L74_CWD"
+  if start_session l74-$$ "$L74_CWD" "$L74_POL" --detach; then
+    # Open a control connection and keep it open (a live client). Use python
+    # to hold the socket so the count stays 1 while we query.
+    L74_SOCK="$(session_dir l74-$$)/control.sock"
+    python3 - "$L74_SOCK" <<'PY' &
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(sys.argv[1])
+# A request line makes it a counted client (a bare connect is not).
+s.sendall(b'{"op":"list"}\n')
+s.recv(4096)
+time.sleep(6)
+PY
+    L74_HOLDER=$!
+    # Wait for the holder to register as a client.
+    L74_N=0
+    for _ in $(seq 1 50); do
+      L74_N=$("$HISN" ls --json 2>/dev/null | $PY ls-count "l74-$$" clients)
+      [ "$L74_N" -ge 1 ] 2>/dev/null && break
+      sleep 0.1
+    done
+    if [ "$L74_N" -ge 1 ] 2>/dev/null; then
+      pass "L74 ls --json clients matches live connections"
+    else
+      fail "L74 ls --json clients matches live connections" "clients=$L74_N while a control connection is held open"
+    fi
+    kill "$L74_HOLDER" 2>/dev/null
+    wait "$L74_HOLDER" 2>/dev/null
+    # After the client goes, the count drops.
+    L74_ZERO=no
+    for _ in $(seq 1 50); do
+      L74_N=$("$HISN" ls --json 2>/dev/null | $PY ls-count "l74-$$" clients)
+      if [ "$L74_N" -eq 0 ] 2>/dev/null; then L74_ZERO=yes; break; fi
+      sleep 0.1
+    done
+    if [ "$L74_ZERO" = yes ]; then
+      pass "L74 ls --json clients drops when the connection closes"
+    else
+      fail "L74 ls --json clients drops when the connection closes" "clients stayed $L74_N"
+    fi
+    # Stop the session: clients is [] and the count 0 even though members exist.
+    "$HISN" stop --session l74-$$ >/dev/null 2>&1
+    reap_bounded "$S_PID" 15 "L74 run exit after stop"
+    L74_STOPPED_CLIENTS=$("$HISN" ls --json 2>/dev/null | $PY ls-count "l74-$$" clients)
+    L74_STATE=$(ls_field "l74-$$" state)
+    if [ "$L74_STATE" = "stopped" ] && [ "$L74_STOPPED_CLIENTS" -eq 0 ] 2>/dev/null; then
+      pass "L74 stopped session has CLIENTS 0 and clients []"
+    else
+      fail "L74 stopped session has CLIENTS 0 and clients []" "state=$L74_STATE clients=$L74_STOPPED_CLIENTS"
+    fi
+    "$HISN" ls --prune >/dev/null 2>&1
+  else
+    skip "L74 ls --json clients" "detached session did not start"
+  fi
+  rm -rf "$L74_CWD"
+else
+  skip "L74 ls --json clients" "hisn check failed (no userns)"
+fi
+
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.
 MANIFEST="$HERE/MANIFEST"

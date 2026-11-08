@@ -117,8 +117,11 @@ class HarnessHelpers(unittest.TestCase):
     """0.4.0 L52/L61: JSON-parsed checks instead of greps."""
 
     LS = json.dumps({"schema": "hisn-ls/v2", "sessions": [
-        {"id": "l61-42", "state": "stopped", "dir": "/tmp/hisn-1000/l61-42"},
-        {"id": "l61-4", "state": "running", "dir": None},
+        {"id": "l61-42", "state": "stopped", "dir": "/tmp/hisn-1000/l61-42",
+         "clients": [], "execs": []},
+        {"id": "l61-4", "state": "running", "dir": None,
+         "clients": [{"uid": 1000, "label": "local"}],
+         "execs": [{"exec_id": "e-1", "attach": True}]},
     ]})
 
     def test_ls_field_matches_the_exact_id(self):
@@ -128,6 +131,16 @@ class HarnessHelpers(unittest.TestCase):
         self.assertEqual(l8.ls_field(self.LS, "l61-4", "dir"), "")
         self.assertEqual(l8.ls_field(self.LS, "l61-$$", "state"), "")
         self.assertEqual(l8.ls_field("not json", "l61-42", "state"), "")
+
+    def test_ls_count_reads_array_lengths(self):
+        # 0.4.1 step 3/4: `clients` is [] for a stopped session, a live count
+        # for a running one; a missing/non-array field reads 0.
+        self.assertEqual(l8.ls_count(self.LS, "l61-42", "clients"), 0)
+        self.assertEqual(l8.ls_count(self.LS, "l61-4", "clients"), 1)
+        self.assertEqual(l8.ls_count(self.LS, "l61-4", "execs"), 1)
+        self.assertEqual(l8.ls_count(self.LS, "l61-4", "state"), 0)
+        self.assertEqual(l8.ls_count(self.LS, "nope", "clients"), 0)
+        self.assertEqual(l8.ls_count("not json", "l61-4", "clients"), 0)
 
     def test_attach_ok_needs_ok_true_and_an_exec_id(self):
         self.assertTrue(l8.attach_ok('{"exec_id":"e-1","ok":true,"pid":3}\n{"exit":{}}'))

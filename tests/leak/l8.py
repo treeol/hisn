@@ -6,6 +6,8 @@
   l8.py json-has FILE KEY VALUE      exit 0 iff top-level KEY == VALUE
   l8.py ls-field ID FIELD < LS.json  print FIELD of session ID (hisn-ls/v2);
                                      empty if not listed / null
+  l8.py ls-count ID FIELD < LS.json  print the length of the array FIELD of
+                                     session ID (0 if absent/null/non-array)
   l8.py attach-ok < RESPONSE         exit 0 iff the first line is
                                      {"ok": true, "exec_id": "e-N", ...}
   l8.py audit-has FILE OP STAGE      exit 0 iff a grants.jsonl line has
@@ -146,6 +148,22 @@ def ls_field(doc_text, want, field):
     return ""
 
 
+def ls_count(doc_text, want, field):
+    """Length of the array FIELD of session WANT (0 for absent/null/non-array).
+
+    Used by L74 to compare `clients` with the live connection count (0 for a
+    stopped session, whose `clients` is `[]`)."""
+    try:
+        doc = json.loads(doc_text)
+    except ValueError:
+        return 0
+    for s in doc.get("sessions", []):
+        if s.get("id") == want:
+            v = s.get(field)
+            return len(v) if isinstance(v, list) else 0
+    return 0
+
+
 def attach_ok(resp_text):
     """True iff the first response line is ok:true with an e-N exec_id."""
     first = resp_text.split("\n", 1)[0]
@@ -188,6 +206,9 @@ def main(argv):
         return 0 if str(load_json(argv[2]).get(argv[3])) == argv[4] else 1
     if cmd == "ls-field":
         print(ls_field(sys.stdin.read(), argv[2], argv[3]))
+        return 0
+    if cmd == "ls-count":
+        print(ls_count(sys.stdin.read(), argv[2], argv[3]))
         return 0
     if cmd == "attach-ok":
         return 0 if attach_ok(sys.stdin.read()) else 1

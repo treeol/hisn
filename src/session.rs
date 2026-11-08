@@ -355,8 +355,11 @@ pub fn is_live(path: &Path) -> bool {
 /// in 6 ms is observed in ~7 ms, not ~100 ms.
 ///
 /// `ENOENT` (socket not created yet) and `ECONNREFUSED` (bound but the accept
-/// loop has not started) both mean "not ready yet". Any other connect error
-/// (`EACCES`, …) is a hard failure and returns immediately.
+/// loop has not started) both mean "not ready yet". The probe is a
+/// **nonblocking** connect, so a listener whose backlog is full (a stalled
+/// accept loop) yields `EAGAIN` — "not ready" — instead of blocking the waiter
+/// past its deadline. Any other connect error (`EACCES`, …) is a hard failure
+/// and returns immediately.
 pub fn wait_control_socket(
     socket: &Path,
     timeout: std::time::Duration,
@@ -365,14 +368,10 @@ pub fn wait_control_socket(
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(1);
     loop {
-        match std::os::unix::net::UnixStream::connect(socket) {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                let code = e.raw_os_error();
-                if !matches!(code, Some(libc::ENOENT) | Some(libc::ECONNREFUSED)) {
-                    return Err(SessionError::Io(e));
-                }
-            }
+        match nonblocking_connect_ready(socket) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => return Err(SessionError::Io(e)),
         }
         let now = Instant::now();
         if now >= deadline {
@@ -387,6 +386,64 @@ pub fn wait_control_socket(
         let remaining = deadline.saturating_duration_since(now);
         std::thread::sleep(delay.min(remaining));
         delay = (delay * 2).min(Duration::from_millis(20));
+    }
+}
+
+/// A nonblocking `connect(2)` to a unix socket path. `Ok(true)` = connected,
+/// `Ok(false)` = not ready yet (socket absent, refusing, or backlog full),
+/// `Err` = a hard error that will not resolve by waiting.
+fn nonblocking_connect_ready(socket: &Path) -> io::Result<bool> {
+    use std::mem::MaybeUninit;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = socket.as_os_str().as_bytes();
+    // sockaddr_un.sun_path is 108 bytes including a NUL.
+    if bytes.len() >= 108 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path too long",
+        ));
+    }
+    // SAFETY: socket() returns a fresh fd or -1; wrapped immediately.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor we own.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: zeroed sockaddr_un is a valid starting point; we fill it in.
+    let mut addr: libc::sockaddr_un = unsafe { MaybeUninit::zeroed().assume_init() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (i, b) in bytes.iter().enumerate() {
+        addr.sun_path[i] = *b as libc::c_char;
+    }
+    // SAFETY: connect() on our fd with a correctly-sized sockaddr_un.
+    let r = unsafe {
+        libc::connect(
+            owned.as_raw_fd(),
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if r == 0 {
+        return Ok(true);
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        // Not ready yet: absent, refusing, or the backlog is full.
+        Some(libc::ENOENT)
+        | Some(libc::ECONNREFUSED)
+        | Some(libc::EAGAIN)
+        | Some(libc::EINPROGRESS)
+        | Some(libc::EALREADY)
+        | Some(libc::EINTR) => Ok(false),
+        _ => Err(e),
     }
 }
 

@@ -72,6 +72,7 @@ pub enum Op {
     Kill,
     Exec,
     Signal,
+    SessionInfo,
 }
 
 impl Op {
@@ -84,6 +85,7 @@ impl Op {
             Request::Kill { .. } => Op::Kill,
             Request::Exec { .. } => Op::Exec,
             Request::Signal { .. } => Op::Signal,
+            Request::SessionInfo { .. } => Op::SessionInfo,
         }
     }
 
@@ -96,6 +98,7 @@ impl Op {
             Op::Kill => "kill",
             Op::Exec => "exec",
             Op::Signal => "signal",
+            Op::SessionInfo => "sessioninfo",
         }
     }
 }

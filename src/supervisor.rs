@@ -154,6 +154,14 @@ struct Shared {
     /// F2 fix: count of connected control clients (accepted connections that
     /// have not yet disconnected). The idle timer treats this as "activity".
     connected_clients: std::sync::atomic::AtomicU64,
+    /// 0.4.1 step 3: per-connection client records, keyed by the connection's
+    /// fd. A live attach shows up here (and under `execs`); `ls --json`
+    /// reports `clients` from this map. Entries are removed on disconnect.
+    clients: Mutex<std::collections::BTreeMap<i32, ClientInfo>>,
+    /// 0.4.1 step 3: live execs for `ls --json` (`execs`), keyed by exec_id.
+    /// Includes attaches (`attach: true`) and ordinary execs, with pid, argv0,
+    /// tty and attach flag. Removed when the exec finishes.
+    exec_info: Mutex<std::collections::BTreeMap<u64, ExecInfo>>,
     /// In-sandbox services (DESIGN §19): name → state for `ls --json`.
     services: Mutex<std::collections::BTreeMap<String, ServiceState>>,
     /// The session directory on the host (for `session.json` member writes).
@@ -173,6 +181,26 @@ struct Shared {
     /// request, not rate-limited). The idle timer reads this instead of
     /// the persisted lease value, which is throttled to 10 s writes.
     last_activity_secs: std::sync::atomic::AtomicI64,
+}
+
+/// 0.4.1 step 3: a live control connection's client record, for `ls --json`
+/// `clients[]`.
+#[derive(Clone)]
+struct ClientInfo {
+    uid: u32,
+    pid: Option<i32>,
+    label: String,
+    label_source: String,
+    connected_since: String,
+}
+
+/// 0.4.1 step 3: a live exec, for `ls --json` `execs[]`.
+#[derive(Clone)]
+struct ExecInfo {
+    pid: i32,
+    argv0: String,
+    tty: bool,
+    attach: bool,
 }
 
 /// The state of an in-sandbox service for `ls --json` (DESIGN §19).
@@ -253,16 +281,42 @@ impl Shared {
         !self.execs.lock().expect("execs").is_empty()
     }
 
-    /// F2 fix: a control client connected (serve_conn thread started).
-    pub fn connect_client(&self) {
+    /// F2 fix: a control client connected (serve_conn thread started). 0.4.1
+    /// step 3: records the connection so `ls --json` can list live clients.
+    /// The client record is refined when the connection's first request is
+    /// handled (`handle` calls `update_client` with the real label).
+    pub fn connect_client(&self, conn: RawFd) {
+        let now = crate::session::rfc3339_now();
+        self.clients.lock().expect("clients").insert(
+            conn,
+            ClientInfo {
+                uid: self.uid,
+                pid: None,
+                label: "connected".into(),
+                label_source: "none".into(),
+                connected_since: now,
+            },
+        );
         self.connected_clients
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 0.4.1 step 3: refine a connected client's record with the request-built
+    /// `ClientRecord` (the label/label_source only arrive with a request line).
+    fn update_client(&self, conn: RawFd, client: &authz::ClientRecord) {
+        if let Some(ci) = self.clients.lock().expect("clients").get_mut(&conn) {
+            ci.uid = client.uid;
+            ci.pid = client.pid;
+            ci.label = client.label.clone();
+            ci.label_source = client.label_source.clone();
+        }
     }
 
     /// F2 fix: a control client disconnected (serve_conn thread exited).
     /// The disconnect is the client's last activity: idle time counts from
     /// here, not from its (possibly much earlier) request.
-    pub fn disconnect_client(&self) {
+    pub fn disconnect_client(&self, conn: RawFd) {
+        self.clients.lock().expect("clients").remove(&conn);
         if self.idle_timeout_s.is_some() {
             let now = crate::lifecycle::Clock::now_secs(&crate::lifecycle::SystemClock);
             self.last_activity_secs
@@ -808,6 +862,17 @@ impl Shared {
         let exec_id = self
             .next_exec_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // 0.4.1 step 3: record the live exec for `ls --json` `execs[]`
+        // (attaches included). Removed when the exec finishes, below.
+        self.exec_info.lock().expect("exec_info").insert(
+            exec_id,
+            ExecInfo {
+                pid: sp.pid,
+                argv0: argv0.clone(),
+                tty: req.tty,
+                attach: req.attach,
+            },
+        );
         let registered = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3)
             .ok()
             .map(|h| {
@@ -846,6 +911,7 @@ impl Shared {
             self.live.lock().expect("live").remove(&pid);
         }
         self.execs.lock().expect("execs").remove(&exec_id);
+        self.exec_info.lock().expect("exec_info").remove(&exec_id);
         let (res, line) = match outcome {
             exec::Outcome::Exited(exec::Exit::Code(c)) => ("ok", json!({ "exit": { "code": c } })),
             exec::Outcome::Exited(exec::Exit::Signal(n)) => (
@@ -922,6 +988,58 @@ impl Shared {
             Ok(()) => ok(json!({})),
             Err(e) => err(control::E_INTERNAL, e.to_string()),
         }
+    }
+
+    /// 0.4.1 step 3: the live per-session view for `ls --json`: currently
+    /// connected clients and live execs (including attaches). Never blocks; a
+    /// client with no requests yet is still listed (label "connected").
+    fn session_info(&self, _auth: &authz::Authorized) -> Value {
+        let clients: Vec<Value> = self
+            .clients
+            .lock()
+            .expect("clients")
+            .values()
+            .map(|c| {
+                json!({
+                    "uid": c.uid,
+                    "pid": c.pid,
+                    "label": c.label,
+                    "label_source": c.label_source,
+                    "connected_since": c.connected_since,
+                })
+            })
+            .collect();
+        let execs: Vec<Value> = self
+            .exec_info
+            .lock()
+            .expect("exec_info")
+            .iter()
+            .map(|(id, e)| {
+                json!({
+                    "exec_id": format!("e-{id}"),
+                    "pid": e.pid,
+                    "argv0": e.argv0,
+                    "tty": e.tty,
+                    "attach": e.attach,
+                })
+            })
+            .collect();
+        let services: Vec<Value> = self
+            .services
+            .lock()
+            .expect("services")
+            .values()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "pid": s.pid,
+                    "socket": s.socket,
+                    "state": s.state,
+                    "exit": s.exit,
+                })
+            })
+            .collect();
+        ok(json!({ "clients": clients, "execs": execs, "services": services }))
     }
 
     fn inspect(&self, _auth: &authz::Authorized) -> Value {
@@ -1025,12 +1143,12 @@ impl Handler for Ctl {
         decision
     }
 
-    fn connect(&self) {
-        self.sh.connect_client();
+    fn connect(&self, conn: RawFd) {
+        self.sh.connect_client(conn);
     }
 
-    fn disconnect(&self) {
-        self.sh.disconnect_client();
+    fn disconnect(&self, conn: RawFd) {
+        self.sh.disconnect_client(conn);
     }
 
     fn handle(&self, req: Request, fds: Vec<OwnedFd>, peer: &UnixStream) -> Value {
@@ -1084,6 +1202,7 @@ impl Handler for Ctl {
         };
         self.sh.record_member(&client);
         self.sh.touch_lease();
+        self.sh.update_client(peer.as_raw_fd(), &client);
         match req {
             Request::Exec {
                 argv,
@@ -1170,6 +1289,7 @@ impl Handler for Ctl {
                 ok(json!({ "grants": grants }))
             }
             Request::Inspect { client: _ } => self.sh.inspect(&auth),
+            Request::SessionInfo { client: _ } => self.sh.session_info(&auth),
             Request::Kill { signal, client: _ } => {
                 self.sh
                     .log_client("kill", "request", None, None, Some(&signal), &client, true);
@@ -1251,6 +1371,9 @@ pub struct Prepared {
     pub host_services: Vec<profile::HostService>,
     /// 0.3.2: SSH agent config from the profile.
     pub ssh: Option<profile::SshConfig>,
+    /// 0.4.1 step 3: the rootfs as the user gave it (a store name or a path),
+    /// for `ls`. `None` when the session uses the host toolchain.
+    pub rootfs_display: Option<String>,
 }
 
 pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
@@ -1335,6 +1458,15 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
         },
     };
     let policy = pol.resolve(&base, &ov, &roots)?;
+    // 0.4.1 step 3: the display form of the rootfs — the store name when the
+    // profile named one, else the path as given. Read before `ov` is consumed.
+    let rootfs_display = match &args.rootfs_path {
+        Some(p) => Some(p.to_string_lossy().into_owned()),
+        None => profile_doc
+            .as_ref()
+            .and_then(|d| d.rootfs.as_ref())
+            .and_then(|r| r.name.clone().or_else(|| r.path.clone())),
+    };
     let grants = args
         .grants
         .iter()
@@ -1348,6 +1480,7 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
         forwards,
         host_services,
         ssh,
+        rootfs_display,
     })
 }
 
@@ -1596,6 +1729,9 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
             },
         );
         meta.env_declared = declared_env_disk.clone();
+        // 0.4.1 step 3: record the rootfs (name or path as given) so `ls`
+        // shows it whether it came from a profile name or a path.
+        meta.rootfs = prep.rootfs_display.clone();
         if let Some(timeout) = policy.idle_timeout_s {
             meta.lease = Some(sessionmeta::Lease {
                 idle_timeout_s: Some(timeout),
@@ -2002,6 +2138,8 @@ fn run_session(
         used_pids: Mutex::new(Default::default()),
         recycled_pids: Mutex::new(Default::default()),
         connected_clients: std::sync::atomic::AtomicU64::new(0),
+        clients: Mutex::new(Default::default()),
+        exec_info: Mutex::new(Default::default()),
         services: Mutex::new(Default::default()),
         session_dir: sdir.path.clone(),
         session_json_lock: Mutex::new(()),

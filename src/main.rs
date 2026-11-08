@@ -463,48 +463,24 @@ fn ls(
                         let policy = read_session_policy(p);
                         let meta = hisn::sessionmeta::read(p);
                         let state = session_state_label(p, *live);
-                        let members: Vec<Value> = meta
-                            .as_ref()
-                            .map(|m| {
-                                m.members
-                                    .iter()
-                                    .map(|mem| {
-                                        json!({
-                                            "uid": mem.uid,
-                                            "label": mem.label,
-                                            "first_seen": mem.first_seen,
-                                            "last_seen": mem.last_seen,
-                                        })
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let lease = meta
-                            .as_ref()
-                            .and_then(|m| m.lease.as_ref())
-                            .map(|l| {
-                                json!({
-                                    "idle_timeout_s": l.idle_timeout_s,
-                                    "last_activity": l.last_activity,
-                                })
-                            })
-                            .unwrap_or(Value::Null);
-                        json!({
-                            "id": n,
-                            "dir": p.display().to_string(),
-                            "state": state,
-                            "cwd": policy.as_ref().map(|p| p["cwd"].clone()).unwrap_or(Value::Null),
-                            "hostname": policy.as_ref().map(|p| p["hostname"].clone()).unwrap_or(Value::Null),
-                            "network": policy.as_ref().map(|p| p["network"].clone()).unwrap_or(Value::Null),
-                            "name": meta.as_ref().and_then(|m| m.name.clone()).map(Value::String).unwrap_or(Value::Null),
-                            "rootfs": meta.as_ref().and_then(|m| m.rootfs.clone()).map(Value::String).unwrap_or(Value::Null),
-                            "pid": Value::Null,
-                            "started": meta.as_ref().map(|m| Value::String(m.created.ts.clone())).unwrap_or(Value::Null),
-                            "execs": [],
-                            "services": [],
-                            "members": members,
-                            "lease": lease,
-                        })
+                        // 0.4.1 step 3: a live session's clients and execs come
+                        // from the supervisor (session.json cannot carry them);
+                        // a stopped/crashed session has neither.
+                        let (clients, execs, services) = if *live {
+                            live_session_view(n)
+                        } else {
+                            (Vec::new(), Vec::new(), Vec::new())
+                        };
+                        session_v2_json(
+                            n,
+                            p,
+                            &state,
+                            policy.as_ref(),
+                            meta.as_ref(),
+                            clients,
+                            execs,
+                            services,
+                        )
                     })
                     .collect();
                 println!("{}", json!({"schema": "hisn-ls/v2", "sessions": sessions}));
@@ -533,10 +509,13 @@ fn ls(
                         .as_ref()
                         .map(|m| age_label(&m.created.ts))
                         .unwrap_or_else(|| "-".into());
-                    let clients = meta
-                        .as_ref()
-                        .map(|m| m.members.len().to_string())
-                        .unwrap_or_else(|| "0".into());
+                    // 0.4.1 step 3: CLIENTS is the live connection count (0 for
+                    // a stopped/crashed session), not the historical members.
+                    let clients = if live {
+                        live_session_view(&n).0.len().to_string()
+                    } else {
+                        "0".into()
+                    };
                     let lease = meta
                         .as_ref()
                         .and_then(|m| m.lease.as_ref())
@@ -550,6 +529,75 @@ fn ls(
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// 0.4.1 step 3: ask a live session's supervisor for its clients and execs.
+/// Returns `(clients, execs, services)`; empty on any error (a session that
+/// stopped between `is_live` and the request simply has none).
+fn live_session_view(session: &str) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let r = match supervisor::client_request(session, &json!({"op":"sessioninfo"})) {
+        Ok(r) if r["ok"] == true => r,
+        _ => return (Vec::new(), Vec::new(), Vec::new()),
+    };
+    let arr = |k: &str| r[k].as_array().cloned().unwrap_or_default();
+    (arr("clients"), arr("execs"), arr("services"))
+}
+
+/// 0.4.1 step 3: one session's `hisn-ls/v2` JSON object. The v1 fields are
+/// kept unchanged; `clients`, live `execs` (with `attach`), `services`,
+/// `rootfs`, `members` and `lease` are additive v2 fields.
+#[allow(clippy::too_many_arguments)]
+fn session_v2_json(
+    id: &str,
+    dir: &Path,
+    state: &str,
+    policy: Option<&Value>,
+    meta: Option<&hisn::sessionmeta::SessionMeta>,
+    clients: Vec<Value>,
+    execs: Vec<Value>,
+    services: Vec<Value>,
+) -> Value {
+    let members: Vec<Value> = meta
+        .map(|m| {
+            m.members
+                .iter()
+                .map(|mem| {
+                    json!({
+                        "uid": mem.uid,
+                        "label": mem.label,
+                        "first_seen": mem.first_seen,
+                        "last_seen": mem.last_seen,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let lease = meta
+        .and_then(|m| m.lease.as_ref())
+        .map(|l| {
+            json!({
+                "idle_timeout_s": l.idle_timeout_s,
+                "last_activity": l.last_activity,
+            })
+        })
+        .unwrap_or(Value::Null);
+    json!({
+        "id": id,
+        "dir": dir.display().to_string(),
+        "state": state,
+        "cwd": policy.map(|p| p["cwd"].clone()).unwrap_or(Value::Null),
+        "hostname": policy.map(|p| p["hostname"].clone()).unwrap_or(Value::Null),
+        "network": policy.map(|p| p["network"].clone()).unwrap_or(Value::Null),
+        "name": meta.and_then(|m| m.name.clone()).map(Value::String).unwrap_or(Value::Null),
+        "rootfs": meta.and_then(|m| m.rootfs.clone()).map(Value::String).unwrap_or(Value::Null),
+        "pid": Value::Null,
+        "started": meta.map(|m| Value::String(m.created.ts.clone())).unwrap_or(Value::Null),
+        "execs": execs,
+        "services": services,
+        "clients": clients,
+        "members": members,
+        "lease": lease,
+    })
 }
 
 /// The session's `--name`, read from the authoritative `name` file (falling
@@ -731,7 +779,9 @@ fn archive_session(dir: &Path, id: &str, uid: u32) -> Result<(), anyhow::Error> 
 
 #[cfg(test)]
 mod ls_tests {
-    use super::{archive_session, parse_rfc3339_secs, prune_prefix_matches};
+    use super::{archive_session, parse_rfc3339_secs, prune_prefix_matches, session_v2_json};
+    use serde_json::{Value, json};
+    use std::path::Path;
 
     #[test]
     fn prune_prefix_filter_selects_named_sessions_only() {
@@ -762,6 +812,69 @@ mod ls_tests {
     fn rfc3339_rejects_garbage() {
         assert_eq!(parse_rfc3339_secs("nope"), None);
         assert_eq!(parse_rfc3339_secs("2026-13-x"), None);
+    }
+
+    /// 0.4.1 step 3: the v2 JSON object carries the additive fields — live
+    /// `clients` and `execs` (with `attach`) for a running session, `[]` for a
+    /// stopped one — and keeps the v1 fields.
+    #[test]
+    fn session_v2_json_adds_clients_and_execs() {
+        use hisn::sessionmeta::{Member, Owner, SessionMeta};
+        let owner = Owner {
+            uid: 1000,
+            label: "local".into(),
+            client_id: "c".into(),
+        };
+        let mut meta = SessionMeta::new("abc", Some("seat"), owner, "/w", "none");
+        meta.rootfs = Some("wakil-dev".into());
+        meta.members = vec![Member {
+            uid: 1000,
+            label: "rubin-wakil".into(),
+            first_seen: "2026-11-07T12:00:00Z".into(),
+            last_seen: "2026-11-07T12:01:00Z".into(),
+        }];
+        let clients = vec![json!({
+            "uid": 1000, "pid": 42, "label": "rubin-wakil",
+            "label_source": "flag", "connected_since": "2026-11-07T12:00:00Z"
+        })];
+        let execs = vec![json!({
+            "exec_id": "e-1", "pid": 7, "argv0": "/bin/sh", "tty": true, "attach": true
+        })];
+        let v = session_v2_json(
+            "abc",
+            Path::new("/run/hisn/abc"),
+            "running",
+            None,
+            Some(&meta),
+            clients.clone(),
+            execs.clone(),
+            Vec::new(),
+        );
+        // v1 fields are kept.
+        assert_eq!(v["id"], "abc");
+        assert_eq!(v["dir"], "/run/hisn/abc");
+        assert_eq!(v["state"], "running");
+        assert_eq!(v["pid"], Value::Null);
+        // Additive fields.
+        assert_eq!(v["name"], "seat");
+        assert_eq!(v["rootfs"], "wakil-dev");
+        assert_eq!(v["clients"].as_array().unwrap().len(), 1);
+        assert_eq!(v["execs"][0]["attach"], true);
+        assert_eq!(v["members"].as_array().unwrap().len(), 1);
+
+        // A stopped session: no clients, no execs.
+        let stopped = session_v2_json(
+            "abc",
+            Path::new("/run/hisn/abc"),
+            "stopped",
+            None,
+            Some(&meta),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(stopped["clients"].as_array().unwrap().is_empty());
+        assert!(stopped["execs"].as_array().unwrap().is_empty());
     }
 
     #[test]

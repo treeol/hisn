@@ -305,9 +305,9 @@ impl Shared {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// 0.4.0 F2 fix: are there any connected control clients? Counted by
-    /// the `connected_clients` atomic — a client is "connected" from accept
-    /// until the serve_conn thread exits.
+    /// 0.4.0 F2 fix: are there any connected control clients? A connection is
+    /// a client from its first complete request line until it closes (a bare
+    /// connect is never a client; see `serve_conn`).
     pub fn has_connected_clients(&self) -> bool {
         self.conns.lock().expect("conns").connected() > 0
     }
@@ -341,10 +341,10 @@ impl Shared {
         f()
     }
 
-    /// F2 fix: a control client connected (serve_conn thread started). 0.4.1
-    /// step 3: records the connection so `ls --json` can list live clients.
-    /// The client record is refined when the connection's first request is
-    /// handled (`handle` calls `update_client` with the real label).
+    /// F2 fix: a control client connected: its first complete request line
+    /// arrived (not at accept). 0.4.1 step 3: records the connection so
+    /// `ls --json` can list live clients. The record is refined when that
+    /// request is handled (`handle` calls `update_client` with the real label).
     pub fn connect_client(&self, conn: ConnId) {
         let now = crate::session::rfc3339_now();
         self.admit(|| {
@@ -377,8 +377,13 @@ impl Shared {
     /// The disconnect is the client's last activity: idle time counts from
     /// here, not from its (possibly much earlier) request.
     pub fn disconnect_client(&self, conn: ConnId) {
-        // Remove the record and bump activity in one place. A disconnect
-        // without a registered connect is a no-op (never a negative count).
+        // The removal and the activity bump happen under `lease_lock`, the same
+        // lock `idle_snapshot` holds while it reads the count and the activity.
+        // Without it the idle check could see zero clients and the old
+        // timestamp in the gap between the two steps. Lock order matches
+        // admission: lease_lock, then conns. A disconnect without a registered
+        // connect is a no-op (never a negative count, no activity bump).
+        let _g = self.lease_lock.lock().expect("lease lock");
         let removed = self.conns.lock().expect("conns").disconnect(conn);
         if removed && self.idle_timeout_s.is_some() {
             let now = crate::lifecycle::Clock::now_secs(&crate::lifecycle::SystemClock);

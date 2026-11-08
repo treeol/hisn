@@ -835,6 +835,7 @@ mod tests {
             seen: Mutex<Vec<ConnId>>,
             violations: Mutex<Vec<String>>,
             net: AtomicI64,
+            disconnects: AtomicUsize,
         }
         impl Handler for Tracking {
             fn authorize(&self, _: &UnixStream) -> Result<(), String> {
@@ -860,6 +861,7 @@ mod tests {
                         .push(format!("disconnect for {c} without a matching connect"));
                 }
                 self.net.fetch_sub(1, O::SeqCst);
+                self.disconnects.fetch_add(1, Ordering::SeqCst);
             }
             fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream, _: ConnId) -> Value {
                 ok(json!({}))
@@ -889,21 +891,34 @@ mod tests {
             let mut r = BufReader::new(s);
             let _ = read_line_limited(&mut r);
         }
-        // (d) request, then the client vanishes without reading the response.
+        // (d) request, then the client goes away. Read to EOF before dropping
+        // so each server thread has finished this connection before the test
+        // moves on: no case leaves work in flight when the state is checked.
         for _ in 0..N {
             let mut s = UnixStream::connect(&sock).unwrap();
             let _ = writeln!(s, r#"{{"op":"list"}}"#);
-            drop(s);
+            // Half-close: the server reads EOF after its one line and ends the
+            // connection. Without this, read_to_end waits for a server that is
+            // waiting for the next line.
+            let _ = s.shutdown(std::net::Shutdown::Write);
+            let mut sink = Vec::new();
+            let _ = s.read_to_end(&mut sink);
         }
 
         // Settle, then take ONE snapshot of the authoritative set and assert
         // on that snapshot only. Re-reading the mutex inside an assertion
         // message can observe a later state than the one that was checked.
+        // Every counted connection must finish (its disconnect must run) before
+        // the state is read: wait for `connects == disconnects` with a bound, so
+        // an in-flight server thread is waited for, not missed.
         let t0 = Instant::now();
         let (live_now, net_now) = loop {
             let live: Vec<ConnId> = h.live.lock().unwrap().iter().copied().collect();
             let net = h.net.load(O::SeqCst);
-            if (live.is_empty() && net == 0) || t0.elapsed() > Duration::from_secs(5) {
+            let connects = h.seen.lock().unwrap().len();
+            let disconnects = h.disconnects.load(O::SeqCst);
+            let done = live.is_empty() && net == 0 && disconnects == connects;
+            if done || t0.elapsed() > Duration::from_secs(5) {
                 break (live, net);
             }
             thread::sleep(Duration::from_millis(5));

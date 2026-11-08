@@ -1606,8 +1606,12 @@ never from the host). 5 (annotation only).
 - **Known issue carried forward:** `ttyname()` inside an attach still fails.
   The attach's pty is allocated on the host `devpts`; the session has a private
   `devpts` and the kernel refuses a second non-`newinstance` devpts in the
-  session userns, and devpts cannot carry an arbitrary node to bind onto. The
-  isolation-preserving fix is to allocate the attach's pty **inside** the
-  session (as init does for the main command) and hand the master back to the
-  client over the control socket — a protocol change to be verified on a host
-  (L76, with L10/L8 green). Not shipped in 0.4.1.
+  session userns, and devpts cannot carry an arbitrary node to bind onto. A
+  Mashūra round (two readers) reviewed the options and both chose **allocate
+  the attach's pty inside the session and hand the master back** to the client
+  over the control socket (the same pattern `init::open_pty` already uses for
+  the main command), rejecting a shared host devpts and a host-node bind (both
+  widen `/dev`/mounts, breaking L10/L8). This is a protocol change to
+  `exec.rs` (an fd travels sandbox→supervisor→client for the first time) and
+  must be verified on a host (L76, with L10/L8 green, plus fd-count and
+  fd-leak checks). Not shipped in 0.4.1.

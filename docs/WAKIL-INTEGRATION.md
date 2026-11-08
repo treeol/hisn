@@ -33,6 +33,11 @@ err := cmd.Run()                // *exec.ExitError.ExitCode() == command's code
   `{"op":"signal","pid":N}` on a second connection, or end the whole session
   with `hisn kill`. Pre-v0.2 (one `hisn run` per tool call, warm `home`)
   still works and remains the fallback when `hisn --version` < 0.2.
+  **0.4.1:** `hisn run --detach` returns once the session is ready
+  (`<id> <name|-> ready` on stdout, exit 0), so Wakil need not poll `hisn ls`;
+  a start failure prints the supervisor's error lines and exits non-zero.
+  Pass secret-shaped values with `--env-file PATH` (KEY=VALUE lines) so they do
+  not appear in `/proc/<pid>/cmdline`.
 * Cancellation: `ctx` cancel → SIGTERM to `hisn`, which forwards to the
   command's process group; after a grace period `hisn kill --session ID
   --signal KILL`.

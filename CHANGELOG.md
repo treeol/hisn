@@ -83,11 +83,13 @@ host (`scrub_argv_overwrites_cmdline`, `proc_self_mem_is_not_writable_after_appl
   allocated on the host `devpts`, and the session has its own private `devpts`
   instance; the kernel refuses mounting a second, non-`newinstance` devpts in
   the session's user namespace, and devpts cannot carry an arbitrary node to
-  bind onto, so the only fix that preserves the `/dev` contents guarantee is to
-  allocate the attach's pty **inside** the session (as init already does for the
-  main command) and hand the **master** back to the client over the control
-  socket — a protocol change that must be verified on a host (L76, with L10/L8
-  staying green). Not shipped in 0.4.1; the L76 host step is listed below.
+  bind onto. A Mashūra round (both readers) reviewed the options and both chose
+  the only isolation-preserving one: allocate the attach's pty **inside** the
+  session (as `init::open_pty` already does for the main command) and hand the
+  **master** back to the client over the control socket. That is a protocol
+  change (an fd travels sandbox→supervisor→client for the first time) and must
+  be verified on a host (L76, with L10/L8 green, plus fd-count and fd-leak
+  checks). Not shipped in 0.4.1; the L76 host step is listed below.
 - L56 and L58 remain host-only / documented checks.
 
 ## [0.4.0] - 2026-11-07

@@ -168,6 +168,19 @@ impl Request {
         }
     }
 
+    /// 0.4.1 R2: a read-only observer. An observer connection is never a
+    /// client: it is not listed in `clients[]`, creates no member, and touches
+    /// neither the lease nor the idle clock, on request or on disconnect. These
+    /// are the `ls --json` / `inspect` / `list` queries a watcher makes.
+    /// Authorized mutations (exec, attach, grant, revoke, signal, kill/stop) are
+    /// clients and activity.
+    pub fn is_observer(&self) -> bool {
+        matches!(
+            self,
+            Request::SessionInfo { .. } | Request::Inspect { .. } | Request::List { .. }
+        )
+    }
+
     /// The client-supplied identity fields (0.4.0 F1), if any.
     pub fn client_field(&self) -> Option<&ClientField> {
         match self {
@@ -273,6 +286,13 @@ pub trait Handler: Send + Sync + 'static {
     /// F2 fix: a client connected (serve_conn thread started, after authorize).
     /// Called once per connection, on its first request line only.
     fn connect(&self, _conn: ConnId) {}
+    /// 0.4.1 R2: should this parsed request make its connection a counted
+    /// client? Asked before `connect`. Only a request that will actually be
+    /// admitted counts: observers never do, and a mutation the authorization
+    /// decision refuses does not register. The default is "any non-observer".
+    fn admit(&self, req: &Request, _peer: &UnixStream, _conn: ConnId) -> bool {
+        !req.is_observer()
+    }
     /// F2 fix: a client disconnected (serve_conn thread exited). Called exactly
     /// once for every `connect`, on every close path (EOF, error, misuse).
     fn disconnect(&self, _conn: ConnId) {}
@@ -452,19 +472,23 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
             _ => return, // EOF, oversized, truncated or malformed framing: close
         };
         lines += 1;
-        if _guard.is_none() {
-            h.connect(id);
-            _guard = Some(ClientGuard {
-                handler: h,
-                conn: id,
-            });
-        }
         if h.authorize(&stream).is_err() {
             return;
         }
         let _inflight = Inflight::enter();
         let resp = match parse_request(&line) {
             Ok(req) => {
+                // 0.4.1 R2: an observer request does not make this connection a
+                // client. Registration waits for the first non-observer
+                // request, so a connection that only observes is never counted
+                // and never touches the idle clock.
+                if _guard.is_none() && h.admit(&req, &stream, id) {
+                    h.connect(id);
+                    _guard = Some(ClientGuard {
+                        handler: h,
+                        conn: id,
+                    });
+                }
                 let is_exec = matches!(req, Request::Exec { .. });
                 // Descriptors are valid only with the first line of a
                 // connection and only for `exec`; `exec` itself must be the
@@ -519,6 +543,7 @@ pub fn request(socket: &std::path::Path, req: &Value) -> io::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::idle_due;
     use std::io::Cursor;
     use std::sync::Mutex;
 
@@ -809,7 +834,11 @@ mod tests {
         for _ in 0..5 {
             drop(UnixStream::connect(&sock).unwrap());
         }
-        request(&sock, &json!({"op":"list"})).unwrap();
+        request(
+            &sock,
+            &json!({"op":"signal","exec_id":"e-0","signal":"TERM"}),
+        )
+        .unwrap();
         let t0 = Instant::now();
         while h.disconnects.load(O::SeqCst) != 1 && t0.elapsed() < Duration::from_secs(2) {
             thread::sleep(Duration::from_millis(5));
@@ -817,6 +846,251 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
         assert_eq!(h.connects.load(O::SeqCst), 1, "bare connects were counted");
         assert_eq!(h.disconnects.load(O::SeqCst), 1);
+    }
+
+    #[test]
+    fn observer_queries_never_count_while_an_exec_connection_is_the_client() {
+        // 0.4.1 R2, the scenario the L74/L61 suite observes: one exec-style
+        // client holds a connection, then ten `ls --json`-style observer queries
+        // each open and close a connection. Only the exec connection is a
+        // client, so `clients` is 1 while it lives and 0 after it closes, and
+        // the observers never register. The activity bump happens only for a
+        // registered (counted) disconnect.
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicI64;
+        use std::sync::atomic::{AtomicU64, Ordering as O};
+        // Fake clock: the test owns time. Activity is the last counted
+        // disconnect (or the start), as in production.
+        const TIMEOUT: u64 = 30;
+        const T_START: i64 = 1_000;
+        #[derive(Default)]
+        struct Observed {
+            clients: Mutex<std::collections::BTreeSet<ConnId>>,
+            activity_bumps: AtomicU64,
+            last_activity: AtomicI64,
+            fake_now: AtomicI64,
+        }
+        impl Handler for Observed {
+            fn authorize(&self, _: &UnixStream) -> Result<(), String> {
+                Ok(())
+            }
+            fn connect(&self, c: ConnId) {
+                self.clients.lock().unwrap().insert(c);
+            }
+            fn disconnect(&self, c: ConnId) {
+                // Mirrors Shared::disconnect_client: removal and the activity
+                // bump happen under one lock, so no observer sees a removed
+                // client with a stale timestamp. Bump only if registered.
+                let mut clients = self.clients.lock().unwrap();
+                if clients.remove(&c) {
+                    self.activity_bumps.fetch_add(1, O::SeqCst);
+                    let now = self.fake_now.load(O::SeqCst);
+                    self.last_activity.fetch_max(now, O::SeqCst);
+                }
+            }
+            fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream, _: ConnId) -> Value {
+                ok(json!({}))
+            }
+        }
+        let h = Arc::new(Observed::default());
+        h.last_activity.store(T_START, O::SeqCst);
+        h.fake_now.store(T_START + 5, O::SeqCst);
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("observers.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let hh: Arc<dyn Handler> = h.clone();
+        thread::spawn(move || serve(l, hh));
+
+        // The exec-style client: a mutation (a non-observer request) that stays
+        // connected while the queries run.
+        let mut exec = UnixStream::connect(&sock).unwrap();
+        writeln!(exec, r#"{{"op":"signal","exec_id":"e-1","signal":"TERM"}}"#).unwrap();
+        let mut exec_r = BufReader::new(exec.try_clone().unwrap());
+        let _ = read_line_limited(&mut exec_r);
+        let wait_for = |want: usize| {
+            let t0 = Instant::now();
+            while h.clients.lock().unwrap().len() != want && t0.elapsed() < Duration::from_secs(5) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_for(1);
+        assert_eq!(
+            h.clients.lock().unwrap().len(),
+            1,
+            "exec client not counted"
+        );
+
+        // Ten observer queries, each a fresh connection, each closed. Activity
+        // must not move: capture it before, compare after.
+        let activity_before = h.last_activity.load(O::SeqCst);
+        for _ in 0..10 {
+            request(&sock, &json!({"op":"sessioninfo"})).unwrap();
+        }
+        // Give the server threads time to run their disconnects.
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            h.last_activity.load(O::SeqCst),
+            activity_before,
+            "observer queries moved last_activity"
+        );
+        // While the exec is connected the session is never idle, however long.
+        h.fake_now.store(T_START + 10_000, O::SeqCst);
+        assert!(
+            !idle_due(
+                !h.clients.lock().unwrap().is_empty(),
+                false,
+                h.last_activity.load(O::SeqCst),
+                h.fake_now.load(O::SeqCst),
+                TIMEOUT
+            ),
+            "idle fired while an exec client was connected"
+        );
+        assert_eq!(
+            h.clients.lock().unwrap().len(),
+            1,
+            "an observer query was counted as a client"
+        );
+        assert_eq!(
+            h.activity_bumps.load(O::SeqCst),
+            0,
+            "observer queries bumped activity"
+        );
+
+        // The exec ends: clients drops to 0, and that one counted disconnect
+        // is the only activity bump.
+        drop(exec_r);
+        drop(exec);
+        wait_for(0);
+        assert_eq!(
+            h.clients.lock().unwrap().len(),
+            0,
+            "client not removed on close"
+        );
+        assert_eq!(
+            h.activity_bumps.load(O::SeqCst),
+            1,
+            "one counted disconnect, one bump"
+        );
+        // Idle counts from the exec's disconnect (the one counted activity),
+        // not from the observer queries: not idle inside the window, idle once
+        // the timeout has elapsed from that disconnect.
+        let closed_at = h.last_activity.load(O::SeqCst);
+        assert_eq!(
+            closed_at,
+            T_START + 10_000,
+            "the exec disconnect is the last activity"
+        );
+        assert!(
+            !idle_due(
+                false,
+                false,
+                closed_at,
+                closed_at + TIMEOUT as i64 - 1,
+                TIMEOUT
+            ),
+            "idle fired inside the timeout window"
+        );
+        assert!(
+            idle_due(
+                false,
+                false,
+                closed_at,
+                closed_at + TIMEOUT as i64 + 1,
+                TIMEOUT
+            ),
+            "idle did not fire after the timeout with no clients"
+        );
+    }
+
+    #[test]
+    fn a_refused_or_observer_first_request_never_registers_until_admitted() {
+        // The admission rule, at serve_conn: a connection registers on the first
+        // ADMITTED request, exactly once. An observer first, then a mutation on
+        // the same connection: one connect, one disconnect. A request the
+        // handler refuses at admission never registers.
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering as O};
+        #[derive(Default)]
+        struct Gate {
+            connects: AtomicU64,
+            disconnects: AtomicU64,
+            // Test knob: refuse every mutation at admission (a denied peer).
+            deny_mutations: Mutex<bool>,
+        }
+        impl Handler for Gate {
+            fn authorize(&self, _: &UnixStream) -> Result<(), String> {
+                Ok(())
+            }
+            fn admit(&self, req: &Request, _: &UnixStream, _: ConnId) -> bool {
+                !req.is_observer() && !*self.deny_mutations.lock().unwrap()
+            }
+            fn connect(&self, _: ConnId) {
+                self.connects.fetch_add(1, O::SeqCst);
+            }
+            fn disconnect(&self, _: ConnId) {
+                self.disconnects.fetch_add(1, O::SeqCst);
+            }
+            fn handle(&self, _: Request, _: Vec<OwnedFd>, _: &UnixStream, _: ConnId) -> Value {
+                ok(json!({}))
+            }
+        }
+        let h = Arc::new(Gate::default());
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("gate.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        let hh: Arc<dyn Handler> = h.clone();
+        thread::spawn(move || serve(l, hh));
+
+        let settle = |n: u64| {
+            let t0 = Instant::now();
+            while h.disconnects.load(O::SeqCst) < n && t0.elapsed() < Duration::from_secs(5) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // Observer first, then a mutation, then another mutation: one connection.
+        let mut s = UnixStream::connect(&sock).unwrap();
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        writeln!(s, r#"{{"op":"sessioninfo"}}"#).unwrap();
+        let _ = read_line_limited(&mut r);
+        assert_eq!(h.connects.load(O::SeqCst), 0, "observer registered");
+        writeln!(s, r#"{{"op":"signal","exec_id":"e-1","signal":"TERM"}}"#).unwrap();
+        let _ = read_line_limited(&mut r);
+        writeln!(s, r#"{{"op":"signal","exec_id":"e-1","signal":"TERM"}}"#).unwrap();
+        let _ = read_line_limited(&mut r);
+        assert_eq!(
+            h.connects.load(O::SeqCst),
+            1,
+            "admitted connection registered more than once"
+        );
+        drop(r);
+        drop(s);
+        settle(1);
+        assert_eq!(
+            h.disconnects.load(O::SeqCst),
+            1,
+            "one connect, one disconnect"
+        );
+
+        // A refused mutation never registers, and its disconnect is never sent.
+        *h.deny_mutations.lock().unwrap() = true;
+        let mut s = UnixStream::connect(&sock).unwrap();
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        writeln!(s, r#"{{"op":"signal","exec_id":"e-1","signal":"TERM"}}"#).unwrap();
+        let _ = read_line_limited(&mut r);
+        drop(r);
+        drop(s);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            h.connects.load(O::SeqCst),
+            1,
+            "a refused request registered"
+        );
+        assert_eq!(
+            h.disconnects.load(O::SeqCst),
+            1,
+            "a refused request was disconnected as a client"
+        );
     }
 
     #[test]
@@ -881,10 +1155,14 @@ mod tests {
         }
         // (b) request then close (the fd is reused by the next connect).
         for _ in 0..N {
-            request(&sock, &json!({"op":"list"})).unwrap();
+            request(
+                &sock,
+                &json!({"op":"signal","exec_id":"e-0","signal":"TERM"}),
+            )
+            .unwrap();
         }
-        // (c) a malformed first line: it arrived as a line, so the connection
-        // is connected for the duration of its reply, then disconnected.
+        // (c) a malformed first line: it does not parse, so it is never
+        // admitted and never registers (no connect, no disconnect).
         for _ in 0..N {
             let mut s = UnixStream::connect(&sock).unwrap();
             let _ = writeln!(s, "not json");
@@ -896,7 +1174,7 @@ mod tests {
         // moves on: no case leaves work in flight when the state is checked.
         for _ in 0..N {
             let mut s = UnixStream::connect(&sock).unwrap();
-            let _ = writeln!(s, r#"{{"op":"list"}}"#);
+            let _ = writeln!(s, r#"{{"op":"signal","exec_id":"e-0","signal":"TERM"}}"#);
             // Half-close: the server reads EOF after its one line and ends the
             // connection. Without this, read_to_end waits for a server that is
             // waiting for the next line.
@@ -930,12 +1208,12 @@ mod tests {
             "connections left registered: {live_now:?}"
         );
         assert_eq!(net_now, 0, "client count did not return to zero");
-        // Bare connects (a) are never counted. The request-carrying cases can
-        // legitimately arrive as EOF before their line is read in (d), so the
-        // exact number is not fixed; every counted connection is paired.
+        // Exactly the admitted connections register: (b) and (d) each send an
+        // admitted `signal`, so 2N; the bare connects (a) and the unparseable
+        // lines (c) never register. (d) reads to EOF before it drops, so every
+        // line was processed before the count is taken.
         let seen = h.seen.lock().unwrap().len();
-        assert!(seen <= 3 * N, "more clients than lines sent: {seen}");
-        assert!(seen >= 2 * N, "requests were not counted: {seen}");
+        assert_eq!(seen, 2 * N, "admitted connections did not register exactly");
     }
 
     #[test]

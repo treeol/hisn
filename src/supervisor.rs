@@ -1221,6 +1221,34 @@ impl Handler for Ctl {
         self.sh.connect_client(conn);
     }
 
+    /// 0.4.1 R2: a request counts its connection only if it is admitted: an
+    /// observer never is, and a mutation the owner-uid decision refuses does
+    /// not register. The decision is the same `authz::authorize` `handle` runs.
+    fn admit(&self, req: &Request, peer: &UnixStream, _conn: ConnId) -> bool {
+        if req.is_observer() {
+            return false;
+        }
+        // The same peer identity `handle` reads (SO_PEERCRED), then the same
+        // decision. A refused request does not register.
+        let (_, peer_uid) = match sys::peer_cred(peer.as_raw_fd()) {
+            Ok((p, u)) => (Some(p), u),
+            Err(_) => (None, u32::MAX),
+        };
+        let client = authz::ClientRecord {
+            uid: peer_uid,
+            pid: None,
+            label: String::new(),
+            label_source: "none".to_string(),
+            req_id: None,
+            seq: 0,
+            principal: None,
+        };
+        let session = authz::SessionAuth {
+            owner_uid: self.sh.uid,
+        };
+        authz::authorize(&client, &session, req).is_ok()
+    }
+
     fn disconnect(&self, conn: ConnId) {
         self.sh.disconnect_client(conn);
     }
@@ -1274,9 +1302,14 @@ impl Handler for Ctl {
                 return err(control::E_UNAUTHORIZED, refusal.reason);
             }
         };
-        self.sh.record_member(&client);
-        self.sh.touch_lease();
-        self.sh.update_client(conn, &client);
+        // 0.4.1 R2: an observer request (sessioninfo, inspect, list) creates no
+        // member, touches no lease, and refines no client record. Only the
+        // authorized mutations that count as clients do those writes.
+        if !req.is_observer() {
+            self.sh.record_member(&client);
+            self.sh.touch_lease();
+            self.sh.update_client(conn, &client);
+        }
         match req {
             Request::Exec {
                 argv,

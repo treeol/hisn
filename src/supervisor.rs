@@ -2809,7 +2809,11 @@ fn run_session(
         let sig = control::parse_signal(&stop_spec.signal).unwrap_or(libc::SIGTERM);
         let _ = sys::kill(*hpid, sig);
         // Wait for grace period, but only while the process is alive.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(stop_spec.grace);
+        // `grace` is validated ≤ 86400, so this checked_add cannot overflow
+        // in practice; fall back to a far-future deadline on error.
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(stop_spec.grace))
+            .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(86400));
         while std::time::Instant::now() < deadline {
             let mut st = 0;
             // SAFETY: non-blocking waitpid on our own child.
@@ -2842,8 +2846,11 @@ fn run_session(
         // socket (same as exec signal).
         let _ = sys::send_all(handle.status.as_raw_fd(), exec::format_kill(sig).as_bytes());
         // Wait for grace period, but only while the service is still alive.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(handle.stop.grace);
+        // `grace` is validated ≤ 86400, so this checked_add cannot overflow
+        // in practice; fall back to a far-future deadline on error.
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(handle.stop.grace))
+            .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(86400));
         while std::time::Instant::now() < deadline {
             // Check if the status socket is still open (service still running).
             // If the service has already exited, skip the remaining grace.
@@ -3062,7 +3069,7 @@ fn wait_service_readiness(s: &profile::Service, timeout_secs: u64) -> Result<()>
             return Ok(());
         }
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = profile::checked_deadline(timeout_secs, "service readiness timeout")?;
     // 0.4.1 step 2: event wait instead of a fixed 100 ms poll. `ready.socket`
     // is stat'ed from the supervisor (userns S); that works for paths under
     // cwd and mounts.ro/rw, not for the sandbox's private tmpfs.
@@ -3142,7 +3149,7 @@ fn start_host_service(h: &profile::HostService) -> Result<i32> {
 }
 
 /// Wait for a host service to become ready (DESIGN §17).
-/// Polls `ready` (socket stat, tcp connect, or command exit 0) with a
+/// Polls `ready` (socket stat or command exit 0) with a
 /// timeout. On timeout returns Err (fail closed).
 fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()> {
     let ready = match &h.ready {
@@ -3160,7 +3167,7 @@ fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()> {
             return Ok(());
         }
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = profile::checked_deadline(timeout_secs, "host service readiness timeout")?;
     // 0.4.1 step 2: event wait instead of a fixed 100 ms poll.
     let ready_fn = || check_readiness(ready);
     if sys::wait_until(

@@ -1188,7 +1188,7 @@ This reuses the exact same mechanism as a ro grant, ensuring:
    grant helper, D17), in the supervisor's userns S. The process runs with
    the user's host credentials (not in the sandbox userns U), the host `PATH`
    (not the sandbox's), and optional `cwd`. Never setuid, never extra caps.
-2. **Readiness:** the supervisor polls `ready` (socket stat, tcp connect, or
+2. **Readiness:** the supervisor polls `ready` (socket stat or
    command exit 0) with a timeout (default 15 s; `ready.timeout` per service).
    On timeout the session fails to start (fail closed) — the service is
    killed and the session exits `125`. Readiness must complete **before**

@@ -17,6 +17,11 @@ use crate::policy::{Overrides, Policy, ResolvedPolicy};
 
 pub const PROFILE_VERSION: &str = "hisn-profile/v1";
 
+/// Upper bound (seconds) for `stop.grace` and readiness `timeout`. Anything
+/// larger is rejected at validation so deadline arithmetic can never overflow
+/// `Instant` (one day).
+pub const MAX_TIMEOUT_SECS: u64 = 86400;
+
 /// Error codes for profile load failures (POLICY-SPEC §7 style).
 pub const E_PROFILE_POLICY: &str = "E_PROFILE_POLICY";
 pub const E_PROFILE_NOT_PROFILE: &str = "E_PROFILE_NOT_PROFILE";
@@ -80,6 +85,15 @@ impl Profile {
         Ok(p)
     }
 
+    /// Reject a string containing a NUL byte (would panic `CString::new` /
+    /// fail `execvp`).
+    fn check_no_nul(value: &str, what: &str) -> Result<()> {
+        if value.contains('\0') {
+            bail!("{what}: must not contain NUL bytes");
+        }
+        Ok(())
+    }
+
     /// Validate the 0.3 surface tables: `[[services]]`, `[[forward]]`,
     /// `[[host_services]]`, and `[docker]`. Enforces risk_ack matching
     /// (§16–§18) and path sanity.
@@ -101,6 +115,9 @@ impl Profile {
             if s.exec.is_empty() {
                 bail!("[[services]] {}: exec must not be empty", s.name);
             }
+            for arg in &s.exec {
+                Self::check_no_nul(arg, &format!("[[services]] {}: exec arg", s.name))?;
+            }
             // restart = "none" only in 0.3.
             match s.restart.as_deref() {
                 None | Some("none") => {}
@@ -117,6 +134,29 @@ impl Profile {
             // `ServiceReadinessSpec` — `deny_unknown_fields` rejects them at
             // parse time with a clear error naming the unknown field. No
             // additional validation needed here.
+            if let Some(r) = &s.ready
+                && let Some(t) = r.timeout
+                && t > MAX_TIMEOUT_SECS
+            {
+                bail!(
+                    "[[services]] {}: ready.timeout {t} exceeds maximum {MAX_TIMEOUT_SECS} seconds",
+                    s.name
+                );
+            }
+            if let Some(stop) = &s.stop {
+                if stop.grace > MAX_TIMEOUT_SECS {
+                    bail!(
+                        "[[services]] {}: stop.grace {} exceeds maximum {} seconds",
+                        s.name,
+                        stop.grace,
+                        MAX_TIMEOUT_SECS
+                    );
+                }
+                Self::check_no_nul(
+                    &stop.signal,
+                    &format!("[[services]] {}: stop.signal", s.name),
+                )?;
+            }
         }
         for f in &self.forwards {
             if f.name.is_empty() {
@@ -163,6 +203,9 @@ impl Profile {
             if h.exec.is_empty() {
                 bail!("[[host_services]] {}: exec must not be empty", h.name);
             }
+            for arg in &h.exec {
+                Self::check_no_nul(arg, &format!("[[host_services]] {}: exec arg", h.name))?;
+            }
             if !h.socket.starts_with('/') {
                 bail!(
                     "[[host_services]] {}: socket must be an absolute path",
@@ -208,6 +251,45 @@ impl Profile {
                     effective.kebab()
                 ),
                 _ => {}
+            }
+            // Readiness and stop validation.
+            if let Some(r) = &h.ready {
+                if r.tcp.is_some() {
+                    bail!(
+                        "E_NOT_SUPPORTED: [[host_services]] {}: ready.tcp is not implemented",
+                        h.name
+                    );
+                }
+                if let Some(cmd) = &r.command {
+                    for arg in cmd {
+                        Self::check_no_nul(
+                            arg,
+                            &format!("[[host_services]] {}: ready.command arg", h.name),
+                        )?;
+                    }
+                }
+                if let Some(t) = r.timeout
+                    && t > MAX_TIMEOUT_SECS
+                {
+                    bail!(
+                        "[[host_services]] {}: ready.timeout {t} exceeds maximum {MAX_TIMEOUT_SECS} seconds",
+                        h.name
+                    );
+                }
+            }
+            if let Some(stop) = &h.stop {
+                if stop.grace > MAX_TIMEOUT_SECS {
+                    bail!(
+                        "[[host_services]] {}: stop.grace {} exceeds maximum {} seconds",
+                        h.name,
+                        stop.grace,
+                        MAX_TIMEOUT_SECS
+                    );
+                }
+                Self::check_no_nul(
+                    &stop.signal,
+                    &format!("[[host_services]] {}: stop.signal", h.name),
+                )?;
             }
         }
         // [docker] tier validation (§18).
@@ -407,7 +489,7 @@ pub struct HostService {
     pub socket: String,
     /// The in-sandbox path where the socket will appear.
     pub expose: String,
-    /// Readiness check (socket stat, tcp connect, or command exit 0).
+    /// Readiness check (socket stat or command exit 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<ReadinessSpec>,
     /// Stop policy (signal + grace).
@@ -459,7 +541,10 @@ pub struct ReadinessSpec {
     /// `socket = "/path"` — stat the socket file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<String>,
-    /// `tcp = "host:port"` — connect to a TCP address.
+    /// `tcp = "host:port"` — not implemented: rejected at validation
+    /// with `E_NOT_SUPPORTED`. Kept in the schema only so the field is
+    /// parsed and rejected with a clear error instead of an unknown-field
+    /// error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp: Option<String>,
     /// `command = ["sh", "-c", "test -S /path"]` — run a command, exit 0 = ready.
@@ -482,6 +567,13 @@ pub struct StopSpec {
     pub grace: u64,
 }
 
+/// Checked `Instant::now() + Duration` that never panics: returns an error
+/// instead of overflowing.
+pub fn checked_deadline(secs: u64, what: &str) -> Result<std::time::Instant> {
+    std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(secs))
+        .ok_or_else(|| anyhow!("{what}: deadline overflow for {secs} seconds"))
+}
 fn default_signal() -> String {
     "TERM".to_string()
 }
@@ -1762,5 +1854,72 @@ exec = ["sleep", "1"]
         )
         .unwrap();
         assert!(p.services[0].ready.is_none());
+    }
+
+    #[test]
+    fn host_service_grace_above_max_rejected() {
+        let text = r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[host_services]]
+name = "kvr-host"
+exec = ["kvr-server"]
+socket = "/run/user/1000/kvr/abc.sock"
+expose = "/run/kvr/kvr.sock"
+ready = { socket = "/run/user/1000/kvr/abc.sock", timeout = 86401 }
+risk_ack = "host-exec"
+"#;
+        let e = Profile::parse(text).unwrap_err().to_string();
+        assert!(e.contains("ready.timeout") && e.contains("86400"), "{e}");
+        let text2 = text.replace("timeout = 86401", "timeout = 15").replace(
+            "ready = { socket",
+            "stop = { grace = 18446744073709551615 }\nready = { socket",
+        );
+        let e2 = Profile::parse(&text2).unwrap_err().to_string();
+        assert!(e2.contains("stop.grace"), "{e2}");
+    }
+
+    #[test]
+    fn nul_bytes_rejected_in_exec_and_ready_command_and_service_argv() {
+        // NUL in host_services.exec
+        let text = "version = \"hisn-profile/v1\"\n[policy]\nversion = \"hisn-policy/v1\"\n[[host_services]]\nname = \"kvr-host\"\nexec = [\"true\\u0000x\"]\nsocket = \"/run/user/1000/kvr/abc.sock\"\nexpose = \"/run/kvr/kvr.sock\"\nready = { socket = \"/run/user/1000/kvr/abc.sock\" }\nrisk_ack = \"host-exec\"\n";
+        let e = Profile::parse(text).unwrap_err().to_string();
+        assert!(e.contains("NUL"), "{e}");
+        // NUL in ready.command
+        let text2 = "version = \"hisn-profile/v1\"\n[policy]\nversion = \"hisn-policy/v1\"\n[[host_services]]\nname = \"kvr-host\"\nexec = [\"true\"]\nsocket = \"/run/user/1000/kvr/abc.sock\"\nexpose = \"/run/kvr/kvr.sock\"\nready = { command = [\"true\\u0000x\"] }\nrisk_ack = \"host-exec\"\n";
+        let e2 = Profile::parse(text2).unwrap_err().to_string();
+        assert!(e2.contains("NUL"), "{e2}");
+        // NUL in service argv
+        let text3 = "version = \"hisn-profile/v1\"\n[policy]\nversion = \"hisn-policy/v1\"\n[[services]]\nname = \"kvr\"\nexec = [\"sleep\\u0000\", \"1\"]\n";
+        let e3 = Profile::parse(text3).unwrap_err().to_string();
+        assert!(e3.contains("NUL"), "{e3}");
+    }
+
+    #[test]
+    fn host_service_ready_tcp_rejected() {
+        let text = r#"
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+[[host_services]]
+name = "kvr-host"
+exec = ["kvr-server"]
+socket = "/run/user/1000/kvr/abc.sock"
+expose = "/run/kvr/kvr.sock"
+ready = { tcp = "127.0.0.1:8080" }
+risk_ack = "host-exec"
+"#;
+        let e = Profile::parse(text).unwrap_err().to_string();
+        assert!(
+            e.contains("ready.tcp") && e.contains("not implemented"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn checked_deadline_overflow_is_error_not_panic() {
+        assert!(checked_deadline(u64::MAX, "overflow test").is_err());
+        assert!(checked_deadline(1, "ok").is_ok());
     }
 }

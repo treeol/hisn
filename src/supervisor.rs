@@ -977,7 +977,7 @@ impl Shared {
             exec::drive(&sp.status, sp.pending, conn.as_raw_fd(), exec::CANCEL_GRACE)
         } else {
             // Client already gone: cancel through the normal path.
-            exec::drive(&sp.status, sp.pending, -1, std::time::Duration::ZERO)
+            exec::drive_from(&sp.status, sp.pending, -1, std::time::Duration::ZERO, true)
         };
         if let Some(pid) = registered {
             self.live.lock().expect("live").remove(&pid);

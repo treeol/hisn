@@ -1932,6 +1932,53 @@ mod tests {
         assert_eq!(t.join().unwrap(), [libc::SIGTERM, libc::SIGKILL]);
     }
     #[test]
+    fn drive_zero_grace_cancelled_kills_immediately() {
+        // The supervisor's failed-`started`-write path calls
+        // drive_from(..., -1, Duration::ZERO, true): with zero grace the
+        // TERM->KILL sequence must complete without waiting for a
+        // program that ignores TERM to exit on its own. (Regression
+        // for B2: the old `drive` call with already_cancelled=false
+        // never sent TERM or KILL and leaked the program.)
+        let (mine, w) = sys::socketpair().unwrap();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let wpid = child.id() as i32;
+        std::mem::forget(child);
+        let t = std::thread::spawn(move || {
+            let mut lines = Lines::default();
+            let mut buf = [0u8; 64];
+            let mut seen = Vec::new();
+            loop {
+                let n = read_some(w.as_raw_fd(), &mut buf).unwrap();
+                lines.push(&buf[..n]);
+                while let Some(l) = lines.pop_line() {
+                    if let Some(sig) = parse_kill(&l) {
+                        seen.push(sig);
+                        if sig == libc::SIGKILL {
+                            let _ = sys::kill(wpid, libc::SIGKILL);
+                            sys::send_all(w.as_raw_fd(), b"X sig 9\n").unwrap();
+                            return seen;
+                        } else {
+                            let _ = sys::kill(wpid, sig);
+                        }
+                    }
+                }
+            }
+        });
+        let start = Instant::now();
+        let o = drive_from(&mine, Lines::default(), -1, Duration::ZERO, true);
+        assert_eq!(o, Outcome::Exited(Exit::Signal(9)));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "zero-grace cancel must not wait for the program to exit"
+        );
+        assert_eq!(t.join().unwrap(), [libc::SIGTERM, libc::SIGKILL]);
+    }
+    #[test]
     fn helper_decoding_checks_counts_truncation_and_moves_fds_high() {
         let s = a_spec();
         let body = serde_json::to_vec(&s).unwrap();

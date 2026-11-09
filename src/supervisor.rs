@@ -2814,24 +2814,31 @@ fn run_session(
         let deadline = std::time::Instant::now()
             .checked_add(std::time::Duration::from_secs(stop_spec.grace))
             .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(86400));
+        let mut reaped = false;
         while std::time::Instant::now() < deadline {
             let mut st = 0;
             // SAFETY: non-blocking waitpid on our own child.
             let r = unsafe { libc::waitpid(*hpid, &mut st, libc::WNOHANG) };
             if r == *hpid {
+                reaped = true;
                 break;
             }
             if r == 0 {
                 // Still running; wait a bit and re-check.
                 std::thread::sleep(std::time::Duration::from_millis(50));
             } else {
-                // waitpid error (e.g. ECHILD) — the process is gone.
+                // waitpid error: EINTR retries, anything else (e.g. ECHILD)
+                // means the child is gone — no kill may be sent to a reaped
+                // pid, whose number may have been reused.
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                reaped = true;
                 break;
             }
         }
-        // SIGKILL if still alive.
-        let mut st_kill = 0;
-        if unsafe { libc::waitpid(*hpid, &mut st_kill, libc::WNOHANG) } != *hpid {
+        // SIGKILL only if we have not already reaped the child.
+        if !reaped {
             let _ = sys::kill(*hpid, libc::SIGKILL);
             let _ = reap_host(*hpid);
         }
@@ -2967,8 +2974,14 @@ fn reap(pid: i32) -> i32 {
 /// Reap a host service process (blocking waitpid).
 fn reap_host(pid: i32) -> i32 {
     let mut st = 0;
-    // SAFETY: blocking waitpid on our own child.
-    unsafe { libc::waitpid(pid, &mut st, 0) };
+    loop {
+        // SAFETY: blocking waitpid on our own child.
+        let r = unsafe { libc::waitpid(pid, &mut st, 0) };
+        if r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break;
+    }
     init::decode_status(st)
 }
 
@@ -3099,20 +3112,41 @@ fn wait_service_readiness(s: &profile::Service, timeout_secs: u64) -> Result<()>
 /// userns S). The process runs with the user's credentials, the host PATH,
 /// and `PR_SET_PDEATHSIG=SIGKILL`. Returns the pid.
 fn start_host_service(h: &profile::HostService) -> Result<i32> {
-    // SAFETY: fork is called while the supervisor is single-threaded (before
-    // the control thread starts). The child runs execve immediately.
+    // Build every CString and pointer vector before fork: between fork and
+    // exec there must be no allocation, no unwrap, and no panic path (the
+    // supervisor may be multithreaded when this runs — the SSH accept thread
+    // can already exist). NUL bytes are rejected at profile validation, so
+    // CString::new cannot fail here; on the impossible error, fail closed
+    // before forking.
+    let argv: Vec<std::ffi::CString> = h
+        .exec
+        .iter()
+        .map(|s| std::ffi::CString::new(s.as_str()))
+        .collect::<std::result::Result<_, _>>()
+        .context("host service exec contains NUL byte")?;
+    let argv_ptrs: Vec<*const libc::c_char> = argv
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    let prog = argv_ptrs[0];
+    let argv_ptr = argv_ptrs.as_ptr();
+    // SAFETY: fork + setpgid/prctl/execvp on our own child. The child path
+    // below uses only async-signal-safe operations (prctl, close_range
+    // syscall, execvp) — no allocation, no unwrap, no panic.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error()).context("fork host service");
     }
     if pid == 0 {
-        // Child: set PDEATHSIG so it dies with the supervisor.
-        // SAFETY: prctl with PDEATHSIG.
+        // Child: set PDEATHSIG so it dies with the supervisor, and become a
+        // process-group leader so the readiness probe's group can be killed
+        // as a whole at the deadline.
+        // SAFETY: prctl/setpgid with valid scalar arguments.
         unsafe {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+            libc::setpgid(0, 0);
         }
-        // Build the environment: inherit the host environment, not the
-        // sandbox's scrubbed one. The host service runs as the user.
         // Close all fds > 2 (don't leak supervisor fds into the host process).
         unsafe {
             // Raw syscall: the libc crate has no close_range wrapper on musl.
@@ -3124,20 +3158,9 @@ fn start_host_service(h: &profile::HostService) -> Result<i32> {
                 4 as libc::c_uint,
             );
         }
-        // execve the command.
-        let argv: Vec<std::ffi::CString> = h
-            .exec
-            .iter()
-            .map(|s| std::ffi::CString::new(s.as_str()).unwrap())
-            .collect();
-        let argv_ptrs: Vec<*const libc::c_char> = argv
-            .iter()
-            .map(|s| s.as_ptr())
-            .chain(std::iter::once(std::ptr::null()))
-            .collect();
         // SAFETY: execve replaces the process image; on failure, _exit.
-        let rc = unsafe { libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr()) };
-        if rc < 0 {
+        // No allocation here — argv was built before fork.
+        if unsafe { libc::execvp(prog, argv_ptr) } < 0 {
             // SAFETY: _exit on exec failure.
             unsafe { libc::_exit(127) };
         }
@@ -3187,7 +3210,21 @@ fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()> {
 }
 
 /// Check one readiness probe. Returns true if the service is ready.
+///
+/// The command probe runs in its own process group with a hard deadline:
+/// if it does not exit within 2 seconds (or `ready.timeout`, when shorter),
+/// the whole group is killed and reaped. Inherited fds are closed in the
+/// child and `PDEATHSIG` is set, so a hung probe cannot outlive the
+/// supervisor or hold the session open.
 fn check_readiness(ready: &profile::ReadinessSpec) -> bool {
+    check_readiness_with_probe(ready, std::time::Duration::from_secs(2))
+}
+
+/// Test seam for [`check_readiness`] with an injectable probe deadline.
+fn check_readiness_with_probe(
+    ready: &profile::ReadinessSpec,
+    probe_timeout: std::time::Duration,
+) -> bool {
     // Socket stat: check if the socket file exists.
     if let Some(sock) = &ready.socket {
         if let Ok(meta) = fs::symlink_metadata(sock)
@@ -3197,40 +3234,79 @@ fn check_readiness(ready: &profile::ReadinessSpec) -> bool {
         }
         return false;
     }
-    // TCP connect: try to connect to the address.
-    if let Some(_addr) = &ready.tcp {
-        // TCP readiness is not implemented in this sandbox (no network
-        // for host services); fall through to command.
-        return false;
-    }
     // Command: run a command, exit 0 = ready.
     if let Some(cmd) = &ready.command {
         if cmd.is_empty() {
             return false;
         }
-        let argv: Vec<std::ffi::CString> = cmd
+        // Build every CString and pointer vector before fork: between fork
+        // and exec there must be no allocation, no unwrap, and no panic
+        // path. NUL bytes are rejected at profile validation.
+        let argv: Vec<std::ffi::CString> = match cmd
             .iter()
-            .map(|s| std::ffi::CString::new(s.as_str()).unwrap())
-            .collect();
+            .map(|s| std::ffi::CString::new(s.as_str()))
+            .collect::<std::result::Result<_, _>>()
+        {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
         let argv_ptrs: Vec<*const libc::c_char> = argv
             .iter()
             .map(|s| s.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
             .collect();
-        // SAFETY: fork + waitpid on our own child.
+        let prog = argv_ptrs[0];
+        let argv_ptr = argv_ptrs.as_ptr();
+        // SAFETY: fork + setpgid/prctl/execvp on our own child. The child
+        // path uses only async-signal-safe operations — no allocation, no
+        // unwrap, no panic.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return false;
         }
         if pid == 0 {
             unsafe {
-                libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr());
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+                libc::setpgid(0, 0);
+                // Close inherited fds (don't hold supervisor sockets open).
+                libc::syscall(
+                    libc::SYS_close_range,
+                    3 as libc::c_uint,
+                    u32::MAX as libc::c_uint,
+                    4 as libc::c_uint,
+                );
+                libc::execvp(prog, argv_ptr);
                 libc::_exit(1);
             }
         }
-        let mut st = 0;
-        unsafe { libc::waitpid(pid, &mut st, 0) };
-        return st == 0;
+        // Poll the probe with the deadline; kill the whole group at the
+        // deadline, then reap.
+        let deadline = std::time::Instant::now() + probe_timeout;
+        loop {
+            let mut st = 0;
+            // SAFETY: non-blocking waitpid on our own child.
+            let r = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
+            if r == pid {
+                return st == 0;
+            }
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                // Any other waitpid error means not ready (and the child
+                // is gone or unwaitable — do not spin).
+                return false;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Kill the process group, then reap.
+                // SAFETY: killpg on the child's group (leader = child).
+                unsafe { libc::killpg(pid, libc::SIGKILL) };
+                let _ = reap_host(pid);
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
     // No readiness check: assume ready.
     true
@@ -3878,5 +3954,42 @@ mod tests {
             vec![("/x".to_owned(), Mode::Rw), ("/y".to_owned(), Mode::Ro)]
         );
         assert!(p.roots.iter().any(|r| r.ends_with("hisn-1000")));
+    }
+
+    #[test]
+    fn readiness_command_hang_is_killed_at_probe_deadline() {
+        let ready = profile::ReadinessSpec {
+            socket: None,
+            tcp: None,
+            command: Some(vec!["sh".into(), "-c".into(), "sleep 30".into()]),
+            timeout: None,
+        };
+        let start = std::time::Instant::now();
+        assert!(!check_readiness_with_probe(
+            &ready,
+            std::time::Duration::from_millis(200)
+        ));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "probe must be killed at its deadline, not allowed to sleep 30s"
+        );
+    }
+
+    #[test]
+    fn readiness_command_success_and_failure() {
+        let ok = profile::ReadinessSpec {
+            socket: None,
+            tcp: None,
+            command: Some(vec!["true".into()]),
+            timeout: None,
+        };
+        assert!(check_readiness(&ok));
+        let fail = profile::ReadinessSpec {
+            socket: None,
+            tcp: None,
+            command: Some(vec!["false".into()]),
+            timeout: None,
+        };
+        assert!(!check_readiness(&fail));
     }
 }

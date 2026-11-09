@@ -14,8 +14,9 @@
 //! old `session.json` files load unchanged when the fields are absent.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -139,8 +140,29 @@ pub fn read(dir: &Path) -> Option<SessionMeta> {
     serde_json::from_str(&text).ok()
 }
 
+/// Hold an exclusive `flock` on `dir/session.json.lock` for the lifetime of
+/// the returned guard. Both the supervisor and the `hisn stop` CLI take this
+/// lock around every read-modify-write of `session.json`, so concurrent
+/// writers in different processes cannot lose an update.
+fn lock(dir: &Path) -> std::io::Result<File> {
+    let f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(dir.join("session.json.lock"))?;
+    // SAFETY: flock on a valid fd.
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(f)
+}
+
 /// Rewrite the `state` field atomically (write temp, fsync, rename).
+/// Takes the cross-process lock around the read-modify-write.
 pub fn set_state(dir: &Path, state: State) -> std::io::Result<()> {
+    let _guard = lock(dir)?;
     let mut m = read(dir).ok_or_else(|| std::io::Error::other("session.json missing"))?;
     m.state = state;
     rewrite(dir, &m)
@@ -150,7 +172,9 @@ pub fn set_state(dir: &Path, state: State) -> std::io::Result<()> {
 /// otherwise update `last_seen`. F8: members are keyed by (uid, label),
 /// not uid alone — two clients with the same uid but different labels
 /// are two members. The caller is responsible for the 60 s rate limit.
+/// Takes the cross-process lock around the read-modify-write.
 pub fn record_member(dir: &Path, uid: u32, label: &str, now: &str) -> std::io::Result<()> {
+    let _guard = lock(dir)?;
     let mut m = read(dir).ok_or_else(|| std::io::Error::other("session.json missing"))?;
     if let Some(mem) = m
         .members
@@ -172,7 +196,9 @@ pub fn record_member(dir: &Path, uid: u32, label: &str, now: &str) -> std::io::R
 /// Update `last_activity` in the lease (0.4.0 step 5). No-op (no write at all)
 /// when the session has no lease: 0.4.1 step 7 verifies that a session without
 /// `idle_timeout` never rewrites `session.json` for a lease touch.
+/// Takes the cross-process lock around the read-modify-write.
 pub fn touch_lease(dir: &Path, now: &str) -> std::io::Result<()> {
+    let _guard = lock(dir)?;
     let mut m = read(dir).ok_or_else(|| std::io::Error::other("session.json missing"))?;
     match m.lease.as_mut() {
         Some(lease) => {
@@ -183,9 +209,15 @@ pub fn touch_lease(dir: &Path, now: &str) -> std::io::Result<()> {
     }
 }
 
-/// Atomically rewrite `session.json` (write temp, fsync, rename).
+/// Atomically rewrite `session.json` (write unique temp, fsync, rename).
+/// The temp name is unique per call (pid + a process-wide counter) so two
+/// writers that somehow both reach this point cannot collide or EEXIST;
+/// the `flock` in the callers is what serialises them.
 fn rewrite(dir: &Path, m: &SessionMeta) -> std::io::Result<()> {
-    let tmp = dir.join(".session.json.tmp");
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".session.json.tmp-{}-{n}", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let body = serde_json::to_string_pretty(m).map_err(std::io::Error::other)?;
     let mut f = OpenOptions::new()
@@ -386,5 +418,43 @@ mod tests {
         assert_eq!(back.members[1].uid, 1000);
         assert_eq!(back.members[1].label, "wakil@rubin");
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn concurrent_writers_lose_no_update() {
+        use std::sync::Arc;
+        let d = std::env::temp_dir().join(format!("hisn-conc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let mut m = SessionMeta::new("abc", None, owner(), "/w", "none");
+        m.lease = Some(Lease {
+            idle_timeout_s: Some(300),
+            last_activity: Some("2026-11-07T12:00:00Z".into()),
+        });
+        m.write_to(&d).unwrap();
+        let d = Arc::new(d);
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let dd = Arc::clone(&d);
+            handles.push(std::thread::spawn(move || {
+                record_member(&dd, 1000 + i, &format!("label-{i}"), "2026-11-07T12:00:00Z")
+                    .expect("record_member");
+                touch_lease(&dd, "2026-11-07T12:00:01Z").expect("touch_lease");
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let back = read(&d).unwrap();
+        assert_eq!(
+            back.members.len(),
+            8,
+            "every concurrent member insert must survive"
+        );
+        assert_eq!(
+            back.lease.as_ref().unwrap().last_activity.as_deref(),
+            Some("2026-11-07T12:00:01Z")
+        );
+        fs::remove_dir_all(&*d).unwrap();
     }
 }

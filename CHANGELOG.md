@@ -7,6 +7,43 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-09
+
+0.4.2 hardens the profile surface and closes audit findings from a review
+of 0.4.1. Profile loading now rejects values that previously panicked or
+hung at run time, readiness probes cannot outlive their timeout, and
+`session.json` updates are race-free.
+
+**Host evidence (rubin):** unit tests 406 passed, 0 failed; leak suite
+307 passed, 0 failed, 9 skipped, 1 weak; readiness checks pass. In the
+build sandbox `cargo test --lib` is 404 passed, 2 failed (the 2 known
+sandbox failures `scrub_argv_overwrites_cmdline` and
+`proc_self_mem_is_not_writable_after_apply`). No sessions, leak or
+integration tests were run in the build sandbox.
+
+### Changed
+- **Profile validation.** Profiles with `stop.grace` or readiness `timeout`
+  above 86400 s, NUL bytes in exec strings, or `ready.tcp` are now rejected
+  at load. `ready.tcp` returns `E_NOT_SUPPORTED` (not implemented).
+- **Readiness probes are bounded.** A `ready.command` probe is bounded by
+  `ready.timeout`; a hung probe is killed with its process group at the
+  deadline and startup fails at about `timeout`.
+- **Cancelled execs are killed.** An exec whose client disconnects before
+  `started` is now cancelled (TERM then KILL), not left running.
+- **`session.json` is written under `session.json.lock`.** Read-modify-write
+  updates (`set_state`, `record_member`, `touch_lease`) are serialized across
+  processes with an exclusive `flock` on `session.json.lock`.
+
+### Fixed
+- **Host-service stop race.** SIGKILL is never sent to an already-reaped
+  pid; `EINTR` no longer ends the stop grace; the probe process group is
+  killed as a whole.
+- **Dead code removed.** `session::mode_of`, `ServiceHandle.name`,
+  `init::raw_fd`, a stale `#[allow(too_many_arguments)]`, and an unused
+  parameter.
+- **L33 test fix.** Leak test L33 cross-exec steps now use `--no-tty`,
+  matching neighbouring steps.
+
 ## [0.4.1] - 2026-11-08
 
 0.4.1 closes four of the 0.4.0 known issues (a returning `--detach`, `ls --json`
@@ -471,7 +508,8 @@ First release.
 - `hisn exec` verifies fail-closed, before running anything, that the root it
   entered is the sandbox root (DESIGN D25).
 
-[Unreleased]: https://github.com/treeol/hisn/compare/v0.4.0...HEAD
-[0.4.0]: https://github.com/treeol/hisn/releases/tag/v0.4.0
+[Unreleased]: https://github.com/treeol/hisn/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/treeol/hisn/releases/tag/v0.4.2
+[0.4.1]: https://github.com/treeol/hisn/releases/tag/v0.4.1
 [0.3.2]: https://github.com/treeol/hisn/releases/tag/v0.3.2
 [0.2.0]: https://github.com/treeol/hisn/releases/tag/v0.2.0

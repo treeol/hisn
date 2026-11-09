@@ -137,7 +137,7 @@ In short:
 
 ## Status
 
-hisn 0.4.1. Release notes: [docs/releases/v0.4.1.md](docs/releases/v0.4.1.md);
+hisn 0.4.2. Release notes: [docs/releases/v0.4.2.md](docs/releases/v0.4.2.md);
 history in [CHANGELOG](CHANGELOG.md). CI runs the leak suite on Ubuntu 22.04
 and 24.04 (x86_64); aarch64 is checked by clippy only. Planned, not yet
 scheduled: an egress proxy, cgroup v2 limits, and a pty allocated inside the

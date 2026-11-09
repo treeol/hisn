@@ -1,6 +1,6 @@
 # hisn — design
 
-Status: current as of hisn 0.4.1. §1–§14 describe the sandbox core (0.2 exec
+Status: current as of hisn 0.4.2. §1–§14 describe the sandbox core (0.2 exec
 included); §15–§19 describe the 0.3 orchestration layer; §20 and §20.1 describe
 named sessions, attach, leases and the 0.4.1 changes. The session lifecycle in
 one place is [sessions.md](sessions.md). The decisions behind

@@ -17,6 +17,10 @@
 - **0.4.1**: `run --detach` returns, event-driven start and stop, live `clients`
   and `execs` in `ls --json`, `ls --prune --name-prefix` and `--dry-run`,
   `run --env-file`, `exec --client`. See [releases/v0.4.1.md](releases/v0.4.1.md).
+- **0.4.2**: profile validation for `grace`/readiness `timeout`, NUL bytes and
+  `ready.tcp`; cancelled execs are killed; `ready.command` probes are bounded by
+  `ready.timeout`; `session.json` writes are locked. See
+  [releases/v0.4.2.md](releases/v0.4.2.md).
 
 ## Planned, not yet scheduled
 

@@ -151,10 +151,18 @@ fn lock(dir: &Path) -> std::io::Result<File> {
         .truncate(false)
         .mode(0o600)
         .open(dir.join("session.json.lock"))?;
-    // SAFETY: flock on a valid fd.
-    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
+    // SAFETY: flock on a valid fd. The supervisor has signal handlers, so
+    // a signal during a contended lock can interrupt the wait: retry on
+    // EINTR, return any other error.
+    loop {
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINTR) {
+            return Err(e);
+        }
     }
     Ok(f)
 }
@@ -218,7 +226,6 @@ fn rewrite(dir: &Path, m: &SessionMeta) -> std::io::Result<()> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(".session.json.tmp-{}-{n}", std::process::id()));
-    let _ = fs::remove_file(&tmp);
     let body = serde_json::to_string_pretty(m).map_err(std::io::Error::other)?;
     let mut f = OpenOptions::new()
         .write(true)

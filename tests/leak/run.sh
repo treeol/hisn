@@ -1110,8 +1110,8 @@ if start_session l33-$$ "$L33_CWD" "$L33_POL"; then
   esac
   # A file created in /dev/shm by exec A is visible to exec B
   ex_shm_file="$L33_CWD/shm_test_file"
-  timeout 30 "$HISN" exec --session l33-$$ -- sh -c "echo hello > /dev/shm/l33test" </dev/null 2>&1
-  got=$(timeout 30 "$HISN" exec --session l33-$$ -- sh -c "cat /dev/shm/l33test" </dev/null 2>&1)
+  timeout 30 "$HISN" exec --no-tty --session l33-$$ -- sh -c "echo hello > /dev/shm/l33test" </dev/null 2>&1
+  got=$(timeout 30 "$HISN" exec --no-tty --session l33-$$ -- sh -c "cat /dev/shm/l33test" </dev/null 2>&1)
   case "$got" in
     hello) pass "L33 file in /dev/shm is visible across execs" ;;
     *) fail "L33 /dev/shm cross-exec" "got [$got] want [hello]" ;;

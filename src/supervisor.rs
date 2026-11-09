@@ -3131,21 +3131,24 @@ fn start_host_service(h: &profile::HostService) -> Result<i32> {
         .collect();
     let prog = argv_ptrs[0];
     let argv_ptr = argv_ptrs.as_ptr();
-    // SAFETY: fork + setpgid/prctl/execvp on our own child. The child path
-    // below uses only async-signal-safe operations (prctl, close_range
-    // syscall, execvp) — no allocation, no unwrap, no panic.
+    // SAFETY: fork + prctl/execvp on our own child. The child path below
+    // performs no allocation, no unwrap and no panic path; `execvp` does
+    // not allocate on glibc or musl as far as verified — that allocation
+    // claim is unverified for the libc versions in use (libc 0.2.191 wraps
+    // the host libc, whose version was not checked).
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error()).context("fork host service");
     }
     if pid == 0 {
-        // Child: set PDEATHSIG so it dies with the supervisor, and become a
-        // process-group leader so the readiness probe's group can be killed
-        // as a whole at the deadline.
-        // SAFETY: prctl/setpgid with valid scalar arguments.
+        // Child: set PDEATHSIG so it dies with the supervisor. It stays in
+        // the supervisor's process group, as before: nothing kills the
+        // host-service group on stop (open point: kill the whole
+        // host-service process group on stop, for the later services.rs
+        // refactor), and terminal signals must still reach it the old way.
+        // SAFETY: prctl with valid scalar arguments.
         unsafe {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
-            libc::setpgid(0, 0);
         }
         // Close all fds > 2 (don't leak supervisor fds into the host process).
         unsafe {
@@ -3160,11 +3163,11 @@ fn start_host_service(h: &profile::HostService) -> Result<i32> {
         }
         // SAFETY: execve replaces the process image; on failure, _exit.
         // No allocation here — argv was built before fork.
-        if unsafe { libc::execvp(prog, argv_ptr) } < 0 {
-            // SAFETY: _exit on exec failure.
-            unsafe { libc::_exit(127) };
-        }
-        // Unreachable: execvp either succeeds or _exit's.
+        unsafe { libc::execvp(prog, argv_ptr) };
+        // Unreachable: execvp either succeeds (never returns) or fails.
+        // _exit unconditionally so a failed exec can never fall through
+        // into supervisor code.
+        // SAFETY: _exit on exec failure.
         unsafe { libc::_exit(127) };
     }
     tracing::info!("host_service: {} started pid {pid}", h.name);
@@ -3172,8 +3175,9 @@ fn start_host_service(h: &profile::HostService) -> Result<i32> {
 }
 
 /// Wait for a host service to become ready (DESIGN §17).
-/// Polls `ready` (socket stat or command exit 0) with a
-/// timeout. On timeout returns Err (fail closed).
+/// Polls `ready` (socket stat or command exit 0) until the overall
+/// deadline `timeout_secs` from now, passing the time remaining to each
+/// probe. On timeout returns Err (fail closed).
 fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()> {
     let ready = match &h.ready {
         Some(r) => r,
@@ -3191,8 +3195,15 @@ fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()> {
         }
     };
     let deadline = profile::checked_deadline(timeout_secs, "host service readiness timeout")?;
-    // 0.4.1 step 2: event wait instead of a fixed 100 ms poll.
-    let ready_fn = || check_readiness(ready);
+    // 0.4.1 step 2: event wait instead of a fixed 100 ms poll. Each probe
+    // gets only the time remaining until the overall deadline, so a slow
+    // probe can run up to `timeout` and a hung one is killed on time.
+    let ready_fn = || {
+        check_readiness(
+            ready,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        )
+    };
     if sys::wait_until(
         deadline.saturating_duration_since(std::time::Instant::now()),
         std::time::Duration::from_millis(1),
@@ -3211,13 +3222,15 @@ fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()> {
 
 /// Check one readiness probe. Returns true if the service is ready.
 ///
-/// The command probe runs in its own process group with a hard deadline:
-/// if it does not exit within 2 seconds (or `ready.timeout`, when shorter),
-/// the whole group is killed and reaped. Inherited fds are closed in the
-/// child and `PDEATHSIG` is set, so a hung probe cannot outlive the
-/// supervisor or hold the session open.
-fn check_readiness(ready: &profile::ReadinessSpec) -> bool {
-    check_readiness_with_probe(ready, std::time::Duration::from_secs(2))
+/// The command probe runs in its own process group, killed and reaped
+/// when the given probe deadline expires. `wait_readiness` passes the
+/// time remaining until the overall readiness deadline, so a probe may
+/// run for up to `ready.timeout` and a hung one is killed on time.
+/// Inherited fds are closed in the child and `PDEATHSIG` is set, so a
+/// hung probe cannot outlive the supervisor or hold the session open.
+/// `check_readiness_with_probe` below is the test seam for this check.
+fn check_readiness(ready: &profile::ReadinessSpec, probe_timeout: std::time::Duration) -> bool {
+    check_readiness_with_probe(ready, probe_timeout)
 }
 
 /// Test seam for [`check_readiness`] with an injectable probe deadline.
@@ -3225,6 +3238,13 @@ fn check_readiness_with_probe(
     ready: &profile::ReadinessSpec,
     probe_timeout: std::time::Duration,
 ) -> bool {
+    // A spec naming `tcp` is never ready here: validation rejects it, so
+    // this is unreachable today — but the fallback "no check: ready" must
+    // never be reached by a spec naming a check this code cannot perform.
+    // Fail closed.
+    if ready.tcp.is_some() {
+        return false;
+    }
     // Socket stat: check if the socket file exists.
     if let Some(sock) = &ready.socket {
         if let Ok(meta) = fs::symlink_metadata(sock)
@@ -3258,8 +3278,11 @@ fn check_readiness_with_probe(
         let prog = argv_ptrs[0];
         let argv_ptr = argv_ptrs.as_ptr();
         // SAFETY: fork + setpgid/prctl/execvp on our own child. The child
-        // path uses only async-signal-safe operations — no allocation, no
-        // unwrap, no panic.
+        // path performs no allocation, no unwrap and no panic path;
+        // `execvp` does not allocate on glibc or musl as far as verified —
+        // that allocation claim is unverified for the libc versions in
+        // use (libc 0.2.191 wraps the host libc, whose version was not
+        // checked).
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return false;
@@ -3276,8 +3299,18 @@ fn check_readiness_with_probe(
                     4 as libc::c_uint,
                 );
                 libc::execvp(prog, argv_ptr);
+                // Unconditional: a failed exec must never fall through.
                 libc::_exit(1);
             }
+        }
+        // The child also sets its own group; do the same from the parent
+        // (the usual both-sides pattern) so `killpg` cannot miss the
+        // group if the child was slow to run its setpgid. Error ignored:
+        // it fails only if the child already exec'd/exited, in which case
+        // the group is the child's own and `kill(pid)` below still hits.
+        // SAFETY: setpgid on our own child.
+        unsafe {
+            libc::setpgid(pid, pid);
         }
         // Poll the probe with the deadline; kill the whole group at the
         // deadline, then reap.
@@ -3299,9 +3332,15 @@ fn check_readiness_with_probe(
                 return false;
             }
             if std::time::Instant::now() >= deadline {
-                // Kill the process group, then reap.
-                // SAFETY: killpg on the child's group (leader = child).
-                unsafe { libc::killpg(pid, libc::SIGKILL) };
+                // Kill the process group and the pid unconditionally, then
+                // reap. `killpg` can miss if the child never made its
+                // group; the direct `kill` guarantees the blocking reap
+                // below can never wait on a live probe.
+                // SAFETY: killpg/kill on our own child and its group.
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                };
                 let _ = reap_host(pid);
                 return false;
             }
@@ -3983,13 +4022,75 @@ mod tests {
             command: Some(vec!["true".into()]),
             timeout: None,
         };
-        assert!(check_readiness(&ok));
+        assert!(check_readiness(&ok, std::time::Duration::from_secs(2)));
         let fail = profile::ReadinessSpec {
             socket: None,
             tcp: None,
             command: Some(vec!["false".into()]),
             timeout: None,
         };
-        assert!(!check_readiness(&fail));
+        assert!(!check_readiness(&fail, std::time::Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn tcp_only_spec_is_not_ready() {
+        // Validation rejects `ready.tcp`, so this is unreachable today —
+        // but the fallback "no check: ready" must never be reached by a
+        // spec naming a check the code cannot perform. Fail closed.
+        let ready = profile::ReadinessSpec {
+            socket: None,
+            tcp: Some("127.0.0.1:80".into()),
+            command: None,
+            timeout: None,
+        };
+        assert!(!check_readiness_with_probe(
+            &ready,
+            std::time::Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn readiness_command_slow_probe_succeeds_within_overall_deadline() {
+        // A probe that takes 1 s and exits 0 must succeed when the probe
+        // deadline is long enough (e.g. the remaining readiness timeout),
+        // not be killed by an arbitrary short one.
+        let ready = profile::ReadinessSpec {
+            socket: None,
+            tcp: None,
+            command: Some(vec!["sh".into(), "-c".into(), "sleep 1; exit 0".into()]),
+            timeout: None,
+        };
+        let start = std::time::Instant::now();
+        assert!(check_readiness_with_probe(
+            &ready,
+            std::time::Duration::from_secs(3)
+        ));
+        assert!(
+            start.elapsed() >= std::time::Duration::from_secs(1),
+            "the 1 s probe must actually have run"
+        );
+    }
+
+    #[test]
+    fn readiness_command_hang_is_killed_at_overall_deadline() {
+        // A probe that hangs must be killed when the overall deadline is
+        // reached: startup fails at about the timeout, not one probe
+        // interval (or a further fixed 2 s) later.
+        let ready = profile::ReadinessSpec {
+            socket: None,
+            tcp: None,
+            command: Some(vec!["sh".into(), "-c".into(), "sleep 30".into()]),
+            timeout: None,
+        };
+        let start = std::time::Instant::now();
+        assert!(!check_readiness_with_probe(
+            &ready,
+            std::time::Duration::from_millis(300)
+        ));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "hung probe must be killed near the deadline, took {elapsed:?}"
+        );
     }
 }

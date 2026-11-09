@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -600,14 +600,10 @@ fn remove_contents(dir: &OwnedFd, uid: u32, depth: usize) -> Result<(), String> 
     Ok(())
 }
 
-#[allow(dead_code)]
-fn mode_of(p: &Path) -> io::Result<u32> {
-    Ok(fs::metadata(p)?.permissions().mode() & 0o7777)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn uid() -> u32 {
         rustix::process::getuid().as_raw()

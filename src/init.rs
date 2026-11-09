@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -530,10 +530,6 @@ pub fn verify_hardening() -> Result<()> {
         other => bail!("Seccomp is {other:?}, expected 2 (filter)"),
     }
     Ok(())
-}
-
-pub fn raw_fd(f: &OwnedFd) -> RawFd {
-    f.as_raw_fd()
 }
 
 /// Overwrite the process's argv memory in place so `/proc/self/cmdline`

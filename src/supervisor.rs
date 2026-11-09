@@ -1970,7 +1970,6 @@ fn run_supervisor_with_ready(
     r
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_supervisor_inner(
     args: RunArgs,
     allow_host_abstract: bool,
@@ -2968,9 +2967,6 @@ fn reap_host(pid: i32) -> i32 {
 
 /// A handle on a started in-sandbox service (DESIGN §19).
 struct ServiceHandle {
-    /// The service name (for logging/audit).
-    #[allow(dead_code)]
-    name: String,
     /// The status socket to the service's monitor `W`.
     status: OwnedFd,
     /// Stop spec (signal + grace).
@@ -3048,7 +3044,6 @@ fn start_in_sandbox_service(
     });
     tracing::info!("service: {} started pid {}", s.name, sp.pid);
     Ok(ServiceHandle {
-        name: s.name.clone(),
         status: sp.status,
         stop,
     })
@@ -3167,7 +3162,7 @@ fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()> {
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     // 0.4.1 step 2: event wait instead of a fixed 100 ms poll.
-    let ready_fn = || check_readiness(ready, &h.socket);
+    let ready_fn = || check_readiness(ready);
     if sys::wait_until(
         deadline.saturating_duration_since(std::time::Instant::now()),
         std::time::Duration::from_millis(1),
@@ -3185,7 +3180,7 @@ fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()> {
 }
 
 /// Check one readiness probe. Returns true if the service is ready.
-fn check_readiness(ready: &profile::ReadinessSpec, _socket: &str) -> bool {
+fn check_readiness(ready: &profile::ReadinessSpec) -> bool {
     // Socket stat: check if the socket file exists.
     if let Some(sock) = &ready.socket {
         if let Ok(meta) = fs::symlink_metadata(sock)

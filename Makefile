@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-.PHONY: build test check lint leaktest leaktest-log
+.PHONY: build test check lint leaktest leaktest-log release-gate
 
 CARGO ?= cargo
 
@@ -45,3 +45,10 @@ leaktest-log: build
 	  echo "hisn:    $$(./target/release/hisn --version)"; \
 	  echo "---"; } > "$$f"; \
 	$(MAKE) leaktest 2>&1 | tee -a "$$f"
+
+# Release gate (scripts/release-gate.sh): fmt, clippy, make test, then the
+# leak suite through a pipe and on a pseudo-terminal. Stops at the first
+# failure; prints one summary line per step plus the leak RESULT lines.
+# HISN_TEST_ROOTFS / HISN_BIG_TESTS are passed through when set.
+release-gate:
+	bash scripts/release-gate.sh

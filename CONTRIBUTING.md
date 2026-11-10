@@ -18,6 +18,12 @@ make leaktest                    # the leak suite; needs unprivileged user names
 for aarch64 and musl, a musl build, the example-profile check, and
 `cargo publish --dry-run`.
 
+`make release-gate` (scripts/release-gate.sh) runs the whole gate in order —
+fmt, clippy, `make test`, then the leak suite through a pipe and on a
+pseudo-terminal — and stops at the first failure. Set `HISN_TEST_ROOTFS`
+and `HISN_BIG_TESTS` when you want the rootfs and big-import cases to run;
+without them the gate prints a warning and those cases skip.
+
 ## Changes that need a host leak log
 
 A change to init, rootfs/mounts, grant, exec, landlock, or seccomp

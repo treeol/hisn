@@ -438,14 +438,16 @@ mod tests {
     fn rewrite_survives_stale_temp_with_same_name() {
         // A leftover temp file with the same pid+counter name (crash +
         // pid reuse) must not make the rewrite fail: the stale file is
-        // removed before create_new.
+        // removed before create_new. The counter is process-wide and
+        // other tests advance it, so plant stale files for a wide range
+        // past the current value — the point is that *some* stale name
+        // in that range collides with the rewrite's own name.
         let d = std::env::temp_dir().join(format!("hisn-stale-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         let m = SessionMeta::new("abc", None, owner(), "/w", "none");
         m.write_to(&d).unwrap();
-        // Plant stale temp files for the first few counter values.
-        for n in 0..4u64 {
+        for n in 0..64u64 {
             fs::write(
                 d.join(format!(".session.json.tmp-{}-{n}", std::process::id())),
                 b"stale",

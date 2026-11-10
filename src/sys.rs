@@ -1151,26 +1151,24 @@ mod tests {
     /// were wrong (e.g. 27 = kstkeip), the address would be 0 or a text
     /// segment address, not a stack address.
     #[test]
+    // `recv_with_fd`'s control buffer is CMSG_SPACE for exactly one fd,
+    // but the kernel's cmsg header plus padding holds two fds in it (only
+    // a third fd truncates — verified with python recvmsg probes). So a
+    // message carrying three fds truncates the control data
+    // (MSG_CTRUNC) and must be an error, the way `recv_with_fds` reports
+    // `truncated`. The received fds are dropped before returning.
     fn recv_with_fd_rejects_truncated_control_message() {
-        // `recv_with_fd` allocates CMSG_SPACE for exactly one fd. The
-        // kernel delivers every fd that fits and sets MSG_CTRUNC when the
-        // control buffer is too small for the message (verified with
-        // python socket.recvmsg: a 0-byte ancillary buffer reports
-        // MSG_CTRUNC; a one-fd buffer with two fds sent is delivered in
-        // full on this kernel). So the truncation case cannot be forced
-        // through `recv_with_fd`'s own fixed buffer — the observable
-        // contract is the other half: a *second* fd in the same cmsg is
-        // closed, not leaked, and the first is returned. That is what
-        // this test pins: two fds sent, one returned, the other closed.
-        // The MSG_CTRUNC guard itself is the two-line check after the
-        // cmsg loop (mirroring `recv_with_fds`' `truncated` flag).
         use std::os::fd::AsRawFd;
         let (a, b) = socketpair_seqpacket().unwrap();
         let filler1 = socketpair_seqpacket().unwrap();
         let filler2 = socketpair_seqpacket().unwrap();
-        // Send two fds in one message from `a` to `b`.
-        let data = b"two-fds";
-        let fds = [filler1.0.as_raw_fd(), filler2.0.as_raw_fd()];
+        let filler3 = socketpair_seqpacket().unwrap();
+        let data = b"three-fds";
+        let fds = [
+            filler1.0.as_raw_fd(),
+            filler2.0.as_raw_fd(),
+            filler3.0.as_raw_fd(),
+        ];
         let mut iov = libc::iovec {
             iov_base: data.as_ptr() as *mut _,
             iov_len: data.len(),
@@ -1187,7 +1185,7 @@ mod tests {
         msg.msg_controllen = space as _;
         // SAFETY: cmsg buffer sized with CMSG_SPACE.
         let c = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-        // SAFETY: buffer valid for two c_int descriptors.
+        // SAFETY: buffer valid for three c_int descriptors.
         unsafe {
             (*c).cmsg_level = libc::SOL_SOCKET;
             (*c).cmsg_type = libc::SCM_RIGHTS;
@@ -1201,18 +1199,13 @@ mod tests {
             let n = libc::sendmsg(a.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
             assert!(n >= 0, "sendmsg failed: {:?}", io::Error::last_os_error());
         }
-        // The receiver's one-fd buffer: the first fd is kept, and this
-        // call must succeed (no MSG_CTRUNC was reported by the kernel for
-        // a one-fd buffer here). The second fd is closed by the
-        // `fd.is_none()` branch, never leaked.
         let mut buf = vec![0u8; 64];
-        let (n, fd) = recv_with_fd(b.as_raw_fd(), &mut buf).unwrap();
-        assert_eq!(n, b"two-fds".len());
-        assert!(fd.is_some(), "first fd must be returned");
-        // The guard below exists for the MSG_CTRUNC case; it is not
-        // reachable through this fixed buffer on this kernel, so the
-        // exact error path is covered by construction (same check as
-        // `recv_with_fds`' `truncated`), not by this runtime probe.
+        let err = recv_with_fd(b.as_raw_fd(), &mut buf).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EMSGSIZE),
+            "truncated control message must be EMSGSIZE, got {err:?}"
+        );
     }
 
     #[test]

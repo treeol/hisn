@@ -1641,7 +1641,7 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
         }) => (services, forwards, host_services, ssh),
         None => (Vec::new(), Vec::new(), Vec::new(), None),
     };
-    let mut ov = Overrides {
+    let ov = Overrides {
         cwd: args.cwd.as_ref().map(|c| {
             if c.is_absolute() {
                 c.clone()
@@ -1666,11 +1666,10 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
             None => rootfs.as_ref().map(profile::rootfs_spec).transpose()?,
         },
     };
-    // The profile-contributed overrides (home/rootfs/nameservers) are the
-    // same construction `profile validate` uses, via `Profile::overrides`
-    // on the document; here the CLI fields win, so the fields are set
-    // directly (identical values, one construction site in `profile.rs`).
-    let _ = &mut ov;
+    // The profile-contributed overrides (home/rootfs/nameservers) use
+    // `Profile::overrides()` on the document and are then overridden by
+    // the CLI fields above — so the CLI wins, with identical values to
+    // the former hand-built `Overrides` (shared construction site).
     let policy = pol.resolve(&base, &ov, &roots)?;
     // 0.4.1 step 3: the display form of the rootfs — the store name when the
     // profile named one, else the path as given.

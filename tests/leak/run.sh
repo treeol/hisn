@@ -3390,6 +3390,126 @@ else
   skip "L79 load-time rejections" "hisn check failed (no userns)"
 fi
 
+# ================================================ L80: host-service stop kills the whole process group (0.4.3, HOST)
+# A host service that spawns a child: after the session ends, neither the
+# service nor its spawned child may survive. The child records its own pid
+# to a file in the session cwd (the helper's argv carries the path, like
+# L37). Bounded by timeout(1) so a hung start cannot hang the suite.
+if needs_host; then
+  L80_CWD=$(new_cwd l80)
+  L80_SOCK="$WORK/l80-svc.sock"
+  L80_CHILD_PID="$L80_CWD/l80-child.pid"
+  L80_PROFILE="$WORK/L80-profile.toml"
+  cat >"$L80_CWD/l80-svc.py" <<'L80PYEOF'
+import socket,subprocess,sys,time
+p=sys.argv[1]
+try: __import__("os").unlink(p)
+except FileNotFoundError: pass
+s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1)
+# Spawn a child that outlives a plain pid kill (it ignores no signals;
+# only a group kill reaches it once the leader is gone).
+child=subprocess.Popen(["sh","-c","sleep 3600 # l80-child-token"])
+open(sys.argv[2],"w").write(str(child.pid))
+time.sleep(3600)
+L80PYEOF
+  cat >"$L80_PROFILE" <<L80EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L80_CWD"
+session.network = "none"
+[[host_services]]
+name = "l80-svc"
+exec = ["python3", "$L80_CWD/l80-svc.py", "$L80_SOCK", "$L80_CHILD_PID"]
+socket = "$L80_SOCK"
+expose = "/run/l80svc.sock"
+risk_ack = "host-exec"
+stop = { signal = "TERM", grace = 5 }
+L80EOF
+  L80_START=$(date +%s%N)
+  if start_profile_session l80-$$ "$L80_CWD" "$L80_PROFILE"; then
+    pass "L80 host-service session starts"
+    # The spawned child's pid is recorded before readiness completes.
+    L80_CHILD=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      [ -f "$L80_CHILD_PID" ] && { L80_CHILD=$(cat "$L80_CHILD_PID" 2>/dev/null); }
+      [ -n "$L80_CHILD" ] && break
+      sleep 0.3
+    done
+    if [ -n "$L80_CHILD" ] && kill -0 "$L80_CHILD" 2>/dev/null; then
+      pass "L80 spawned child is running during the session ($L80_CHILD)"
+    else
+      fail "L80 spawned child is running during the session" "child pid file=[$(cat "$L80_CHILD_PID" 2>/dev/null)]"
+    fi
+    end_session "$L80_CWD" "$S_PID"
+    # After the session ends, neither the service nor its child may exist.
+    # Poll briefly: the group SIGKILL takes a moment to take effect.
+    L80_GONE=0
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      if ! kill -0 "$L80_CHILD" 2>/dev/null && ! pgrep -f "l80-svc.py" >/dev/null 2>&1; then
+        L80_GONE=1; break
+      fi
+      sleep 0.3
+    done
+    if [ "$L80_GONE" -eq 1 ]; then
+      pass "L80 after session end neither the host service nor its child exists"
+    else
+      fail "L80 after session end neither the host service nor its child exists" "child=$L80_CHILD alive=$(kill -0 "$L80_CHILD" 2>/dev/null && echo yes) svc=$(pgrep -af l80-svc.py | head -c 200)"
+    fi
+  else
+    fail "L80 host-service session" "session did not start"
+  fi
+  rm -f "$L80_SOCK" 2>/dev/null
+  rm -rf "$L80_CWD"
+else
+  skip "L80 host-service process group stop" "hisn check failed (no userns)"
+fi
+
+# ================================================ L81: readiness fails when the host service is already dead (0.4.3, HOST)
+# A host service that exits immediately, with a ready.command that would
+# pass and a long timeout: startup must fail at once naming the service
+# and its exit status, not run to (or pass at) the timeout.
+if needs_host; then
+  L81_CWD=$(new_cwd l81)
+  L81_SOCK="$WORK/l81-svc.sock"
+  L81_PROFILE="$WORK/L81-profile.toml"
+  cat >"$L81_PROFILE" <<L81EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L81_CWD"
+session.network = "none"
+[[host_services]]
+name = "l81-svc"
+exec = ["sh", "-c", "exit 7"]
+socket = "$L81_SOCK"
+expose = "/run/l81svc.sock"
+risk_ack = "host-exec"
+ready = { command = ["true"], timeout = 30 }
+stop = { signal = "TERM", grace = 5 }
+L81EOF
+  L81_START=$(date +%s%N)
+  L81_OUT=$(timeout 20 "$HISN" run --profile "$L81_PROFILE" --session-id "l81-$$" -- "$L81_CWD/leakprobe" loop "$L81_CWD/ctl" </dev/null 2>&1)
+  L81_RC=$?
+  L81_ELAPSED_MS=$(( ($(date +%s%N) - L81_START) / 1000000 ))
+  if [ "$L81_RC" -eq 125 ] && [ "$L81_ELAPSED_MS" -ge 0 ] && [ "$L81_ELAPSED_MS" -le 6000 ] 2>/dev/null; then
+    pass "L81 dead host service fails readiness at once with exit 125 (${L81_ELAPSED_MS}ms < 30 s timeout)"
+  else
+    fail "L81 dead host service fails readiness at once with exit 125" "rc=$L81_RC elapsed=${L81_ELAPSED_MS}ms out=[$(printf '%s' "$L81_OUT" | head -c 300)]"
+  fi
+  case "$L81_OUT" in
+    *l81-svc*) pass "L81 failure names the dead service" ;;
+    *) fail "L81 failure names the dead service" "out=[$(printf '%s' "$L81_OUT" | head -c 300)]" ;;
+  esac
+  case "$L81_OUT" in
+    *7*) pass "L81 failure names the exit status" ;;
+    *) fail "L81 failure names the exit status" "out=[$(printf '%s' "$L81_OUT" | head -c 300)]" ;;
+  esac
+  rm -rf "$L81_CWD"
+else
+  skip "L81 dead host service readiness" "hisn check failed (no userns)"
+fi
+
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.
 MANIFEST="$HERE/MANIFEST"

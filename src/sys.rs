@@ -507,6 +507,22 @@ pub fn send_with_fd(sock: RawFd, data: &[u8], fd: Option<RawFd>) -> io::Result<(
 /// A truncated control message (`MSG_CTRUNC`/`MSG_TRUNC`) is an error, the
 /// same way [`recv_with_fds`] reports it: the message must be rejected,
 /// never half-used. Any fd that did arrive is closed before returning.
+///
+/// Call-site audit (0.4.3, Part 2.4): the four callers are
+/// - `init.rs` GO/START: 1-byte messages on a SOCK_STREAM channel; the
+///   sender sends exactly `&[MSG_GO]`/`&[MSG_START]` (supervisor.rs), so
+///   1 byte cannot truncate.
+/// - `grant.rs` helper_loop: `grant|forward|revoke <path>` + one tree fd
+///   on a SOCK_STREAM socketpair; the path comes from `parse_abs` (an
+///   absolute path) and is bounded by the kernel (`PATH_MAX` — a longer
+///   path fails `openat2`/`canonicalize` with ENAMETOOLONG before a grant
+///   is built). On SOCK_STREAM an oversized message is not truncated by
+///   the kernel at all (it is a byte stream), so `MSG_TRUNC` cannot fire;
+///   only `MSG_CTRUNC` (more than one fd) could, and the sender sends
+///   exactly one fd per call.
+/// - `grant.rs` `HelperClient::call`: replies are `ok <id>` or
+///   `err <errno> <msg>` from the helper — a few dozen bytes, into a 4096
+///   buffer; one fd at most, sent with `send_with_fd`.
 pub fn recv_with_fd(sock: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<OwnedFd>)> {
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),

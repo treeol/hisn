@@ -406,6 +406,93 @@ fn check_readiness_with_probe(
     true
 }
 
+/// A stoppable service process: the signal delivery, the liveness check
+/// during the grace period, and the final SIGKILL differ between host
+/// services (a real pid) and in-sandbox services (a status socket); the
+/// grace handling around them is identical, so [`stop_and_reap`] owns it.
+///
+/// `signal`: deliver `sig` (the stop signal, then `SIGKILL`).
+/// `alive`: whether the process is still running (polled during grace).
+pub trait Stoppable {
+    fn signal(&self, sig: i32);
+    fn alive(&self) -> bool;
+}
+
+/// Stop one service: deliver `sig`, wait out up to `grace` seconds while it
+/// lives, then SIGKILL if it is still alive. Never panics.
+///
+/// `grace` is validated ≤ 86400, so `checked_add` cannot overflow in
+/// practice; fall back to a far-future deadline on error.
+pub fn stop_and_reap(target: &dyn Stoppable, sig: i32, grace: u64) {
+    target.signal(sig);
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(grace))
+        .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(86400));
+    while std::time::Instant::now() < deadline {
+        if !target.alive() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if target.alive() {
+        target.signal(libc::SIGKILL);
+    }
+}
+
+/// A `[[host_services]]` process: a real child pid. `alive` reaps it with a
+/// non-blocking `waitpid` when it exits (a reaped pid is never signalled
+/// again, per the pid-reuse rule); the final `signal(SIGKILL)` is followed
+/// by a blocking reap.
+pub struct HostServiceTarget {
+    pub pid: i32,
+}
+
+impl Stoppable for HostServiceTarget {
+    fn signal(&self, sig: i32) {
+        let _ = sys::kill(self.pid, sig);
+        if sig == libc::SIGKILL {
+            let _ = reap(self.pid);
+        }
+    }
+
+    fn alive(&self) -> bool {
+        let mut st = 0;
+        // SAFETY: non-blocking waitpid on our own child.
+        let r = unsafe { libc::waitpid(self.pid, &mut st, libc::WNOHANG) };
+        if r == self.pid {
+            return false;
+        }
+        if r == 0 {
+            return true;
+        }
+        // waitpid error: EINTR means still running; anything else (e.g.
+        // ECHILD) means the child is gone — no kill may be sent to a
+        // reaped pid, whose number may have been reused.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+    }
+}
+
+impl Stoppable for ServiceHandle {
+    fn signal(&self, sig: i32) {
+        // The service's pid is in the sandbox pid ns; signal it via the
+        // status socket (same as exec signal).
+        let _ = sys::send_all(self.status.as_raw_fd(), exec::format_kill(sig).as_bytes());
+    }
+
+    fn alive(&self) -> bool {
+        // Check if the status socket is still open (service still running).
+        // If the service has already exited, the monitor is gone.
+        let mut pollfds = [libc::pollfd {
+            fd: self.status.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: poll on our own fd, non-blocking.
+        let r = unsafe { libc::poll(&mut pollfds[0], 1, 0) };
+        !(r > 0 && (pollfds[0].revents & (libc::POLLHUP | libc::POLLERR)) != 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{check_readiness, check_readiness_with_probe};

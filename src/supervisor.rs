@@ -3104,41 +3104,8 @@ fn teardown_services(host_pids: &[(i32, profile::StopSpec)], service_handles: &[
     // Check if the process is already gone before sleeping the full grace (P27).
     for (hpid, stop_spec) in host_pids {
         let sig = control::parse_signal(&stop_spec.signal).unwrap_or(libc::SIGTERM);
-        let _ = sys::kill(*hpid, sig);
-        // Wait for grace period, but only while the process is alive.
-        // `grace` is validated ≤ 86400, so this checked_add cannot overflow
-        // in practice; fall back to a far-future deadline on error.
-        let deadline = std::time::Instant::now()
-            .checked_add(std::time::Duration::from_secs(stop_spec.grace))
-            .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(86400));
-        let mut reaped = false;
-        while std::time::Instant::now() < deadline {
-            let mut st = 0;
-            // SAFETY: non-blocking waitpid on our own child.
-            let r = unsafe { libc::waitpid(*hpid, &mut st, libc::WNOHANG) };
-            if r == *hpid {
-                reaped = true;
-                break;
-            }
-            if r == 0 {
-                // Still running; wait a bit and re-check.
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            } else {
-                // waitpid error: EINTR retries, anything else (e.g. ECHILD)
-                // means the child is gone — no kill may be sent to a reaped
-                // pid, whose number may have been reused.
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                reaped = true;
-                break;
-            }
-        }
-        // SIGKILL only if we have not already reaped the child.
-        if !reaped {
-            let _ = sys::kill(*hpid, libc::SIGKILL);
-            let _ = services::reap(*hpid);
-        }
+        let target = services::HostServiceTarget { pid: *hpid };
+        services::stop_and_reap(&target, sig, stop_spec.grace);
     }
     // Stop in-sandbox services (DESIGN §19): best-effort signal + grace.
     // If init has already exited, the kernel has killed everything in the pid
@@ -3146,38 +3113,7 @@ fn teardown_services(host_pids: &[(i32, profile::StopSpec)], service_handles: &[
     // before sleeping the full grace period (P27).
     for handle in service_handles {
         let sig = control::parse_signal(&handle.stop.signal).unwrap_or(libc::SIGTERM);
-        // The service's pid is in the sandbox pid ns; signal it via the status
-        // socket (same as exec signal).
-        let _ = sys::send_all(handle.status.as_raw_fd(), exec::format_kill(sig).as_bytes());
-        // Wait for grace period, but only while the service is still alive.
-        // `grace` is validated ≤ 86400, so this checked_add cannot overflow
-        // in practice; fall back to a far-future deadline on error.
-        let deadline = std::time::Instant::now()
-            .checked_add(std::time::Duration::from_secs(handle.stop.grace))
-            .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(86400));
-        while std::time::Instant::now() < deadline {
-            // Check if the status socket is still open (service still running).
-            // If the service has already exited, skip the remaining grace.
-            // Use a non-blocking read: if the socket is closed, the service
-            // monitor is gone.
-            let mut pollfds = [libc::pollfd {
-                fd: handle.status.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            }];
-            // SAFETY: poll on our own fd, non-blocking.
-            let r = unsafe { libc::poll(&mut pollfds[0], 1, 0) };
-            if r > 0 && (pollfds[0].revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
-                // Service monitor is gone; skip the remaining grace.
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        // SIGKILL via the status socket.
-        let _ = sys::send_all(
-            handle.status.as_raw_fd(),
-            exec::format_kill(libc::SIGKILL).as_bytes(),
-        );
+        services::stop_and_reap(handle, sig, handle.stop.grace);
     }
 }
 

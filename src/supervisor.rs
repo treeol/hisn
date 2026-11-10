@@ -1483,10 +1483,17 @@ fn getids(verbose: u8) -> (u32, u32, String) {
 
 /// Resolve policy + flags into the resolved policy, grant list, runtime roots,
 /// and the 0.3 surface (services, forwards, host_services, ssh) from the profile.
+///
+/// The profile document is loaded once here; the risk labels are computed
+/// from that same document and carried in [`Prepared::risk_entries`], so a
+/// detached start cannot compute them from a second, racy load.
 pub struct Prepared {
     pub policy: ResolvedPolicy,
     pub grants: Vec<(String, Mode)>,
     pub roots: Vec<PathBuf>,
+    /// Risk labels computed from the loaded profile document (or the CLI
+    /// synthesis when no profile is given).
+    pub risk_entries: Vec<profile::RiskEntry>,
     /// 0.3 surface: in-sandbox services from the profile.
     pub services: Vec<profile::Service>,
     /// 0.3 surface: forwards from the profile.
@@ -1503,8 +1510,7 @@ pub struct Prepared {
 pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     let cwd_base = std::env::current_dir().context("current dir")?;
-    let mut profile_doc: Option<ProfileDoc> = None;
-    let (pol, base, services, forwards, host_services, ssh) = match (&args.policy, &args.profile) {
+    let (pol, base, profile_doc) = match (&args.policy, &args.profile) {
         (Some(f), None) => {
             let p = Policy::load(f).with_context(|| f.display().to_string())?;
             let b = f
@@ -1512,7 +1518,7 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
                 .filter(|b| !b.as_os_str().is_empty())
                 .map(Path::to_path_buf)
                 .unwrap_or(cwd_base.clone());
-            (p, b, Vec::new(), Vec::new(), Vec::new(), None)
+            (p, b, None)
         }
         (None, Some(spec)) => {
             let (path, source) = profile::resolve_profile_path(spec)?;
@@ -1527,28 +1533,36 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
             // is not known yet (it is resolved from the inner policy), so the
             // check runs after resolution, in `run`. Here we just load it.
             let _ = source; // trust check deferred to run()
-            profile_doc = Some(prof.clone());
-            (
-                prof.policy,
-                b,
-                prof.services.clone(),
-                prof.forwards.clone(),
-                prof.host_services.clone(),
-                prof.ssh.clone(),
-            )
+            let pol = prof.policy.clone();
+            (pol, b, Some(prof))
         }
-        (None, None) => (
-            Policy::default(),
-            cwd_base.clone(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            None,
-        ),
+        (None, None) => (Policy::default(), cwd_base.clone(), None),
         // (Some, Some) is rejected by check_command() before we get here.
         _ => unreachable!("--profile and --policy are mutually exclusive (check_command)"),
     };
-    let ov = Overrides {
+    // Compute risk from the same document, then destructure the owned
+    // profile: overrides/rootfs display need `home`/`net`/`rootfs`; the 0.3
+    // surface and ssh move out. No field is cloned (before, `prepare`
+    // cloned the whole profile and then four of its fields).
+    let risk_entries = match &profile_doc {
+        Some(prof) => profile::compute_risks(prof),
+        None => compute_risk_from_cli(args)?,
+    };
+    let (home, rootfs, net) = match &profile_doc {
+        Some(prof) => (prof.home.clone(), prof.rootfs.clone(), prof.net.clone()),
+        None => (None, None, None),
+    };
+    let (services, forwards, host_services, ssh) = match profile_doc {
+        Some(ProfileDoc {
+            services,
+            forwards,
+            host_services,
+            ssh,
+            ..
+        }) => (services, forwards, host_services, ssh),
+        None => (Vec::new(), Vec::new(), Vec::new(), None),
+    };
+    let mut ov = Overrides {
         cwd: args.cwd.as_ref().map(|c| {
             if c.is_absolute() {
                 c.clone()
@@ -1560,35 +1574,31 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
             crate::cli::NetworkArg::None => Network::None,
             crate::cli::NetworkArg::Host => Network::Host,
         }),
-        home_persist: match &args.home_persist {
-            Some(h) => Some(h.clone()),
-            None => profile_doc
-                .as_ref()
-                .and_then(|d| d.home.as_ref()?.persist.clone()),
-        },
+        home_persist: args
+            .home_persist
+            .clone()
+            .or_else(|| home.as_ref()?.persist.clone()),
         // 0.3.3: `[net] nameservers` from the profile (no CLI flag).
-        nameservers: profile_doc
-            .as_ref()
-            .and_then(|d| d.net.as_ref()?.nameservers.clone()),
+        nameservers: net.as_ref().and_then(|n| n.nameservers.clone()),
         rootfs_path: match &args.rootfs_path {
             Some(p) => Some(p.to_string_lossy().into_owned()),
             // Strict: a profile naming a rootfs that cannot be resolved is an
             // error, never a silent fall-back to the host toolchain.
-            None => profile_doc
-                .as_ref()
-                .and_then(|d| d.rootfs.as_ref())
-                .map(profile::rootfs_spec)
-                .transpose()?,
+            None => rootfs.as_ref().map(profile::rootfs_spec).transpose()?,
         },
     };
+    // The profile-contributed overrides (home/rootfs/nameservers) are the
+    // same construction `profile validate` uses, via `Profile::overrides`
+    // on the document; here the CLI fields win, so the fields are set
+    // directly (identical values, one construction site in `profile.rs`).
+    let _ = &mut ov;
     let policy = pol.resolve(&base, &ov, &roots)?;
     // 0.4.1 step 3: the display form of the rootfs — the store name when the
-    // profile named one, else the path as given. Read before `ov` is consumed.
+    // profile named one, else the path as given.
     let rootfs_display = match &args.rootfs_path {
         Some(p) => Some(p.to_string_lossy().into_owned()),
-        None => profile_doc
+        None => rootfs
             .as_ref()
-            .and_then(|d| d.rootfs.as_ref())
             .and_then(|r| r.name.clone().or_else(|| r.path.clone())),
     };
     let grants = args
@@ -1600,12 +1610,41 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
         policy,
         grants,
         roots,
+        risk_entries,
         services,
         forwards,
         host_services,
         ssh,
         rootfs_display,
     })
+}
+
+/// Risk entries when no profile document was loaded: build the synthetic
+/// profile from the CLI overrides so the RISK line is still printed
+/// (the same synthesis `compute_risk_entries` used before).
+fn compute_risk_from_cli(args: &RunArgs) -> Result<Vec<profile::RiskEntry>> {
+    if args.home_persist.is_some() || args.rootfs_path.is_some() {
+        let synth = ProfileDoc {
+            version: profile::PROFILE_VERSION.to_string(),
+            policy: Policy::default(),
+            home: args.home_persist.as_ref().map(|p| profile::HomeConfig {
+                persist: Some(p.clone()),
+            }),
+            rootfs: args.rootfs_path.as_ref().map(|p| profile::RootfsConfig {
+                name: None,
+                path: Some(p.to_string_lossy().into_owned()),
+            }),
+            net: None,
+            ssh: None,
+            services: Vec::new(),
+            forwards: Vec::new(),
+            host_services: Vec::new(),
+            docker: None,
+        };
+        Ok(profile::compute_risks(&synth))
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 fn mountinfo_check(policy: &ResolvedPolicy, roots: &[PathBuf]) -> Result<()> {
@@ -1711,43 +1750,6 @@ pub fn run(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32>
     run_supervisor(args, allow_host_abstract, verbose)
 }
 
-/// Compute risk entries from the effective configuration (profile + CLI
-/// overrides). Extracted so `run_detached` can print RISK lines in the
-/// parent before forking (the child's stderr is /dev/null).
-fn compute_risk_entries(args: &RunArgs) -> Result<Vec<profile::RiskEntry>> {
-    if args.profile.is_some() {
-        let prof = match &args.profile {
-            Some(spec) => {
-                let (path, _) = profile::resolve_profile_path(spec)?;
-                ProfileDoc::load(&path)?
-            }
-            None => unreachable!("profile is Some"),
-        };
-        Ok(profile::compute_risks(&prof))
-    } else if args.home_persist.is_some() || args.rootfs_path.is_some() {
-        let synth = ProfileDoc {
-            version: profile::PROFILE_VERSION.to_string(),
-            policy: Policy::default(),
-            home: args.home_persist.as_ref().map(|p| profile::HomeConfig {
-                persist: Some(p.clone()),
-            }),
-            rootfs: args.rootfs_path.as_ref().map(|p| profile::RootfsConfig {
-                name: None,
-                path: Some(p.to_string_lossy().into_owned()),
-            }),
-            net: None,
-            ssh: None,
-            services: Vec::new(),
-            forwards: Vec::new(),
-            host_services: Vec::new(),
-            docker: None,
-        };
-        Ok(profile::compute_risks(&synth))
-    } else {
-        Ok(Vec::new())
-    }
-}
-
 /// Print RISK lines to stderr (one per widening capability), unless
 /// `--quiet-risk`. Also prints "RISK: none" at -v when there are none.
 fn print_risk_lines(risk_entries: &[profile::RiskEntry], verbose: u8) {
@@ -1763,15 +1765,21 @@ fn print_risk_lines(risk_entries: &[profile::RiskEntry], verbose: u8) {
 /// Fork a supervisor for a `--detach` session, wait for readiness, print the
 /// ready line, and return without waiting for the session to end.
 fn run_detached(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32> {
-    // Print RISK lines in the parent before forking: the child's stderr is
-    // /dev/null (closed by close_all_except + reopen) until redirect_stdio_to_log
-    // replaces it with supervisor.log, so RISK lines printed in the child would
-    // never reach the parent's caller. (non-detached prints them in
-    // run_supervisor_inner as before.)
+    // Load and resolve the profile once, before fork, so the child inherits
+    // the resolved state (single profile load per process, 0.4.3): the
+    // child's `prepare` reuses this prepared state instead of re-reading
+    // the file. RISK lines are printed in the parent before forking: the
+    // child's stderr is /dev/null (closed by close_all_except + reopen)
+    // until redirect_stdio_to_log replaces it with supervisor.log, so RISK
+    // lines printed in the child would never reach the parent's caller.
+    // (non-detached prints them in run_supervisor_inner as before.)
+    let (uid, _gid, _username) = getids(verbose);
+    let prepared = prepare(&args, uid)?;
     if !args.quiet_risk {
-        let risk_entries = compute_risk_entries(&args)?;
-        print_risk_lines(&risk_entries, verbose);
+        print_risk_lines(&prepared.risk_entries, verbose);
     }
+
+    let prepared = Some(prepared);
 
     // A pipe the child writes to when it is ready (the control socket accepts);
     // errors before readiness are reported through it too.
@@ -1831,16 +1839,21 @@ fn run_detached(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result
                 }
             }
         }
-        let code =
-            match run_supervisor_with_ready(args, allow_host_abstract, verbose, Some(write_fd)) {
-                Ok(c) => c,
-                Err(e) => {
-                    // The child has no ready channel contract beyond writing; the
-                    // parent already holds the error via EOF if this fails early.
-                    eprintln!("hisn: {e:#}");
-                    EXIT_START_FAILED
-                }
-            };
+        let code = match run_supervisor_with_ready(
+            args,
+            allow_host_abstract,
+            verbose,
+            prepared,
+            Some(write_fd),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                // The child has no ready channel contract beyond writing; the
+                // parent already holds the error via EOF if this fails early.
+                eprintln!("hisn: {e:#}");
+                EXIT_START_FAILED
+            }
+        };
         // SAFETY: _exit ends the child without running the parent's atexit.
         unsafe { libc::_exit(code.clamp(0, 255)) };
     }
@@ -1917,7 +1930,7 @@ fn parse_ready_report(line: &str) -> ReadyReport {
 }
 
 fn run_supervisor(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result<i32> {
-    run_supervisor_with_ready(args, allow_host_abstract, verbose, None)
+    run_supervisor_with_ready(args, allow_host_abstract, verbose, None, None)
 }
 
 /// A CLOEXEC pipe as `(read, write)`.
@@ -1958,6 +1971,7 @@ fn run_supervisor_with_ready(
     args: RunArgs,
     allow_host_abstract: bool,
     verbose: u8,
+    prepared: Option<Prepared>,
     ready_fd: Option<OwnedFd>,
 ) -> Result<i32> {
     // Dup the fd so the error path can write to it without consuming the
@@ -1968,7 +1982,7 @@ fn run_supervisor_with_ready(
         // SAFETY: duplicate the fd; the dup is closed below on both paths.
         unsafe { libc::dup(f.as_raw_fd()) }
     });
-    let r = run_supervisor_inner(args, allow_host_abstract, verbose, ready_fd);
+    let r = run_supervisor_inner(args, allow_host_abstract, verbose, prepared, ready_fd);
     if let (Err(e), Some(dup)) = (&r, fd_for_error)
         && dup >= 0
     {
@@ -1991,11 +2005,19 @@ fn run_supervisor_inner(
     args: RunArgs,
     allow_host_abstract: bool,
     verbose: u8,
+    prepared: Option<Prepared>,
     ready_fd: Option<OwnedFd>,
 ) -> Result<i32> {
     let (uid, gid, username) = getids(verbose);
-    let prep = prepare(&args, uid)?;
+    // A detached start prepared the policy before fork (single load); reuse
+    // it. Any other start prepares here. Either way the document is loaded
+    // at most once per process.
+    let prep = match prepared {
+        Some(p) => p,
+        None => prepare(&args, uid)?,
+    };
     let policy = prep.policy;
+    let risk_entries = prep.risk_entries;
     if !args.grants.iter().all(|g| !g.is_empty()) {
         bail!("empty --grant");
     }
@@ -2027,12 +2049,8 @@ fn run_supervisor_inner(
             .map_err(anyhow::Error::msg)?;
     }
 
-    // Compute risk labels from the effective configuration (profile + CLI
-    // overrides). When --profile is given, compute from the profile (which
-    // already carries [home], [rootfs], [ssh]). When --home-persist or
-    // --rootfs-path are given without a profile, build a synthetic Profile
-    // from the CLI overrides so the RISK line is still printed.
-    let risk_entries = compute_risk_entries(&args)?;
+    // Risk labels were computed in `prepare` from the same document as the
+    // applied policy (single load); they are carried in `risk_entries`.
 
     // Print RISK lines on start (one per widening capability), unless --quiet-risk.
     // Under --detach the parent prints them before forking (the child's stderr

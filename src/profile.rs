@@ -94,6 +94,28 @@ impl Profile {
         Ok(())
     }
 
+    /// Check one `risk_ack` against the label its capability computed, in the
+    /// shared form used by `[[forward]]`, `[[host_services]]` and `[docker]`
+    /// (0.4.3: the three copies of this match block became one helper).
+    ///
+    /// `subject` is the `[[forward]] <name>` / `[[host_services]] <name>` /
+    /// `[docker]` prefix the error messages name. The messages are
+    /// byte-identical to the former copies.
+    fn check_risk_ack(subject: &str, label: RiskLabel, ack: &Option<String>) -> Result<()> {
+        match ack {
+            None => bail!(
+                "E_RISK_ACK_REQUIRED: {subject}: requires risk_ack = \"{}\"",
+                label.kebab()
+            ),
+            Some(a) if a != label.kebab() => bail!(
+                "E_RISK_ACK_MISMATCH: {subject}: risk_ack = {a:?} but the computed label is {:?}",
+                label.kebab()
+            ),
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Validate the 0.3 surface tables: `[[services]]`, `[[forward]]`,
     /// `[[host_services]]`, and `[docker]`. Enforces risk_ack matching
     /// (§16–§18) and path sanity.
@@ -179,21 +201,7 @@ impl Profile {
                 );
             }
             if label.requires_ack() {
-                match &f.risk_ack {
-                    None => bail!(
-                        "E_RISK_ACK_REQUIRED: [[forward]] {}: {} requires risk_ack = \"{}\"",
-                        f.name,
-                        f.socket,
-                        label.kebab()
-                    ),
-                    Some(ack) if ack != label.kebab() => bail!(
-                        "E_RISK_ACK_MISMATCH: [[forward]] {}: risk_ack = {:?} but the computed label is {:?}",
-                        f.name,
-                        ack,
-                        label.kebab()
-                    ),
-                    _ => {}
-                }
+                Self::check_risk_ack(&format!("[[forward]] {}", f.name), label, &f.risk_ack)?;
             }
         }
         for h in &self.host_services {
@@ -238,20 +246,14 @@ impl Profile {
             } else {
                 RiskLabel::HostExec
             };
-            match &h.risk_ack {
-                None => bail!(
-                    "E_RISK_ACK_REQUIRED: [[host_services]] {}: requires risk_ack = \"{}\"",
-                    h.name,
-                    effective.kebab()
-                ),
-                Some(ack) if ack != effective.kebab() => bail!(
-                    "E_RISK_ACK_MISMATCH: [[host_services]] {}: risk_ack = {:?} but the computed label is {:?}",
-                    h.name,
-                    ack,
-                    effective.kebab()
-                ),
-                _ => {}
-            }
+            // `[[host_services]]` always requires an ack: its effective
+            // label is at least `host-exec` (the execution itself), so the
+            // ack must match it (None is an error, not "no ack needed").
+            Self::check_risk_ack(
+                &format!("[[host_services]] {}", h.name),
+                effective,
+                &h.risk_ack,
+            )?;
             // Readiness and stop validation.
             if let Some(r) = &h.ready {
                 if r.tcp.is_some() {
@@ -297,18 +299,15 @@ impl Profile {
             let tier = docker_tier(d)?;
             if tier == "socket" {
                 let label = RiskLabel::RootEquivalent;
-                match &d.risk_ack {
-                    None => bail!(
+                if d.risk_ack.is_none() {
+                    // The `[docker]` subject names only the tier in the
+                    // required message (byte-identical to the former copy).
+                    bail!(
                         "E_RISK_ACK_REQUIRED: [docker] tier = \"socket\" requires risk_ack = \"{}\"",
                         label.kebab()
-                    ),
-                    Some(ack) if ack != label.kebab() => bail!(
-                        "E_RISK_ACK_MISMATCH: [docker] risk_ack = {:?} but the computed label is {:?}",
-                        ack,
-                        label.kebab()
-                    ),
-                    _ => {}
+                    );
                 }
+                Self::check_risk_ack("[docker]", label, &d.risk_ack)?;
             }
         }
         Ok(())
@@ -333,6 +332,27 @@ impl Profile {
         self.policy
             .resolve(base_dir, overrides, runtime_roots)
             .map_err(|e| anyhow!("{e}"))
+    }
+
+    /// The [`Overrides`] this profile contributes: its `[home] persist`,
+    /// `[rootfs]` (store name or path, via [`rootfs_spec`]) and `[net]
+    /// nameservers`. The supervisor's `prepare` and `profile validate` share
+    /// this one construction (0.4.3-style single source; before, each built
+    /// the same three fields by hand and had already drifted once).
+    ///
+    /// CLI flags win over profile values, so callers apply their CLI
+    /// overrides on top of the returned value (e.g.
+    /// `overrides.cwd = args.cwd`); the profile never sets `cwd` or
+    /// `network`, so those stay `None` here.
+    pub fn overrides(&self) -> Result<Overrides> {
+        Ok(Overrides {
+            home_persist: self.home.as_ref().and_then(|h| h.persist.clone()),
+            // Strict: a profile naming a rootfs that cannot be resolved is
+            // an error, never a silent fall-back to the host toolchain.
+            rootfs_path: self.rootfs.as_ref().map(rootfs_spec).transpose()?,
+            nameservers: self.net.as_ref().and_then(|n| n.nameservers.clone()),
+            ..Default::default()
+        })
     }
 }
 
@@ -1057,16 +1077,8 @@ pub fn validate(path: Option<&Path>) -> Result<ResolvedPolicy> {
     let roots =
         crate::session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     // Resolve [rootfs] name/path through the same code the session start
-    // uses (supervisor::prepare). Overrides::default() sets rootfs_path =
-    // None, so we must extract it from the profile and pass it explicitly.
-    let rootfs_path = profile.rootfs.as_ref().map(rootfs_spec).transpose()?;
-    let home_persist = profile.home.as_ref().and_then(|h| h.persist.clone());
-    let overrides = Overrides {
-        home_persist,
-        rootfs_path,
-        nameservers: profile.net.as_ref().and_then(|n| n.nameservers.clone()),
-        ..Default::default()
-    };
+    // uses (Profile::overrides, shared with supervisor::prepare).
+    let overrides = profile.overrides()?;
     let resolved = profile.resolve(base, &overrides, &roots)?;
     // 0.3.3: the mount plan's conflicts (src:dst vs session mounts) are
     // validate-time errors too, as at session start.

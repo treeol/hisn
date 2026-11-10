@@ -63,6 +63,18 @@ fn open_dir_path(p: &Path) -> io::Result<OwnedFd> {
     sys::openat2(libc::AT_FDCWD, &sys::cstr(p)?, O_PATH_DIR, 0, 0)
 }
 
+/// Duplicate `root` into an owned handle, checking the result: a failed
+/// `dup` (e.g. EMFILE) must be an OS error, never an `OwnedFd(-1)`.
+fn dup_owned(root: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: dup of a valid fd; the result is checked before wrapping.
+    let fd = unsafe { libc::dup(root) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fresh descriptor from a successful dup.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// Walk `rel` (no `..`, no leading slash) from `root`, creating directories
 /// as needed. Returns an `O_PATH` fd of the final directory.
 pub fn ensure_dir(root: RawFd, rel: &Path) -> io::Result<OwnedFd> {
@@ -73,8 +85,7 @@ pub fn ensure_dir(root: RawFd, rel: &Path) -> io::Result<OwnedFd> {
 /// (relative to `root`, shallowest first) so a revoke can remove exactly
 /// those and leave the path as ENOENT again.
 pub fn ensure_dir_tracked(root: RawFd, rel: &Path) -> io::Result<(OwnedFd, Vec<PathBuf>)> {
-    // SAFETY: dup of a valid fd to get an owned handle we can replace.
-    let mut cur = unsafe { OwnedFd::from_raw_fd(libc::dup(root)) };
+    let mut cur = dup_owned(root)?;
     let mut created = Vec::new();
     let mut walked = PathBuf::new();
     for comp in rel.components() {
@@ -122,8 +133,7 @@ pub fn remove_created(root: RawFd, rels: &[PathBuf]) {
 
 /// Open an existing directory beneath `root` (never creating anything).
 fn ensure_existing_dir(root: RawFd, rel: &Path) -> io::Result<OwnedFd> {
-    // SAFETY: dup of a valid fd.
-    let mut cur = unsafe { OwnedFd::from_raw_fd(libc::dup(root)) };
+    let mut cur = dup_owned(root)?;
     for comp in rel.components() {
         if let Component::Normal(name) = comp {
             cur = sys::openat2(

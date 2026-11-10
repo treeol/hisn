@@ -63,12 +63,33 @@ fn read_msg(r: &mut impl Read) -> io::Result<Vec<u8>> {
 }
 
 /// Write a complete ssh-agent message: 4-byte big-endian length + payload.
+///
+/// The host agent socket gets a write timeout (see `HOST_WRITE_TIMEOUT`):
+/// a host agent that accepts a connection but never reads must not pin
+/// the worker thread forever.
 fn write_msg(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
     let len = payload.len() as u32;
     w.write_all(&len.to_be_bytes())?;
     w.write_all(payload)?;
     w.flush()?;
     Ok(())
+}
+
+/// Write timeout on the host agent socket. The client side already has
+/// `CLIENT_IDLE_TIMEOUT` on reads; without a write bound a wedged host
+/// agent wedges the worker (and its client counter slot) indefinitely.
+const HOST_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// RAII guard for one proxy client: decrements the active-clients counter
+/// on *every* exit path, including a panic unwinding through
+/// `handle_client`. Replaces the manual `fetch_sub` after the call.
+struct ClientGuard {
+    counter: Arc<AtomicUsize>,
+}
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Build a `SSH_AGENT_FAILURE` message (1 byte payload).
@@ -229,6 +250,11 @@ fn handle_client(mut client: UnixStream, host_agent: &str, allowed: Vec<String>,
             return;
         }
     };
+    // Bound every write to the host agent: without it a host agent that
+    // stops reading pins this worker (and the client's counter slot).
+    if let Err(e) = host.set_write_timeout(Some(HOST_WRITE_TIMEOUT)) {
+        tracing::warn!("ssh-agent proxy [{session_id}]: host write timeout: {e}");
+    }
     loop {
         let payload = match read_msg(&mut client) {
             Ok(p) => p,
@@ -363,11 +389,17 @@ pub fn spawn_accept_loop(
                     let a = allowed.clone();
                     let id = session_id.clone();
                     let counter = Arc::clone(&active);
-                    // Builder::spawn returns Err instead of panicking when the
-                    // OS refuses a thread.
+                    // The guard lives in the worker thread: it decrements
+                    // the counter when the worker exits, including on a
+                    // panic unwinding through handle_client.
+                    let guard_counter = Arc::clone(&counter);
+                    // Builder::spawn returns Err instead of panicking when
+                    // the OS refuses a thread.
                     let spawned = thread::Builder::new().spawn(move || {
+                        let _guard = ClientGuard {
+                            counter: guard_counter,
+                        };
                         handle_client(s, &h, a, &id);
-                        counter.fetch_sub(1, Ordering::SeqCst);
                     });
                     if let Err(e) = spawned {
                         active.fetch_sub(1, Ordering::SeqCst);
@@ -585,6 +617,20 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let result = read_msg(&mut cursor);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn client_guard_decrements_on_panic_unwind() {
+        // The counter must return to zero even when the worker panics:
+        // ClientGuard's Drop runs during unwinding.
+        let counter = Arc::new(AtomicUsize::new(1));
+        let c2 = Arc::clone(&counter);
+        let r = std::panic::catch_unwind(move || {
+            let _guard = ClientGuard { counter: c2 };
+            panic!("worker panic");
+        });
+        assert!(r.is_err());
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
     #[test]

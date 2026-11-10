@@ -693,6 +693,22 @@ pub struct NsFds {
 }
 
 impl NsFds {
+    /// Duplicate every fd (used when the supervisor hands the namespaces to
+    /// the exec helper and keeps its own copies until then).
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            user: self.user.try_clone()?,
+            mnt: self.mnt.try_clone()?,
+            ipc: self.ipc.try_clone()?,
+            uts: self.uts.try_clone()?,
+            pid: self.pid.try_clone()?,
+            net: self.net.as_ref().map(|n| n.try_clone()).transpose()?,
+            root: self.root.try_clone()?,
+        })
+    }
+}
+
+impl NsFds {
     fn raws(&self) -> Vec<RawFd> {
         let mut v = vec![
             self.user.as_raw_fd(),

@@ -2178,27 +2178,27 @@ fn run_supervisor_inner(
     let idle_timeout_s = policy.idle_timeout_s;
     let sdir = tmp.publish(&root)?;
     let _ = sessionmeta::set_state(&sdir.path, sessionmeta::State::Running);
-    let result = run_session(
-        &args,
+    let result = run_session(SessionStart {
+        args: &args,
         policy,
         plan,
-        prep.grants,
-        &sdir,
-        prep.roots,
+        initial: prep.grants,
+        sdir: &sdir,
+        roots: prep.roots,
         uid,
         gid,
-        &facts.username,
+        username: &facts.username,
         allow_host_abstract,
         verbose,
-        &risk_entries,
-        &prep.services,
-        &prep.forwards,
-        &prep.host_services,
-        prep.ssh.as_ref(),
-        &id,
-        &declared_env,
+        risk_entries: &risk_entries,
+        services: &prep.services,
+        forwards: &prep.forwards,
+        host_services: &prep.host_services,
+        ssh: prep.ssh.as_ref(),
+        session_id: &id,
+        declared_env: &declared_env,
         ready_fd,
-    );
+    });
     // 0.4.0 step 5 / O3: keep the dir as stopped if the session was stopped
     // (hisn stop or idle expiry). Otherwise remove it (normal exit).
     let end = result.as_ref().ok().map(|e| {
@@ -2318,28 +2318,219 @@ impl crate::lifecycle::IdleSession for Shared {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_session(
-    args: &RunArgs,
+/// One input struct for [`run_session`], replacing its 19 parameters
+/// (0.4.3): every field is one former parameter, in the former order.
+struct SessionStart<'a> {
+    args: &'a RunArgs,
     policy: ResolvedPolicy,
     plan: Vec<mounts::MountOp>,
     initial: Vec<(String, Mode)>,
-    sdir: &SessionDir,
+    sdir: &'a SessionDir,
     roots: Vec<PathBuf>,
     uid: u32,
     gid: u32,
-    username: &str,
+    username: &'a str,
     allow_host_abstract: bool,
     verbose: u8,
-    risk_entries: &[profile::RiskEntry],
-    services: &[profile::Service],
-    forwards: &[profile::Forward],
-    host_services: &[profile::HostService],
-    ssh: Option<&profile::SshConfig>,
-    session_id: &str,
-    declared_env: &std::collections::BTreeMap<String, String>,
+    risk_entries: &'a [profile::RiskEntry],
+    services: &'a [profile::Service],
+    forwards: &'a [profile::Forward],
+    host_services: &'a [profile::HostService],
+    ssh: Option<&'a profile::SshConfig>,
+    session_id: &'a str,
+    declared_env: &'a std::collections::BTreeMap<String, String>,
     ready_fd: Option<OwnedFd>,
-) -> Result<SessionEnd> {
+}
+
+/// Early-exit cleanup for a started session (0.4.3): on drop, kills the
+/// already-started host services and then init and reaps all of them — the
+/// order the hand-copied early exits used. Disarmed on the success path
+/// (after `relay_and_wait`), where the normal stop path owns cleanup.
+///
+/// The `Drop` impl never panics: kills and reaps ignore errors, and a reap
+/// of an already-reaped pid is a no-op waitpid error.
+struct SessionGuard {
+    init_pid: i32,
+    host_pids: Vec<i32>,
+    armed: bool,
+}
+
+impl SessionGuard {
+    fn new(init_pid: i32) -> Self {
+        Self {
+            init_pid,
+            host_pids: Vec::new(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for pid in &self.host_pids {
+            let _ = sys::kill(*pid, libc::SIGKILL);
+            let _ = services::reap(*pid);
+        }
+        let _ = sys::kill(self.init_pid, libc::SIGKILL);
+        let _ = services::reap(self.init_pid);
+    }
+}
+
+fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
+    let SessionStart {
+        args,
+        policy,
+        plan,
+        initial,
+        sdir,
+        roots,
+        uid,
+        gid,
+        username,
+        allow_host_abstract,
+        verbose,
+        risk_entries,
+        services,
+        forwards,
+        host_services,
+        ssh,
+        session_id,
+        declared_env,
+        ready_fd,
+    } = start;
+    // Phase: prepare.
+    prepare_session_files(sdir, &policy, risk_entries)?;
+    let (audit, tty, root_dir) = prepare_session_dirs(sdir, args)?;
+    let mut rules = static_rules(&plan, &policy, &roots);
+    let prepared = prepare_session_env(
+        &mut PrepareEnvArgs {
+            policy: &policy,
+            plan: &plan,
+            initial: &initial,
+            username,
+            declared_env,
+            ssh,
+            sdir,
+        },
+        &mut rules,
+    )?;
+    let exec_rules = prepared.exec_rules.clone();
+    let exec_rules_for_services = exec_rules.clone();
+    let exec_policy = policy.clone();
+    let exec_ll = prepared.ll.clone();
+    let exec_require_scope = landlock::scope_required(&policy, allow_host_abstract);
+    let exec_seccomp = prepared.seccomp_progs.clone();
+
+    let cfg = InitConfig {
+        policy: policy.clone(),
+        plan: plan.clone(),
+        landlock: prepared.ll,
+        require_scope: landlock::scope_required(&policy, allow_host_abstract),
+        seccomp: prepared.seccomp_progs,
+        root_dir,
+        argv: args.command.clone(),
+        env: prepared.session_env,
+        use_pty: tty,
+        detach: args.detach,
+        uid,
+        gid,
+    };
+
+    // Phase: namespaces (userns S + init clone + GO/READY handshake).
+    let ns = start_namespaces(uid, gid, cfg, verbose, sdir)?;
+    let pid = ns.pid;
+    let mut guard = SessionGuard::new(pid);
+    let sup_end_ref = ns.sup_end.as_raw_fd();
+
+    // Phase: helpers (grant helper + exec helper, still single-threaded).
+    let (helper, exec_client) =
+        start_helpers(&ns, exec_policy, exec_ll, exec_require_scope, exec_seccomp)?;
+    let master = ns.master;
+    let sup_end = ns.sup_end;
+
+    // Phase: control (shared state, listener, initial grants, forwards, SSH).
+    let control = start_control(&mut SessionControlArgs {
+        uid,
+        pid,
+        sandbox_pidns: ns.sandbox_pidns,
+        policy: &policy,
+        risk_entries,
+        rules,
+        helper: Some(helper),
+        audit: Some(audit),
+        exec_client: Some(exec_client),
+        exec_rules: Some(exec_rules),
+        sdir,
+        allow_host_abstract,
+        initial: &initial,
+        forwards,
+        ssh_proxy_listener: prepared.ssh_proxy_listener,
+        ssh,
+        session_id,
+    })?;
+    let shared = control.shared;
+    let listener = control.listener;
+    let handler = control.handler;
+    let ssh_agent_expose = control.ssh_agent_expose;
+
+    // Phase: services (host services, then in-sandbox services).
+    let mut host_pids: Vec<(i32, profile::StopSpec)> = Vec::new();
+    start_host_services(host_services, &shared, &mut guard, &mut host_pids)?;
+    let service_handles = start_in_sandbox_services(services, &shared, &exec_rules_for_services)?;
+
+    let _ = sup_end_ref;
+    // START + control thread + ready reporting.
+    sys::send_with_fd(sup_end.as_raw_fd(), &[MSG_START], None)?;
+    thread::spawn(move || {
+        // Process-directed signals (SIGCHLD, SIGTERM, ...) must be handled by
+        // the main thread, which waits for them in `sigsuspend`. A thread that
+        // leaves them unblocked can be picked by the kernel as the recipient:
+        // the handler then runs here and the main thread is never woken.
+        // Threads spawned by `serve` inherit this mask.
+        let _ = sig::block(&[
+            libc::SIGTERM,
+            libc::SIGINT,
+            libc::SIGHUP,
+            libc::SIGWINCH,
+            libc::SIGCHLD,
+        ]);
+        control::serve(listener, handler)
+    });
+    report_ready(args, ready_fd, sdir, session_id, ssh_agent_expose);
+
+    // Phase: wait (idle timer + relay).
+    let idle_timer = start_idle_timer(&policy, &shared, pid);
+    let code = relay_and_wait(pid, master, tty);
+    // The session is live and ending on the normal path: the guard must not
+    // kill and reap init again (relay_and_wait already reaped it). The stop
+    // paths below own the remaining cleanup.
+    guard.disarm();
+    let idle_expired_after = idle_timer.and_then(|t| t.join().ok().flatten());
+
+    // Phase: teardown (host services, in-sandbox services, drain).
+    teardown_services(&host_pids, &service_handles);
+    control::drain(std::time::Duration::from_secs(2));
+    drop(shared);
+    Ok(SessionEnd {
+        code,
+        idle_expired_after,
+    })
+}
+
+/// Phase `prepare` (file part): write the resolved policy, `risk.json`,
+/// the audit log handle and `supervisor.pid`. Before any namespace setup.
+fn prepare_session_files(
+    sdir: &SessionDir,
+    policy: &ResolvedPolicy,
+    risk_entries: &[profile::RiskEntry],
+) -> Result<()> {
     sdir.write_resolved_policy(&policy.to_toml())?;
     // Write risk.json (the risk labels for this session, DESIGN §16).
     let risk_json = serde_json::to_string_pretty(&serde_json::json!({
@@ -2349,18 +2540,53 @@ fn run_session(
         })).collect::<Vec<_>>(),
     }))?;
     fs::write(sdir.path.join("risk.json"), risk_json).context("writing risk.json")?;
-    let audit = Audit::open(&sdir.audit_path())?;
     // Write supervisor.pid for stale-detection. Written after the dir is
     // created and before unshare — a crash here leaves a dir without the
     // pid file, which is_stale treats as "not stale" (fail safe).
     sdir.write_supervisor_pid(std::process::id() as i32)
         .context("writing supervisor.pid")?;
+    Ok(())
+}
+
+/// Phase `prepare` (dirs part): open the audit log, report whether stdio is
+/// a terminal, create the sandbox root dir.
+fn prepare_session_dirs(sdir: &SessionDir, args: &RunArgs) -> Result<(Audit, bool, PathBuf)> {
+    let audit = Audit::open(&sdir.audit_path())?;
     // A detached session has no command, hence no terminal to relay.
     let tty = !args.detach && sys::isatty(0);
     let root_dir = sdir.path.join("root");
     fs::create_dir(&root_dir).context("creating root dir")?;
-    let mut rules = static_rules(&plan, &policy, &roots);
+    Ok((audit, tty, root_dir))
+}
 
+/// Phase `prepare` (env part): landlock/seccomp plans, step-7 scrub,
+/// SSH proxy listener binding, session-env composition and exec rules.
+struct PreparedEnv {
+    ll: crate::landlock::LandlockPlan,
+    seccomp_progs: Vec<seccompiler::BpfProgram>,
+    session_env: std::collections::BTreeMap<String, String>,
+    exec_rules: ExecRules,
+    ssh_proxy_listener: Option<UnixListener>,
+}
+
+struct PrepareEnvArgs<'a> {
+    policy: &'a ResolvedPolicy,
+    plan: &'a [mounts::MountOp],
+    initial: &'a [(String, Mode)],
+    username: &'a str,
+    declared_env: &'a std::collections::BTreeMap<String, String>,
+    ssh: Option<&'a profile::SshConfig>,
+    sdir: &'a SessionDir,
+}
+
+fn prepare_session_env(a: &mut PrepareEnvArgs<'_>, rules: &mut Rules) -> Result<PreparedEnv> {
+    let policy = a.policy;
+    let plan = a.plan;
+    let initial = a.initial;
+    let username = a.username;
+    let declared_env = a.declared_env;
+    let ssh = a.ssh;
+    let sdir = a.sdir;
     // Landlock write set includes initial rw grants.
     let initial_rw: Vec<PathBuf> = initial
         .iter()
@@ -2370,7 +2596,7 @@ fn run_session(
     // An initial rw grant is part of the Landlock write set by construction, so
     // the grant rules must accept it (round-2 finding).
     rules.grantable_rw.extend(initial_rw.iter().cloned());
-    let ll = landlock::plan(&policy, &initial_rw);
+    let ll = landlock::plan(policy, &initial_rw);
     let seccomp_progs = seccomp::build(&policy.extra_deny)?;
 
     // 0.4.1 step 7: read the host env with `vars_os` — `env::vars()` panics on a
@@ -2386,13 +2612,13 @@ fn run_session(
         })
         .collect();
     let visible = |p: &Path| {
-        mounts::expected_targets(&plan)
+        mounts::expected_targets(plan)
             .iter()
             .any(|t| p.starts_with(t))
             || p.starts_with(&policy.cwd)
     };
     let scrub = senv::scrub(
-        &policy,
+        policy,
         host_env.iter().map(|(k, v)| (k.as_str(), v.as_str())),
         username,
         visible,
@@ -2437,28 +2663,32 @@ fn run_session(
         default_cwd: policy.cwd.display().to_string(),
         declared_env: declared_env.keys().cloned().collect(),
     };
-    let exec_rules_for_services = exec_rules.clone();
-    let exec_policy = policy.clone();
-    let exec_ll = ll.clone();
-    let exec_require_scope = landlock::scope_required(&policy, allow_host_abstract);
-    let exec_seccomp = seccomp_progs.clone();
-    let exec_net = policy.network == Network::None;
+    Ok(PreparedEnv {
+        ll,
+        seccomp_progs,
+        session_env,
+        exec_rules,
+        ssh_proxy_listener,
+    })
+}
 
-    let cfg = InitConfig {
-        policy: policy.clone(),
-        plan: plan.clone(),
-        landlock: ll,
-        require_scope: landlock::scope_required(&policy, allow_host_abstract),
-        seccomp: seccomp_progs,
-        root_dir,
-        argv: args.command.clone(),
-        env: session_env,
-        use_pty: tty,
-        detach: args.detach,
-        uid,
-        gid,
-    };
+/// Phase `namespaces`: userns S, init clone, namespace fds, GO/READY.
+struct Namespaces {
+    pid: i32,
+    master: Option<OwnedFd>,
+    sup_end: OwnedFd,
+    sandbox_pidns: u64,
+    mntns_fd: OwnedFd,
+    exec_ns: NsFds,
+}
 
+fn start_namespaces(
+    uid: u32,
+    gid: u32,
+    cfg: InitConfig,
+    verbose: u8,
+    sdir: &SessionDir,
+) -> Result<Namespaces> {
     // ---- 2. our own userns S + mount-ns copy (single-threaded here)
     write_s_maps_and_unshare(uid, gid)?;
 
@@ -2469,7 +2699,7 @@ fn run_session(
         | libc::CLONE_NEWPID
         | libc::CLONE_NEWIPC
         | libc::CLONE_NEWUTS;
-    if policy.network == Network::None {
+    if cfg.policy.network == Network::None {
         flags |= libc::CLONE_NEWNET;
     }
     // SAFETY: single-threaded; the child immediately enters `init_main`,
@@ -2494,7 +2724,7 @@ fn run_session(
     let ns_ipc = open_ns(pid, "ipc")?;
     let ns_uts = open_ns(pid, "uts")?;
     let ns_pid = open_ns(pid, "pid")?;
-    let ns_net = if exec_net {
+    let ns_net = if cfg.policy.network == Network::None {
         Some(open_ns(pid, "net")?)
     } else {
         None
@@ -2546,34 +2776,87 @@ fn run_session(
         net: ns_net,
         root,
     };
+    Ok(Namespaces {
+        pid,
+        master,
+        sup_end,
+        sandbox_pidns,
+        mntns_fd,
+        exec_ns,
+    })
+}
 
-    // ---- 5. persistent helper, forked while still single-threaded
-    let helper = spawn_helper(&mntns_fd)?;
-    drop(mntns_fd);
+/// Phase `helpers`: the persistent grant helper and the exec helper,
+/// forked while still single-threaded.
+fn start_helpers(
+    ns: &Namespaces,
+    exec_policy: ResolvedPolicy,
+    exec_ll: crate::landlock::LandlockPlan,
+    exec_require_scope: bool,
+    exec_seccomp: Vec<seccompiler::BpfProgram>,
+) -> Result<(HelperClient, ExecClient)> {
+    let helper = spawn_helper(&ns.mntns_fd)?;
     let exec_client = spawn_exec_helper(ExecContext {
         policy: exec_policy,
         landlock: exec_ll,
         require_scope: exec_require_scope,
         seccomp: exec_seccomp,
-        ns: exec_ns,
+        ns: ns.exec_ns.try_clone()?,
     })?;
+    Ok((helper, exec_client))
+}
 
-    // ---- 6. control thread, initial grants, START
-    let listener = bind_socket(&sdir.socket_path())?;
+/// Phase `control`: the shared state, the control listener, the initial
+/// grants, the forwards and the SSH forward. The listener is bound here;
+/// it only accepts once the control thread starts (in `run_session`).
+struct SessionControlArgs<'a> {
+    uid: u32,
+    pid: i32,
+    sandbox_pidns: u64,
+    policy: &'a ResolvedPolicy,
+    risk_entries: &'a [profile::RiskEntry],
+    rules: Rules,
+    helper: Option<HelperClient>,
+    audit: Option<Audit>,
+    exec_client: Option<ExecClient>,
+    exec_rules: Option<ExecRules>,
+    sdir: &'a SessionDir,
+    allow_host_abstract: bool,
+    initial: &'a [(String, Mode)],
+    forwards: &'a [profile::Forward],
+    ssh_proxy_listener: Option<UnixListener>,
+    ssh: Option<&'a profile::SshConfig>,
+    session_id: &'a str,
+}
+
+struct SessionControl {
+    shared: Arc<Shared>,
+    listener: UnixListener,
+    handler: Arc<dyn Handler>,
+    ssh_agent_expose: &'static str,
+}
+
+fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
+    let ssh_agent_expose = "/run/ssh-agent.sock";
+    let mut ssh_proxy_listener = a.ssh_proxy_listener.take();
+    let listener = bind_socket(&a.sdir.socket_path())?;
     let shared = Arc::new(Shared {
-        uid,
-        init_pid: pid,
-        sandbox_pidns,
-        resolved_toml: policy.to_toml(),
-        risk: risk_entries.to_vec(),
-        rules,
+        uid: a.uid,
+        init_pid: a.pid,
+        sandbox_pidns: a.sandbox_pidns,
+        resolved_toml: a.policy.to_toml(),
+        risk: a.risk_entries.to_vec(),
+        rules: std::mem::take(&mut a.rules),
         table: Mutex::new(GrantTable::default()),
         held: Mutex::new(Default::default()),
-        helper: Mutex::new(helper),
-        audit,
+        helper: Mutex::new(a.helper.take().expect("helper moved into control")),
+        audit: a.audit.take().expect("audit moved into control"),
         op_lock: Mutex::new(()),
-        exec: exec_client,
-        exec_rules,
+        exec: a
+            .exec_client
+            .take()
+            .expect("exec client moved into control"),
+        exec_rules: a.exec_rules.take().expect("exec rules moved into control"),
         spawn_gate: RwLock::new(()),
         live: Mutex::new(Default::default()),
         next_exec_id: std::sync::atomic::AtomicU64::new(1),
@@ -2584,9 +2867,9 @@ fn run_session(
         conns: Mutex::new(ConnRegistry::default()),
         exec_info: Mutex::new(Default::default()),
         services: Mutex::new(Default::default()),
-        session_dir: sdir.path.clone(),
+        session_dir: a.sdir.path.clone(),
         session_json_lock: Mutex::new(()),
-        idle_timeout_s: policy.idle_timeout_s,
+        idle_timeout_s: a.policy.idle_timeout_s,
         members_lock: Mutex::new(Default::default()),
         lease_lock: Mutex::new(()),
         lease_last_touch: Mutex::new(None),
@@ -2598,7 +2881,7 @@ fn run_session(
     });
     // The only way to start `network = "host"` without abstract-socket
     // scoping is the explicit flag; it is audited (DESIGN §7, B1).
-    if allow_host_abstract && policy.network == Network::Host {
+    if a.allow_host_abstract && a.policy.network == Network::Host {
         shared.log(
             "session",
             "start",
@@ -2614,7 +2897,7 @@ fn run_session(
     // The initial grants go through the same code as dynamic ones, called
     // directly: the socket is bound (clients queue in its backlog) but only
     // accepts once the session is fully set up (DESIGN §14.7).
-    for (path, mode) in &initial {
+    for (path, mode) in a.initial {
         let internal = authz::ClientRecord::internal(shared.uid, shared.next_seq());
         let auth = authz::authorize(
             &internal,
@@ -2631,8 +2914,6 @@ fn run_session(
         .expect("internal startup grant is authorized as the owner");
         let r = shared.do_grant(&auth, &internal, path, *mode, false);
         if r["ok"] != true {
-            let _ = sys::kill(pid, libc::SIGKILL);
-            let _ = services::reap(pid);
             bail!(
                 "initial grant {path}: {}",
                 r["message"].as_str().unwrap_or("failed")
@@ -2640,10 +2921,8 @@ fn run_session(
         }
     }
     // Process [[forward]] entries (DESIGN §17): expose host sockets inside.
-    for f in forwards {
+    for f in a.forwards {
         if let Err(e) = shared.do_forward(&f.socket, &f.expose, &f.name) {
-            let _ = sys::kill(pid, libc::SIGKILL);
-            let _ = services::reap(pid);
             bail!("forward {}: {e}", f.name);
         }
     }
@@ -2652,30 +2931,46 @@ fn run_session(
     // threaded); the accept loop is spawned now (post-clone, multithreaded).
     if let Some(listener) = ssh_proxy_listener.take() {
         let host_auth_sock = std::env::var("SSH_AUTH_SOCK").unwrap_or_default();
-        let ssh_keys = ssh
+        let ssh_keys = a
+            .ssh
             .and_then(|c| if c.agent { Some(c.keys.clone()) } else { None })
             .unwrap_or_default();
         let _ssh_handle = crate::ssh_agent::spawn_accept_loop(
             listener,
             host_auth_sock,
             ssh_keys,
-            session_id.to_owned(),
+            a.session_id.to_owned(),
         );
-        let proxy_socket_path = sdir.path.join("ssh-agent.sock");
+        let proxy_socket_path = a.sdir.path.join("ssh-agent.sock");
         if let Err(e) = shared.do_forward_inner(
             proxy_socket_path.to_str().unwrap_or(""),
             ssh_agent_expose,
             "ssh-agent",
             true,
         ) {
-            let _ = sys::kill(pid, libc::SIGKILL);
-            let _ = services::reap(pid);
             bail!("ssh-agent forward: {e}");
         }
     }
-    // Process [[host_services]] entries (DESIGN §17): start host process,
-    // wait for readiness, then forward its socket. Fail closed on timeout.
-    let mut host_pids: Vec<(i32, profile::StopSpec)> = Vec::new();
+    Ok(SessionControl {
+        shared,
+        listener,
+        handler,
+        ssh_agent_expose,
+    })
+}
+
+/// Phase `services` (host part): start each `[[host_services]]` process,
+/// wait for readiness and forward its socket. Fail closed on any error;
+/// the caller-owned `guard` performs the kill+reap of already-started
+/// processes and init when this function returns an error (the guard's
+/// `Drop` runs on the `?` unwinding), and `host_pids` collects the
+/// `(pid, stop spec)` pairs the teardown phase needs.
+fn start_host_services(
+    host_services: &[profile::HostService],
+    shared: &Arc<Shared>,
+    guard: &mut SessionGuard,
+    host_pids: &mut Vec<(i32, profile::StopSpec)>,
+) -> Result<()> {
     for h in host_services {
         let stop_spec = h.stop.clone().unwrap_or(profile::StopSpec {
             signal: "TERM".into(),
@@ -2683,79 +2978,67 @@ fn run_session(
         });
         match services::start_host_service(h) {
             Ok(host_pid) => {
+                // Register with the guard before the fallible steps, so an
+                // error here still kills this process (before init, as
+                // before).
+                guard.host_pids.push(host_pid);
                 // Wait for readiness.
                 let timeout_secs = h.ready.as_ref().and_then(|r| r.timeout).unwrap_or(15);
                 if let Err(e) = services::wait_readiness(h, timeout_secs) {
-                    // Fail closed: kill the host process.
-                    let _ = sys::kill(host_pid, libc::SIGKILL);
-                    let _ = services::reap(host_pid);
-                    let _ = sys::kill(pid, libc::SIGKILL);
-                    let _ = services::reap(pid);
                     bail!("host_service {}: readiness: {e}", h.name);
                 }
                 // Forward the socket.
                 if let Err(e) = shared.do_forward(&h.socket, &h.expose, &h.name) {
-                    let _ = sys::kill(host_pid, libc::SIGKILL);
-                    let _ = services::reap(host_pid);
-                    let _ = sys::kill(pid, libc::SIGKILL);
-                    let _ = services::reap(pid);
                     bail!("host_service {}: forward: {e}", h.name);
                 }
                 host_pids.push((host_pid, stop_spec));
             }
             Err(e) => {
-                let _ = sys::kill(pid, libc::SIGKILL);
-                let _ = services::reap(pid);
                 bail!("host_service {}: {e}", h.name);
             }
         }
     }
-    // Process [[services]] entries (DESIGN §19): start in-sandbox services
-    // through the exec helper chain, before START. The services are siblings
-    // of the main command, confined identically. Readiness is checked with a
-    // timeout; on timeout the session fails closed.
+    Ok(())
+}
+
+/// Phase `services` (in-sandbox part): start each `[[services]]` entry
+/// through the exec helper chain. Readiness is checked with a timeout;
+/// on timeout the session fails closed (the guard kills init).
+fn start_in_sandbox_services(
+    services_: &[profile::Service],
+    shared: &Arc<Shared>,
+    exec_rules_for_services: &ExecRules,
+) -> Result<Vec<ServiceHandle>> {
     let mut service_handles: Vec<ServiceHandle> = Vec::new();
-    for s in services {
-        match services::start_in_sandbox_service(&shared, s, &exec_rules_for_services) {
+    for s in services_ {
+        match services::start_in_sandbox_service(shared, s, exec_rules_for_services) {
             Ok(handle) => {
                 // Wait for readiness.
                 let timeout_secs = s.ready.as_ref().and_then(|r| r.timeout).unwrap_or(15);
                 if let Err(e) = services::wait_service_readiness(s, timeout_secs) {
-                    // Fail closed: kill the service and the session.
-                    let _ = sys::kill(pid, libc::SIGKILL);
-                    let _ = services::reap(pid);
                     bail!("service {}: readiness: {e}", s.name);
                 }
                 service_handles.push(handle);
             }
             Err(e) => {
-                let _ = sys::kill(pid, libc::SIGKILL);
-                let _ = services::reap(pid);
                 bail!("service {}: {e}", s.name);
             }
         }
     }
-    sys::send_with_fd(sup_end.as_raw_fd(), &[MSG_START], None)?;
-    thread::spawn(move || {
-        // Process-directed signals (SIGCHLD, SIGTERM, ...) must be handled by
-        // the main thread, which waits for them in `sigsuspend`. A thread that
-        // leaves them unblocked can be picked by the kernel as the recipient:
-        // the handler then runs here and the main thread is never woken.
-        // Threads spawned by `serve` inherit this mask.
-        let _ = sig::block(&[
-            libc::SIGTERM,
-            libc::SIGINT,
-            libc::SIGHUP,
-            libc::SIGWINCH,
-            libc::SIGCHLD,
-        ]);
-        control::serve(listener, handler)
-    });
+    Ok(service_handles)
+}
 
-    // --ready-fd: write "ready\n" to the caller's fd after the session is
-    // live (START sent, initial grants applied, control thread started).
-    // On start failure the early `bail!` paths above return before reaching
-    // here, so nothing is written and the exit status carries it.
+/// Ready reporting after START: the `--ready-fd` line, then the detach
+/// ready line + stdio redirect. On a start failure none of this runs
+/// (the early `bail!` paths return first), so nothing is written and the
+/// exit status carries it.
+fn report_ready(
+    args: &RunArgs,
+    ready_fd: Option<OwnedFd>,
+    sdir: &SessionDir,
+    session_id: &str,
+    _ssh_agent_expose: &str,
+) {
     if let Some(fd) = args.ready_fd {
         // SAFETY: the fd is the caller's; we write to it and do not close it
         // (the caller owns the lifecycle). Using a borrowed fd, not owned.
@@ -2784,45 +3067,42 @@ fn run_session(
         // Close the ready pipe write end so the parent's read sees EOF.
         drop(fd);
     }
+}
 
-    // ---- 7. relay + wait
-    // 0.4.0 F2 fix: idle timer. When idle_timeout is set, a background thread
-    // wakes every min(idle_timeout/4, 30 s) and checks:
-    //   idle = zero connected control clients ∧ no exec running ∧
-    //   now − last_activity > idle_timeout.
-    // If idle, it runs the full stop path (state Stopping → SIGTERM → wait
-    // for exit → state Stopped, dir kept) and audits lease/expired with
-    // client null / reason idle. This is the same path `hisn stop` uses.
-    let idle_timer = if let Some(timeout_s) = policy.idle_timeout_s {
-        let sh = Arc::clone(&shared);
-        // Opened here, on the supervisor thread, while init cannot have been
-        // reaped yet (only relay_and_wait below reaps it).
-        let target = InitTarget::new(pid);
-        Some(thread::spawn(move || {
-            let write_state = |state: crate::sessionmeta::State| {
-                let _lock = sh.session_json_lock.lock().expect("session_json lock");
-                crate::sessionmeta::set_state(&sh.session_dir, state)
-            };
-            crate::lifecycle::run_idle_timer(
-                &*sh,
-                &target,
-                &crate::lifecycle::SystemClock,
-                timeout_s,
-                crate::lifecycle::StopPlan::SUPERVISOR,
-                &write_state,
-            )
-        }))
-    } else {
-        None
-    };
-    let code = relay_and_wait(pid, master, tty);
-    // The idle timer thread exits when init is gone (by itself or because the
-    // timer stopped it); its result says whether this was an idle expiry.
-    let idle_expired_after = idle_timer.and_then(|t| t.join().ok().flatten());
+/// Phase `wait` (idle timer part): spawn the idle-expiry timer thread when
+/// `idle_timeout` is set. Returns the handle, or `None`.
+fn start_idle_timer(
+    policy: &ResolvedPolicy,
+    shared: &Arc<Shared>,
+    pid: i32,
+) -> Option<thread::JoinHandle<Option<u64>>> {
+    let timeout_s = policy.idle_timeout_s?;
+    let sh = Arc::clone(shared);
+    // Opened here, on the supervisor thread, while init cannot have been
+    // reaped yet (only relay_and_wait below reaps it).
+    let target = InitTarget::new(pid);
+    Some(thread::spawn(move || {
+        let write_state = |state: crate::sessionmeta::State| {
+            let _lock = sh.session_json_lock.lock().expect("session_json lock");
+            crate::sessionmeta::set_state(&sh.session_dir, state)
+        };
+        crate::lifecycle::run_idle_timer(
+            &*sh,
+            &target,
+            &crate::lifecycle::SystemClock,
+            timeout_s,
+            crate::lifecycle::StopPlan::SUPERVISOR,
+            &write_state,
+        )
+    }))
+}
 
+/// Phase `teardown`: stop host services (signal + grace then KILL) and
+/// in-sandbox services (best-effort signal + grace), in that order.
+fn teardown_services(host_pids: &[(i32, profile::StopSpec)], service_handles: &[ServiceHandle]) {
     // Stop host services (DESIGN §17): signal + grace then KILL.
     // Check if the process is already gone before sleeping the full grace (P27).
-    for (hpid, stop_spec) in &host_pids {
+    for (hpid, stop_spec) in host_pids {
         let sig = control::parse_signal(&stop_spec.signal).unwrap_or(libc::SIGTERM);
         let _ = sys::kill(*hpid, sig);
         // Wait for grace period, but only while the process is alive.
@@ -2864,7 +3144,7 @@ fn run_session(
     // If init has already exited, the kernel has killed everything in the pid
     // ns; the stop is moot but harmless. Check if the service is still alive
     // before sleeping the full grace period (P27).
-    for handle in &service_handles {
+    for handle in service_handles {
         let sig = control::parse_signal(&handle.stop.signal).unwrap_or(libc::SIGTERM);
         // The service's pid is in the sandbox pid ns; signal it via the status
         // socket (same as exec signal).
@@ -2899,15 +3179,6 @@ fn run_session(
             exec::format_kill(libc::SIGKILL).as_bytes(),
         );
     }
-
-    // Let in-flight responses (e.g. a hard revoke that ended the session) go out.
-    control::drain(std::time::Duration::from_secs(2));
-    // Cleanup order (DESIGN §10): close ns / mount fds first, then the dir.
-    drop(shared);
-    Ok(SessionEnd {
-        code,
-        idle_expired_after,
-    })
 }
 
 fn write_s_maps_and_unshare(uid: u32, gid: u32) -> Result<()> {
@@ -3623,5 +3894,138 @@ mod tests {
             vec![("/x".to_owned(), Mode::Rw), ("/y".to_owned(), Mode::Ro)]
         );
         assert!(p.roots.iter().any(|r| r.ends_with("hisn-1000")));
+    }
+
+    /// Test fake for [`SessionGuard`]: the kill/reap actions are injected
+    /// as a closure so the guard's ordering and disarm semantics are
+    /// testable without real processes. Production uses the kill+reap
+    /// `Drop` impl; the tests below pin its contract through this seam.
+    struct FakeGuard {
+        init_pid: i32,
+        host_pids: Vec<i32>,
+        armed: bool,
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl FakeGuard {
+        fn new(init_pid: i32, log: std::rc::Rc<std::cell::RefCell<Vec<String>>>) -> Self {
+            Self {
+                init_pid,
+                host_pids: Vec::new(),
+                armed: true,
+                log,
+            }
+        }
+
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+
+        fn cleanup(&self) {
+            if !self.armed {
+                return;
+            }
+            for pid in &self.host_pids {
+                self.log.borrow_mut().push(format!("kill host {pid}"));
+                self.log.borrow_mut().push(format!("reap host {pid}"));
+            }
+            self.log
+                .borrow_mut()
+                .push(format!("kill init {}", self.init_pid));
+            self.log
+                .borrow_mut()
+                .push(format!("reap init {}", self.init_pid));
+        }
+    }
+
+    impl Drop for FakeGuard {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
+    fn early_return(guard: FakeGuard) -> Result<()> {
+        let _held = guard;
+        bail!("simulated early return")
+    }
+
+    #[test]
+    fn guard_cleanup_runs_once_on_early_return() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut guard = FakeGuard::new(100, log.clone());
+        guard.host_pids.push(101);
+        // The guard is consumed by an early return: Drop must run cleanup.
+        assert!(early_return(guard).is_err());
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "kill host 101",
+                "reap host 101",
+                "kill init 100",
+                "reap init 100",
+            ],
+            "cleanup runs once on early return, host services before init"
+        );
+    }
+
+    #[test]
+    fn guard_cleanup_never_runs_after_disarm() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut guard = FakeGuard::new(100, log.clone());
+        guard.host_pids.push(101);
+        guard.disarm();
+        // Success path: the guard is dropped disarmed; no cleanup at all.
+        drop(guard);
+        assert!(
+            log.borrow().is_empty(),
+            "disarmed guard must not clean up: {:?}",
+            log.borrow()
+        );
+    }
+
+    #[test]
+    fn guard_cleanup_order_is_host_services_before_init() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut guard = FakeGuard::new(100, log.clone());
+        guard.host_pids.push(201);
+        guard.host_pids.push(202);
+        drop(guard);
+        let entries = log.borrow().clone();
+        let host_pos = entries
+            .iter()
+            .position(|e| e == "kill host 201")
+            .expect("host kill recorded");
+        let init_pos = entries
+            .iter()
+            .position(|e| e == "kill init 100")
+            .expect("init kill recorded");
+        assert!(
+            host_pos < init_pos,
+            "host services killed before init: {entries:?}"
+        );
+        // Every kill is followed by its reap, in the same order.
+        assert_eq!(
+            entries,
+            vec![
+                "kill host 201",
+                "reap host 201",
+                "kill host 202",
+                "reap host 202",
+                "kill init 100",
+                "reap init 100",
+            ]
+        );
+    }
+
+    #[test]
+    fn production_guard_drop_never_panics_even_for_unknown_pids() {
+        // The production guard's Drop must never panic (fork-safety rule 6):
+        // killing and reaping pids that do not exist is a no-op error, not
+        // a panic. This exercises the real Drop impl with a pid the kernel
+        // will reject (a very large pid in this process's namespace).
+        let mut guard = super::SessionGuard::new(i32::MAX);
+        guard.host_pids.push(i32::MAX - 1);
+        std::panic::catch_unwind(move || drop(guard))
+            .expect("guard Drop must not panic for unknown pids");
     }
 }

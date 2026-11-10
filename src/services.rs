@@ -166,7 +166,12 @@ pub fn wait_service_readiness(s: &profile::Service, timeout_secs: u64) -> Result
 
 /// Start a `[[host_services]]` process on the host (in the supervisor's
 /// userns S). The process runs with the user's credentials, the host PATH,
-/// and `PR_SET_PDEATHSIG=SIGKILL`. Returns the pid.
+/// and `PR_SET_PDEATHSIG=SIGKILL`, in its own process group (so a stop
+/// kills the whole group: the service and any child it spawns).
+///
+/// Because the service is then outside the terminal's foreground group, its
+/// stdin is `/dev/null` (a terminal read would raise SIGTTIN; the service
+/// must never block on the supervisor's terminal). Returns the pid.
 pub fn start_host_service(h: &profile::HostService) -> Result<i32> {
     // Build every CString and pointer vector before fork: between fork and
     // exec there must be no allocation, no unwrap, and no panic path (the
@@ -197,14 +202,28 @@ pub fn start_host_service(h: &profile::HostService) -> Result<i32> {
         return Err(io::Error::last_os_error()).context("fork host service");
     }
     if pid == 0 {
-        // Child: set PDEATHSIG so it dies with the supervisor. It stays in
-        // the supervisor's process group, as before: nothing kills the
-        // host-service group on stop (open point: kill the whole
-        // host-service process group on stop, for the later services.rs
-        // refactor), and terminal signals must still reach it the old way.
-        // SAFETY: prctl with valid scalar arguments.
+        // Child: set PDEATHSIG so it dies with the supervisor, and become a
+        // process-group leader so the stop path can kill the whole group.
+        // Its stdin is /dev/null: outside the terminal's foreground group,
+        // a stdin read from the terminal would raise SIGTTIN.
+        // SAFETY: prctl with valid scalar arguments; setpgid(0,0) is the
+        // child joining its own new group.
         unsafe {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+            libc::setpgid(0, 0);
+        }
+        // stdin/stdout/stderr from /dev/null (stdout/stderr so a chatty
+        // service cannot corrupt the supervisor's terminal either).
+        unsafe {
+            let fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+            if fd >= 0 {
+                libc::dup2(fd, 0);
+                libc::dup2(fd, 1);
+                libc::dup2(fd, 2);
+                if fd > 2 {
+                    libc::close(fd);
+                }
+            }
         }
         // Close all fds > 2 (don't leak supervisor fds into the host process).
         unsafe {
@@ -226,8 +245,52 @@ pub fn start_host_service(h: &profile::HostService) -> Result<i32> {
         // SAFETY: _exit on exec failure.
         unsafe { libc::_exit(127) };
     }
+    // The child also sets its own group; do the same from the parent (the
+    // usual both-sides pattern, as the readiness probe does) so `killpg`
+    // cannot miss the group if the child was slow to run its setpgid.
+    // SAFETY: setpgid on our own child.
+    unsafe {
+        libc::setpgid(pid, pid);
+    }
     tracing::info!("host_service: {} started pid {pid}", h.name);
     Ok(pid)
+}
+
+/// The readiness poll loop for host services. Returns the first readiness
+/// result; [`wait_readiness`] is the deadline-bounded wrapper.
+///
+/// Accepting `probe` as a closure (which eventually checks the service
+/// pid) lets the dead-service failure be unit-tested with a fake probe.
+fn wait_readiness_poll(check: impl Fn() -> bool, deadline: std::time::Instant) -> bool {
+    sys::wait_until(
+        deadline.saturating_duration_since(std::time::Instant::now()),
+        std::time::Duration::from_millis(1),
+        std::time::Duration::from_millis(20),
+        check,
+    )
+}
+/// One readiness probe evaluation, with the host-service pid checked
+/// against it: if the service process has already exited, startup fails
+/// at once (the probe result is meaningless — a dead service is never
+/// "ready", even if `ready.command` would pass).
+///
+/// `pid` is the host-service child's pid. The exit status is obtained by
+/// a non-blocking `waitpid`: a reaped pid is never signalled again.
+/// Returns `Ok(true)` while the service is still running, and `Err` with
+/// the exit status when it is already dead.
+pub fn check_service_alive(pid: i32) -> std::result::Result<bool, i32> {
+    let mut st = 0;
+    // SAFETY: non-blocking waitpid on our own child.
+    let r = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
+    if r == pid {
+        return Err(crate::init::decode_status(st));
+    }
+    if r == 0 {
+        return Ok(true);
+    }
+    // Any other waitpid error (ECHILD etc.) means the child is gone:
+    // already reaped elsewhere, so the status is unknown (0).
+    Err(0)
 }
 
 /// Wait for a host service to become ready (DESIGN §17).
@@ -235,6 +298,18 @@ pub fn start_host_service(h: &profile::HostService) -> Result<i32> {
 /// deadline `timeout_secs` from now, passing the time remaining to each
 /// probe. On timeout returns Err (fail closed).
 pub fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()> {
+    wait_readiness_pid(h, timeout_secs, None)
+}
+
+/// Wait for a host service to become ready, knowing its pid. When `pid` is
+/// `Some`, the pid is checked on every readiness iteration: if the service
+/// has already exited, startup fails at once naming the service and its
+/// exit status (Part 2.2), even if `ready.command` would pass.
+pub fn wait_readiness_pid(
+    h: &profile::HostService,
+    timeout_secs: u64,
+    pid: Option<i32>,
+) -> Result<()> {
     let ready = match &h.ready {
         Some(r) => r,
         None => {
@@ -253,19 +328,41 @@ pub fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()>
     let deadline = profile::checked_deadline(timeout_secs, "host service readiness timeout")?;
     // 0.4.1 step 2: event wait instead of a fixed 100 ms poll. Each probe
     // gets only the time remaining until the overall deadline, so a slow
-    // probe can run up to `timeout` and a hung one is killed on time.
+    // probe can run up to `timeout` and a hung one is killed on time. The
+    // service pid is checked inside the probe: a service that has already
+    // exited fails startup at once, even if the probe would pass. The
+    // exit status is carried out of the poll through a `Cell` (the poll
+    // takes `Fn`, and `check_service_alive` reaps on first detection, so
+    // the status can only be read once).
+    let dead_status = std::cell::Cell::new(None);
     let ready_fn = || {
+        if let Some(p) = pid
+            && dead_status.get().is_none()
+            && let Err(status) = check_service_alive(p)
+        {
+            dead_status.set(Some(status));
+            return true; // dead marker: stop the poll now
+        }
+        if dead_status.get().is_some() {
+            return true;
+        }
         check_readiness(
             ready,
             deadline.saturating_duration_since(std::time::Instant::now()),
         )
     };
-    if sys::wait_until(
-        deadline.saturating_duration_since(std::time::Instant::now()),
-        std::time::Duration::from_millis(1),
-        std::time::Duration::from_millis(20),
-        ready_fn,
-    ) {
+    // The event wait stops at the first `true`. For a live service that
+    // is the probe passing; for a dead one it is the dead marker: the
+    // closure returns true once `dead_status` is set, so the poll exits
+    // immediately instead of running to the deadline.
+    let polled = wait_readiness_poll(ready_fn, deadline);
+    if let Some(status) = dead_status.get() {
+        return Err(anyhow!(
+            "host_service {}: exited with status {status} before readiness completed",
+            h.name
+        ));
+    }
+    if polled {
         Ok(())
     } else {
         Err(anyhow!(
@@ -449,7 +546,16 @@ pub struct HostServiceTarget {
 
 impl Stoppable for HostServiceTarget {
     fn signal(&self, sig: i32) {
-        let _ = sys::kill(self.pid, sig);
+        // TERM and KILL go to the whole process group (the service leader
+        // setpgid'd itself to its pid), so children the service spawned die
+        // with it. `killpg` can miss if the group was never made or is
+        // already gone; the direct `kill` guarantees the leader itself is
+        // signalled. On the final SIGKILL the leader is blocked-reaped.
+        // SAFETY: killpg/kill on our own child and its group.
+        unsafe {
+            libc::killpg(self.pid, sig);
+            libc::kill(self.pid, sig);
+        }
         if sig == libc::SIGKILL {
             let _ = reap(self.pid);
         }
@@ -571,6 +677,117 @@ mod tests {
         assert!(
             start.elapsed() >= std::time::Duration::from_secs(1),
             "the 1 s probe must actually have run"
+        );
+    }
+
+    #[test]
+    fn host_service_process_group_kills_spawned_children() {
+        // A host service that spawns a child: stopping it must kill the
+        // whole group, so neither process survives. The child records its
+        // pid to a file; after stop_and_reap both must be gone (kill -0
+        // fails) — and a zombie of the leader must not linger.
+        use super::HostServiceTarget;
+        use super::stop_and_reap;
+        let dir = tempfile::tempdir().unwrap();
+        let child_pid_file = dir.path().join("child.pid");
+        std::fs::write(
+            dir.path().join("svc.sh"),
+            format!(
+                "#!/bin/sh\nsleep 300 &\necho $! > {}\nwait\n",
+                child_pid_file.display()
+            ),
+        )
+        .unwrap();
+        let h = profile::HostService {
+            name: "group-test".into(),
+            exec: vec![
+                "/bin/sh".into(),
+                dir.path().join("svc.sh").to_string_lossy().into_owned(),
+            ],
+            socket: dir
+                .path()
+                .join("unused.sock")
+                .to_string_lossy()
+                .into_owned(),
+            expose: "/unused".into(),
+            risk: None,
+            risk_ack: Some("host-exec".into()),
+            ready: None,
+            stop: None,
+        };
+        let pid = super::start_host_service(&h).unwrap();
+        // Wait for the child pid file (bounded).
+        let start = std::time::Instant::now();
+        let child_pid: i32 = loop {
+            if let Ok(s) = std::fs::read_to_string(&child_pid_file)
+                && let Ok(p) = s.trim().parse::<i32>()
+            {
+                break p;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "child pid file never appeared"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        // Stop the leader (TERM, grace 0 → immediate KILL of the group).
+        stop_and_reap(&HostServiceTarget { pid }, libc::SIGTERM, 0);
+        // Neither the leader nor the spawned child may survive.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let gone = |p: i32| unsafe { libc::kill(p, 0) != 0 };
+        while !(gone(pid) && gone(child_pid)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "group members survived stop: leader {pid}, child {child_pid}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(gone(pid), "leader survived group stop");
+        assert!(gone(child_pid), "spawned child survived group stop");
+    }
+
+    #[test]
+    fn readiness_fails_at_once_when_the_host_service_is_already_dead() {
+        // A host service that exits 7 at once, with a ready.command that
+        // would pass, must fail readiness immediately — naming the service
+        // and its exit status — not time out.
+        //
+        // The pid is NOT pre-reaped by the test: `wait_readiness_pid` must
+        // itself detect the already-exited child (a non-blocking waitpid
+        // inside the poll), because in production the supervisor has not
+        // reaped it either. A pre-reap here would consume the status and
+        // the poll would see ECHILD (status 0), never the real 7.
+        let h = profile::HostService {
+            name: "dead-svc".into(),
+            exec: vec!["sh".into(), "-c".into(), "exit 7".into()],
+            socket: "/nonexistent.sock".into(),
+            expose: "/nonexistent".into(),
+            risk: None,
+            risk_ack: Some("host-exec".into()),
+            ready: Some(profile::ReadinessSpec {
+                socket: None,
+                tcp: None,
+                command: Some(vec!["true".into()]),
+                timeout: Some(30),
+            }),
+            stop: None,
+        };
+        let pid = super::start_host_service(&h).unwrap();
+        // Give the child a moment to exit so the pid check sees a zombie,
+        // not a race against its own start.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        let err = super::wait_readiness_pid(&h, 30, Some(pid))
+            .expect_err("dead service must fail readiness");
+        let msg = err.to_string();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "dead service must fail at once, took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            msg.contains("dead-svc") && msg.contains('7'),
+            "message must name the service and its exit status: {msg}"
         );
     }
 

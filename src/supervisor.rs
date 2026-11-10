@@ -3070,9 +3070,9 @@ fn start_host_services(
                 // error here still kills this process (before init, as
                 // before).
                 guard.host_pids.push(host_pid);
-                // Wait for readiness.
+                // Wait for readiness (fails at once if the service dies).
                 let timeout_secs = h.ready.as_ref().and_then(|r| r.timeout).unwrap_or(15);
-                if let Err(e) = services::wait_readiness(h, timeout_secs) {
+                if let Err(e) = services::wait_readiness_pid(h, timeout_secs, Some(host_pid)) {
                     bail!("host_service {}: readiness: {e}", h.name);
                 }
                 // Forward the socket.

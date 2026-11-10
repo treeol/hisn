@@ -25,7 +25,7 @@ fail() { printf 'release-gate: FAIL %s: %s\n' "$1" "$2" >&2; exit 1; }
 run_leak_pipe() {
   step 4 "leak suite through a pipe"
   set -o pipefail
-  make leaktest 2>&1
+  make leaktest 2>&1 | cat
   local rc=$?
   set +o pipefail
   [ "$rc" -eq 0 ] || fail "leak-suite-pipe" "make leaktest exited $rc"
@@ -41,8 +41,10 @@ run_leak_pty() {
     set +o pipefail
     [ "$rc" -eq 0 ] || fail "leak-suite-pty" "make leaktest under script exited $rc"
     ok "leak-suite-pty"
+    LEAK_PTY=ok
   else
-    printf 'release-gate: SKIP leak-suite-pty: `script` (util-linux) not present on this host; the pseudo-terminal run was skipped and why\n'
+    printf 'release-gate: SKIP leak-suite-pty: `script` (util-linux) not present on this host, so the pseudo-terminal run was skipped\n'
+    LEAK_PTY=skipped-no-script
   fi
 }
 
@@ -68,4 +70,4 @@ ok "make-test"
 run_leak_pipe
 run_leak_pty
 
-printf 'release-gate: summary fmt=ok clippy=ok make-test=ok leak-suite-pipe=ok leak-suite-pty=ok\n'
+printf 'release-gate: summary fmt=ok clippy=ok make-test=ok leak-suite-pipe=ok leak-suite-pty=%s\n' "${LEAK_PTY:-skipped}"

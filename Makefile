@@ -48,7 +48,7 @@ leaktest-log: build
 
 # Release gate (scripts/release-gate.sh): fmt, clippy, make test, then the
 # leak suite through a pipe and on a pseudo-terminal. Stops at the first
-# failure; prints one summary line per step plus the leak RESULT lines.
+# failure; prints one summary line per step.
 # HISN_TEST_ROOTFS / HISN_BIG_TESTS are passed through when set.
 release-gate:
 	bash scripts/release-gate.sh

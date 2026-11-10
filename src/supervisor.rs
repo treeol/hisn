@@ -236,11 +236,14 @@ struct ExecInfo {
 
 /// One live exec, held in [`ExecTable`]: the `ls --json` info, the pid, and
 /// the two dup'd status-fd handles (one for `signal` by `exec_id`, one for
-/// `signal` by pid — the same dup the old `execs`/`live` pair made).
+/// `signal` by pid — the same dup the old `execs`/`live` pair made). The
+/// handles are `None` when a status dup failed at registration (EMFILE):
+/// the exec is still listed, but not signal-able (the old `if let Ok(dup)`
+/// skip, without a panic).
 struct ExecEntry {
     info: ExecInfo,
-    status_by_id: OwnedFd,
-    status_by_pid: OwnedFd,
+    status_by_id: Option<OwnedFd>,
+    status_by_pid: Option<OwnedFd>,
 }
 
 /// All live execs of a session, keyed by `exec_id`, plus the pid-reuse
@@ -259,13 +262,27 @@ struct ExecTable {
 }
 
 impl ExecTable {
-    fn insert(&mut self, exec_id: u64, entry: ExecEntry) {
-        let pid = entry.info.pid;
+    fn insert_info(&mut self, exec_id: u64, info: ExecInfo) {
+        let pid = info.pid;
         if self.used_pids.contains(&pid) {
             self.recycled_pids.insert(pid);
         }
         self.used_pids.insert(pid);
-        self.live.insert(exec_id, entry);
+        self.live.insert(
+            exec_id,
+            ExecEntry {
+                info,
+                status_by_id: None,
+                status_by_pid: None,
+            },
+        );
+    }
+
+    fn set_status(&mut self, exec_id: u64, by_id: OwnedFd, by_pid: OwnedFd) {
+        if let Some(e) = self.live.get_mut(&exec_id) {
+            e.status_by_id = Some(by_id);
+            e.status_by_pid = Some(by_pid);
+        }
     }
 
     fn remove(&mut self, exec_id: u64) {
@@ -277,7 +294,9 @@ impl ExecTable {
     }
 
     fn by_id(&self, exec_id: u64) -> Option<&OwnedFd> {
-        self.live.get(&exec_id).map(|e| &e.status_by_id)
+        self.live
+            .get(&exec_id)
+            .and_then(|e| e.status_by_id.as_ref())
     }
 
     /// Signal-by-pid lookup: `None` if the pid is recycled (reject with the
@@ -289,7 +308,7 @@ impl ExecTable {
         self.live
             .values()
             .find(|e| e.info.pid == pid)
-            .map(|e| &e.status_by_pid)
+            .and_then(|e| e.status_by_pid.as_ref())
     }
 
     fn is_recycled(&self, pid: i32) -> bool {
@@ -1006,30 +1025,37 @@ impl Shared {
         // Register for `signal` before the client learns the pid. One
         // admission inserts one table entry (info + both status dups +
         // pid-recycling); the idle check therefore sees the exec atomically.
+        // No panic path: if a status dup fails (EMFILE), the exec is still
+        // listed in `ls --json` (info inserted unconditionally, as the old
+        // `exec_info` insert was) but is not signal-able — exactly the old
+        // `if let Ok(dup)` skip for the `execs` map, never a panic inside
+        // the `admit`/`lease_lock` closure (a panic there would poison the
+        // lock for every later admit and idle check).
         // 0.4.1 step 7: registration is admission — it takes the lease lock
         // so an idle check in flight cannot miss this exec and stop the
         // session.
         let registered = self.admit(|| {
-            sys::dup_cloexec_min(sp.status.as_raw_fd(), 3)
-                .ok()
-                .map(|by_pid| {
-                    let by_id = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3)
-                        .expect("dup status fd for exec table");
-                    self.exec_table.lock().expect("exec_table").insert(
-                        exec_id,
-                        ExecEntry {
-                            info: ExecInfo {
-                                pid: sp.pid,
-                                argv0: argv0.clone(),
-                                tty: req.tty,
-                                attach: req.attach,
-                            },
-                            status_by_id: by_id,
-                            status_by_pid: by_pid,
-                        },
-                    );
-                    sp.pid
-                })
+            let by_pid = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3).ok();
+            let by_id = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3).ok();
+            let mut table = self.exec_table.lock().expect("exec_table");
+            // The info is always recorded (the old `exec_info` insert was
+            // unconditional); the signal handles are only present when
+            // both dups succeeded.
+            table.insert_info(
+                exec_id,
+                ExecInfo {
+                    pid: sp.pid,
+                    argv0: argv0.clone(),
+                    tty: req.tty,
+                    attach: req.attach,
+                },
+            );
+            if let (Some(by_pid), Some(by_id)) = (by_pid, by_id) {
+                table.set_status(exec_id, by_id, by_pid);
+                Some(sp.pid)
+            } else {
+                None
+            }
         });
         let mut w = conn;
         let started = writeln!(
@@ -2511,19 +2537,22 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     let ns = start_namespaces(uid, gid, cfg, verbose, sdir)?;
     let pid = ns.pid;
     let mut guard = SessionGuard::new(pid);
-    let sup_end_ref = ns.sup_end.as_raw_fd();
 
     // Phase: helpers (grant helper + exec helper, still single-threaded).
+    // The namespace fds are dropped right after the helpers are forked
+    // (the helpers hold their own dups): the supervisor must not pin the
+    // namespaces — and hold 7–8 extra fds — for the session's lifetime.
     let (helper, exec_client) =
         start_helpers(&ns, exec_policy, exec_ll, exec_require_scope, exec_seccomp)?;
     let master = ns.master;
     let sup_end = ns.sup_end;
+    let sandbox_pidns = ns.sandbox_pidns;
 
     // Phase: control (shared state, listener, initial grants, forwards, SSH).
     let control = start_control(&mut SessionControlArgs {
         uid,
         pid,
-        sandbox_pidns: ns.sandbox_pidns,
+        sandbox_pidns,
         policy: &policy,
         risk_entries,
         rules,
@@ -2549,7 +2578,6 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     start_host_services(host_services, &shared, &mut guard, &mut host_pids)?;
     let service_handles = start_in_sandbox_services(services, &shared, &exec_rules_for_services)?;
 
-    let _ = sup_end_ref;
     // START + control thread + ready reporting.
     sys::send_with_fd(sup_end.as_raw_fd(), &[MSG_START], None)?;
     thread::spawn(move || {

@@ -98,17 +98,31 @@ impl Profile {
     /// shared form used by `[[forward]]`, `[[host_services]]` and `[docker]`
     /// (0.4.3: the three copies of this match block became one helper).
     ///
-    /// `subject` is the `[[forward]] <name>` / `[[host_services]] <name>` /
-    /// `[docker]` prefix the error messages name. The messages are
-    /// byte-identical to the former copies.
-    fn check_risk_ack(subject: &str, label: RiskLabel, ack: &Option<String>) -> Result<()> {
+    /// `subject` is the subject prefix the error messages name, without the
+    /// following colon: `[[forward]] <name>`, `[[host_services]] <name>`, or
+    /// `[docker]`. The messages are byte-identical to the former copies:
+    /// the `[docker]` mismatch was `[docker] risk_ack = ...` (colon-less,
+    /// extra space), so it passes `is_docker=true`; the `[[forward]]`
+    /// required message named the socket, so it passes `name=Some(socket)`.
+    fn check_risk_ack(
+        subject: &str,
+        name: Option<&str>,
+        label: RiskLabel,
+        ack: &Option<String>,
+    ) -> Result<()> {
         match ack {
-            None => bail!(
-                "E_RISK_ACK_REQUIRED: {subject}: requires risk_ack = \"{}\"",
-                label.kebab()
-            ),
+            None => match name {
+                Some(n) => bail!(
+                    "E_RISK_ACK_REQUIRED: {subject}: {n} requires risk_ack = \"{}\"",
+                    label.kebab()
+                ),
+                None => bail!(
+                    "E_RISK_ACK_REQUIRED: {subject}: requires risk_ack = \"{}\"",
+                    label.kebab()
+                ),
+            },
             Some(a) if a != label.kebab() => bail!(
-                "E_RISK_ACK_MISMATCH: {subject}: risk_ack = {a:?} but the computed label is {:?}",
+                "E_RISK_ACK_MISMATCH: {subject} risk_ack = {a:?} but the computed label is {:?}",
                 label.kebab()
             ),
             _ => {}
@@ -201,7 +215,12 @@ impl Profile {
                 );
             }
             if label.requires_ack() {
-                Self::check_risk_ack(&format!("[[forward]] {}", f.name), label, &f.risk_ack)?;
+                Self::check_risk_ack(
+                    &format!("[[forward]] {}", f.name),
+                    Some(&f.socket),
+                    label,
+                    &f.risk_ack,
+                )?;
             }
         }
         for h in &self.host_services {
@@ -251,6 +270,7 @@ impl Profile {
             // ack must match it (None is an error, not "no ack needed").
             Self::check_risk_ack(
                 &format!("[[host_services]] {}", h.name),
+                None,
                 effective,
                 &h.risk_ack,
             )?;
@@ -307,7 +327,11 @@ impl Profile {
                         label.kebab()
                     );
                 }
-                Self::check_risk_ack("[docker]", label, &d.risk_ack)?;
+                // The required message keeps its colon-less form via the
+                // helper's None path is NOT what we want: see helper docs —
+                // the colon-less `[docker]` text is produced by the explicit
+                // None bail above; the helper handles the mismatch here.
+                Self::check_risk_ack("[docker]", None, label, &d.risk_ack)?;
             }
         }
         Ok(())

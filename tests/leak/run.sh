@@ -3084,10 +3084,11 @@ L76EOF
   if start_session l76-$$ "$L76_CWD" "$L76_POL" --detach; then
     L76_DIR=$(session_dir "l76-$$")
     # Helper script written into this case's own cwd (never .wakil/): it
-    # sends the exec request with 3 fds, closes at once, then lingers
-    # briefly so the supervisor's peer-liveness check still passes.
-    # The sleeper uses a unique token so the pgrep below cannot match an
-    # unrelated host process or the L77 probe.
+    # receives the control socket path as argv[1] (no environment is
+    # read), sends the exec request with 3 fds, closes at once, then
+    # lingers briefly so the supervisor's peer-liveness check still
+    # passes. The sleeper uses a unique token so the pgrep below cannot
+    # match an unrelated host process or the L77 probe.
     cat >"$L76_CWD/l76-exec-cancel.py" <<'L76PYEOF'
 import array, json, os, socket, sys, time
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -3156,17 +3157,20 @@ fi
 
 # ================================================ L77: hung readiness probe (0.4.2, HOST)
 # ready.command that never exits, timeout = 2: start fails at about 2 s
-# with exit 125, and no probe process or descendant is left.
+# with exit 125, and no probe process or descendant is left. The socket
+# path reaches the helper as a command-line argument in the profile
+# `exec` line (like L37); environment variables do not reach a host
+# service.
 if needs_host; then
   L77_CWD=$(new_cwd l77)
   L77_SOCK="$WORK/l77-svc.sock"
   L77_PROFILE="$WORK/L77-profile.toml"
   cat >"$L77_CWD/l77-svc.py" <<'L77PYEOF'
-import socket,os,time
-p=os.environ["L77_SOCK"]
-try: os.unlink(p)
+import socket,sys
+p=sys.argv[1]
+try: __import__("os").unlink(p)
 except FileNotFoundError: pass
-s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1); time.sleep(3600)
+s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1); __import__("time").sleep(3600)
 L77PYEOF
   cat >"$L77_PROFILE" <<L77EOF
 version = "hisn-profile/v1"
@@ -3176,7 +3180,7 @@ session.cwd = "$L77_CWD"
 session.network = "none"
 [[host_services]]
 name = "l77-svc"
-exec = ["python3", "$L77_CWD/l77-svc.py"]
+exec = ["python3", "$L77_CWD/l77-svc.py", "$L77_SOCK"]
 socket = "$L77_SOCK"
 expose = "/run/l77svc.sock"
 risk_ack = "host-exec"
@@ -3185,8 +3189,10 @@ stop = { signal = "TERM", grace = 5 }
 L77EOF
   L77_START=$(date +%s%N)
   # timeout(1) bounds the foreground run: if start wrongly succeeds the
-  # leakprobe loop would otherwise block the suite forever.
-  L77_OUT=$(L77_SOCK="$L77_SOCK" timeout 20 "$HISN" run --profile "$L77_PROFILE" --session-id "l77-$$" -- "$L77_CWD/leakprobe" loop "$L77_CWD/ctl" </dev/null 2>&1)
+  # leakprobe loop would otherwise block the suite forever. The argv
+  # path reaches the helper via the profile exec line, so no
+  # environment variable is needed (or set).
+  L77_OUT=$(timeout 20 "$HISN" run --profile "$L77_PROFILE" --session-id "l77-$$" -- "$L77_CWD/leakprobe" loop "$L77_CWD/ctl" </dev/null 2>&1)
   L77_RC=$?
   L77_ELAPSED_MS=$(( ($(date +%s%N) - L77_START) / 1000000 ))
   if [ "$L77_RC" -eq 125 ] && [ "$L77_ELAPSED_MS" -ge 1000 ] && [ "$L77_ELAPSED_MS" -le 6000 ] 2>/dev/null; then
@@ -3218,15 +3224,19 @@ else
 fi
 
 # ================================================ L78: slow readiness probe (0.4.2, HOST)
-# ready.command that sleeps 3 s then exits 0, timeout = 10: the session starts.
+# ready.command that sleeps 3 s then exits 0, timeout = 10: the session starts,
+# startup took at least about 3 s and less than the 10 s timeout, and the
+# host service socket exists and accepts a connection. The socket path is
+# passed to the helper as a command-line argument in the profile `exec`
+# line (like L37); environment variables do not reach a host service.
 if needs_host; then
   L78_CWD=$(new_cwd l78)
   L78_SOCK="$WORK/l78-svc.sock"
   L78_PROFILE="$WORK/L78-profile.toml"
   cat >"$L78_CWD/l78-svc.py" <<'L78PYEOF'
-import socket,os,time
-p=os.environ["L78_SOCK"]
-try: os.unlink(p)
+import socket,sys,time
+p=sys.argv[1]
+try: __import__("os").unlink(p)
 except FileNotFoundError: pass
 s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1); time.sleep(3600)
 L78PYEOF
@@ -3238,7 +3248,7 @@ session.cwd = "$L78_CWD"
 session.network = "none"
 [[host_services]]
 name = "l78-svc"
-exec = ["python3", "$L78_CWD/l78-svc.py"]
+exec = ["python3", "$L78_CWD/l78-svc.py", "$L78_SOCK"]
 socket = "$L78_SOCK"
 expose = "/run/l78svc.sock"
 risk_ack = "host-exec"
@@ -3250,11 +3260,23 @@ L78EOF
     L78_ELAPSED_MS=$(( ($(date +%s%N) - L78_START) / 1000000 ))
     pass "L78 slow readiness probe within timeout starts the session"
     # The probe sleeps 3 s before succeeding; a start that returns
-    # without waiting for it cannot have run the probe to completion.
-    if [ "$L78_ELAPSED_MS" -ge 2500 ] 2>/dev/null; then
-      pass "L78 start waited for the 3 s probe (${L78_ELAPSED_MS}ms)"
+    # without waiting for it cannot have run the probe to completion,
+    # and it must finish well before the 10 s timeout.
+    if [ "$L78_ELAPSED_MS" -ge 2500 ] && [ "$L78_ELAPSED_MS" -lt 10000 ] 2>/dev/null; then
+      pass "L78 start took about 3 s and less than 10 s (${L78_ELAPSED_MS}ms)"
     else
-      fail "L78 start waited for the 3 s probe" "start took ${L78_ELAPSED_MS}ms, probe sleeps 3000ms"
+      fail "L78 start took about 3 s and less than 10 s" "start took ${L78_ELAPSED_MS}ms, probe sleeps 3000ms, timeout 10000ms"
+    fi
+    # The host service socket exists and accepts a connection.
+    if [ -S "$L78_SOCK" ]; then
+      pass "L78 host service socket exists"
+    else
+      fail "L78 host service socket exists" "no socket at $L78_SOCK"
+    fi
+    if python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(5); s.connect(sys.argv[1]); s.close()" "$L78_SOCK" </dev/null 2>/dev/null; then
+      pass "L78 host service socket accepts a connection"
+    else
+      fail "L78 host service socket accepts a connection" "connect to $L78_SOCK failed"
     fi
     end_session "$L78_CWD" "$S_PID"
   else

@@ -657,6 +657,11 @@ pub fn socketpair_seqpacket() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 /// Point fd 0, 1 and 2 at `/dev/null` (of the caller's current mount ns).
+///
+/// The fd returned by `open` is closed only when it is above 2: when it
+/// lands *on* 0, 1 or 2 it already is the target descriptor, and closing
+/// it would take out the very stdio slot just redirected. The error path
+/// follows the same rule.
 pub fn stdio_to_dev_null() -> io::Result<()> {
     // SAFETY: open + dup2 onto the three standard descriptors.
     unsafe {
@@ -667,7 +672,9 @@ pub fn stdio_to_dev_null() -> io::Result<()> {
         for fd in 0..3 {
             if n != fd && libc::dup2(n, fd) < 0 {
                 let e = io::Error::last_os_error();
-                libc::close(n);
+                if n > 2 {
+                    libc::close(n);
+                }
                 return Err(e);
             }
         }

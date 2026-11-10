@@ -2031,6 +2031,8 @@ fn run_supervisor_with_ready(
         && dup >= 0
     {
         use std::io::Write;
+        // SAFETY: the dup is a fresh descriptor we own; from_raw_fd takes
+        // ownership and File::drop closes it after the write.
         let mut f = unsafe { std::fs::File::from_raw_fd(dup) };
         let _ = writeln!(f, "error {e:#}");
         // File::drop closes the fd (from_raw_fd took ownership).
@@ -3114,6 +3116,8 @@ fn report_ready(
     if let Some(fd) = ready_fd {
         use std::io::Write;
         let raw = fd.as_raw_fd();
+        // SAFETY: borrowed write on the ready pipe we own; into_raw_fd below
+        // returns ownership to the OwnedFd, which closes it on drop.
         let mut f = unsafe { std::fs::File::from_raw_fd(raw) };
         let _ = writeln!(f, "ready {session_id}");
         let _ = f.into_raw_fd(); // do not close via File; OwnedFd closes it

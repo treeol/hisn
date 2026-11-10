@@ -94,8 +94,39 @@ pub fn parse_reply(line: &str) -> Option<Reply> {
     })
 }
 
+/// Parse an `exit` line (the `{"exit":…}` shape) shared by the exec and
+/// attach clients: returns the [`Finish`] if `line` is an exit line, else
+/// `None`. A line carrying an `error` counts as lost (the attach client
+/// treats a refused attach as a lost session; the exec client parses
+/// errors separately via [`parse_reply`]).
+pub fn parse_exit(line: &str) -> Option<Finish> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    if let Some(x) = v.get("exit") {
+        if x["lost"] == true {
+            return Some(Finish::Lost);
+        }
+        if let Some(c) = x["code"].as_i64() {
+            return Some(Finish::Code(c as i32));
+        }
+        if let Some(s) = x["signal"].as_str()
+            && let Some(n) = control::parse_signal(s)
+        {
+            return Some(Finish::Signal(n));
+        }
+    }
+    if v.get("error").is_some() {
+        return Some(Finish::Lost);
+    }
+    None
+}
+
 /// Allocate a fresh pty on the *host*. Returns `(master, slave)`.
-fn open_host_pty() -> io::Result<(OwnedFd, OwnedFd)> {
+///
+/// The one shared implementation (0.4.3): `attach` previously used
+/// `openpty`, `exec` used `posix_openpt`/`grantpt`/`unlockpt`/`ptsname_r`
+/// by hand. `openpty` is the same glibc call sequence internally, so the
+/// behaviour is identical; on musl both go through the same functions.
+pub fn open_host_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     // SAFETY: standard pty allocation with checked return values; every
     // descriptor is wrapped immediately.
     unsafe {

@@ -10,14 +10,14 @@
 //! path. The key sequence is never forwarded to the shell.
 
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::cli::AttachArgs;
-use crate::execcli::Finish;
+use crate::execcli::{Finish, exit_code, open_host_pty, parse_exit};
 use crate::supervisor;
 use crate::sys;
 
@@ -72,33 +72,7 @@ pub fn run(args: AttachArgs) -> Result<i32> {
 
     // Relay the pty with detach-key interception.
     let finish = relay_with_detach(&conn, master)?;
-    Ok(crate::execcli::exit_code(&finish))
-}
-
-/// Open a host pty pair `(master, slave)` for the attach.
-fn open_host_pty() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut master_fd: libc::c_int = -1;
-    let mut slave_fd: libc::c_int = -1;
-    // SAFETY: openpty writes two fresh fds into the pointers we pass.
-    let rc = unsafe {
-        libc::openpty(
-            &mut master_fd,
-            &mut slave_fd,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: both are fresh descriptors we just created.
-    Ok(unsafe {
-        (
-            OwnedFd::from_raw_fd(master_fd),
-            OwnedFd::from_raw_fd(slave_fd),
-        )
-    })
+    Ok(exit_code(&finish))
 }
 
 /// Relay the pty master to stdin/stdout, intercepting Ctrl-] d as the
@@ -301,25 +275,4 @@ fn read_exit_after_detach(mut conn: &UnixStream) -> Result<Finish> {
             Err(e) => return Err(e).context("attach: reading exit after detach"),
         }
     }
-}
-
-fn parse_exit(line: &str) -> Option<Finish> {
-    let v: Value = serde_json::from_str(line).ok()?;
-    if let Some(x) = v.get("exit") {
-        if x["lost"] == true {
-            return Some(Finish::Lost);
-        }
-        if let Some(c) = x["code"].as_i64() {
-            return Some(Finish::Code(c as i32));
-        }
-        if let Some(s) = x["signal"].as_str()
-            && let Some(n) = crate::control::parse_signal(s)
-        {
-            return Some(Finish::Signal(n));
-        }
-    }
-    if v.get("error").is_some() {
-        return Some(Finish::Lost);
-    }
-    None
 }

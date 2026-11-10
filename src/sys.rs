@@ -97,7 +97,9 @@ pub fn umount2(target: &Path, flags: c_int) -> io::Result<()> {
 }
 
 pub fn open_tree(dirfd: RawFd, path: &CStr, flags: c_uint) -> io::Result<OwnedFd> {
-    // SAFETY: valid fd/C string; the kernel validates flags.
+    // SAFETY: `path` is a valid C string we own; the kernel validates the
+    // fd and flags and returns an error for anything invalid (nothing here
+    // can cause undefined behaviour).
     let r = unsafe { libc::syscall(libc::SYS_open_tree, dirfd, path.as_ptr(), flags) };
     cvt(r).map(owned)
 }
@@ -109,7 +111,8 @@ pub fn move_mount(
     to_path: &CStr,
     flags: c_uint,
 ) -> io::Result<()> {
-    // SAFETY: valid fds/C strings.
+    // SAFETY: paths are valid C strings we own; the kernel validates the
+    // fds and flags and returns an error for anything invalid.
     let r = unsafe {
         libc::syscall(
             libc::SYS_move_mount,
@@ -187,6 +190,12 @@ pub fn prctl(
 }
 
 /// Close every fd >= 3 that is not in `keep`.
+///
+/// This closes descriptors beyond the caller's ownership: it is only called
+/// in a forked child before `exec`, where every fd except the ones in `keep`
+/// is meant to go away (including any the child inherited from the parent's
+/// `OwnedFd`s — closing them in the child does not affect the parent's
+/// copies).
 pub fn close_all_except(keep: &[RawFd]) {
     let mut keep: Vec<RawFd> = keep.iter().copied().filter(|f| *f >= 3).collect();
     keep.sort_unstable();
@@ -197,8 +206,10 @@ pub fn close_all_except(keep: &[RawFd]) {
         .chain(std::iter::once(c_uint::MAX))
     {
         if k > start {
-            // SAFETY: closing a range of descriptors we own; EINVAL/ENOSYS
-            // are handled by the fallback below.
+            // SAFETY: closing a range [start, k-1] of raw descriptor numbers
+            // (numbers only — nothing is dereferenced); a range that is
+            // already closed is an ignored error, and EINVAL/ENOSYS are
+            // handled by the fallback below.
             let r = unsafe { libc::syscall(libc::SYS_close_range, start, k - 1, 0 as c_uint) };
             if r < 0 {
                 close_range_fallback(start, k - 1);
@@ -209,9 +220,12 @@ pub fn close_all_except(keep: &[RawFd]) {
 }
 
 fn close_range_fallback(lo: c_uint, hi: c_uint) {
+    // The fallback is capped at 65535: fds above that are not closed by the
+    // fallback (the close_range syscall path above has no such cap).
     let top = hi.min(65535);
     for fd in lo..=top {
-        // SAFETY: closing arbitrary fds is memory-safe; errors are ignored.
+        // SAFETY: closing a raw descriptor number (nothing is dereferenced);
+        // errors are ignored, so an already-closed number is fine.
         unsafe { libc::close(fd as RawFd) };
     }
 }
@@ -498,7 +512,10 @@ pub fn recv_with_fd(sock: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<Ow
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
     };
-    // SAFETY: as in `send_with_fd`; received fds are wrapped immediately.
+    // SAFETY: msghdr/ancillary storage is zeroed and sized for one fd; the
+    // iovec points at the caller-owned `buf`; recvmsg is called on the raw
+    // socket fd and any received fd is wrapped in an OwnedFd immediately
+    // (and closed again if the message is truncated, below).
     unsafe {
         let space = libc::CMSG_SPACE(std::mem::size_of::<c_int>() as c_uint) as usize;
         let mut cbuf = vec![0u64; space.div_ceil(8)];

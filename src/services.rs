@@ -106,7 +106,9 @@ pub fn start_in_sandbox_service(
                 name: s.name.clone(),
                 pid: sp.pid,
                 socket: s.socket.clone(),
-                state: "ready",
+                // Readiness has not passed yet: the state is "starting"
+                // until `wait_service_readiness` succeeds (Part 2.3).
+                state: "starting",
                 exit: None,
                 status: status_dup,
             },
@@ -125,16 +127,23 @@ pub fn start_in_sandbox_service(
     })
 }
 
-/// Wait for an in-sandbox service to become ready (DESIGN §19).
+/// Wait for an in-sandbox service to become ready (DESIGN §19) and flip
+/// its recorded state to `"ready"` on success, so `ls --json` reports
+/// `"starting"` until readiness has passed (Part 2.3).
 /// Polls `ready.socket` (stat from the supervisor) with a timeout. On
 /// timeout returns Err (fail closed). Only `socket` stat is available for
 /// in-sandbox services in 0.3 (P25: `command` would run on the host with the
 /// user's credentials; `tcp` is not available for in-sandbox services).
-pub fn wait_service_readiness(s: &profile::Service, timeout_secs: u64) -> Result<()> {
+pub fn wait_service_readiness(
+    shared: &Arc<crate::supervisor::Shared>,
+    s: &profile::Service,
+    timeout_secs: u64,
+) -> Result<()> {
     let ready = match &s.ready {
         Some(r) => r,
         None => {
-            // No readiness check: assume ready immediately.
+            // No readiness check: passes immediately.
+            mark_service_ready(shared, &s.name);
             return Ok(());
         }
     };
@@ -154,6 +163,7 @@ pub fn wait_service_readiness(s: &profile::Service, timeout_secs: u64) -> Result
         std::time::Duration::from_millis(20),
         ready_fn,
     ) {
+        mark_service_ready(shared, &s.name);
         Ok(())
     } else {
         Err(anyhow!(
@@ -161,6 +171,17 @@ pub fn wait_service_readiness(s: &profile::Service, timeout_secs: u64) -> Result
             s.name,
             timeout_secs
         ))
+    }
+}
+
+/// Flip an in-sandbox service's recorded state to `"ready"` (readiness
+/// passed). A service that already exited is left alone.
+fn mark_service_ready(shared: &Arc<crate::supervisor::Shared>, name: &str) {
+    let mut svcs = shared.services().lock().expect("services");
+    if let Some(s) = svcs.get_mut(name)
+        && s.state == "starting"
+    {
+        s.state = "ready";
     }
 }
 

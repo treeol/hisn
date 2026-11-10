@@ -1184,6 +1184,12 @@ impl Shared {
                 })
             })
             .collect();
+        // `"starting"`: a service whose readiness has not passed yet is
+        // reported as starting. `start_in_sandbox_service` inserts the
+        // state as "starting"; only the readiness pass (in
+        // `start_in_sandbox_services` via `wait_service_readiness`) and
+        // the exit detect below flip it. Before this change every service
+        // was inserted as "ready" and `"starting"` never appeared.
         let services: Vec<Value> = self
             .services
             .lock()
@@ -1209,21 +1215,25 @@ impl Shared {
             // (P26). A service whose status socket is closed or whose pid
             // is gone has exited.
             for s in svcs.values_mut() {
-                if s.state == "ready" {
-                    // Check if the service process is still alive via the
-                    // status socket. If the socket is closed (POLLHUP), the
-                    // monitor is gone, so the service has exited.
-                    let alive = s.status.as_raw_fd();
-                    let mut pollfds = [libc::pollfd {
-                        fd: alive,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    }];
-                    // SAFETY: poll on our own fd, non-blocking.
-                    let r = unsafe { libc::poll(&mut pollfds[0], 1, 0) };
-                    if r > 0 && (pollfds[0].revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
-                        s.state = "exited";
-                    }
+                let alive = s.status.as_raw_fd();
+                let mut pollfds = [libc::pollfd {
+                    fd: alive,
+                    events: libc::POLLIN,
+                    revents: 0,
+                }];
+                // SAFETY: poll on our own fd, non-blocking.
+                let r = unsafe { libc::poll(&mut pollfds[0], 1, 0) };
+                if r > 0 && (pollfds[0].revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
+                    // The monitor is gone. The exit status itself is not
+                    // recoverable from the status socket (Part 2.3 evidence
+                    // note): the pid is in the sandbox pid namespace, so
+                    // the supervisor cannot waitpid it; only the monitor
+                    // `W` reaps it, and the status stream carries the pid
+                    // but no exit code on this path without new plumbing
+                    // across threads. `exit` therefore stays None for
+                    // in-sandbox services (as before); the state flip is
+                    // the truthful part.
+                    s.state = "exited";
                 }
             }
             svcs.values()
@@ -3103,7 +3113,7 @@ fn start_in_sandbox_services(
             Ok(handle) => {
                 // Wait for readiness.
                 let timeout_secs = s.ready.as_ref().and_then(|r| r.timeout).unwrap_or(15);
-                if let Err(e) = services::wait_service_readiness(s, timeout_secs) {
+                if let Err(e) = services::wait_service_readiness(shared, s, timeout_secs) {
                     bail!("service {}: readiness: {e}", s.name);
                 }
                 service_handles.push(handle);

@@ -21,6 +21,7 @@ pub mod rootfs;
 pub mod rootfs_import;
 pub mod rootfs_store;
 pub mod seccomp;
+pub mod services;
 pub mod session;
 pub mod sessionmeta;
 pub mod sig;

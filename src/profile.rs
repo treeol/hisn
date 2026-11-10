@@ -98,12 +98,12 @@ impl Profile {
     /// shared form used by `[[forward]]`, `[[host_services]]` and `[docker]`
     /// (0.4.3: the three copies of this match block became one helper).
     ///
-    /// `subject` is the subject prefix the error messages name, without the
-    /// following colon: `[[forward]] <name>`, `[[host_services]] <name>`, or
-    /// `[docker]`. The messages are byte-identical to the former copies:
-    /// the `[docker]` mismatch was `[docker] risk_ack = ...` (colon-less,
-    /// extra space), so it passes `is_docker=true`; the `[[forward]]`
-    /// required message named the socket, so it passes `name=Some(socket)`.
+    /// `subject` is the subject prefix the error messages name, with colon:
+    /// `[[forward]] <name>:` / `[[host_services]] <name>:` for the mismatch
+    /// form, and `[docker] ` (colon-less, trailing space) for the docker
+    /// mismatch — the former copies differ there and both are kept byte for
+    /// byte. `name` is the socket path the `[[forward]]` required message
+    /// named, `Some` only for forwards.
     fn check_risk_ack(
         subject: &str,
         name: Option<&str>,
@@ -215,12 +215,8 @@ impl Profile {
                 );
             }
             if label.requires_ack() {
-                Self::check_risk_ack(
-                    &format!("[[forward]] {}", f.name),
-                    Some(&f.socket),
-                    label,
-                    &f.risk_ack,
-                )?;
+                let subject = format!("[[forward]] {}:", f.name);
+                Self::check_risk_ack(&subject, Some(&f.socket), label, &f.risk_ack)?;
             }
         }
         for h in &self.host_services {
@@ -269,7 +265,7 @@ impl Profile {
             // label is at least `host-exec` (the execution itself), so the
             // ack must match it (None is an error, not "no ack needed").
             Self::check_risk_ack(
-                &format!("[[host_services]] {}", h.name),
+                &format!("[[host_services]] {}:", h.name),
                 None,
                 effective,
                 &h.risk_ack,

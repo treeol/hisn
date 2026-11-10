@@ -9,6 +9,17 @@
 # run on a host where 'hisn check' passes (user namespaces usable) and skip
 # in CI (where hisn check fails and the suite exits at preflight). The
 # needs_host() helper gates them on capability, not on an env var or hostname.
+#
+# L80 (host-service process-group stop, 0.4.3): the host service binds its
+# socket in the case's own $WORK cwd and spawns a child via subprocess; the
+# release gate cannot run it inside a live hisn session (it needs a real
+# host), so it runs only on the host gate.
+#
+# L81 (dead host service, 0.4.3): the service exits 7 at once; the case
+# asserts the literal "exited with status 7 before readiness completed"
+# text, which the forward step can never produce (the socket path in the
+# case never exists, so a forward failure would name the socket, not the
+# status), and bounds the elapsed time well below the 30 s timeout.
 L1
 L1c
 L2

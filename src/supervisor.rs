@@ -1034,13 +1034,16 @@ impl Shared {
         // 0.4.1 step 7: registration is admission — it takes the lease lock
         // so an idle check in flight cannot miss this exec and stop the
         // session.
-        let registered = self.admit(|| {
+        self.admit(|| {
             let by_pid = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3).ok();
             let by_id = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3).ok();
             let mut table = self.exec_table.lock().expect("exec_table");
             // The info is always recorded (the old `exec_info` insert was
             // unconditional); the signal handles are only present when
-            // both dups succeeded.
+            // both dups succeeded. Insertion marks the pid used even when
+            // a dup failed (the old `used_pids` marking was unconditional
+            // too, conditioned on the first dup — the table keeps the
+            // unconditional marking, the safer direction for pid reuse).
             table.insert_info(
                 exec_id,
                 ExecInfo {
@@ -1052,9 +1055,6 @@ impl Shared {
             );
             if let (Some(by_pid), Some(by_id)) = (by_pid, by_id) {
                 table.set_status(exec_id, by_id, by_pid);
-                Some(sp.pid)
-            } else {
-                None
             }
         });
         let mut w = conn;
@@ -1069,7 +1069,6 @@ impl Shared {
             // Client already gone: cancel through the normal path.
             exec::drive_from(&sp.status, sp.pending, -1, std::time::Duration::ZERO, true)
         };
-        let _registered = registered;
         self.exec_table.lock().expect("exec_table").remove(exec_id);
         let (res, line) = match outcome {
             exec::Outcome::Exited(exec::Exit::Code(c)) => ("ok", json!({ "exit": { "code": c } })),
@@ -2475,7 +2474,21 @@ impl Drop for SessionGuard {
             return;
         }
         for pid in &self.host_pids {
-            let _ = sys::kill(*pid, libc::SIGKILL);
+            // Host services run in their own process group (leader's pid is
+            // the group id): kill the whole group, so children the service
+            // spawned die with it on a failed start too. `killpg` tolerates
+            // a group that is already gone; the direct kill covers the
+            // leader if the group was never made. `killpg` is tried first:
+            // a leader that already exited on its own still has its zombie
+            // pinning the group id until reaped, so the group kill reaches
+            // its children; reaping happens after in the loop below. A
+            // reaped pid is never signalled (readiness dead-detection
+            // removes it from `host_pids`).
+            // SAFETY: killpg/kill on our own child and its group.
+            unsafe {
+                libc::killpg(*pid, libc::SIGKILL);
+                libc::kill(*pid, libc::SIGKILL);
+            }
             let _ = services::reap(*pid);
         }
         let _ = sys::kill(self.init_pid, libc::SIGKILL);
@@ -2544,19 +2557,29 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     };
 
     // Phase: namespaces (userns S + init clone + GO/READY handshake).
-    let ns = start_namespaces(uid, gid, cfg, verbose, sdir)?;
-    let pid = ns.pid;
+    let Namespaces {
+        pid,
+        master,
+        sup_end,
+        sandbox_pidns,
+        mntns_fd,
+        exec_ns,
+    } = start_namespaces(uid, gid, cfg, verbose, sdir)?;
     let mut guard = SessionGuard::new(pid);
 
     // Phase: helpers (grant helper + exec helper, still single-threaded).
-    // The namespace fds are dropped right after the helpers are forked
-    // (the helpers hold their own dups): the supervisor must not pin the
+    // The namespace fds are dropped as soon as the helpers are forked (the
+    // helpers hold their own dups): the supervisor must not pin the
     // namespaces — and hold 7–8 extra fds — for the session's lifetime.
-    let (helper, exec_client) =
-        start_helpers(&ns, exec_policy, exec_ll, exec_require_scope, exec_seccomp)?;
-    let master = ns.master;
-    let sup_end = ns.sup_end;
-    let sandbox_pidns = ns.sandbox_pidns;
+    let (helper, exec_client) = start_helpers(
+        &mntns_fd,
+        exec_ns,
+        exec_policy,
+        exec_ll,
+        exec_require_scope,
+        exec_seccomp,
+    )?;
+    drop(mntns_fd);
 
     // Phase: control (shared state, listener, initial grants, forwards, SSH).
     let control = start_control(&mut SessionControlArgs {
@@ -2889,21 +2912,24 @@ fn start_namespaces(
 }
 
 /// Phase `helpers`: the persistent grant helper and the exec helper,
-/// forked while still single-threaded.
+/// forked while still single-threaded. Both namespace fds are consumed
+/// here (moved into the exec helper; the grant helper keeps its own dup
+/// of the mount namespace), so the caller can drop its originals.
 fn start_helpers(
-    ns: &Namespaces,
+    mntns_fd: &OwnedFd,
+    exec_ns: NsFds,
     exec_policy: ResolvedPolicy,
     exec_ll: crate::landlock::LandlockPlan,
     exec_require_scope: bool,
     exec_seccomp: Vec<seccompiler::BpfProgram>,
 ) -> Result<(HelperClient, ExecClient)> {
-    let helper = spawn_helper(&ns.mntns_fd)?;
+    let helper = spawn_helper(mntns_fd)?;
     let exec_client = spawn_exec_helper(ExecContext {
         policy: exec_policy,
         landlock: exec_ll,
         require_scope: exec_require_scope,
         seccomp: exec_seccomp,
-        ns: ns.exec_ns.try_clone()?,
+        ns: exec_ns,
     })?;
     Ok((helper, exec_client))
 }
@@ -3081,9 +3107,41 @@ fn start_host_services(
                 // before).
                 guard.host_pids.push(host_pid);
                 // Wait for readiness (fails at once if the service dies).
+                // The pid check reaps the child on detection, so an
+                // already-reaped pid must leave the guard's kill set: the
+                // guard never signals a reaped pid.
                 let timeout_secs = h.ready.as_ref().and_then(|r| r.timeout).unwrap_or(15);
-                if let Err(e) = services::wait_readiness_pid(h, timeout_secs, Some(host_pid)) {
-                    bail!("host_service {}: readiness: {e}", h.name);
+                let ready = services::wait_readiness_pid(h, timeout_secs, Some(host_pid));
+                match ready {
+                    Ok(()) => {}
+                    Err(status) if status >= 0 => {
+                        guard.host_pids.retain(|p| *p != host_pid);
+                        bail!(
+                            "host_service {}: exited with status {status} before readiness completed",
+                            h.name
+                        );
+                    }
+                    Err(-1) => {
+                        bail!(
+                            "host_service {}: socket {} does not exist",
+                            h.name,
+                            h.socket
+                        );
+                    }
+                    Err(-2) => {
+                        bail!(
+                            "host_service {}: readiness timeout ({}s)",
+                            h.name,
+                            timeout_secs
+                        );
+                    }
+                    Err(_) => {
+                        bail!(
+                            "host_service {}: readiness timeout ({}s)",
+                            h.name,
+                            timeout_secs
+                        );
+                    }
                 }
                 // Forward the socket.
                 if let Err(e) = shared.do_forward(&h.socket, &h.expose, &h.name) {

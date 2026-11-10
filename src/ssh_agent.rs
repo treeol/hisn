@@ -245,10 +245,8 @@ fn is_forwarded(msg_type: u8) -> bool {
     )
 }
 
-/// Handled one client; returning from here releases the counter via
-/// `ClientGuard` on every exit path (including a read/write timeout on
-/// either the client or the host socket: both are plain `Err` returns, so
-/// the RAII guard runs either way).
+/// Handle one client connection: read messages, forward the allowed ones
+/// to the host agent, filter responses. Disallowed messages get FAILURE.
 fn handle_client(mut client: UnixStream, host_agent: &str, allowed: Vec<String>, session_id: &str) {
     let mut host = match UnixStream::connect(host_agent) {
         Ok(s) => s,
@@ -352,6 +350,11 @@ const CLIENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Bind the proxy listener socket at `socket_path` (mode 0600). Called
 /// before `unshare(NEWUSER)` — must not spawn threads.
+///
+/// Note on `HOST_READ_TIMEOUT`: a sign request that waits on a human (a
+/// touch or a confirm prompt) can legitimately take longer than 30 s;
+/// such a sign is failed by the proxy. That is the documented trade-off
+/// of the bound, accepted in 0.4.3 (Part 2.5).
 pub fn bind_proxy_socket(socket_path: &Path) -> Result<UnixListener> {
     if socket_path.exists() {
         std::fs::remove_file(socket_path).ok();

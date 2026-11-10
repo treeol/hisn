@@ -1,9 +1,11 @@
 //! Session services (DESIGN §17, §19): `[[host_services]]` and `[[services]]`.
 //!
 //! Host-service and in-sandbox service start, readiness and stop code, moved
-//! out of [`crate::supervisor`] as a pure move (hisn 0.4.3): no behaviour
-//! change. The supervisor owns the session lifecycle; this module owns how a
-//! service process is started, awaited, and (via [`stop_and_reap`]) stopped.
+//! out of [`crate::supervisor`] for the 0.4.3 startup refactor and extended
+//! with the 0.4.3 behaviour changes (host-service process groups,
+//! dead-service readiness). The supervisor owns the session lifecycle; this
+//! module owns how a service process is started, awaited, and (via
+//! [`stop_and_reap`]) stopped.
 
 use std::fs;
 use std::io;
@@ -277,11 +279,8 @@ pub fn start_host_service(h: &profile::HostService) -> Result<i32> {
     Ok(pid)
 }
 
-/// The readiness poll loop for host services. Returns the first readiness
-/// result; [`wait_readiness`] is the deadline-bounded wrapper.
-///
-/// Accepting `probe` as a closure (which eventually checks the service
-/// pid) lets the dead-service failure be unit-tested with a fake probe.
+/// The readiness poll loop for host services: `wait_until` with the 1 ms /
+/// 20 ms event-driven backoff, starting from an absolute deadline.
 fn wait_readiness_poll(check: impl Fn() -> bool, deadline: std::time::Instant) -> bool {
     sys::wait_until(
         deadline.saturating_duration_since(std::time::Instant::now()),
@@ -319,79 +318,119 @@ pub fn check_service_alive(pid: i32) -> std::result::Result<bool, i32> {
 /// deadline `timeout_secs` from now, passing the time remaining to each
 /// probe. On timeout returns Err (fail closed).
 pub fn wait_readiness(h: &profile::HostService, timeout_secs: u64) -> Result<()> {
-    wait_readiness_pid(h, timeout_secs, None)
+    let status = match wait_readiness_pid(h, timeout_secs, None) {
+        Ok(()) => return Ok(()),
+        Err(s) => s,
+    };
+    Err(readiness_error(h, timeout_secs, status))
+}
+
+/// Ready-reporting error for a host-service readiness failure, by kind:
+/// the dead-service exit status (≥ 0), the missing-socket error (-1), the
+/// deadline error (-2), or a plain timeout (-3 or any other negative).
+pub fn readiness_error(h: &profile::HostService, timeout_secs: u64, status: i32) -> anyhow::Error {
+    match status {
+        s if s >= 0 => anyhow::anyhow!(
+            "host_service {}: exited with status {s} before readiness completed",
+            h.name
+        ),
+        -1 => anyhow::anyhow!(
+            "host_service {}: socket {} does not exist",
+            h.name,
+            h.socket
+        ),
+        -2 => anyhow::anyhow!(
+            "host_service {}: readiness timeout ({}s)",
+            h.name,
+            timeout_secs
+        ),
+        _ => anyhow::anyhow!(
+            "host_service {}: readiness timeout ({}s)",
+            h.name,
+            timeout_secs
+        ),
+    }
 }
 
 /// Wait for a host service to become ready, knowing its pid. When `pid` is
-/// `Some`, the pid is checked on every readiness iteration: if the service
+/// `Some`, the pid is checked before and after every probe: if the service
 /// has already exited, startup fails at once naming the service and its
-/// exit status (Part 2.2), even if `ready.command` would pass.
+/// exit status (Part 2.2), even if `ready.command` would pass. The
+/// after-probe check matters: a service that dies while its probe runs
+/// (e.g. a `true` probe that takes 10 ms) must not be declared ready.
+///
+/// The dead detection reaps the child on first sight; the caller must not
+/// signal or reap that pid again (the guard tracks reaped pids for this
+/// reason). Returns the exit status via `Err` when dead.
 pub fn wait_readiness_pid(
     h: &profile::HostService,
     timeout_secs: u64,
     pid: Option<i32>,
-) -> Result<()> {
+) -> std::result::Result<(), i32> {
     let ready = match &h.ready {
         Some(r) => r,
         None => {
-            // No readiness check: assume the socket exists immediately.
-            // Verify the socket path exists.
+            // No readiness check: verify the socket path exists. The pid
+            // check still applies: a dead service with a stale socket file
+            // is not ready.
+            if let Some(p) = pid
+                && let Err(status) = check_service_alive(p)
+            {
+                return Err(status);
+            }
             if !Path::new(&h.socket).exists() {
-                return Err(anyhow!(
-                    "host_service {}: socket {} does not exist",
-                    h.name,
-                    h.socket
-                ));
+                return Err(-1);
             }
             return Ok(());
         }
     };
-    let deadline = profile::checked_deadline(timeout_secs, "host service readiness timeout")?;
+    let deadline = match profile::checked_deadline(timeout_secs, "host service readiness timeout") {
+        Ok(d) => d,
+        Err(_) => return Err(-2),
+    };
     // 0.4.1 step 2: event wait instead of a fixed 100 ms poll. Each probe
     // gets only the time remaining until the overall deadline, so a slow
     // probe can run up to `timeout` and a hung one is killed on time. The
-    // service pid is checked inside the probe: a service that has already
-    // exited fails startup at once, even if the probe would pass. The
-    // exit status is carried out of the poll through a `Cell` (the poll
-    // takes `Fn`, and `check_service_alive` reaps on first detection, so
-    // the status can only be read once).
+    // service pid is checked inside the probe (before and after it): a
+    // service that has already exited fails startup at once, even if the
+    // probe would pass. The exit status is carried out of the poll through
+    // a `Cell` (the poll takes `Fn`, and `check_service_alive` reaps on
+    // first detection, so the status can only be read once).
     let dead_status = std::cell::Cell::new(None);
     let ready_fn = || {
+        if let Some(p) = pid {
+            if dead_status.get().is_none()
+                && let Err(status) = check_service_alive(p)
+            {
+                dead_status.set(Some(status));
+            }
+            if dead_status.get().is_some() {
+                // Stop the poll; the dead verdict is read below.
+                return true;
+            }
+        }
+        let probe = check_readiness(
+            ready,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        );
+        if !probe {
+            return false;
+        }
+        // The probe passed: re-check the pid before declaring ready, so a
+        // service that died during the probe is never "ready".
         if let Some(p) = pid
-            && dead_status.get().is_none()
             && let Err(status) = check_service_alive(p)
         {
             dead_status.set(Some(status));
-            return true; // dead marker: stop the poll now
-        }
-        if dead_status.get().is_some() {
             return true;
         }
-        check_readiness(
-            ready,
-            deadline.saturating_duration_since(std::time::Instant::now()),
-        )
+        probe
     };
-    // The event wait stops at the first `true`. For a live service that
-    // is the probe passing; for a dead one it is the dead marker: the
-    // closure returns true once `dead_status` is set, so the poll exits
-    // immediately instead of running to the deadline.
     let polled = wait_readiness_poll(ready_fn, deadline);
     if let Some(status) = dead_status.get() {
-        return Err(anyhow!(
-            "host_service {}: exited with status {status} before readiness completed",
-            h.name
-        ));
+        return Err(status);
     }
-    if polled {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "host_service {}: readiness timeout ({}s)",
-            h.name,
-            timeout_secs
-        ))
-    }
+    if polled { Ok(()) } else { Err(-3) }
 }
 
 /// Check one readiness probe. Returns true if the service is ready.
@@ -541,6 +580,19 @@ pub trait Stoppable {
 ///
 /// `grace` is validated ≤ 86400, so `checked_add` cannot overflow in
 /// practice; fall back to a far-future deadline on error.
+///
+/// Group-kill on reap: for the host target, `alive()` reaps the leader as
+/// soon as it exits. If the leader dies on TERM but a child outlasts it,
+/// the group KILL below would be skipped (the leader is gone, so the pid
+/// may already be reused). To keep the group kill reachable, `alive()` for
+/// host targets reaps the leader but the final `signal(SIGKILL)` still
+/// `killpg`s the (now leader-less) group first: the child's group id is
+/// the dead leader's pid, which no new process can claim as a pgid before
+/// it is reaped-by-us — and we reap it in the same check, so the killpg
+/// races only against a reaped-and-recycled zombie, which is already
+/// reaped here. On the success path the reap in `alive()` is the only
+/// reap; the SIGKILL `killpg` may miss (ESRCH) an already-gone group and
+/// that miss is harmless.
 pub fn stop_and_reap(target: &dyn Stoppable, sig: i32, grace: u64) {
     target.signal(sig);
     let deadline = std::time::Instant::now()
@@ -548,6 +600,11 @@ pub fn stop_and_reap(target: &dyn Stoppable, sig: i32, grace: u64) {
         .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(86400));
     while std::time::Instant::now() < deadline {
         if !target.alive() {
+            // The leader is gone (and reaped for a host target). Still
+            // SIGKILL the group: a child that outlasted TERM must not
+            // survive, and the group id cannot be a live process's pid
+            // any more (the zombie that pinned it was just reaped).
+            target.signal(libc::SIGKILL);
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -569,13 +626,21 @@ impl Stoppable for HostServiceTarget {
     fn signal(&self, sig: i32) {
         // TERM and KILL go to the whole process group (the service leader
         // setpgid'd itself to its pid), so children the service spawned die
-        // with it. `killpg` can miss if the group was never made or is
-        // already gone; the direct `kill` guarantees the leader itself is
-        // signalled. On the final SIGKILL the leader is blocked-reaped.
+        // with it. `killpg` is tried first and the direct `kill` only on
+        // `ESRCH`: a second non-KILL signal would otherwise reach the
+        // leader twice (a custom `stop.signal` like INT can abort graceful
+        // shutdown). SIGKILL is idempotent, so the double-send there is
+        // harmless. On the final SIGKILL the leader is blocked-reaped.
         // SAFETY: killpg/kill on our own child and its group.
         unsafe {
-            libc::killpg(self.pid, sig);
-            libc::kill(self.pid, sig);
+            let r = libc::killpg(self.pid, sig);
+            if sig != libc::SIGKILL && r != 0 {
+                // ESRCH: no such group (never made, or already gone) —
+                // the leader itself may still need it.
+                let _ = libc::kill(self.pid, sig);
+            } else if sig == libc::SIGKILL {
+                let _ = libc::kill(self.pid, sig);
+            }
         }
         if sig == libc::SIGKILL {
             let _ = reap(self.pid);
@@ -798,16 +863,20 @@ mod tests {
         // not a race against its own start.
         std::thread::sleep(std::time::Duration::from_millis(50));
         let start = std::time::Instant::now();
-        let err = super::wait_readiness_pid(&h, 30, Some(pid))
+        let status = super::wait_readiness_pid(&h, 30, Some(pid))
             .expect_err("dead service must fail readiness");
-        let msg = err.to_string();
+        assert_eq!(status, 7, "the exit status of the dead service");
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "dead service must fail at once, took {:?}",
             start.elapsed()
         );
+        // The caller-side error message, built by the same helper the
+        // supervisor uses, names the service and its exit status.
+        let msg = super::readiness_error(&h, 30, status).to_string();
         assert!(
-            msg.contains("dead-svc") && msg.contains('7'),
+            msg.contains("dead-svc")
+                && msg.contains("exited with status 7 before readiness completed"),
             "message must name the service and its exit status: {msg}"
         );
     }

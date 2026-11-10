@@ -3391,10 +3391,11 @@ else
 fi
 
 # ================================================ L80: host-service stop kills the whole process group (0.4.3, HOST)
-# A host service that spawns a child: after the session ends, neither the
-# service nor its spawned child may survive. The child records its own pid
-# to a file in the session cwd (the helper's argv carries the path, like
-# L37). Bounded by timeout(1) so a hung start cannot hang the suite.
+# A host service that spawns a child which ignores TERM (so only the
+# group SIGKILL can take it): after the session ends, neither the service
+# nor its spawned child may survive. The child records its own pid to a
+# file in the session cwd (the helper's argv carries the path, like L37).
+# Host-only (needs a real host); bounded by the suite's own timeouts.
 if needs_host; then
   L80_CWD=$(new_cwd l80)
   L80_SOCK="$WORK/l80-svc.sock"
@@ -3406,9 +3407,9 @@ p=sys.argv[1]
 try: __import__("os").unlink(p)
 except FileNotFoundError: pass
 s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1)
-# Spawn a child that outlives a plain pid kill (it ignores no signals;
-# only a group kill reaches it once the leader is gone).
-child=subprocess.Popen(["sh","-c","sleep 3600 # l80-child-token"])
+# Spawn a child that ignores TERM: only the group SIGKILL on stop can
+# take it once the leader is gone.
+child=subprocess.Popen(["sh","-c","trap '' TERM; sleep 3600 # l80-child-token"])
 open(sys.argv[2],"w").write(str(child.pid))
 time.sleep(3600)
 L80PYEOF
@@ -3424,12 +3425,14 @@ exec = ["python3", "$L80_CWD/l80-svc.py", "$L80_SOCK", "$L80_CHILD_PID"]
 socket = "$L80_SOCK"
 expose = "/run/l80svc.sock"
 risk_ack = "host-exec"
+ready = { command = ["sh", "-c", "test -S $L80_SOCK"], timeout = 15 }
 stop = { signal = "TERM", grace = 5 }
 L80EOF
-  L80_START=$(date +%s%N)
   if start_profile_session l80-$$ "$L80_CWD" "$L80_PROFILE"; then
     pass "L80 host-service session starts"
-    # The spawned child's pid is recorded before readiness completes.
+    # The spawned child's pid is recorded by the service before it sleeps
+  # (the bind above runs first, but the pid file is written immediately
+  # after the spawn, before the service sleeps).
     L80_CHILD=""
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       [ -f "$L80_CHILD_PID" ] && { L80_CHILD=$(cat "$L80_CHILD_PID" 2>/dev/null); }
@@ -3498,12 +3501,9 @@ L81EOF
     fail "L81 dead host service fails readiness at once with exit 125" "rc=$L81_RC elapsed=${L81_ELAPSED_MS}ms out=[$(printf '%s' "$L81_OUT" | head -c 300)]"
   fi
   case "$L81_OUT" in
-    *l81-svc*) pass "L81 failure names the dead service" ;;
-    *) fail "L81 failure names the dead service" "out=[$(printf '%s' "$L81_OUT" | head -c 300)]" ;;
-  esac
-  case "$L81_OUT" in
-    *7*) pass "L81 failure names the exit status" ;;
-    *) fail "L81 failure names the exit status" "out=[$(printf '%s' "$L81_OUT" | head -c 300)]" ;;
+    *"exited with status 7 before readiness completed"*)
+      pass "L81 failure names the service and its exit status (literal)" ;;
+    *) fail "L81 failure names the service and its exit status (literal)" "out=[$(printf '%s' "$L81_OUT" | head -c 300)]" ;;
   esac
   rm -rf "$L81_CWD"
 else

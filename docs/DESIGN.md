@@ -1,8 +1,13 @@
 # hisn — design
 
-Status: current as of hisn 0.4.2. §1–§14 describe the sandbox core (0.2 exec
-included); §15–§19 describe the 0.3 orchestration layer; §20 and §20.1 describe
-named sessions, attach, leases and the 0.4.1 changes. The session lifecycle in
+Status: current as of hisn 0.4.2 (0.4.3 in preparation — §21). §1–§14
+describe the sandbox core (0.2 exec
+included); §15–§19 describe the 0.3 orchestration layer; §20 and §20.1
+describe named sessions, attach, leases and the 0.4.1 changes; §21
+describes the 0.4.3 session-startup refactor and behaviour changes (in
+preparation; its release notes are drafted in
+`.wakil/reports/0.4.3-session2.md`, not in `docs/releases/` yet). The
+session lifecycle in
 one place is [sessions.md](sessions.md). The decisions behind
 each part are in [`docs/adr/`](adr/README.md). Binding input: `docs/BRIEF.md`
 (the DO NOT ALTER block there always wins). §12 records where working the
@@ -154,9 +159,10 @@ and unit-tested; `hisn inspect` output must equal it exactly (L8). Order:
 | 1 | `/usr /bin /sbin /lib /lib32 /lib64 /opt /nix` (only those existing on host) | same host path | recursive bind, **recursive ro** |
 | 1b | `/etc` — **not** a bind of the host `/etc`: a tmpfs holding one bind (or recreated symlink) per *top-level entry that exists at session start and is not masked* (§4.2) | `/etc/<entry>` | recursive bind, recursive ro |
 | 2 | policy `mounts.ro[]` | same path | recursive bind, recursive ro |
-| 3 | `/tmp` | tmpfs `size=1g,mode=1777` | nosuid,nodev |
+| 3 | `/tmp` | tmpfs `size=<session.tmp_size MiB>,mode=1777` (default 1024 MiB) | nosuid,nodev |
 | 4 | `/run` | tmpfs `size=64m,mode=0755` | nosuid,nodev |
 | 5 | `$HOME` (`/run/hisn/home`, §4.4) | tmpfs `size=1g,mode=0700` or rw bind of `home` path | nosuid,nodev |
+| 3b | `/dev/shm` (opt-in, `session.shm`) | tmpfs `size=<session.shm_size MiB>,mode=1777` (default 64 MiB) | nosuid,nodev |
 | 6 | cwd (identical path) | host cwd | recursive bind, rw |
 | 7 | policy `mounts.rw[]`, initial `--grant`s | same path | bind (non-recursive unless stated), rw/ro as given |
 | 8 | masks (§4.2) | `/dev/null` bind (files) / empty ro tmpfs (dirs) | ro |
@@ -220,7 +226,10 @@ explicit grant.
 * `/dev`: tmpfs with exactly `null zero full random urandom tty` (bind-mounted
   from the host nodes, since mknod is impossible), `ptmx → pts/ptmx`, a **new**
   devpts instance (`newinstance,ptmxmode=0666,mode=0620`), and the symlinks
-  `fd stdin stdout stderr → /proc/self/fd[/N]`. No `/dev/shm` (OPEN-POINTS).
+  `fd stdin stdout stderr → /proc/self/fd[/N]`. `/dev/shm` is present only
+  when the policy sets `session.shm = true` (0.4.1; default off) — it is a
+  tmpfs of `session.shm_size` MiB (default 64), not a permanent part of
+  `/dev`.
 * `/sys`: not mounted. `/var`: not mounted.
 
 ### 4.4 $HOME and caches
@@ -1433,6 +1442,16 @@ the actual `bind(2)` address (the service may listen anywhere).
    - `ready.tcp` is **not available in 0.3** for in-sandbox services (the
      supervisor cannot reach the sandbox's netns; `network = "none"` has only
      loopback). A `ready.tcp` entry is a load error for `[[services]]`.
+   - `"starting"` (0.4.3): the recorded `state` for a `[[services]]` entry
+     is `"starting"` from spawn until readiness passes. Before 0.4.3 every
+     entry was inserted as `"ready"` and `"starting"` never appeared.
+   - `exit` (0.4.3): `ServiceState.exit` records the exit status when a
+     service is reaped. It is `null` for in-sandbox services today: the pid
+     is in the sandbox pid namespace, so the supervisor cannot `waitpid`
+     it — only the monitor `W` reaps it, and the status stream carries no
+     exit code on this path without new plumbing across threads. The field
+     exists in `ls --json` with its former name and type; only the `state`
+     value became truthful.
 4. **Stop** (best-effort): before the supervisor closes the ns fds and
    removes the session dir (`§10`), it sends `stop.signal` to each service's
    process group, waits `stop.grace`, then `SIGKILL`. If init exits first
@@ -1668,3 +1687,82 @@ never from the host). 5 (annotation only).
   `exec.rs` (an fd travels sandbox→supervisor→client for the first time) and
   must be verified on a host (L76, with L10/L8 green, plus fd-count and
   fd-leak checks). Not shipped in 0.4.1.
+
+### 20.2 0.4.2 changes
+
+0.4.2 shipped the regression suite, the release gate and the small
+corrections recorded in `.wakil/reports/0.4.3-session1.md` on top of 0.4.1:
+leak cases L76–L79 (exec cancel on early disconnect, hung and slow
+readiness probes, load-time rejections), `scripts/release-gate.sh` +
+`make release-gate`, and the small `recv_with_fd`/`rootfs`/`sys` corrections.
+Nothing in §1–§20 changed shape; the control-socket protocol, the
+`ls --json` fields, the `supervisor.pid` format and the exit codes are
+unchanged.
+
+## 21. Session-startup refactor and behaviour alignment (0.4.3, in preparation)
+
+0.4.3 makes the session-startup code safe to extend (the egress proxy,
+cgroups and multi-seat work all add start/stop/cleanup steps). The
+procedure and per-commit record are in
+`.wakil/reports/0.4.3-session2.md`; release-note bullets for 0.4.3 are
+drafted there, not in `docs/releases/`.
+
+### Module layout
+
+- **`src/services.rs`** (new): host-service and in-sandbox service start,
+  readiness and stop. Moved out of `supervisor.rs` as a pure move; the
+  former `reap`/`reap_host` pair is one `services::reap` (blocking `waitpid`,
+  retrying `EINTR`).
+- **`run_session`** (`src/supervisor.rs`): now takes one `SessionStart`
+  input struct (19 fields, no `too_many_arguments` allowance) and runs as
+  named phases — `prepare`, `namespaces`, `helpers`, `control`, `services`,
+  `wait`, `teardown`. The eight hand-copied "kill init and reap" early
+  exits and the already-started-host-service cleanup are one
+  `SessionGuard` whose `Drop` SIGKILLs the started host services (in
+  start order) and then init, and reaps all of them. It is disarmed on
+  the success path, after `relay_and_wait` has reaped init. The guard's
+  `Drop` never panics.
+- **One stop path**: `services::stop_and_reap(&dyn Stoppable, sig, grace)`
+  owns the signal + grace loop for both host services (a real pid) and
+  in-sandbox services (a status socket). The host and in-sandbox stop
+  loops kept their signals, grace handling and order.
+- **One profile load**: `prepare` loads the profile once and carries the
+  risk entries in `Prepared`; `run_detached` prepares before `fork` so
+  the child inherits the result. `Profile::overrides()` is the one
+  profile-to-`Overrides` construction (used by `profile validate`;
+  `prepare` applies CLI-over-profile precedence on top of it with the
+  same values). `check_risk_ack` is the one `risk_ack` check for
+  `[[forward]]`, `[[host_services]]` and `[docker]`; every error message
+  keeps its former wording byte for byte.
+- **One exec table**: `live`, `execs`, `exec_info`, `used_pids` and
+  `recycled_pids` are one `ExecTable` keyed by `exec_id` (lock order:
+  `lease_lock`, then the table). Pid-recycling semantics are unchanged.
+- **Shared client helpers**: `execcli::open_host_pty` and
+  `execcli::parse_exit` are the one PTY allocation and the one exit-line
+  parser, used by both `hisn exec` and `hisn attach`.
+
+### Behaviour changes (each its own commit)
+
+- **Host-service stop kills the whole process group.** The host-service
+  child `setpgid(0, 0)` (the parent also `setpgid(pid, pid)`), and TERM
+  and KILL go to the group. The service is then outside the terminal's
+  foreground group, so its stdin is `/dev/null` (as are stdout/stderr).
+- **Readiness fails when the host service is already dead.** If the
+  service process has exited before readiness completes, startup fails at
+  once naming the service and its exit status — even if `ready.command`
+  would pass (L81).
+- **Real service state.** `ServiceState.state` is `"starting"` until
+  readiness passes, then `"ready"`; `"exited"` when the monitor is gone.
+  Field names and types in `ls --json` are unchanged. `ServiceState.exit`
+  stays `null` for in-sandbox services: the supervisor cannot `waitpid`
+  a process in the sandbox pid namespace, and the status stream carries
+  no exit code without new plumbing across threads (§19, above).
+- **`recv_with_fd` call sites audited** (`sys.rs` doc comment): no
+  legitimate message can exceed its buffer (init GO/START are 1 byte;
+  grant requests are one absolute path + one fd over SOCK_STREAM, so no
+  `MSG_TRUNC` can fire, and only one fd is ever sent; helper replies are
+  `ok <id>`/`err <errno>` over a 4096 buffer).
+- **SSH agent proxy**: the host agent socket now carries a 30 s read
+  timeout matching the 30 s write timeout.
+- **Release gate**: `scripts/release-gate.sh` now runs `make check` as
+  step 3 (its summary line prints `make-check=ok`).

@@ -136,30 +136,21 @@ pub struct Shared {
     /// Spawns hold it shared until the program is inside init's tree; a hard
     /// revoke takes it exclusively before sweeping (DESIGN §14.6, D22).
     spawn_gate: RwLock<()>,
-    /// Live exec'd programs: in-sandbox pid → a handle on their status socket
-    /// (only used to deliver `signal`).
-    live: Mutex<std::collections::BTreeMap<i32, OwnedFd>>,
+    /// One table for every live exec, keyed by `exec_id` (0.4.3: folded
+    /// from the former `live`/`execs`/`exec_info`/`used_pids`/
+    /// `recycled_pids` maps, whose five collections duplicated the same
+    /// registration). Lock order, documented: `lease_lock` (via `admit`)
+    /// then this table's lock; the table is the only lock taken for exec
+    /// bookkeeping, so there is no cross-map ordering to get wrong.
+    exec_table: Mutex<ExecTable>,
     /// Monotonic exec_id counter (never reused within a session).
     next_exec_id: std::sync::atomic::AtomicU64,
     /// Monotonic request sequence number, supervisor-assigned (0.4.0 step 3).
     seq: std::sync::atomic::AtomicU64,
-    /// Map of exec_id → (pid, status fd handle) for live execs.
-    execs: Mutex<std::collections::BTreeMap<u64, (i32, OwnedFd)>>,
-    /// All pids ever used by any exec in this session. Used to detect pid
-    /// reuse: if a new exec gets a pid that was used by a previous exec
-    /// (even a finished one), `signal` by that pid is rejected.
-    used_pids: Mutex<std::collections::BTreeSet<i32>>,
-    /// Pids that have been reused by a later exec. A `signal` by such a
-    /// pid is rejected — the client must use `exec_id`.
-    recycled_pids: Mutex<std::collections::BTreeSet<i32>>,
     /// 0.4.1 R2: the live control connections (the client count and the
     /// `clients[]` records). The idle timer treats a non-empty registry as
     /// activity. Keyed by [`ConnId`]; see [`ConnRegistry`].
     conns: Mutex<ConnRegistry>,
-    /// 0.4.1 step 3: live execs for `ls --json` (`execs`), keyed by exec_id.
-    /// Includes attaches (`attach: true`) and ordinary execs, with pid, argv0,
-    /// tty and attach flag. Removed when the exec finishes.
-    exec_info: Mutex<std::collections::BTreeMap<u64, ExecInfo>>,
     /// In-sandbox services (DESIGN §19): name → state for `ls --json`.
     services: Mutex<std::collections::BTreeMap<String, ServiceState>>,
     /// The session directory on the host (for `session.json` member writes).
@@ -241,6 +232,73 @@ struct ExecInfo {
     argv0: String,
     tty: bool,
     attach: bool,
+}
+
+/// One live exec, held in [`ExecTable`]: the `ls --json` info, the pid, and
+/// the two dup'd status-fd handles (one for `signal` by `exec_id`, one for
+/// `signal` by pid — the same dup the old `execs`/`live` pair made).
+struct ExecEntry {
+    info: ExecInfo,
+    status_by_id: OwnedFd,
+    status_by_pid: OwnedFd,
+}
+
+/// All live execs of a session, keyed by `exec_id`, plus the pid-reuse
+/// history (0.4.3: one table; before, five collections tracked the same
+/// exec and could disagree).
+///
+/// Pid-recycling semantics are unchanged: a pid ever used is remembered
+/// (`used_pids`); a pid handed to a later exec is `recycled` and `signal`
+/// by that pid is rejected. Entries are removed when the exec finishes;
+/// the used/recycled history is not.
+#[derive(Default)]
+struct ExecTable {
+    live: std::collections::BTreeMap<u64, ExecEntry>,
+    used_pids: std::collections::BTreeSet<i32>,
+    recycled_pids: std::collections::BTreeSet<i32>,
+}
+
+impl ExecTable {
+    fn insert(&mut self, exec_id: u64, entry: ExecEntry) {
+        let pid = entry.info.pid;
+        if self.used_pids.contains(&pid) {
+            self.recycled_pids.insert(pid);
+        }
+        self.used_pids.insert(pid);
+        self.live.insert(exec_id, entry);
+    }
+
+    fn remove(&mut self, exec_id: u64) {
+        self.live.remove(&exec_id);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.live.is_empty()
+    }
+
+    fn by_id(&self, exec_id: u64) -> Option<&OwnedFd> {
+        self.live.get(&exec_id).map(|e| &e.status_by_id)
+    }
+
+    /// Signal-by-pid lookup: `None` if the pid is recycled (reject with the
+    /// recycled error) or not live. Returns the status handle.
+    fn by_pid(&self, pid: i32) -> Option<&OwnedFd> {
+        if self.recycled_pids.contains(&pid) {
+            return None;
+        }
+        self.live
+            .values()
+            .find(|e| e.info.pid == pid)
+            .map(|e| &e.status_by_pid)
+    }
+
+    fn is_recycled(&self, pid: i32) -> bool {
+        self.recycled_pids.contains(&pid)
+    }
+
+    fn infos(&self) -> impl Iterator<Item = (u64, &ExecInfo)> {
+        self.live.iter().map(|(id, e)| (*id, &e.info))
+    }
 }
 
 /// The state of an in-sandbox service for `ls --json` (DESIGN §19).
@@ -329,10 +387,10 @@ impl Shared {
         self.conns.lock().expect("conns").connected() > 0
     }
 
-    /// 0.4.0 F2 fix: are there any running execs? (Any entry in the execs
-    /// map, regardless of state — a finished exec is removed immediately.)
+    /// 0.4.0 F2 fix: are there any running execs? (Any entry in the exec
+    /// table, regardless of state — a finished exec is removed immediately.)
     pub fn has_running_execs(&self) -> bool {
-        !self.execs.lock().expect("execs").is_empty()
+        !self.exec_table.lock().expect("exec_table").is_empty()
     }
 
     /// 0.4.1 step 7: the idle predicate input, read under `lease_lock` so an
@@ -343,7 +401,7 @@ impl Shared {
         let _g = self.lease_lock.lock().expect("lease lock");
         (
             self.conns.lock().expect("conns").connected() > 0,
-            !self.execs.lock().expect("execs").is_empty(),
+            !self.exec_table.lock().expect("exec_table").is_empty(),
             self.last_activity_secs
                 .load(std::sync::atomic::Ordering::SeqCst),
         )
@@ -945,42 +1003,31 @@ impl Shared {
         let exec_id = self
             .next_exec_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // 0.4.1 step 3: record the live exec for `ls --json` `execs[]`
-        // (attaches included). Removed when the exec finishes, below.
-        // 0.4.1 step 7: registration is admission — it takes the lease lock so
-        // an idle check in flight cannot miss this exec and stop the session.
-        self.admit(|| {
-            self.exec_info.lock().expect("exec_info").insert(
-                exec_id,
-                ExecInfo {
-                    pid: sp.pid,
-                    argv0: argv0.clone(),
-                    tty: req.tty,
-                    attach: req.attach,
-                },
-            );
-        });
+        // Register for `signal` before the client learns the pid. One
+        // admission inserts one table entry (info + both status dups +
+        // pid-recycling); the idle check therefore sees the exec atomically.
+        // 0.4.1 step 7: registration is admission — it takes the lease lock
+        // so an idle check in flight cannot miss this exec and stop the
+        // session.
         let registered = self.admit(|| {
             sys::dup_cloexec_min(sp.status.as_raw_fd(), 3)
                 .ok()
-                .map(|h| {
-                    // Check if this pid was used by a previous exec (even a
-                    // finished one). If so, mark it as recycled so `signal`
-                    // by pid is rejected for the new exec.
-                    {
-                        let mut used = self.used_pids.lock().expect("used_pids");
-                        if used.contains(&sp.pid) {
-                            self.recycled_pids.lock().expect("recycled").insert(sp.pid);
-                        }
-                        used.insert(sp.pid);
-                    }
-                    self.live.lock().expect("live").insert(sp.pid, h);
-                    if let Ok(dup) = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3) {
-                        self.execs
-                            .lock()
-                            .expect("execs")
-                            .insert(exec_id, (sp.pid, dup));
-                    }
+                .map(|by_pid| {
+                    let by_id = sys::dup_cloexec_min(sp.status.as_raw_fd(), 3)
+                        .expect("dup status fd for exec table");
+                    self.exec_table.lock().expect("exec_table").insert(
+                        exec_id,
+                        ExecEntry {
+                            info: ExecInfo {
+                                pid: sp.pid,
+                                argv0: argv0.clone(),
+                                tty: req.tty,
+                                attach: req.attach,
+                            },
+                            status_by_id: by_id,
+                            status_by_pid: by_pid,
+                        },
+                    );
                     sp.pid
                 })
         });
@@ -996,11 +1043,8 @@ impl Shared {
             // Client already gone: cancel through the normal path.
             exec::drive_from(&sp.status, sp.pending, -1, std::time::Duration::ZERO, true)
         };
-        if let Some(pid) = registered {
-            self.live.lock().expect("live").remove(&pid);
-        }
-        self.execs.lock().expect("execs").remove(&exec_id);
-        self.exec_info.lock().expect("exec_info").remove(&exec_id);
+        let _registered = registered;
+        self.exec_table.lock().expect("exec_table").remove(exec_id);
         let (res, line) = match outcome {
             exec::Outcome::Exited(exec::Exit::Code(c)) => ("ok", json!({ "exit": { "code": c } })),
             exec::Outcome::Exited(exec::Exit::Signal(n)) => (
@@ -1041,8 +1085,8 @@ impl Shared {
             let Some(eid_num) = eid_num else {
                 return err(control::E_BAD_REQUEST, format!("invalid exec_id {eid:?}"));
             };
-            let execs = self.execs.lock().expect("execs");
-            let Some((_, h)) = execs.get(&eid_num) else {
+            let table = self.exec_table.lock().expect("exec_table");
+            let Some(h) = table.by_id(eid_num) else {
                 return err(
                     control::E_NOT_FOUND,
                     format!("no running exec with exec_id {eid}"),
@@ -1060,14 +1104,14 @@ impl Shared {
                 "signal requires exec_id or pid".to_owned(),
             );
         };
-        if self.recycled_pids.lock().expect("recycled").contains(&pid) {
+        let table = self.exec_table.lock().expect("exec_table");
+        if table.is_recycled(pid) {
             return err(
                 control::E_NOT_FOUND,
                 format!("pid {pid} has been recycled; use exec_id"),
             );
         }
-        let live = self.live.lock().expect("live");
-        let Some(h) = live.get(&pid) else {
+        let Some(h) = table.by_pid(pid) else {
             return err(
                 control::E_NOT_FOUND,
                 format!("no running exec with pid {pid}"),
@@ -1100,10 +1144,10 @@ impl Shared {
             })
             .collect();
         let execs: Vec<Value> = self
-            .exec_info
+            .exec_table
             .lock()
-            .expect("exec_info")
-            .iter()
+            .expect("exec_table")
+            .infos()
             .map(|(id, e)| {
                 json!({
                     "exec_id": format!("e-{id}"),
@@ -2876,14 +2920,10 @@ fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
             .expect("exec client moved into control"),
         exec_rules: a.exec_rules.take().expect("exec rules moved into control"),
         spawn_gate: RwLock::new(()),
-        live: Mutex::new(Default::default()),
+        exec_table: Mutex::new(ExecTable::default()),
         next_exec_id: std::sync::atomic::AtomicU64::new(1),
         seq: std::sync::atomic::AtomicU64::new(1),
-        execs: Mutex::new(Default::default()),
-        used_pids: Mutex::new(Default::default()),
-        recycled_pids: Mutex::new(Default::default()),
         conns: Mutex::new(ConnRegistry::default()),
-        exec_info: Mutex::new(Default::default()),
         services: Mutex::new(Default::default()),
         session_dir: a.sdir.path.clone(),
         session_json_lock: Mutex::new(()),

@@ -221,12 +221,19 @@ pub fn touch_lease(dir: &Path, now: &str) -> std::io::Result<()> {
 /// The temp name is unique per call (pid + a process-wide counter) so two
 /// writers that somehow both reach this point cannot collide or EEXIST;
 /// the `flock` in the callers is what serialises them.
+///
+/// A leftover temp file with the same pid and counter (a crash followed by
+/// pid reuse, with the counter reset) would make `create_new` fail. The
+/// lock already serialises writers, so no live writer can own that exact
+/// name: remove a stale file with the exact name before creating it.
 fn rewrite(dir: &Path, m: &SessionMeta) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(".session.json.tmp-{}-{n}", std::process::id()));
     let body = serde_json::to_string_pretty(m).map_err(std::io::Error::other)?;
+    // Remove a stale temp file with this exact name before create_new.
+    let _ = fs::remove_file(&tmp);
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -424,6 +431,30 @@ mod tests {
         assert_eq!(back.members[0].label, "local");
         assert_eq!(back.members[1].uid, 1000);
         assert_eq!(back.members[1].label, "wakil@rubin");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn rewrite_survives_stale_temp_with_same_name() {
+        // A leftover temp file with the same pid+counter name (crash +
+        // pid reuse) must not make the rewrite fail: the stale file is
+        // removed before create_new.
+        let d = std::env::temp_dir().join(format!("hisn-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let m = SessionMeta::new("abc", None, owner(), "/w", "none");
+        m.write_to(&d).unwrap();
+        // Plant stale temp files for the first few counter values.
+        for n in 0..4u64 {
+            fs::write(
+                d.join(format!(".session.json.tmp-{}-{n}", std::process::id())),
+                b"stale",
+            )
+            .unwrap();
+        }
+        set_state(&d, State::Running).unwrap();
+        let back = read(&d).unwrap();
+        assert_eq!(back.state, State::Running);
         fs::remove_dir_all(&d).unwrap();
     }
 

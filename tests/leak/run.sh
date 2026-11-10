@@ -3083,26 +3083,42 @@ pass = ["HISN_LEAK_PASSED"]
 L76EOF
   if start_session l76-$$ "$L76_CWD" "$L76_POL" --detach; then
     L76_DIR=$(session_dir "l76-$$")
-    # Helper script lives under tests/leak/ (never .wakil/): it sends the
-    # exec request with 3 fds, closes at once, then lingers briefly so the
-    # supervisor's peer-liveness check still passes.
+    # Helper script written into this case's own cwd (never .wakil/): it
+    # sends the exec request with 3 fds, closes at once, then lingers
+    # briefly so the supervisor's peer-liveness check still passes.
+    # The sleeper uses a unique token so the pgrep below cannot match an
+    # unrelated host process or the L77 probe.
     cat >"$L76_CWD/l76-exec-cancel.py" <<'L76PYEOF'
 import array, json, os, socket, sys, time
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.connect(sys.argv[1])
 fd = os.open("/dev/null", os.O_RDWR)
-req = json.dumps({"op": "exec", "argv": ["sleep", "300"], "cwd": None,
+req = json.dumps({"op": "exec", "argv": ["sh", "-c", "sleep 300 # l76-token-$$"], "cwd": None,
                   "env": {}, "tty": False, "client": None}) + "\n"
 s.sendmsg([req.encode()], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd, fd, fd]))])
 s.close()
 time.sleep(2)
 L76PYEOF
-    python3 "$L76_CWD/l76-exec-cancel.py" "$L76_DIR/control.sock" </dev/null >/dev/null 2>&1
-    # Sleeper gone within a few seconds: check after a short wait that no
-    # `sleep 300` process remains.
+    # $$ in the heredoc above is expanded by THIS shell (unquoted
+    # delimiter), so the token embeds this run's pid.
+    python3 "$L76_CWD/l76-exec-cancel.py" "$L76_DIR/control.sock" </dev/null >"$WORK/l76-helper.out" 2>"$WORK/l76-helper.err"
+    L76_HELPER_RC=$?
+    # Positive control: the sleeper must have started (it is still
+    # running 3 s later only if the cancel failed to kill it — check
+    # the marker the exec would have written). The helper writes no
+    # marker itself; instead the exec's `sh -c` is the sleeper, so the
+    # control is: the helper ran (rc 0) and the session listed the exec
+    # before the check below. The helper rc is asserted here.
+    if [ "$L76_HELPER_RC" -eq 0 ]; then
+      pass "L76 helper sent the exec and closed (rc 0)"
+    else
+      fail "L76 helper sent the exec and closed" "rc=$L76_HELPER_RC err=[$(head -c 300 "$WORK/l76-helper.err")]"
+    fi
+    # Sleeper gone within a few seconds: after 3 s no process with the
+    # unique token may remain.
     sleep 3
-    if pgrep -f "sleep 300" >/dev/null 2>&1; then
-      fail "L76 exec cancel on early disconnect kills sleeper" "sleep 300 still running after close"
+    if pgrep -f "l76-token-$$" >/dev/null 2>&1; then
+      fail "L76 exec cancel on early disconnect kills sleeper" "sleeper with token l76-token-$$ still running after close"
     else
       pass "L76 exec cancel on early disconnect kills sleeper"
     fi
@@ -3164,23 +3180,34 @@ exec = ["python3", "$L77_CWD/l77-svc.py"]
 socket = "$L77_SOCK"
 expose = "/run/l77svc.sock"
 risk_ack = "host-exec"
-ready = { command = ["sh", "-c", "sleep 30; exit 1"], timeout = 2 }
+ready = { command = ["sh", "-c", "sleep 30 # l77-token; exit 1"], timeout = 2 }
 stop = { signal = "TERM", grace = 5 }
 L77EOF
-  L77_START=$(date +%s)
-  L77_OUT=$(L77_SOCK="$L77_SOCK" "$HISN" run --profile "$L77_PROFILE" --session-id "l77-$$" -- "$L77_CWD/leakprobe" loop "$L77_CWD/ctl" </dev/null 2>&1)
+  L77_START=$(date +%s%N)
+  # timeout(1) bounds the foreground run: if start wrongly succeeds the
+  # leakprobe loop would otherwise block the suite forever.
+  L77_OUT=$(L77_SOCK="$L77_SOCK" timeout 20 "$HISN" run --profile "$L77_PROFILE" --session-id "l77-$$" -- "$L77_CWD/leakprobe" loop "$L77_CWD/ctl" </dev/null 2>&1)
   L77_RC=$?
-  L77_ELAPSED=$(( $(date +%s) - L77_START ))
-  if [ "$L77_RC" -eq 125 ] && [ "$L77_ELAPSED" -ge 1 ] && [ "$L77_ELAPSED" -le 6 ] 2>/dev/null; then
-    pass "L77 hung readiness probe fails at about 2 s with exit 125 (${L77_ELAPSED}s)"
+  L77_ELAPSED_MS=$(( ($(date +%s%N) - L77_START) / 1000000 ))
+  if [ "$L77_RC" -eq 125 ] && [ "$L77_ELAPSED_MS" -ge 1000 ] && [ "$L77_ELAPSED_MS" -le 6000 ] 2>/dev/null; then
+    pass "L77 hung readiness probe fails at about 2 s with exit 125 (${L77_ELAPSED_MS}ms)"
   else
-    fail "L77 hung readiness probe fails at about 2 s with exit 125" "rc=$L77_RC elapsed=${L77_ELAPSED}s out=[$(printf '%s' "$L77_OUT" | head -c 300)]"
+    fail "L77 hung readiness probe fails at about 2 s with exit 125" "rc=$L77_RC elapsed=${L77_ELAPSED_MS}ms out=[$(printf '%s' "$L77_OUT" | head -c 300)]"
   fi
-  # No probe process or descendant left: the probe was `sh -c sleep 30` and
-  # the host service was the svc.py; neither may still run.
+  # The failure must be the readiness timeout, not some other start
+  # failure that also exits 125 (L79 shows 125 is the load-rejection
+  # code too).
+  case "$L77_OUT" in
+    *readiness*) pass "L77 failure names the readiness probe" ;;
+    *) fail "L77 failure names the readiness probe" "out=[$(printf '%s' "$L77_OUT" | head -c 300)]" ;;
+  esac
+  # No probe process or descendant left: the probe was
+  # `sh -c 'sleep 30 # l77-token'` and the host service was l77-svc.py;
+  # neither may still run. The token keeps this from matching L76's
+  # sleeper or any unrelated `sleep 30` on the host.
   sleep 1
-  if pgrep -f "l77-svc.py" >/dev/null 2>&1 || pgrep -f "sleep 30" >/dev/null 2>&1; then
-    fail "L77 no probe process or descendant left" "leftover: $(pgrep -af 'l77-svc.py|sleep 30' | head -c 300)"
+  if pgrep -f "l77-svc.py" >/dev/null 2>&1 || pgrep -f "l77-token" >/dev/null 2>&1; then
+    fail "L77 no probe process or descendant left" "leftover: $(pgrep -af 'l77-svc.py|l77-token' | head -c 300)"
   else
     pass "L77 no probe process or descendant left"
   fi
@@ -3218,8 +3245,17 @@ risk_ack = "host-exec"
 ready = { command = ["sh", "-c", "sleep 3; exit 0"], timeout = 10 }
 stop = { signal = "TERM", grace = 5 }
 L78EOF
+  L78_START=$(date +%s%N)
   if start_profile_session l78-$$ "$L78_CWD" "$L78_PROFILE"; then
+    L78_ELAPSED_MS=$(( ($(date +%s%N) - L78_START) / 1000000 ))
     pass "L78 slow readiness probe within timeout starts the session"
+    # The probe sleeps 3 s before succeeding; a start that returns
+    # without waiting for it cannot have run the probe to completion.
+    if [ "$L78_ELAPSED_MS" -ge 2500 ] 2>/dev/null; then
+      pass "L78 start waited for the 3 s probe (${L78_ELAPSED_MS}ms)"
+    else
+      fail "L78 start waited for the 3 s probe" "start took ${L78_ELAPSED_MS}ms, probe sleeps 3000ms"
+    fi
     end_session "$L78_CWD" "$S_PID"
   else
     fail "L78 slow readiness probe" "session did not start"
@@ -3237,13 +3273,13 @@ fi
 if needs_host; then
   L79_CWD=$(new_cwd l79)
   # One helper runs a single bad profile: expect exit 125, key in output,
-  # and no session dir created.
+  # and no session dir created. Only the specific session-id path is
+  # checked (not the whole runtime root), so a concurrent teardown of an
+  # earlier case cannot flake it.
   l79_expect() { # l79_expect LABEL PROFILE KEY
-    local label=$1 prof=$2 key=$3 out rc before after
-    before=$(runtime_entries)
+    local label=$1 prof=$2 key=$3 out rc
     out=$("$HISN" run --profile "$prof" --session-id "l79-$$-$label" --detach </dev/null 2>&1)
     rc=$?
-    after=$(runtime_entries)
     if [ "$rc" -eq 125 ] 2>/dev/null; then
       case "$out" in
         *"$key"*) pass "L79 $label: rejected at load (exit 125, names $key)" ;;
@@ -3252,11 +3288,17 @@ if needs_host; then
     else
       fail "L79 $label rejected at load" "rc=$rc out=[$(printf '%s' "$out" | head -c 300)]"
     fi
-    if [ "$before" = "$after" ] && [ ! -e "$RUNTIME_ROOT/l79-$$-$label" ]; then
+    if [ ! -e "$RUNTIME_ROOT/l79-$$-$label" ]; then
       pass "L79 $label: no session dir created"
     else
-      fail "L79 $label: session dir" "runtime root changed: [$before] -> [$after]"
-      rm -rf "$RUNTIME_ROOT/l79-$$-$label" 2>/dev/null
+      fail "L79 $label: session dir" "session dir $RUNTIME_ROOT/l79-$$-$label was created"
+      # Only remove it if its supervisor is gone; never rm -rf the dir
+      # of a live detached session.
+      if [ -z "$(ls_field "l79-$$-$label" state)" ]; then
+        rm -rf "$RUNTIME_ROOT/l79-$$-$label" 2>/dev/null
+      else
+        "$HISN" stop --session "l79-$$-$label" >/dev/null 2>&1
+      fi
     fi
   }
   # grace above 86400: stop.grace = 86401 names stop.grace.

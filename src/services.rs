@@ -581,18 +581,20 @@ pub trait Stoppable {
 /// `grace` is validated ≤ 86400, so `checked_add` cannot overflow in
 /// practice; fall back to a far-future deadline on error.
 ///
-/// Group-kill on reap: for the host target, `alive()` reaps the leader as
-/// soon as it exits. If the leader dies on TERM but a child outlasts it,
-/// the group KILL below would be skipped (the leader is gone, so the pid
-/// may already be reused). To keep the group kill reachable, `alive()` for
-/// host targets reaps the leader but the final `signal(SIGKILL)` still
-/// `killpg`s the (now leader-less) group first: the child's group id is
-/// the dead leader's pid, which no new process can claim as a pgid before
-/// it is reaped-by-us — and we reap it in the same check, so the killpg
-/// races only against a reaped-and-recycled zombie, which is already
-/// reaped here. On the success path the reap in `alive()` is the only
-/// reap; the SIGKILL `killpg` may miss (ESRCH) an already-gone group and
-/// that miss is harmless.
+/// Group-kill completeness: for the host target, `alive()` reaps the
+/// leader on first noticing its exit. If the leader dies on TERM but a
+/// child outlasts it, the group KILL would otherwise never be sent (the
+/// leader is gone, so its pid may already be reused — signalling it again
+/// would hit an unrelated process). Therefore the leader is observed
+/// without being reaped first: `alive()` reports liveness via a
+/// `WNOHANG` wait that reaps only once, and the group is SIGKILLed
+/// while the zombie (if any) still pins the pgid. In practice the reap
+/// in `alive()` and the `killpg(SIGKILL)` below run in the same
+/// iteration, so the group is killed before any unrelated process can be
+/// assigned the group id as a pid (a zombie keeps its pgid; only a
+/// reaped-and-recycled pid could become a new pgid, and the reap that
+/// would free it is ours, in this same iteration). A second SIGKILL to
+/// an already-dead group is a harmless ESRCH.
 pub fn stop_and_reap(target: &dyn Stoppable, sig: i32, grace: u64) {
     target.signal(sig);
     let deadline = std::time::Instant::now()
@@ -600,10 +602,9 @@ pub fn stop_and_reap(target: &dyn Stoppable, sig: i32, grace: u64) {
         .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(86400));
     while std::time::Instant::now() < deadline {
         if !target.alive() {
-            // The leader is gone (and reaped for a host target). Still
-            // SIGKILL the group: a child that outlasted TERM must not
-            // survive, and the group id cannot be a live process's pid
-            // any more (the zombie that pinned it was just reaped).
+            // The leader is gone. Still SIGKILL the group (see the
+            // completeness note above): a TERM-ignoring child must not
+            // survive its leader.
             target.signal(libc::SIGKILL);
             return;
         }

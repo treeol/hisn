@@ -3062,6 +3062,270 @@ else
   skip "L75 run --detach prints '<id> <name> ready'" "hisn check failed (no userns)"
 fi
 
+# ================================================ L76: exec cancel on early disconnect (0.4.2)
+# A client that sends an exec for a long sleeper and closes before reading
+# `started` must not leak the sleeper: it is killed within a few seconds,
+# `ls --json` shows no exec and no client for the session, and a session
+# with a short idle_timeout stops itself.
+if needs_host; then
+  L76_CWD=$(new_cwd l76)
+  L76_POL="$WORK/l76.toml"
+  cat >"$L76_POL" <<L76EOF
+version = "hisn-policy/v1"
+[session]
+cwd = "$L76_CWD"
+network = "none"
+idle_timeout = "3s"
+[mounts]
+grantable_rw = ["$WORK/g_rw"]
+[env]
+pass = ["HISN_LEAK_PASSED"]
+L76EOF
+  if start_session l76-$$ "$L76_CWD" "$L76_POL" --detach; then
+    L76_DIR=$(session_dir "l76-$$")
+    # Helper script lives under tests/leak/ (never .wakil/): it sends the
+    # exec request with 3 fds, closes at once, then lingers briefly so the
+    # supervisor's peer-liveness check still passes.
+    cat >"$L76_CWD/l76-exec-cancel.py" <<'L76PYEOF'
+import array, json, os, socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+fd = os.open("/dev/null", os.O_RDWR)
+req = json.dumps({"op": "exec", "argv": ["sleep", "300"], "cwd": None,
+                  "env": {}, "tty": False, "client": None}) + "\n"
+s.sendmsg([req.encode()], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd, fd, fd]))])
+s.close()
+time.sleep(2)
+L76PYEOF
+    python3 "$L76_CWD/l76-exec-cancel.py" "$L76_DIR/control.sock" </dev/null >/dev/null 2>&1
+    # Sleeper gone within a few seconds: check after a short wait that no
+    # `sleep 300` process remains.
+    sleep 3
+    if pgrep -f "sleep 300" >/dev/null 2>&1; then
+      fail "L76 exec cancel on early disconnect kills sleeper" "sleep 300 still running after close"
+    else
+      pass "L76 exec cancel on early disconnect kills sleeper"
+    fi
+    # ls --json shows no exec and no client for the session.
+    L76_EXECS=$("$HISN" ls --json 2>/dev/null | $PY ls-count "l76-$$" execs)
+    L76_CLIENTS=$("$HISN" ls --json 2>/dev/null | $PY ls-count "l76-$$" clients)
+    if [ "$L76_EXECS" = "0" ] 2>/dev/null && [ "$L76_CLIENTS" = "0" ] 2>/dev/null; then
+      pass "L76 ls --json shows no exec and no client after cancel"
+    else
+      fail "L76 ls --json shows no exec and no client after cancel" "execs=$L76_EXECS clients=$L76_CLIENTS"
+    fi
+    # The session with short idle_timeout stops itself (state becomes stopped).
+    L76_DEADLINE=$(( $(date +%s) + 20 ))
+    while [ "$(date +%s)" -lt "$L76_DEADLINE" ]; do
+      L76_STATE=$(ls_field "l76-$$" state)
+      [ "$L76_STATE" = "stopped" ] && break
+      [ -z "$L76_STATE" ] && break
+      sleep 1
+    done
+    L76_STATE=$(ls_field "l76-$$" state)
+    if [ "$L76_STATE" = "stopped" ]; then
+      pass "L76 session with short idle_timeout stops itself"
+    else
+      fail "L76 session with short idle_timeout stops itself" "state=[$L76_STATE] after idle timeout"
+    fi
+    reap_bounded "$S_PID" 15 "L76 run exit after idle stop"
+    "$HISN" ls --prune >/dev/null 2>&1
+  else
+    skip "L76 exec cancel on early disconnect" "session did not start"
+  fi
+  rm -rf "$L76_CWD"
+else
+  skip "L76 exec cancel on early disconnect" "hisn check failed (no userns)"
+fi
+
+# ================================================ L77: hung readiness probe (0.4.2, HOST)
+# ready.command that never exits, timeout = 2: start fails at about 2 s
+# with exit 125, and no probe process or descendant is left.
+if needs_host; then
+  L77_CWD=$(new_cwd l77)
+  L77_SOCK="$WORK/l77-svc.sock"
+  L77_PROFILE="$WORK/L77-profile.toml"
+  cat >"$L77_CWD/l77-svc.py" <<'L77PYEOF'
+import socket,os,time
+p=os.environ["L77_SOCK"]
+try: os.unlink(p)
+except FileNotFoundError: pass
+s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1); time.sleep(3600)
+L77PYEOF
+  cat >"$L77_PROFILE" <<L77EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L77_CWD"
+session.network = "none"
+[[host_services]]
+name = "l77-svc"
+exec = ["python3", "$L77_CWD/l77-svc.py"]
+socket = "$L77_SOCK"
+expose = "/run/l77svc.sock"
+risk_ack = "host-exec"
+ready = { command = ["sh", "-c", "sleep 30; exit 1"], timeout = 2 }
+stop = { signal = "TERM", grace = 5 }
+L77EOF
+  L77_START=$(date +%s)
+  L77_OUT=$(L77_SOCK="$L77_SOCK" "$HISN" run --profile "$L77_PROFILE" --session-id "l77-$$" -- "$L77_CWD/leakprobe" loop "$L77_CWD/ctl" </dev/null 2>&1)
+  L77_RC=$?
+  L77_ELAPSED=$(( $(date +%s) - L77_START ))
+  if [ "$L77_RC" -eq 125 ] && [ "$L77_ELAPSED" -ge 1 ] && [ "$L77_ELAPSED" -le 6 ] 2>/dev/null; then
+    pass "L77 hung readiness probe fails at about 2 s with exit 125 (${L77_ELAPSED}s)"
+  else
+    fail "L77 hung readiness probe fails at about 2 s with exit 125" "rc=$L77_RC elapsed=${L77_ELAPSED}s out=[$(printf '%s' "$L77_OUT" | head -c 300)]"
+  fi
+  # No probe process or descendant left: the probe was `sh -c sleep 30` and
+  # the host service was the svc.py; neither may still run.
+  sleep 1
+  if pgrep -f "l77-svc.py" >/dev/null 2>&1 || pgrep -f "sleep 30" >/dev/null 2>&1; then
+    fail "L77 no probe process or descendant left" "leftover: $(pgrep -af 'l77-svc.py|sleep 30' | head -c 300)"
+  else
+    pass "L77 no probe process or descendant left"
+  fi
+  rm -f "$L77_SOCK" 2>/dev/null
+  rm -rf "$L77_CWD"
+else
+  skip "L77 hung readiness probe" "hisn check failed (no userns)"
+fi
+
+# ================================================ L78: slow readiness probe (0.4.2, HOST)
+# ready.command that sleeps 3 s then exits 0, timeout = 10: the session starts.
+if needs_host; then
+  L78_CWD=$(new_cwd l78)
+  L78_SOCK="$WORK/l78-svc.sock"
+  L78_PROFILE="$WORK/L78-profile.toml"
+  cat >"$L78_CWD/l78-svc.py" <<'L78PYEOF'
+import socket,os,time
+p=os.environ["L78_SOCK"]
+try: os.unlink(p)
+except FileNotFoundError: pass
+s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1); time.sleep(3600)
+L78PYEOF
+  cat >"$L78_PROFILE" <<L78EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L78_CWD"
+session.network = "none"
+[[host_services]]
+name = "l78-svc"
+exec = ["python3", "$L78_CWD/l78-svc.py"]
+socket = "$L78_SOCK"
+expose = "/run/l78svc.sock"
+risk_ack = "host-exec"
+ready = { command = ["sh", "-c", "sleep 3; exit 0"], timeout = 10 }
+stop = { signal = "TERM", grace = 5 }
+L78EOF
+  if start_profile_session l78-$$ "$L78_CWD" "$L78_PROFILE"; then
+    pass "L78 slow readiness probe within timeout starts the session"
+    end_session "$L78_CWD" "$S_PID"
+  else
+    fail "L78 slow readiness probe" "session did not start"
+  fi
+  rm -f "$L78_SOCK" 2>/dev/null
+  rm -rf "$L78_CWD"
+else
+  skip "L78 slow readiness probe" "hisn check failed (no userns)"
+fi
+
+# ================================================ L79: load-time rejections (0.4.2, HOST)
+# grace above 86400, readiness timeout above 86400, NUL in host_services.exec,
+# NUL in ready.command, and ready.tcp: each fails at load with exit 125 and
+# names the offending key, and no session dir is created.
+if needs_host; then
+  L79_CWD=$(new_cwd l79)
+  # One helper runs a single bad profile: expect exit 125, key in output,
+  # and no session dir created.
+  l79_expect() { # l79_expect LABEL PROFILE KEY
+    local label=$1 prof=$2 key=$3 out rc before after
+    before=$(runtime_entries)
+    out=$("$HISN" run --profile "$prof" --session-id "l79-$$-$label" --detach </dev/null 2>&1)
+    rc=$?
+    after=$(runtime_entries)
+    if [ "$rc" -eq 125 ] 2>/dev/null; then
+      case "$out" in
+        *"$key"*) pass "L79 $label: rejected at load (exit 125, names $key)" ;;
+        *) fail "L79 $label names offending key" "rc=125 but output lacks [$key]: [$(printf '%s' "$out" | head -c 300)]" ;;
+      esac
+    else
+      fail "L79 $label rejected at load" "rc=$rc out=[$(printf '%s' "$out" | head -c 300)]"
+    fi
+    if [ "$before" = "$after" ] && [ ! -e "$RUNTIME_ROOT/l79-$$-$label" ]; then
+      pass "L79 $label: no session dir created"
+    else
+      fail "L79 $label: session dir" "runtime root changed: [$before] -> [$after]"
+      rm -rf "$RUNTIME_ROOT/l79-$$-$label" 2>/dev/null
+    fi
+  }
+  # grace above 86400: stop.grace = 86401 names stop.grace.
+  L79_GRACE="$WORK/L79-grace.toml"
+  cat >"$L79_GRACE" <<L79EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L79_CWD"
+session.network = "none"
+[[host_services]]
+name = "l79"
+exec = ["python3", "-c", "import time; time.sleep(60)"]
+socket = "$WORK/l79-grace.sock"
+expose = "/run/l79.sock"
+risk_ack = "host-exec"
+stop = { signal = "TERM", grace = 86401 }
+L79EOF
+  l79_expect "grace-above-86400" "$L79_GRACE" "grace"
+  # readiness timeout above 86400: ready.timeout = 86401 names ready.timeout.
+  L79_TIMEOUT="$WORK/L79-timeout.toml"
+  cat >"$L79_TIMEOUT" <<L79EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L79_CWD"
+session.network = "none"
+[[host_services]]
+name = "l79"
+exec = ["python3", "-c", "import time; time.sleep(60)"]
+socket = "$WORK/l79-timeout.sock"
+expose = "/run/l79.sock"
+risk_ack = "host-exec"
+ready = { command = ["true"], timeout = 86401 }
+stop = { signal = "TERM", grace = 5 }
+L79EOF
+  l79_expect "timeout-above-86400" "$L79_TIMEOUT" "timeout"
+  # NUL in host_services.exec: the TOML escape \u0000 decodes to a NUL byte
+  # in the parsed string, which validation rejects naming the exec arg.
+  L79_NUL_EXEC="$WORK/L79-nul-exec.toml"
+  printf 'version = "hisn-profile/v1"\n[policy]\nversion = "hisn-policy/v1"\nsession.cwd = "%s"\nsession.network = "none"\n[[host_services]]\nname = "l79"\nexec = ["true\\u0000x"]\nsocket = "%s/l79-nulexec.sock"\nexpose = "/run/l79.sock"\nrisk_ack = "host-exec"\n' "$L79_CWD" "$WORK" >"$L79_NUL_EXEC"
+  l79_expect "nul-in-host-services-exec" "$L79_NUL_EXEC" "NUL"
+  # NUL in ready.command: ready.command arg containing a NUL names ready.command / NUL.
+  L79_NUL_READY="$WORK/L79-nul-ready.toml"
+  printf 'version = "hisn-profile/v1"\n[policy]\nversion = "hisn-policy/v1"\nsession.cwd = "%s"\nsession.network = "none"\n[[host_services]]\nname = "l79"\nexec = ["python3", "-c", "import time; time.sleep(60)"]\nsocket = "%s/l79-nulready.sock"\nexpose = "/run/l79.sock"\nrisk_ack = "host-exec"\nready = { command = ["true\\u0000x"], timeout = 5 }\nstop = { signal = "TERM", grace = 5 }\n' "$L79_CWD" "$WORK" >"$L79_NUL_READY"
+  l79_expect "nul-in-ready-command" "$L79_NUL_READY" "ready.command"
+  # ready.tcp: names ready.tcp.
+  L79_TCP="$WORK/L79-tcp.toml"
+  cat >"$L79_TCP" <<L79EOF
+version = "hisn-profile/v1"
+[policy]
+version = "hisn-policy/v1"
+session.cwd = "$L79_CWD"
+session.network = "none"
+[[host_services]]
+name = "l79"
+exec = ["python3", "-c", "import time; time.sleep(60)"]
+socket = "$WORK/l79-tcp.sock"
+expose = "/run/l79.sock"
+risk_ack = "host-exec"
+ready = { tcp = "127.0.0.1:1234", timeout = 5 }
+stop = { signal = "TERM", grace = 5 }
+L79EOF
+  l79_expect "ready-tcp" "$L79_TCP" "ready.tcp"
+  rm -rf "$L79_CWD"
+else
+  skip "L79 load-time rejections" "hisn check failed (no userns)"
+fi
+
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.
 MANIFEST="$HERE/MANIFEST"

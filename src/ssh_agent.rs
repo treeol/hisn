@@ -80,6 +80,12 @@ fn write_msg(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
 /// agent wedges the worker (and its client counter slot) indefinitely.
 const HOST_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Read timeout on the host agent socket: symmetric with the write timeout
+/// (a host agent that accepts but never replies pins the worker and the
+/// client's counter slot). Chosen identical to `HOST_WRITE_TIMEOUT` so both
+/// directions have the same bound.
+const HOST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// RAII guard for one proxy client: decrements the active-clients counter
 /// on *every* exit path, including a panic unwinding through
 /// `handle_client`. Replaces the manual `fetch_sub` after the call.
@@ -239,8 +245,10 @@ fn is_forwarded(msg_type: u8) -> bool {
     )
 }
 
-/// Handle one client connection: read messages, forward the allowed ones to
-/// the host agent, filter responses. Disallowed messages get FAILURE.
+/// Handled one client; returning from here releases the counter via
+/// `ClientGuard` on every exit path (including a read/write timeout on
+/// either the client or the host socket: both are plain `Err` returns, so
+/// the RAII guard runs either way).
 fn handle_client(mut client: UnixStream, host_agent: &str, allowed: Vec<String>, session_id: &str) {
     let mut host = match UnixStream::connect(host_agent) {
         Ok(s) => s,
@@ -252,8 +260,14 @@ fn handle_client(mut client: UnixStream, host_agent: &str, allowed: Vec<String>,
     };
     // Bound every write to the host agent: without it a host agent that
     // stops reading pins this worker (and the client's counter slot).
+    // The read side gets the symmetric bound from `HOST_READ_TIMEOUT`
+    // (Part 2.5): a host agent that accepts but never replies would
+    // otherwise block `read_msg` forever.
     if let Err(e) = host.set_write_timeout(Some(HOST_WRITE_TIMEOUT)) {
         tracing::warn!("ssh-agent proxy [{session_id}]: host write timeout: {e}");
+    }
+    if let Err(e) = host.set_read_timeout(Some(HOST_READ_TIMEOUT)) {
+        tracing::warn!("ssh-agent proxy [{session_id}]: host read timeout: {e}");
     }
     loop {
         let payload = match read_msg(&mut client) {
@@ -631,6 +645,15 @@ mod tests {
         });
         assert!(r.is_err());
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn host_read_timeout_matches_the_write_timeout() {
+        // Part 2.5: the host agent socket carries a read timeout symmetric
+        // with the write timeout, so a wedged host agent cannot pin the
+        // worker on either direction. The constants are the contract.
+        assert_eq!(HOST_READ_TIMEOUT, HOST_WRITE_TIMEOUT);
+        assert_eq!(HOST_READ_TIMEOUT, std::time::Duration::from_secs(30));
     }
 
     #[test]

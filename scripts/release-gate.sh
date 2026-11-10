@@ -4,9 +4,11 @@
 # Steps, in order:
 #   1. cargo fmt --check
 #   2. cargo clippy --all-targets -- -D warnings
-#   3. make test
-#   4. the leak suite with output through a pipe
-#   5. the leak suite on a pseudo-terminal (via `script` when present)
+#   3. make check (hisn check: host-capability report; exit 2 if a required
+#      capability is missing)
+#   4. make test
+#   5. the leak suite with output through a pipe
+#   6. the leak suite on a pseudo-terminal (via `script` when present)
 #
 # HISN_TEST_ROOTFS and HISN_BIG_TESTS, when set, are passed through to the
 # leak suite; when they are not set the rootfs and big-import cases skip and
@@ -23,7 +25,7 @@ ok()   { printf 'release-gate: OK %s\n' "$1"; }
 fail() { printf 'release-gate: FAIL %s: %s\n' "$1" "$2" >&2; exit 1; }
 
 run_leak_pipe() {
-  step 4 "leak suite through a pipe"
+  step 5 "leak suite through a pipe"
   set -o pipefail
   make leaktest 2>&1 | cat
   local rc=$?
@@ -33,7 +35,7 @@ run_leak_pipe() {
 }
 
 run_leak_pty() {
-  step 5 "leak suite on a pseudo-terminal"
+  step 6 "leak suite on a pseudo-terminal"
   if command -v script >/dev/null 2>&1; then
     set -o pipefail
     script -qec 'make leaktest' /dev/null
@@ -63,11 +65,15 @@ step 2 "cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings || fail "clippy" "cargo clippy exited $?"
 ok "clippy"
 
-step 3 "make test"
+step 3 "make check"
+make check || fail "make-check" "make check exited $?"
+ok "make-check"
+
+step 4 "make test"
 make test || fail "make-test" "make test exited $?"
 ok "make-test"
 
 run_leak_pipe
 run_leak_pty
 
-printf 'release-gate: summary fmt=ok clippy=ok make-test=ok leak-suite-pipe=ok leak-suite-pty=%s\n' "${LEAK_PTY:-skipped}"
+printf 'release-gate: summary fmt=ok clippy=ok make-check=ok make-test=ok leak-suite-pipe=ok leak-suite-pty=%s\n' "${LEAK_PTY:-skipped}"

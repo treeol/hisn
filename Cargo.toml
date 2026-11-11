@@ -1,6 +1,6 @@
 [package]
 name = "hisn"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 description = "Daemonless, rootless, single-binary Linux sandbox for AI coding agents: namespaces, pivot_root, seccomp, Landlock, no root"
 license = "Apache-2.0"

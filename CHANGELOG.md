@@ -7,6 +7,59 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-11
+
+0.4.3 adds no features. It locks in the 0.4.2 fixes with regression tests,
+adds a release gate, fixes smaller audit findings, and restructures
+session startup so the coming egress proxy, cgroup v2 limits and
+multi-seat work can be added safely.
+
+**Host evidence (rubin):** `make release-gate` all ok (fmt, clippy, make
+check, make test), leak suite 333 passed, 0 failed, 9 skipped, 1 weak;
+with `HISN_TEST_ROOTFS` and `HISN_BIG_TESTS` the leak suite reports 346
+passed, 0 failed, 5 skipped, 1 weak; `make leaktest` on a terminal also
+reports 333 passed, 0 failed, 9 skipped, 1 weak. The gate's
+pseudo-terminal step was skipped because `script` is not installed; the
+direct terminal run covers it. No unit-test count for rubin is recorded;
+no sessions, leak or integration tests were run in the build sandbox.
+
+### Changed
+- **Host services run in their own process group.** Each host service is
+  a process-group leader with stdin `/dev/null` (stdout and stderr too).
+  Stopping a session signals the whole group, then SIGKILLs it after the
+  leader is reaped, so a TERM-ignoring child does not survive.
+- **Startup fails at once when a host service exits before readiness
+  completes**, with `host_service <name>: exited with status <n> before
+  readiness completed`.
+- **A service shows `starting` in `ls --json` until readiness passes**,
+  then `ready`. `exit` stays `null` for in-sandbox services.
+- **SSH agent proxy timeouts.** The host agent socket now has a 30 s
+  read timeout alongside the existing 30 s write timeout.
+- **Release gate.** `make release-gate` runs fmt, clippy, `make check`,
+  `make test` and the leak suite (pipe, then pseudo-terminal when
+  `script` is present), stopping at the first failure.
+
+### Fixed
+- `recv_with_fd` treats a truncated control message as an error.
+- `rootfs.rs` `dup` failures now return the OS error instead of wrapping -1.
+- `stdio_to_dev_null` closes the opened fd only above fd 2 on error.
+- The SSH agent client counter is decremented on every exit path via a
+  guard inside the worker thread.
+- `sessionmeta::rewrite` removes a stale temp of the same name before
+  creating a new one.
+- Leak tests L77/L78 take the helper socket path from `argv[1]`; the
+  release gate pipes the leak suite and reports a skipped pseudo-terminal
+  run honestly; dead-service detection, the cleanup guard's group kill,
+  and the ExecTable insert panic are fixed.
+
+### Hardening
+- `run_session` is split into named phases behind one cleanup guard; a new
+  `src/services.rs` holds the service code; host and in-sandbox stops
+  share one `stop_and_reap` path; one profile load; one exec table.
+- Leak cases L76–L81: exec cancel on early disconnect, hung and slow
+  readiness probes, load-time rejections, host-service group stop, and
+  readiness failing for an already-dead host service.
+
 ## [0.4.2] - 2026-11-09
 
 0.4.2 hardens the profile surface and closes audit findings from a review
@@ -508,7 +561,8 @@ First release.
 - `hisn exec` verifies fail-closed, before running anything, that the root it
   entered is the sandbox root (DESIGN D25).
 
-[Unreleased]: https://github.com/treeol/hisn/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/treeol/hisn/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/treeol/hisn/releases/tag/v0.4.3
 [0.4.2]: https://github.com/treeol/hisn/releases/tag/v0.4.2
 [0.4.1]: https://github.com/treeol/hisn/releases/tag/v0.4.1
 [0.3.2]: https://github.com/treeol/hisn/releases/tag/v0.3.2

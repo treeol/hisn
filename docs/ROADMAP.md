@@ -21,6 +21,11 @@
   `ready.tcp`; cancelled execs are killed; `ready.command` probes are bounded by
   `ready.timeout`; `session.json` writes are locked. See
   [releases/v0.4.2.md](releases/v0.4.2.md).
+- **0.4.3**: no features. The 0.4.2 fixes gain leak regression tests
+  (L76–L81), a release gate (`make release-gate`) is added, smaller audit
+  findings are fixed, and session startup is restructured so the egress
+  proxy, cgroup v2 limits and the pty work can be added safely. See
+  [releases/v0.4.3.md](releases/v0.4.3.md).
 
 ## Planned, not yet scheduled
 

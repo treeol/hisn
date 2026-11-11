@@ -1,4 +1,4 @@
-# Sessions and lifecycle (0.4.2)
+# Sessions and lifecycle (0.4.3)
 
 This page describes one hisn session from creation to removal. It collects
 what DESIGN §9, §20 and §20.1 and the code say in one place. Where they

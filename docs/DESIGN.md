@@ -1,12 +1,11 @@
 # hisn — design
 
-Status: current as of hisn 0.4.2 (0.4.3 in preparation — §21). §1–§14
+Status: current as of hisn 0.4.3. §1–§14
 describe the sandbox core (0.2 exec
 included); §15–§19 describe the 0.3 orchestration layer; §20 and §20.1
-describe named sessions, attach, leases and the 0.4.1 changes; §21
-describes the 0.4.3 session-startup refactor and behaviour changes (in
-preparation; its release notes are drafted in
-`.wakil/reports/0.4.3-session2.md`, not in `docs/releases/` yet). The
+describe named sessions, attach, leases and the 0.4.1 changes; §21 and
+§20.2 describe the 0.4.3 session-startup refactor, behaviour changes and
+the 0.4.2 follow-up fixes. The
 session lifecycle in
 one place is [sessions.md](sessions.md). The decisions behind
 each part are in [`docs/adr/`](adr/README.md). Binding input: `docs/BRIEF.md`

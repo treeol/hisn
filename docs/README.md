@@ -38,6 +38,7 @@
 ## Releases
 
 - [CHANGELOG](../CHANGELOG.md)
+- [v0.4.3](releases/v0.4.3.md)
 - [v0.4.2](releases/v0.4.2.md)
 - [v0.4.1](releases/v0.4.1.md)
 - [v0.4.0](releases/v0.4.0.md)

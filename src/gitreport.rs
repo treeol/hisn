@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::raw::c_char;
 use std::os::unix::io::FromRawFd;
 use std::path::Path;
 
@@ -267,6 +267,61 @@ fn close_fd(fd: i32) {
     unsafe { libc::close(fd) };
 }
 
+/// A stat result for a hook entry (the fields the report needs).
+struct EntryStat {
+    is_symlink: bool,
+    is_file: bool,
+    size: u64,
+    mode: u32,
+}
+
+/// Stat `name` relative to a pinned dir fd, without following symlinks
+/// (`fstatat` with `AT_SYMLINK_NOFOLLOW` — the `symlink_metadata`
+/// equivalent for an fd-relative name).
+fn fstatat(dir_fd: i32, name: &str) -> Option<EntryStat> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(std::ffi::OsStr::new(name).as_bytes()).ok()?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(
+            dir_fd,
+            c.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let m = st.st_mode as u32;
+    Some(EntryStat {
+        is_symlink: (m & libc::S_IFMT) == libc::S_IFLNK,
+        is_file: (m & libc::S_IFMT) == libc::S_IFREG,
+        size: st.st_size as u64,
+        mode: m & 0o7777,
+    })
+}
+
+/// Read the link target of `name` relative to a pinned dir fd (`readlinkat`,
+/// bounded at 4 KiB — a longer target reads as truncation, never followed).
+fn readlinkat(dir_fd: i32, name: &str) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(std::ffi::OsStr::new(name).as_bytes()).ok()?;
+    let mut buf = [0u8; 4096];
+    let n = unsafe {
+        libc::readlinkat(
+            dir_fd,
+            c.as_ptr(),
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
 /// Open `name` relative to a pinned dir fd, refusing symlinks
 /// (`O_NOFOLLOW`) and non-directories when `is_dir`. Returns the raw fd.
 fn openat(dir_fd: i32, name: &str, is_dir: bool) -> Option<i32> {
@@ -323,36 +378,36 @@ fn snapshot_hooks(git_fd: i32, dir: &Path) -> (Vec<HookEntry>, bool) {
     }
     for name_os in names {
         let name = name_os.to_string_lossy().into_owned();
-        // Stat + open the entry relative to the pinned hooks fd.
-        let Ok(md) = fs::symlink_metadata(dir.join(&name_os)) else {
+        // Stat the entry relative to the pinned hooks fd (fstatat, never
+        // by path — R2: the hooks dir itself was pinned, so its members
+        // must be reached the same way).
+        let Some(md) = fstatat(hooks_fd, &name_os.to_string_lossy()) else {
             continue;
         };
-        if md.file_type().is_symlink() {
-            // Record the link target (readlink, bounded, never followed) —
-            // a bare `sha256: None` made a same-length retarget invisible
-            // in the diff (R1). Hash the target string instead.
-            let target = fs::read_link(dir.join(&name_os))
-                .map(|t| t.to_string_lossy().into_owned())
-                .unwrap_or_default();
+        if md.is_symlink {
+            // Record the link target (readlinkat on the pinned fd, bounded,
+            // never followed) — a bare `sha256: None` made a same-length
+            // retarget invisible in the diff (R1). Hash the target string.
+            let target = readlinkat(hooks_fd, &name_os.to_string_lossy()).unwrap_or_default();
             let mut h = Sha256::new();
             h.update(target.as_bytes());
             out.push(HookEntry {
                 name,
-                size: md.len(),
-                mode: md.mode() & 0o7777,
+                size: md.size,
+                mode: md.mode,
                 sha256: Some(format!("{:x}", h.finalize())),
             });
             continue;
         }
-        if !md.is_file() {
+        if !md.is_file {
             continue; // directories and specials are not hooks
         }
-        let sha = hash_file(hooks_fd, &name_os.to_string_lossy(), md.len());
+        let sha = hash_file(hooks_fd, &name_os.to_string_lossy(), md.size);
         let oversized = sha.is_none();
         out.push(HookEntry {
             name,
-            size: md.len(),
-            mode: md.mode() & 0o7777,
+            size: md.size,
+            mode: md.mode,
             sha256: sha,
         });
         if oversized {

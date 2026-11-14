@@ -269,12 +269,19 @@ pub fn touch_lease(dir: &Path, now: &str) -> std::io::Result<()> {
 /// pid reuse, with the counter reset) would make `create_new` fail. The
 /// lock already serialises writers, so no live writer can own that exact
 /// name: remove a stale file with the exact name before creating it.
+///
+/// **Unknown top-level fields survive** (item 2): the body is not the bare
+/// struct serialization but the on-disk JSON object with the struct's fields
+/// overlaid on it, so a field this build does not know (written by a newer
+/// hisn) is carried through every read-modify-write instead of being
+/// dropped. Whichever build wrote the file last wins for the fields it
+/// knows; unknown fields belong to their writer and pass through untouched.
 fn rewrite(dir: &Path, m: &SessionMeta) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(".session.json.tmp-{}-{n}", std::process::id()));
-    let body = serde_json::to_string_pretty(m).map_err(std::io::Error::other)?;
+    let body = merged_body(dir, m)?;
     // Remove a stale temp file with this exact name before create_new.
     let _ = fs::remove_file(&tmp);
     let mut f = OpenOptions::new()
@@ -286,6 +293,28 @@ fn rewrite(dir: &Path, m: &SessionMeta) -> std::io::Result<()> {
     f.sync_all()?;
     drop(f);
     fs::rename(&tmp, dir.join(FILE))
+}
+
+/// The JSON body for a rewrite: the current on-disk object with the struct's
+/// serialized fields overlaid, so unknown top-level fields survive. Falls
+/// back to the bare struct serialization when the on-disk file is missing or
+/// is not a JSON object (the callers already required a readable meta, so
+/// this is only a belt-and-braces path).
+fn merged_body(dir: &Path, m: &SessionMeta) -> std::io::Result<String> {
+    let mut obj = serde_json::to_value(m)
+        .map_err(std::io::Error::other)?
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    if let Ok(text) = fs::read_to_string(dir.join(FILE))
+        && let Ok(serde_json::Value::Object(known)) =
+            serde_json::from_str::<serde_json::Value>(&text)
+    {
+        for (k, v) in known {
+            obj.entry(k).or_insert(v);
+        }
+    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(obj)).map_err(std::io::Error::other)
 }
 
 #[cfg(test)]
@@ -356,6 +385,47 @@ mod tests {
         assert_eq!(crate::control::PROTOCOL_VERSION, 2);
         // A dev version string does not lower the revision.
         assert!(HISN_VERSION.contains("0.5.0"));
+    }
+
+    #[test]
+    fn unknown_top_level_fields_survive_every_rewrite() {
+        // Item 2: a file carrying a field this build does not know keeps it
+        // across set_state, record_member and touch_lease. Before the merge
+        // in `rewrite`, each of these silently dropped it.
+        let d = std::env::temp_dir().join(format!("hisn-unknown-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let mut m = SessionMeta::new("abc", Some("nm"), owner(), "/w", "none");
+        m.lease = Some(Lease {
+            idle_timeout_s: Some(300),
+            last_activity: Some("2026-11-07T12:00:00Z".into()),
+        });
+        // Write with an extra unknown field by hand (as a newer build would).
+        let mut body = serde_json::to_value(&m).unwrap();
+        body.as_object_mut().unwrap().insert(
+            "future_field".into(),
+            serde_json::json!({"nested": [1, 2, 3], "note": "keep me"}),
+        );
+        fs::write(d.join(FILE), serde_json::to_string_pretty(&body).unwrap()).unwrap();
+        let has_future = || {
+            let text = fs::read_to_string(d.join(FILE)).unwrap();
+            text.contains("future_field") && text.contains("keep me")
+        };
+        set_state(&d, State::Running).unwrap();
+        assert!(has_future(), "set_state dropped the unknown field");
+        record_member(&d, 1000, "local", "2026-11-07T12:01:00Z").unwrap();
+        assert!(has_future(), "record_member dropped the unknown field");
+        touch_lease(&d, "2026-11-07T12:02:00Z").unwrap();
+        assert!(has_future(), "touch_lease dropped the unknown field");
+        // And the known fields still updated.
+        let back = read(&d).unwrap();
+        assert_eq!(back.state, State::Running);
+        assert_eq!(back.members.len(), 1);
+        assert_eq!(
+            back.lease.as_ref().unwrap().last_activity.as_deref(),
+            Some("2026-11-07T12:02:00Z")
+        );
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

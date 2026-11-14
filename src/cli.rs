@@ -183,6 +183,16 @@ impl RunArgs {
                 "E_PROFILE_POLICY: --profile and --policy are mutually exclusive".to_string(),
             );
         }
+        // `--workspace` names a workspace, never a path: strict charset,
+        // refused here so a name like `../x` or an absolute path can never
+        // reach the supervisor (item 4).
+        if let Some(w) = &self.workspace
+            && !crate::workspace::is_valid_workspace_name(w)
+        {
+            return Err(format!(
+                "invalid --workspace name {w:?} (allowed: [A-Za-z0-9._-]{{1,64}}, no leading '.')"
+            ));
+        }
         Ok(())
     }
 }

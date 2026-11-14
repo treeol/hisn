@@ -612,6 +612,11 @@ impl Shared {
             None,
             json!({ "workspace": self.workspace.id }),
         );
+        // Durability point (journal module docs): on session stop, sync the
+        // journal to disk. No sync is paid per record.
+        if which == "stop" {
+            self.journal.sync();
+        }
     }
 
     /// Session start is journaled (B3): the journal outlives the session dir,

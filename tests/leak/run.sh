@@ -3712,18 +3712,33 @@ if needs_host; then
       sleep 0.2
     done
     if [ -f "$L86_AUDIT" ]; then
+      # The exec must actually have run (guards against the whole case
+      # passing vacuously when every action failed silently).
+      if grep -q '"op": *"exec"' "$L86_AUDIT"; then
+        pass "L86 exec audit line present (exec ran)"
+      else
+        fail "L86 exec audit line present (exec ran)" "no exec line in audit: [$(head -c 400 "$L86_AUDIT")]"
+      fi
       # Every line has client, authz and seq.
       L86_LINES=$(grep -c '"client"' "$L86_AUDIT" 2>/dev/null || echo 0)
       L86_TOTAL=$(wc -l < "$L86_AUDIT" 2>/dev/null || echo 0)
+      # `grep -c` prints 0 and exits 1 on no match, yielding "0\n0" with
+      # the || echo; normalise to the first number.
+      L86_LINES=$(printf '%s' "$L86_LINES" | head -n1)
       if [ "$L86_LINES" -gt 0 ] && [ "$L86_LINES" -ge "$L86_TOTAL" ]; then
         pass "L86 grants.jsonl lines carry client"
       else
         fail "L86 grants.jsonl lines carry client" "$L86_LINES/$L86_TOTAL lines have client"
       fi
-      if grep -q '"authz"' "$L86_AUDIT" && grep -q '"seq"' "$L86_AUDIT"; then
+      # authz and seq on *every* line, not just somewhere.
+      L86_AUTHZ=$(grep -c '"authz"' "$L86_AUDIT" 2>/dev/null || echo 0)
+      L86_AUTHZ=$(printf '%s' "$L86_AUTHZ" | head -n1)
+      L86_SEQ=$(grep -c '"seq"' "$L86_AUDIT" 2>/dev/null || echo 0)
+      L86_SEQ=$(printf '%s' "$L86_SEQ" | head -n1)
+      if [ "$L86_AUTHZ" -ge "$L86_TOTAL" ] && [ "$L86_SEQ" -ge "$L86_TOTAL" ]; then
         pass "L86 grants.jsonl lines carry authz and seq"
       else
-        fail "L86 grants.jsonl lines carry authz and seq" "authz or seq missing"
+        fail "L86 grants.jsonl lines carry authz and seq" "authz/seq on $L86_AUTHZ/$L86_SEQ of $L86_TOTAL lines"
       fi
       # Rule 4: nothing new leaks into the audit format.
       if grep -q "$L86_ARG" "$L86_AUDIT"; then

@@ -861,26 +861,27 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
     if skipped > 0 {
         eprintln!("hisn: skipped {skipped} unparseable journal line(s)");
     }
-    if out.is_empty() && !dir.exists() {
-        // Item 4: when the session lookup failed, say which workspace was
-        // searched (the cwd-derived one) and point at `--workspace`.
-        if session_arg.is_some()
-            && a.workspace.is_none()
-            && workspace_for_session(session_arg.as_deref().unwrap()).is_none()
-        {
-            eprintln!(
-                "hisn: no session {} found (or it has no workspace record); \
-                 searched workspace {id} (dir {}); use --workspace <name-or-id> \
-                 to choose the workspace explicitly",
-                session_arg.as_deref().unwrap(),
-                dir.display()
-            );
-        } else {
-            eprintln!(
-                "hisn: no journal for workspace {id} (dir {})",
-                dir.display()
-            );
-        }
+    // Item 4 (Mashūra round 2): when the session lookup failed, the
+    // fallback must be visible even when the cwd's workspace *has* a
+    // journal (empty output would otherwise look like success with no
+    // records). Print the fallback note whenever resolution fell through.
+    let session_fell_back = session_arg.is_some()
+        && a.workspace.is_none()
+        && workspace_for_session(session_arg.as_deref().unwrap()).is_none();
+    if session_fell_back {
+        eprintln!(
+            "hisn: no session {} found (or it has no workspace record); \
+             showing workspace {id} (dir {}) instead; use --workspace \
+             <name-or-id> to choose the workspace explicitly",
+            session_arg.as_deref().unwrap(),
+            dir.display()
+        );
+    }
+    if out.is_empty() && !dir.exists() && !session_fell_back {
+        eprintln!(
+            "hisn: no journal for workspace {id} (dir {})",
+            dir.display()
+        );
     }
     Ok(ExitCode::SUCCESS)
 }

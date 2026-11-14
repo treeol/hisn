@@ -799,6 +799,21 @@ pub fn change_record(before: &Snapshot, after: &Snapshot) -> Value {
     })
 }
 
+/// Include every flagged config key's value in the before/after subsets
+/// (Mashūra round 2: "plus everything flagged" — an unchanged flagged key
+/// is still evidence, and without it the record shows a flag with no
+/// value). The flagged set comes from `diff()`'s own output so the two
+/// never disagree.
+fn include_flagged(sub: &mut Snapshot, original: &Snapshot, flagged: &[String]) {
+    for k in flagged {
+        if let Some(v) = original.config.get(k) {
+            sub.config.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    // Unflagged keys that changed are already in; flagged hooks are
+    // covered by the change lists (hooks have no flags of their own).
+}
+
 /// The snapshot entries of `this` that belong to a change against
 /// `other`: hooks added/removed/modified plus everything flagged, and
 /// the config keys added/removed/changed plus everything flagged.
@@ -832,12 +847,26 @@ fn changed_subset(this: &Snapshot, other: &Snapshot) -> Snapshot {
             _ => {}
         }
     }
-    Snapshot {
+    // Everything flagged: an unchanged dangerous key is still evidence,
+    // and without its value the record would show the flag alone
+    // (Mashūra round 2). The flagged set is recomputed from the keys
+    // themselves (`is_dangerous_key`) rather than from `diff()`, because
+    // `diff()` only flags keys that changed — an unchanged dangerous key
+    // is in neither change list.
+    let flagged_vals: Vec<String> = this
+        .config
+        .keys()
+        .filter(|k| is_dangerous_key(k.as_str()))
+        .cloned()
+        .collect();
+    let mut sub = Snapshot {
         skipped: this.skipped.clone(),
         hooks,
         config,
         truncated: this.truncated,
-    }
+    };
+    include_flagged(&mut sub, this, &flagged_vals);
+    sub
 }
 
 #[cfg(test)]
@@ -1353,5 +1382,98 @@ mod tests {
         );
         assert_eq!(rec["changes"]["truncated"]["after"], true);
         assert_eq!(rec["after"]["truncated"], true);
+    }
+
+    #[test]
+    fn unchanged_flagged_key_keeps_its_value_alongside_an_unrelated_change() {
+        // Mashūra round 2: "plus everything flagged" — an unchanged
+        // dangerous key is still in the record with its value when an
+        // unrelated change takes the full-record path.
+        let d = tempfile::tempdir().unwrap();
+        let cwd = git_dir(&d);
+        write(
+            &cwd.join(".git/config"),
+            b"[core]\n\thooksPath = /safe/hooks\n[alias]\n\tst = status\n",
+        );
+        let before = snapshot(&cwd);
+        write(
+            &cwd.join(".git/config"),
+            b"[core]\n\thooksPath = /safe/hooks\n[alias]\n\tst = status\n\tci = commit\n",
+        );
+        let after = snapshot(&cwd);
+        let rec = change_record(&before, &after);
+        assert!(rec.get("unchanged").is_none(), "a change happened: {rec}");
+        assert_eq!(
+            rec["before"]["config"]["core.hookspath"],
+            json!(["/safe/hooks"]),
+            "unchanged flagged key keeps its value"
+        );
+        assert_eq!(
+            rec["after"]["config"]["core.hookspath"],
+            json!(["/safe/hooks"])
+        );
+        // And the unrelated change is there too.
+        assert_eq!(rec["changes"]["config"]["added"], json!(["alias.ci"]));
+    }
+
+    #[test]
+    fn every_change_kind_prevents_the_unchanged_shortcut() {
+        // Mashūra round 2: a missing key must not read as "empty" — every
+        // change kind (hook removed/modified, config added/removed/
+        // unflagged change) must take the full-record path.
+        let d = tempfile::tempdir().unwrap();
+        let cwd = git_dir(&d);
+        write(&cwd.join(".git/hooks/pre-commit"), b"#!/bin/sh\nexit 0\n");
+        write(
+            &cwd.join(".git/config"),
+            b"[core]\n\tbare = true\n[alias]\n\tst = status\n",
+        );
+        let before = snapshot(&cwd);
+        // Hook removed.
+        fs::remove_file(cwd.join(".git/hooks/pre-commit")).unwrap();
+        let after = snapshot(&cwd);
+        let rec = change_record(&before, &after);
+        assert!(
+            rec.get("unchanged").is_none(),
+            "hook removed is a change: {rec}"
+        );
+        assert_eq!(rec["changes"]["hooks"]["removed"], json!(["pre-commit"]));
+        // Hook modified.
+        write(&cwd.join(".git/hooks/pre-commit"), b"#!/bin/sh\nexit 0\n");
+        let before = snapshot(&cwd);
+        write(&cwd.join(".git/hooks/pre-commit"), b"#!/bin/sh\nexit 1\n");
+        let after = snapshot(&cwd);
+        let rec = change_record(&before, &after);
+        assert!(
+            rec.get("unchanged").is_none(),
+            "hook modified is a change: {rec}"
+        );
+        assert_eq!(rec["changes"]["hooks"]["modified"], json!(["pre-commit"]));
+        // Config added (unflagged) and removed.
+        let before = snapshot(&cwd);
+        write(
+            &cwd.join(".git/config"),
+            b"[core]\n\tbare = true\n[alias]\n\tst = status\n\tci = commit\n",
+        );
+        let after = snapshot(&cwd);
+        let rec = change_record(&before, &after);
+        assert!(
+            rec.get("unchanged").is_none(),
+            "unflagged config add is a change: {rec}"
+        );
+        assert_eq!(rec["changes"]["config"]["added"], json!(["alias.ci"]));
+        // Config removed: take a fresh `before` that still has the key.
+        let before = snapshot(&cwd);
+        write(
+            &cwd.join(".git/config"),
+            b"[core]\n\tbare = true\n[alias]\n\tst = status\n",
+        );
+        let after = snapshot(&cwd);
+        let rec = change_record(&before, &after);
+        assert!(
+            rec.get("unchanged").is_none(),
+            "config removed is a change: {rec}"
+        );
+        assert_eq!(rec["changes"]["config"]["removed"], json!(["alias.ci"]));
     }
 }

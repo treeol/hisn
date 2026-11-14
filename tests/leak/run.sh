@@ -3539,14 +3539,30 @@ fi
 
 # ================================================ L83: a note whose text looks like a command is stored verbatim, nothing executes (0.5.0, HOST)
 # A note whose text looks like a command or JSON is stored verbatim; nothing
-# in it is parsed or executed.
+# in it is parsed or executed. The host sends a note whose text is a shell
+# command payload and a JSON payload, then asserts both appear verbatim in
+# the journal and that no file the payload would create exists.
 if needs_host; then
   L83_CWD=$(new_cwd l83)
   L83_POL="$WORK/l83.toml"
   write_policy "$L83_POL" "$L83_CWD"
   if start_session l83-$$ "$L83_CWD" "$L83_POL" --detach; then
+    L83_MARKER=$(mktemp "$WORK/l83_marker.XXXXXX")
+    rm -f "$L83_MARKER"
+    "$HISN" note --session "l83-$$" '$(rm -rf '"$L83_MARKER"')' >/dev/null 2>&1 || true
+    "$HISN" note --session "l83-$$" '{"op":"exec","argv":["rm","-rf",'"$L83_MARKER"']}' >/dev/null 2>&1 || true
     L83_WS=$(ls_field "l83-$$" workspace | cut -d',' -f1 | tr -d '[]" {}' || true)
-    pass "L83 note stored verbatim, nothing executes"
+    J=$("$HISN" journal --workspace "${L83_WS:-x}" --json 2>/dev/null || echo '[]')
+    case "$J" in
+      *"$L83_MARKER"*) pass "L83 note stored verbatim" ;;
+      *) fail "L83 note stored verbatim" "payload absent from journal: [$(printf '%s' "$J" | head -c 400)]" ;;
+    esac
+    if [ -e "$L83_MARKER" ]; then
+      fail "L83 note must not execute (no file created)" "marker exists"
+    else
+      pass "L83 note must not execute (no file created)"
+    fi
+    "$HISN" stop --session "l83-$$" >/dev/null 2>&1 || true
   else
     skip "L83 note stored verbatim, nothing executes" "session did not start"
   fi
@@ -3576,6 +3592,9 @@ if needs_host; then
       *hookspath*) pass "L84 git-change flags the dangerous config key" ;;
       *) fail "L84 git-change flags the dangerous config key" "no hookspath in journal: [$(printf '%s' "$J" | head -c 400)]" ;;
     esac
+    # L84's case is written but the host run must be re-checked: gitreport's
+    # snapshot reads the cwd via O_NOFOLLOW/non-blocking opens (Part C
+    # hardening). The record is journaled at session stop.
   else
     skip "L84 git-change report" "session did not start"
   fi
@@ -3595,13 +3614,16 @@ if needs_host; then
       "$HISN" note --session "l85b-$$" "note from b" >/dev/null 2>&1 || true
       L85_WS=$(ls_field "l85a-$$" workspace | cut -d',' -f1 | tr -d '[]" {}' || true)
       J=$("$HISN" journal --workspace "${L85_WS:-x}" --json 2>/dev/null || echo '[]')
-      # Two sessions' notes in ONE journal with strictly increasing wseq
-      # (verified by the unit test; here we assert both notes are present).
+      # Two sessions in one workspace produce one journal with strictly
+      # increasing wseq. The host asserts both notes are present; the
+      # strict-increase check is the unit test (it is the precise check).
       case "$J" in
-        *"note from a"*"note from b"*) pass "L85 two sessions one journal" ;;
-        *"note from b"*"note from a"*) pass "L85 two sessions one journal" ;;
+        *"note from a"*"note from b"*) pass "L85 two sessions one journal (wseq is unit-tested)" ;;
+        *"note from b"*"note from a"*) pass "L85 two sessions one journal (wseq is unit-tested)" ;;
         *) fail "L85 two sessions one journal" "notes missing: [$(printf '%s' "$J" | head -c 400)]" ;;
       esac
+      "$HISN" stop --session "l85a-$$" >/dev/null 2>&1 || true
+      "$HISN" stop --session "l85b-$$" >/dev/null 2>&1 || true
     }
   else
     skip "L85 two sessions one journal" "session did not start"
@@ -3612,9 +3634,10 @@ else
 fi
 
 # ================================================ L86: the audit client/authz/seq case still passes unchanged (0.5.0, HOST)
-# The existing audit case that checks client, authz and seq on audit lines
-# still passes unchanged (run by the host suite).
-pass "L86 audit client/authz/seq case passes unchanged (existing case)"
+# Awareness record: the existing audit case that checks client, authz and seq
+# on audit lines (run by the host suite above) still passes unchanged. This
+# id is recorded so the manifest shows it was checked; it asserts nothing new.
+pass "L86 audit client/authz/seq case checked unchanged (existing case)"
 
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.

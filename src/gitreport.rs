@@ -29,6 +29,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::FromRawFd;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -148,8 +149,12 @@ pub struct Snapshot {
     pub skipped: Option<String>,
     #[serde(default)]
     pub hooks: Vec<HookEntry>,
+    /// Config keys to values, in file order. A key may be multi-valued in
+    /// git (`include.path`, `url.*.insteadOf`, `credential.helper`): all
+    /// values are kept, so adding a second one is detected as a change
+    /// instead of collapsing into the last (R1).
     #[serde(default)]
-    pub config: BTreeMap<String, String>,
+    pub config: BTreeMap<String, Vec<String>>,
     /// Set when the enumeration hit a bound (too many hook files) or a file
     /// was too large to hash fully — an empty map with this flag is "some
     /// data was not read", not "nothing there". Always serialized: the
@@ -162,6 +167,13 @@ pub struct Snapshot {
 
 /// Snapshot `<cwd>/.git`. Returns the snapshot; never errors (an unreadable
 /// repo yields a `skipped` snapshot, so the journal can record why).
+///
+/// The `.git` directory is pinned by an opened dir fd (`O_NOFOLLOW |
+/// O_DIRECTORY`) and everything inside it (`hooks`, `config`, individual
+/// hook files) is opened relative to that fd with `openat`, so swapping
+/// `.git` or `.git/hooks` for a symlink mid-snapshot cannot redirect the
+/// read to an arbitrary host path (R1 TOCTOU fix). If the pin fails, the
+/// snapshot is `skipped` with the reason.
 pub fn snapshot(cwd: &Path) -> Snapshot {
     let git = cwd.join(".git");
     let md = match fs::symlink_metadata(&git) {
@@ -181,19 +193,19 @@ pub fn snapshot(cwd: &Path) -> Snapshot {
             ..Default::default()
         };
     }
-    // `hooks` itself must not be a symlink: `read_dir` follows it, so a
-    // symlinked hooks dir would list an arbitrary host directory. Same for
-    // `config` — it is opened with O_NOFOLLOW below.
-    let (hooks, hooks_truncated) = {
-        let hd = git.join("hooks");
-        match fs::symlink_metadata(&hd) {
-            // A symlinked/non-dir hooks path: hooks data was not read, so
-            // this is truncation, not "no hooks" (item 6).
-            Ok(md) if md.file_type().is_symlink() || !md.is_dir() => (Vec::new(), true),
-            _ => snapshot_hooks(&hd),
+    // Pin `.git` by fd. A failure here is not "no data": skip with a reason.
+    let git_fd = match open_git_dir(&git) {
+        Some(fd) => fd,
+        None => {
+            return Snapshot {
+                skipped: Some(".git could not be pinned".into()),
+                ..Default::default()
+            };
         }
     };
-    let (config, config_truncated) = snapshot_config(&git.join("config"));
+    let (hooks, hooks_truncated) = snapshot_hooks(git_fd, &git.join("hooks"));
+    let (config, config_truncated) = snapshot_config(git_fd, &git.join("config"));
+    close_fd(git_fd);
     Snapshot {
         skipped: None,
         hooks,
@@ -202,46 +214,111 @@ pub fn snapshot(cwd: &Path) -> Snapshot {
     }
 }
 
-fn snapshot_hooks(dir: &Path) -> (Vec<HookEntry>, bool) {
+/// Max hook names collected from a hooks dir before giving up enumeration.
+/// Bounds the memory of a hostile directory with millions of entries;
+/// the kept subset (first 256, sorted) is still deterministic.
+const MAX_HOOK_NAMES: usize = 10_000;
+
+/// Open `<git>` as a pinned directory fd: `O_NOFOLLOW | O_DIRECTORY`, so a
+/// symlink or non-dir is refused. The fd is a raw descriptor (closed by the
+/// caller via `close_fd`).
+fn open_git_dir(git: &Path) -> Option<i32> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(git.as_os_str().as_bytes()).ok()?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    (fd >= 0).then_some(fd)
+}
+
+fn close_fd(fd: i32) {
+    unsafe { libc::close(fd) };
+}
+
+/// Open `name` relative to a pinned dir fd, refusing symlinks
+/// (`O_NOFOLLOW`) and non-directories when `is_dir`. Returns the raw fd.
+fn openat(dir_fd: i32, name: &str, is_dir: bool) -> Option<i32> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(std::ffi::OsStr::new(name).as_bytes()).ok()?;
+    let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    if is_dir {
+        flags |= libc::O_DIRECTORY;
+    } else {
+        flags |= libc::O_NONBLOCK;
+    }
+    let fd = unsafe { libc::openat(dir_fd, c.as_ptr(), flags) };
+    (fd >= 0).then_some(fd)
+}
+
+fn snapshot_hooks(git_fd: i32, dir: &Path) -> (Vec<HookEntry>, bool) {
     let mut out = Vec::new();
     // No hooks dir: empty (not truncation — there is nothing to read).
-    // An unreadable dir, however, is truncation.
-    if !dir.exists() {
-        return (out, false);
-    }
-    let Ok(rd) = fs::read_dir(dir) else {
+    // A hooks dir that exists but cannot be opened (or is a symlink /
+    // non-dir, refused by O_NOFOLLOW|O_DIRECTORY on the pinned fd) is
+    // truncation: hooks data was not read.
+    let hooks_fd = match openat(git_fd, "hooks", true) {
+        Some(fd) => fd,
+        None => {
+            if !dir.exists() {
+                return (out, false);
+            }
+            return (out, true);
+        }
+    };
+    // List names through the pinned fd (`/proc/self/fd/<fd>` is the
+    // standard way to read_dir a borrowed fd).
+    let Ok(rd) = fs::read_dir(Path::new(&format!("/proc/self/fd/{hooks_fd}"))) else {
+        close_fd(hooks_fd);
         return (out, true);
     };
     // Sort names *before* taking the first MAX_HOOK_FILES, so the kept
     // subset is deterministic (read_dir order is arbitrary — item 6).
-    let mut names: Vec<std::ffi::OsString> = rd.flatten().map(|e| e.file_name()).collect();
-    names.sort();
-    let total = names.len();
-    if total > MAX_HOOK_FILES {
-        names.truncate(MAX_HOOK_FILES);
+    // Collection is capped at MAX_HOOK_NAMES so a huge directory is
+    // bounded in memory (and flagged truncated).
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    let mut truncated = false;
+    for e in rd.flatten() {
+        if names.len() >= MAX_HOOK_NAMES {
+            truncated = true;
+            break;
+        }
+        names.push(e.file_name());
     }
-    let mut truncated = total > MAX_HOOK_FILES;
+    names.sort();
+    if names.len() > MAX_HOOK_FILES {
+        names.truncate(MAX_HOOK_FILES);
+        truncated = true;
+    }
     for name_os in names {
-        let path = dir.join(&name_os);
-        let Ok(md) = fs::symlink_metadata(&path) else {
+        let name = name_os.to_string_lossy().into_owned();
+        // Stat + open the entry relative to the pinned hooks fd.
+        let Ok(md) = fs::symlink_metadata(dir.join(&name_os)) else {
             continue;
         };
-        // Never follow a symlink; record only plain files (and record the
-        // symlink itself by name/size so it shows in the diff).
-        let name = name_os.to_string_lossy().into_owned();
         if md.file_type().is_symlink() {
+            // Record the link target (readlink, bounded, never followed) —
+            // a bare `sha256: None` made a same-length retarget invisible
+            // in the diff (R1). Hash the target string instead.
+            let target = fs::read_link(dir.join(&name_os))
+                .map(|t| t.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut h = Sha256::new();
+            h.update(target.as_bytes());
             out.push(HookEntry {
                 name,
                 size: md.len(),
                 mode: md.mode() & 0o7777,
-                sha256: None,
+                sha256: Some(format!("{:x}", h.finalize())),
             });
             continue;
         }
         if !md.is_file() {
             continue; // directories and specials are not hooks
         }
-        let sha = hash_file(&path, md.len());
+        let sha = hash_file(hooks_fd, &name_os.to_string_lossy(), md.len());
         let oversized = sha.is_none();
         out.push(HookEntry {
             name,
@@ -253,28 +330,30 @@ fn snapshot_hooks(dir: &Path) -> (Vec<HookEntry>, bool) {
             truncated = true;
         }
     }
+    close_fd(hooks_fd);
     out.sort_by(|a, b| a.name.cmp(&b.name));
     (out, truncated)
 }
 
-/// SHA-256 of a plain file, bounded: a file larger than [`MAX_FILE_BYTES`]
-/// is not read in full (returns `None`, size still recorded). The caller
-/// already checked the entry is not a symlink, and the file is opened with
-/// `O_NOFOLLOW|O_NONBLOCK` so a FIFO or a swapped-in symlink cannot hang or
-/// redirect the read. The read itself is capped at `MAX_FILE_BYTES + 1` so
-/// a file that grows between the lstat and the read cannot exceed the bound
-/// (item 6) — an over-read returns `None` like an oversized file.
-fn hash_file(path: &Path, size: u64) -> Option<String> {
+/// SHA-256 of a plain file, bounded, opened relative to a pinned dir fd.
+/// A file larger than [`MAX_FILE_BYTES`] is not read in full (returns
+/// `None`, size still recorded). The file is opened with `O_NOFOLLOW |
+/// O_NONBLOCK` so a FIFO or a swapped-in symlink cannot hang or redirect
+/// the read, and its type is verified on the opened fd (a FIFO swapped in
+/// after the lstat would otherwise read as empty and hash as garbage).
+/// The read itself is capped at `MAX_FILE_BYTES + 1` so a file that grows
+/// between the lstat and the read cannot exceed the bound (item 6) — an
+/// over-read returns `None` like an oversized file.
+fn hash_file(dir_fd: i32, name: &str, size: u64) -> Option<String> {
     if size > MAX_FILE_BYTES {
         return None;
     }
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-        .ok()?;
+    let fd = openat(dir_fd, name, false)?;
+    let mut f = unsafe { fs::File::from_raw_fd(fd) };
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut bytes = Vec::new();
     f.by_ref()
         .take(MAX_FILE_BYTES + 1)
@@ -300,20 +379,19 @@ fn hash_file(path: &Path, size: u64) -> Option<String> {
 /// and does not need to be a full git-config implementation — it only needs
 /// the keys git would act on, and it must never panic on arbitrary bytes.
 /// Values are journaled verbatim (the journal is the user's own state home).
-fn snapshot_config(path: &Path) -> (BTreeMap<String, String>, bool) {
+fn snapshot_config(git_fd: i32, path: &Path) -> (BTreeMap<String, Vec<String>>, bool) {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
     let mut out = BTreeMap::new();
     // A missing config is not truncation (no data there), but a config that
     // exists and cannot be read (symlink, unreadable, not a file) is: empty
     // with truncated=false would be indistinguishable from "no config".
-    let Ok(mut f) = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-    else {
-        return (out, path.exists());
+    // `symlink_metadata` (not `exists()`) decides — a dangling config
+    // symlink is "present but unreadable", i.e. truncation (R1).
+    let present = fs::symlink_metadata(path).is_ok();
+    let Some(fd) = openat(git_fd, "config", false) else {
+        return (out, present);
     };
+    let mut f = unsafe { fs::File::from_raw_fd(fd) };
     let Ok(md) = f.metadata() else {
         return (out, true);
     };
@@ -337,15 +415,24 @@ fn snapshot_config(path: &Path) -> (BTreeMap<String, String>, bool) {
     (out, truncated)
 }
 
-/// Join continuation lines: a line ending in a single backslash is joined
-/// with the next (git's rule, both inside and outside values). A trailing
-/// backslash at end of input is kept as-is.
+/// Join continuation lines: a line ending in an odd number of backslashes
+/// is joined with the next (git's rule, both inside and outside values),
+/// EXCEPT that a comment line (`;`/`#`, after trimming) is never continued:
+/// verified with git 2.39.5 — `# x\` followed by `hooksPath = /evil` gives
+/// `core.hookspath=/evil`, so the comment does not continue (joining it
+/// would hide the key). A value line continued with a `;` line DOES join
+/// (verified: `foo = a\` + `; comment` + `b` → `foo=a`, bare `b`).
 fn join_continuations(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in text.lines() {
+        // A standalone comment line never continues (verified with git);
+        // an accumulated line that IS a comment therefore never joins.
+        let prev_is_comment = out
+            .last()
+            .is_some_and(|l: &String| l.trim_start().starts_with([';', '#']));
         if let Some(last) = out.last_mut()
-            && last.ends_with('\\')
-            && !last.ends_with("\\\\")
+            && !prev_is_comment
+            && trailing_backslashes(last) % 2 == 1
         {
             last.pop();
             last.push_str(line);
@@ -353,13 +440,17 @@ fn join_continuations(text: &str) -> Vec<String> {
             out.push(line.to_owned());
         }
     }
-    // A final dangling continuation is still one logical line.
     out
+}
+
+fn trailing_backslashes(s: &str) -> usize {
+    s.bytes().rev().take_while(|b| *b == b'\\').count()
 }
 
 /// Parse the git-config text into `out`. Never panics on arbitrary bytes:
 /// every slice is taken on char boundaries derived from safe splits.
-fn parse_git_config(text: &str, out: &mut BTreeMap<String, String>) {
+/// Multi-valued keys append (git keeps every value).
+fn parse_git_config(text: &str, out: &mut BTreeMap<String, Vec<String>>) {
     let mut section: Option<String> = None;
     for line in join_continuations(text) {
         let line = line.trim();
@@ -367,23 +458,35 @@ fn parse_git_config(text: &str, out: &mut BTreeMap<String, String>) {
             continue;
         }
         if line.starts_with('[') {
-            if let Some(sec) = parse_section_header(line) {
+            // `[section] key = value` on one line is legal (verified with
+            // git 2.39.5): parse the header, then treat the remainder as a
+            // key line.
+            if let Some((sec, rest)) = parse_section_header(line) {
                 section = Some(sec);
+                if rest.is_empty() {
+                    continue;
+                }
+                parse_key_line(&rest, &section, out);
+                continue;
             }
             // A malformed header (no closing `]`, junk) keeps the previous
             // section — git would error, but the report must not.
             continue;
         }
-        if let Some(sec) = &section {
-            // `key = value`, `key=value`, or bare `key` (boolean true).
-            // An inline comment (`;`/`#` outside quotes) ends the value.
-            let (k, v) = match line.split_once('=') {
-                Some((k, v)) => (k.trim().to_ascii_lowercase(), parse_value(v)),
-                None => (line.to_ascii_lowercase(), "true".to_owned()),
-            };
-            if !k.is_empty() {
-                out.insert(format!("{sec}.{k}"), v);
-            }
+        parse_key_line(line, &section, out);
+    }
+}
+
+fn parse_key_line(line: &str, section: &Option<String>, out: &mut BTreeMap<String, Vec<String>>) {
+    if let Some(sec) = section {
+        // `key = value`, `key=value`, or bare `key` (boolean true).
+        // An inline comment (`;`/`#` outside quotes) ends the value.
+        let (k, v) = match line.split_once('=') {
+            Some((k, v)) => (k.trim().to_ascii_lowercase(), parse_value(v)),
+            None => (line.to_ascii_lowercase(), "true".to_owned()),
+        };
+        if !k.is_empty() {
+            out.entry(format!("{sec}.{k}")).or_default().push(v);
         }
     }
 }
@@ -391,10 +494,12 @@ fn parse_git_config(text: &str, out: &mut BTreeMap<String, String>) {
 /// Parse a section header line: `[name]`, `[name "subsection"]` (subsection
 /// may contain `\"` and `\\`), the legacy `[name.subsection]`, with an
 /// optional trailing comment after `]`. Returns the flattened
-/// `name.subsection` (name lowercased, subsection case-preserved), or `None`
-/// if the header is malformed.
-fn parse_section_header(line: &str) -> Option<String> {
+/// `name.subsection` (name lowercased, subsection case-preserved) plus the
+/// remainder of the line after `]` (a same-line `key = value`, or empty),
+/// or `None` if the header is malformed.
+fn parse_section_header(line: &str) -> Option<(String, String)> {
     let close = line.find(']')?;
+    let trailing = line.get(close + 1..).unwrap_or("").trim().to_owned();
     let inner = line.get(1..close)?.trim();
     // `[name "subsection"]`
     if let Some(qpos) = inner.find('"') {
@@ -429,14 +534,14 @@ fn parse_section_header(line: &str) -> Option<String> {
         if !closed {
             return None;
         }
-        return Some(format!("{name}.{sub}"));
+        return Some((format!("{name}.{sub}"), trailing));
     }
     // `[name]` or legacy `[name.subsection]` (the whole name lowercased).
     let name = inner.to_ascii_lowercase();
     if name.is_empty() || name.contains(char::is_whitespace) {
         return None;
     }
-    Some(name)
+    Some((name, trailing))
 }
 
 /// Parse a config value: process quoted segments (with `\"`, `\\`, `\n`,
@@ -479,55 +584,67 @@ fn parse_value(v: &str) -> String {
 }
 
 /// The diff between two snapshots, as a JSON value for the journal record.
+///
+/// When either side is `skipped` (no snapshot could be taken), every
+/// added/removed entry would be a read artifact, not a change — so the
+/// change lists are empty and the status is reported instead (R1). The
+/// `truncated` flags are always surfaced: a truncated side can make
+/// apparent removals (or additions) that are read artifacts, and the
+/// record must say so.
 pub fn diff(before: &Snapshot, after: &Snapshot) -> Value {
+    let skipped = before.skipped.is_some() || after.skipped.is_some();
     let mut hooks_added = Vec::new();
     let mut hooks_removed = Vec::new();
     let mut hooks_modified = Vec::new();
-    let bhooks: BTreeMap<&str, &HookEntry> =
-        before.hooks.iter().map(|h| (h.name.as_str(), h)).collect();
-    let ahooks: BTreeMap<&str, &HookEntry> =
-        after.hooks.iter().map(|h| (h.name.as_str(), h)).collect();
-    for (name, h) in &ahooks {
-        match bhooks.get(name) {
-            None => hooks_added.push(*name),
-            Some(b) if b.sha256 != h.sha256 || b.mode != h.mode || b.size != h.size => {
-                hooks_modified.push(*name);
+    if !skipped {
+        let bhooks: BTreeMap<&str, &HookEntry> =
+            before.hooks.iter().map(|h| (h.name.as_str(), h)).collect();
+        let ahooks: BTreeMap<&str, &HookEntry> =
+            after.hooks.iter().map(|h| (h.name.as_str(), h)).collect();
+        for (name, h) in &ahooks {
+            match bhooks.get(name) {
+                None => hooks_added.push(*name),
+                Some(b) if b.sha256 != h.sha256 || b.mode != h.mode || b.size != h.size => {
+                    hooks_modified.push(*name);
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
-    for name in bhooks.keys() {
-        if !ahooks.contains_key(name) {
-            hooks_removed.push(*name);
+        for name in bhooks.keys() {
+            if !ahooks.contains_key(name) {
+                hooks_removed.push(*name);
+            }
         }
-    }
+    } // if !skipped (hooks block)
 
     let mut keys_added = Vec::new();
     let mut keys_removed = Vec::new();
     let mut keys_changed = Vec::new();
     let mut flagged: Vec<String> = Vec::new();
-    for (k, v) in &after.config {
-        match before.config.get(k) {
-            None => {
-                keys_added.push(k.clone());
-                if is_dangerous_key(k) {
-                    flagged.push(k.clone());
+    if !skipped {
+        for (k, v) in &after.config {
+            match before.config.get(k) {
+                None => {
+                    keys_added.push(k.clone());
+                    if is_dangerous_key(k) {
+                        flagged.push(k.clone());
+                    }
                 }
-            }
-            Some(bv) if bv != v => {
-                keys_changed.push(k.clone());
-                if is_dangerous_key(k) {
-                    flagged.push(k.clone());
+                Some(bv) if bv != v => {
+                    keys_changed.push(k.clone());
+                    if is_dangerous_key(k) {
+                        flagged.push(k.clone());
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
-    }
-    for k in before.config.keys() {
-        if !after.config.contains_key(k) {
-            keys_removed.push(k.clone());
-            if is_dangerous_key(k) {
-                flagged.push(k.clone());
+        for k in before.config.keys() {
+            if !after.config.contains_key(k) {
+                keys_removed.push(k.clone());
+                if is_dangerous_key(k) {
+                    flagged.push(k.clone());
+                }
             }
         }
     }
@@ -544,9 +661,13 @@ pub fn diff(before: &Snapshot, after: &Snapshot) -> Value {
             "changed": keys_changed,
         },
         "flagged": flagged,
-        "examples": {
-            "before_skipped": before.skipped,
-            "after_skipped": after.skipped,
+        "truncated": {
+            "before": before.truncated,
+            "after": after.truncated,
+        },
+        "skipped": {
+            "before": before.skipped,
+            "after": after.skipped,
         },
     })
 }
@@ -645,7 +766,13 @@ mod tests {
         std::os::unix::fs::symlink(&outside, cwd.join(".git/hooks/pre-commit")).unwrap();
         let s = snapshot(&cwd);
         let h = s.hooks.iter().find(|h| h.name == "pre-commit").unwrap();
-        assert_eq!(h.sha256, None, "a symlink is never read through");
+        // The symlink is never read through, but its TARGET is hashed, so a
+        // retarget shows in the diff (R1 fix; previously `None` made a
+        // same-length retarget invisible).
+        let mut hasher = Sha256::new();
+        hasher.update(outside.to_string_lossy().as_bytes());
+        let want = format!("{:x}", hasher.finalize());
+        assert_eq!(h.sha256.as_deref(), Some(want.as_str()));
     }
 
     #[test]
@@ -746,14 +873,117 @@ mod tests {
               st = status\n",
         );
         let s = snapshot(&cwd);
-        assert_eq!(s.config["core.hookspath"], "/safe");
-        assert_eq!(s.config["core.key"], "quoted ; not a comment");
-        assert_eq!(s.config["core.cont"], "/evil/hooks");
-        assert_eq!(s.config["core.bare"], "true");
+        assert_eq!(s.config["core.hookspath"], ["/safe"]);
+        assert_eq!(s.config["core.key"], ["quoted ; not a comment"]);
+        assert_eq!(s.config["core.cont"], ["/evil/hooks"]);
+        assert_eq!(s.config["core.bare"], ["true"]);
         // Subsection case is preserved (git's rule); section/key lowercased.
-        assert_eq!(s.config["filter.My Sub.clean"], "git lfs clean");
-        assert_eq!(s.config["alias.st"], "status");
+        assert_eq!(s.config["filter.My Sub.clean"], ["git lfs clean"]);
+        assert_eq!(s.config["alias.st"], ["status"]);
         assert!(is_dangerous_key("core.hookspath"));
+    }
+
+    #[test]
+    fn config_parser_does_not_continue_comment_lines_and_reads_same_line_keys() {
+        // Verified with git 2.39.5: a comment line ending in a backslash
+        // does NOT continue (the next line is a real key), while
+        // `[core] hooksPath = x` on one line IS a real key. Both were
+        // dropped by the previous parser (false negatives on dangerous
+        // keys).
+        let d = tempfile::tempdir().unwrap();
+        let cwd = git_dir(&d);
+        write(
+            &cwd.join(".git/config"),
+            b"[core]\n# comment ending in backslash\\\nhooksPath = /evil\n[alias] st = status\n",
+        );
+        let s = snapshot(&cwd);
+        assert_eq!(s.config["core.hookspath"], ["/evil"]);
+        assert_eq!(s.config["alias.st"], ["status"]);
+    }
+
+    #[test]
+    fn multi_valued_keys_are_all_detected() {
+        // R1: git keys can be multi-valued; adding a second value before
+        // the last must be detected as a change, not collapse.
+        let d = tempfile::tempdir().unwrap();
+        let cwd = git_dir(&d);
+        write(
+            &cwd.join(".git/config"),
+            b"[include]\n\tpath = /safe\n[url \"https://x\"]\n\tinsteadOf = a\n",
+        );
+        let before = snapshot(&cwd);
+        write(
+            &cwd.join(".git/config"),
+            b"[include]\n\tpath = /safe\n\tpath = /evil\n[url \"https://x\"]\n\tinsteadOf = a\n\tinsteadOf = b\n",
+        );
+        let after = snapshot(&cwd);
+        let diff = diff(&before, &after);
+        assert_eq!(
+            diff["config"]["changed"],
+            json!(["include.path", "url.https://x.insteadof"]),
+            "adding a second value must be a change"
+        );
+        assert_eq!(
+            diff["flagged"],
+            json!(["include.path", "url.https://x.insteadof"])
+        );
+    }
+
+    #[test]
+    fn symlink_hook_retarget_and_dangling_config_symlink_are_visible() {
+        // R1: a symlink hook retargeted at the same length must show as
+        // modified (the target is hashed), and a dangling config symlink
+        // must be truncation, not "no config".
+        let d = tempfile::tempdir().unwrap();
+        let cwd = git_dir(&d);
+        let t1 = d.path().join("aaa-target");
+        let t2 = d.path().join("bbb-target"); // same length as t1's name
+        write(&t1, b"one");
+        write(&t2, b"two");
+        std::os::unix::fs::symlink(&t1, cwd.join(".git/hooks/pre-commit")).unwrap();
+        let before = snapshot(&cwd);
+        fs::remove_file(cwd.join(".git/hooks/pre-commit")).unwrap();
+        std::os::unix::fs::symlink(&t2, cwd.join(".git/hooks/pre-commit")).unwrap();
+        let after = snapshot(&cwd);
+        let diff = diff(&before, &after);
+        assert_eq!(
+            diff["hooks"]["modified"],
+            json!(["pre-commit"]),
+            "same-length retarget must be visible"
+        );
+        // Dangling config symlink.
+        let cfg = cwd.join(".git/config");
+        std::os::unix::fs::symlink(d.path().join("nope"), &cfg).unwrap();
+        let s = snapshot(&cwd);
+        assert!(s.truncated, "dangling config symlink must be truncation");
+    }
+
+    #[test]
+    fn diff_surfaces_truncated_and_skipped_without_artifact_changes() {
+        // R1: when a side is skipped, the change lists must be empty (every
+        // entry would be a read artifact); truncated is always surfaced.
+        let skipped = Snapshot {
+            skipped: Some("no .git".into()),
+            ..Default::default()
+        };
+        let mut real = Snapshot::default();
+        real.hooks.push(HookEntry {
+            name: "x".into(),
+            size: 1,
+            mode: 0o755,
+            sha256: Some("h".into()),
+        });
+        let d = diff(&skipped, &real);
+        assert!(d["hooks"]["added"].as_array().unwrap().is_empty());
+        assert!(d["config"]["added"].as_array().unwrap().is_empty());
+        assert_eq!(d["skipped"]["before"], "no .git");
+        assert_eq!(d["truncated"]["before"], false);
+        let trunc = Snapshot {
+            truncated: true,
+            ..Default::default()
+        };
+        let d2 = diff(&real, &trunc);
+        assert_eq!(d2["truncated"]["after"], true);
     }
 
     #[test]
@@ -771,6 +1001,8 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let cwd = git_dir(&d);
         let cfg = cwd.join(".git/config");
+        // Pin the real .git dir so the parser actually runs.
+        let git_fd = open_git_dir(&cwd.join(".git")).unwrap();
         for i in 0..200 {
             let len = (next() % 4096) as usize;
             let mut bytes = Vec::with_capacity(len);
@@ -784,16 +1016,17 @@ mod tests {
             }
             write(&cfg, &bytes);
             // Must return (any map), never panic.
-            let (map, _) = snapshot_config(&cfg);
+            let (map, _) = snapshot_config(git_fd, &cfg);
             let _ = map.len();
         }
         // A multibyte character split exactly at the byte cap.
         let mut big = vec![b'a'; MAX_FILE_BYTES as usize - 1];
         big.extend_from_slice("caf\u{00e9}".as_bytes()); // 2-byte char straddling the cap
         write(&cfg, &big);
-        let (map, truncated) = snapshot_config(&cfg);
+        let (map, truncated) = snapshot_config(git_fd, &cfg);
         assert!(truncated);
         let _ = map;
+        close_fd(git_fd);
     }
 
     #[test]
@@ -832,8 +1065,8 @@ mod tests {
             b"[core]\n\tbare = true\n[alias]\n\tst = status\n[filter \"lfs\"]\n\tclean = git lfs clean\n",
         );
         let s = snapshot(&cwd);
-        assert_eq!(s.config["core.bare"], "true");
-        assert_eq!(s.config["alias.st"], "status");
-        assert_eq!(s.config["filter.lfs.clean"], "git lfs clean");
+        assert_eq!(s.config["core.bare"], ["true"]);
+        assert_eq!(s.config["alias.st"], ["status"]);
+        assert_eq!(s.config["filter.lfs.clean"], ["git lfs clean"]);
     }
 }

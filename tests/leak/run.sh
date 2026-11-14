@@ -3687,11 +3687,131 @@ else
   skip "L85 two sessions one journal" "hisn check failed (no userns)"
 fi
 
-# ================================================ L86: the audit client/authz/seq case still passes unchanged (0.5.0, HOST)
-# Awareness record: the existing audit case that checks client, authz and seq
-# on audit lines (run by the host suite above) still passes unchanged. This
-# id is recorded so the manifest shows it was checked; it asserts nothing new.
-pass "L86 audit client/authz/seq case checked unchanged (existing case)"
+# ================================================ L86: audit-format guard for rule 4 (0.5.0 polish, HOST)
+# After a session with a grant, an exec with a recognisable argument and a
+# revoke: every grants.jsonl line still has client, authz and seq, and no
+# line contains the recognisable argument, an `argv` field, or any
+# exec/exit data. (0.5.0 polish: L86 was a bare pass; it is now the real
+# guard. Written against a neighbouring passing case; unexecuted here.)
+if needs_host; then
+  L86_CWD=$(new_cwd l86)
+  L86_POL="$WORK/l86.toml"
+  write_policy "$L86_POL" "$L86_CWD"
+  if start_session l86-$$ "$L86_CWD" "$L86_POL" --detach; then
+    L86_ARG="RECOGNISABLE-ARG-42"
+    mkdir -p "$WORK/l86-grant"
+    "$HISN" grant --session "l86-$$" -- "$WORK/l86-grant" >/dev/null 2>&1 || true
+    timeout 10 "$HISN" exec --no-tty --session "l86-$$" -- sh -c "echo $L86_ARG" >/dev/null 2>&1 || true
+    "$HISN" revoke --session "l86-$$" -- "$WORK/l86-grant" >/dev/null 2>&1 || true
+    "$HISN" stop --session "l86-$$" >/dev/null 2>&1 || true
+    # Wait for the audit log to settle (stop archives it; give the
+    # supervisor a moment to finish the last writes).
+    L86_AUDIT="$(session_dir l86-$$)/grants.jsonl"
+    for _ in $(seq 1 50); do
+      [ -f "$L86_AUDIT" ] && break
+      sleep 0.2
+    done
+    if [ -f "$L86_AUDIT" ]; then
+      # Every line has client, authz and seq.
+      L86_LINES=$(grep -c '"client"' "$L86_AUDIT" 2>/dev/null || echo 0)
+      L86_TOTAL=$(wc -l < "$L86_AUDIT" 2>/dev/null || echo 0)
+      if [ "$L86_LINES" -gt 0 ] && [ "$L86_LINES" -ge "$L86_TOTAL" ]; then
+        pass "L86 grants.jsonl lines carry client"
+      else
+        fail "L86 grants.jsonl lines carry client" "$L86_LINES/$L86_TOTAL lines have client"
+      fi
+      if grep -q '"authz"' "$L86_AUDIT" && grep -q '"seq"' "$L86_AUDIT"; then
+        pass "L86 grants.jsonl lines carry authz and seq"
+      else
+        fail "L86 grants.jsonl lines carry authz and seq" "authz or seq missing"
+      fi
+      # Rule 4: nothing new leaks into the audit format.
+      if grep -q "$L86_ARG" "$L86_AUDIT"; then
+        fail "L86 grants.jsonl contains no exec argument" "recognisable argument found in audit"
+      else
+        pass "L86 grants.jsonl contains no exec argument"
+      fi
+      if grep -q '"argv"' "$L86_AUDIT"; then
+        fail "L86 grants.jsonl contains no argv field" "argv field found in audit"
+      else
+        pass "L86 grants.jsonl contains no argv field"
+      fi
+      if grep -q 'exec/exit' "$L86_AUDIT"; then
+        fail "L86 grants.jsonl contains no exec/exit data" "exec/exit found in audit"
+      else
+        pass "L86 grants.jsonl contains no exec/exit data"
+      fi
+    else
+      skip "L86 audit-format guard" "no grants.jsonl"
+    fi
+  else
+    skip "L86 audit-format guard" "session did not start"
+  fi
+  rm -rf "$L86_CWD"
+else
+  skip "L86 audit-format guard" "hisn check failed (no userns)"
+fi
+
+# ================================================ L87: journal exec record + exec/exit (0.5.0 polish, HOST)
+# The recognisable argument appears in the journal's exec record, and an
+# exec/exit record with the right exit code follows it.
+if needs_host; then
+  L87_CWD=$(new_cwd l87)
+  L87_POL="$WORK/l87.toml"
+  write_policy "$L87_POL" "$L87_CWD"
+  if start_session l87-$$ "$L87_CWD" "$L87_POL" --detach; then
+    L87_ARG="RECOGNISABLE-ARG-87"
+    timeout 10 "$HISN" exec --no-tty --session "l87-$$" -- sh -c "echo $L87_ARG; exit 3" >/dev/null 2>&1 || true
+    L87_WS=$(ls_workspace_id "l87-$$")
+    J=""
+    for _ in $(seq 1 50); do
+      J=$("$HISN" journal --workspace "${L87_WS:-x}" --json 2>/dev/null || echo '[]')
+      case "$J" in
+        *"$L87_ARG"*) break ;;
+      esac
+      sleep 0.2
+    done
+    case "$J" in
+      *"$L87_ARG"*) pass "L87 recognisable argument in journal exec record" ;;
+      *) fail "L87 recognisable argument in journal exec record" "argument absent: [$(printf '%s' "$J" | head -c 400)]" ;;
+    esac
+    case "$J" in
+      *'"exit_code":3'*|*'"exit_code": 3'*) pass "L87 exec/exit carries exit code 3" ;;
+      *) fail "L87 exec/exit carries exit code 3" "no exit_code 3 in journal: [$(printf '%s' "$J" | head -c 400)]" ;;
+    esac
+    "$HISN" stop --session "l87-$$" >/dev/null 2>&1 || true
+  else
+    skip "L87 journal exec record and exec/exit" "session did not start"
+  fi
+  rm -rf "$L87_CWD"
+else
+  skip "L87 journal exec record and exec/exit" "hisn check failed (no userns)"
+fi
+
+# ================================================ L88: journal --session from an unrelated directory (0.5.0 polish, HOST)
+# `hisn journal --session <id>` run from an unrelated directory prints
+# that session's records.
+if needs_host; then
+  L88_CWD=$(new_cwd l88)
+  L88_POL="$WORK/l88.toml"
+  write_policy "$L88_POL" "$L88_CWD"
+  if start_session l88-$$ "$L88_CWD" "$L88_POL" --detach; then
+    "$HISN" note --session "l88-$$" "L88-NOTE-TEXT" >/dev/null 2>&1 || true
+    L88_OTHER=$(new_cwd l88other)
+    J=$(cd "$L88_OTHER" && "$HISN" journal --session "l88-$$" --json 2>/dev/null || echo '[]')
+    case "$J" in
+      *"L88-NOTE-TEXT"*) pass "L88 journal --session from unrelated directory" ;;
+      *) fail "L88 journal --session from unrelated directory" "note absent: [$(printf '%s' "$J" | head -c 400)]" ;;
+    esac
+    "$HISN" stop --session "l88-$$" >/dev/null 2>&1 || true
+    rm -rf "$L88_OTHER"
+  else
+    skip "L88 journal --session from unrelated directory" "session did not start"
+  fi
+  rm -rf "$L88_CWD"
+else
+  skip "L88 journal --session from unrelated directory" "hisn check failed (no userns)"
+fi
 
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.

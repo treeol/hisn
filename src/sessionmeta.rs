@@ -420,6 +420,10 @@ mod tests {
         // R2: a known `skip_serializing_if` field cleared in memory must
         // stay cleared on rewrite. The previous merge-based rewrite
         // resurrected the old on-disk value; the flatten design cannot.
+        // Drive `rewrite` directly (the test is in-module, so the private
+        // fn is reachable) with the lease still on disk — the test that
+        // used to hand-write the cleared body first proved nothing, since
+        // the old merge code would have passed it too (Mashūra round 1).
         let d = std::env::temp_dir().join(format!("hisn-clear-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
@@ -429,23 +433,17 @@ mod tests {
             last_activity: Some("2026-11-07T12:00:00Z".into()),
         });
         m.write_to(&d).unwrap();
-        // Clear the lease in memory (as a future build might) and rewrite
-        // via set_state — the lease must NOT come back.
+        // Sanity: the lease is on disk.
+        assert!(
+            fs::read_to_string(d.join(FILE))
+                .unwrap()
+                .contains("\"lease\"")
+        );
+        // Clear it in memory and rewrite directly — `rewrite` must not
+        // merge the old on-disk value back in.
         let mut m2 = read(&d).unwrap();
         m2.lease = None;
-        // set_state re-reads from disk, so drive the rewrite directly the
-        // way set_state does: read-modify-write through `rewrite` is not
-        // reachable here; instead simulate by writing the cleared meta's
-        // serialized form via set_state on a field that clears on read.
-        // Simplest faithful simulation: serialize the cleared struct and
-        // check the lease key is absent, then round-trip through read.
-        let body = serde_json::to_value(&m2).unwrap();
-        assert!(
-            body.as_object().unwrap().get("lease").is_none(),
-            "cleared lease must not be serialized (no resurrection source)"
-        );
-        fs::write(d.join(FILE), serde_json::to_string_pretty(&body).unwrap()).unwrap();
-        set_state(&d, State::Running).unwrap();
+        rewrite(&d, &m2).unwrap();
         let text = fs::read_to_string(d.join(FILE)).unwrap();
         assert!(
             !text.contains("\"lease\""),

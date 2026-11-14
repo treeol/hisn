@@ -1765,3 +1765,48 @@ drafted there, not in `docs/releases/`.
   timeout matching the 30 s write timeout.
 - **Release gate**: `scripts/release-gate.sh` now runs `make check` as
   step 3 (its summary line prints `make-check=ok`).
+
+## 22. Workspace, journal, version gate, git-change report (0.5.0)
+
+0.5.0 is the first of the collaboration releases: the workspace where several
+seats work on one repo. The plan is `.wakil/plans/PLAN-0.5.md`; the journal
+decision is [ADR 0020](adr/0020-workspace-journal.md); the wire is
+[CONTROL-PROTOCOL.md](CONTROL-PROTOCOL.md). Nothing in Part 1 blocks, fails
+or changes the wire for a 0.4.3 client.
+
+### Workspaces and the journal
+
+Every session belongs to a workspace (default: derived from the canonical
+cwd — a stable id from the canonical path, a readable name from its last
+component; `--workspace NAME` overrides). Workspace state lives under
+`$XDG_STATE_HOME/hisn/workspaces/<id>/` (dir `0700`), never under a runtime
+root and never inside a working tree; the mount planner never mounts the
+state home in a session (L82). The journal is one append-only
+`journal.jsonl` per workspace (`wseq` under an exclusive `flock`, single
+write per record, 64 MiB rotation from day one; queries read host-side and
+work for stopped/pruned sessions). Every `grants.jsonl` event is also
+journaled (same information, journal shape); `grants.jsonl` itself is
+unchanged. A failed journal write never fails the operation it records
+(counted, in `supervisor.log` and in `ls --json`); a `note` whose text looks
+like a command or JSON is stored verbatim and executed nowhere (L83). The
+journal is a **record, not a replay mechanism**.
+
+### Version gate and the wire
+
+The supervisor records its own version in `session.json` (`hisn_version`).
+`client.protocol_version` is an additive request field; a request declaring a
+newer version (or, while declaring one, an op the supervisor does not know)
+is answered `E_VERSION` naming the supported version, before any effect.
+Requests without the field are 0.4.3 and behave exactly as before. The new
+CLI reads `hisn_version` and does not send a new field or op to a supervisor
+that does not declare it. `ls --json` gains only additive fields
+(`hisn_version`, `workspace`, `journal`, `journal_failures`, `journal_bytes`).
+
+### Git-change report (report only)
+
+At session start and stop hisn snapshots `.git/hooks` and `.git/config`
+(plain files, bounded, no symlinks out of `.git`, no git invocation) and
+journals one `git-change` record naming hooks added/removed/modified and
+config keys added/removed/changed, flagging program-executing keys. Nothing
+is blocked or reverted (L84). The next releases add seats/roles, approvals,
+tasks, messages, invites, network `ask` and secrets.

@@ -1,10 +1,18 @@
-# Sessions and lifecycle (0.4.3)
+# Sessions and lifecycle (0.5.0)
 
 This page describes one hisn session from creation to removal. It collects
 what DESIGN §9, §20 and §20.1 and the code say in one place. Where they
 differ, the code wins; the file and line references are in `src/session.rs`,
 `src/sessionmeta.rs`, `src/supervisor.rs`, `src/lifecycle.rs`,
 `src/control.rs`, `src/authz.rs` and `src/main.rs`.
+
+> 0.5.0 additions: every session belongs to a **workspace** and its events are
+> also recorded in the **workspace journal** (`journal.jsonl`,
+> `$XDG_STATE_HOME/hisn/workspaces/<id>/`); the supervisor records its own
+> version in `session.json` as `hisn_version`; and a **git-change report**
+> (start/stop snapshots of `.git/hooks` and `.git/config`, journaled as one
+> `git-change` record) is taken for every session whose cwd contains a `.git`
+> directory. See the sections below.
 
 ## Names and ids
 
@@ -74,6 +82,75 @@ stateDiagram-v2
 | `members` | append-only list of clients seen: `uid`, `label`, `first_seen`, `last_seen`; omitted when empty |
 | `lease` | `idle_timeout_s` and `last_activity`; omitted when the session has no lease |
 | `env_declared` | the session env snapshot (`--env`, `--env-file`); values that look secret are stored as `<redacted>`; omitted when empty |
+| `hisn_version` | the supervisor's own version at creation (0.5.0; `null`/absent on a pre-0.5.0 session) — the CLI reads it to gate new fields/ops |
+| `workspace` | the workspace this session belongs to: `{id, name}` (0.5.0) |
+
+## Workspaces and the journal (0.5.0)
+
+Every session belongs to a **workspace**. By default the workspace is derived
+from the session's canonical cwd: a stable id (16 hex chars of SHA-256 over
+the canonical path — a symlinked `--cwd` is already canonicalised by
+`Policy::resolve`, so it cannot yield a second id) and a readable name from
+the path's last component. `--workspace NAME` overrides the name (and
+therefore the id). Two sessions started from the same directory share a
+workspace.
+
+Workspace state lives under `$XDG_STATE_HOME/hisn/workspaces/<id>/`
+(dir `0700`), **never** under a runtime root and **never** inside a working
+tree. The mount planner never mounts the state home inside a session, so a
+session can never read or write the workspace state (leak case L82 asserts
+it). `session.json` gains the optional `workspace` field recording it.
+
+The **journal** is one append-only `journal.jsonl` (0600, `O_APPEND`, one
+JSON object per line, one `write` per record) in the workspace dir. Every
+record has `v` (1), `ts`, `wseq` (a workspace-wide sequence assigned under an
+exclusive `flock`, because several supervisors write to one workspace),
+`session`, `kind`, `client` (when one exists — `uid`, `label`,
+`label_source`, `req_id`) and `data`.
+
+Every event written to `grants.jsonl` today is also journaled (same
+information, journal shape) — the audit log itself is unchanged (the journal
+is in addition to it). Plus session start/stop, notes and markers, and the
+git-change records. It is a **record, not a replay mechanism**: nothing
+re-executes it. Queries read the host-side files directly
+(`hisn journal [--workspace W | --session S] [--seat LABEL] [--kind K]
+[--since TS] [--last N] [--json]`), so they also work for stopped and pruned
+sessions. Default output is one readable line per record; `--json` prints
+the records unchanged.
+
+**Failure handling.** A journal write that fails does not fail the operation
+it records (nothing new blocks). The failure is logged to `supervisor.log`,
+counted, and the count is visible in `hisn journal` output and as the
+additive `journal_failures` key in `ls --json` (and as `journal_bytes` and
+`workspace`). The one exception: a `note` request returns an error to the
+caller, because the journal write *is* the operation.
+
+**Rotation.** When `journal.jsonl` exceeds 64 MiB it is renamed to
+`journal.<n>.jsonl` under the same lock and a new file is started; queries
+read rotated files too. `wseq` is recovered from the rotated file's tail
+after a rotation, so it never restarts.
+
+**Notes.** The new control op `note` (`kind` = `note` or `marker`, `text`
+at most 8 KiB) appends a record whose text is stored and returned verbatim
+and is **never parsed, interpreted or executed** anywhere. CLI:
+`hisn note --session S [--marker] TEXT`, with `-` reading from stdin.
+
+## Git-change report (0.5.0, report only)
+
+At session start, if the working directory contains a `.git` *directory*,
+hisn snapshots: for each file under `.git/hooks`, its name, size, mode and
+SHA-256; and the SHA-256 plus parsed keys of `.git/config`. Files are read
+as plain files, bounded in size and count, without following symlinks out
+of `.git` and without invoking git. If `.git` is a file (a linked worktree
+or submodule) or missing, one record says the report was skipped and why. At
+session stop it snapshots again and journals one `git-change` record: hooks
+added, removed or modified, and config keys added, removed or changed. Keys
+that can make git run programs (`core.hooksPath`, `core.fsmonitor`,
+`core.sshCommand`, `core.pager`, `core.editor`, `sequence.editor`,
+`alias.*`, `filter.*`, `diff.*.textconv`, `diff.external`,
+`merge.*.driver`, `credential.helper`, `gpg.program`, `include.path`,
+`includeIf.*`, `url.*.insteadOf`) are flagged. **Nothing is blocked,
+reverted or made read-only**, and no profile key is required.
 
 ## Creating
 
@@ -222,16 +299,24 @@ This is the one place the programmatic contract is described; the README and
   `started`, `execs`, `services`, `clients`, `members` and `lease`. `clients`
   entries have `uid`, `pid`, `label`, `label_source` and `connected_since`; a
   live attach appears in `execs` with `attach: true`. For a stopped or crashed
-  session `clients` is `[]`.
+  session `clients` is `[]`. 0.5.0 adds `hisn_version` (the recorded
+  supervisor version, or `null`), `workspace` (`{id, name}`) and a `journal`
+  summary (`{dir, files, bytes}`) per session.
 - **sessioninfo.** The control op `{"op":"sessioninfo"}` returns
   `{"ok":true,"clients":[...],"execs":[...],"services":[...]}`, the live view
   that `session.json` cannot hold. `hisn ls --json` calls it for each running
   session. If the call fails, `ls` shows empty `clients`, `execs` and
   `services` for that session and does not fail. A request with `sessioninfo`
   is an observer: it does not count as a client and does not keep the session
-  alive.
+  alive. 0.5.0 adds `journal_failures`, `journal_bytes` and `workspace`.
 - **Control socket.** `<session-dir>/control.sock`, one JSON object per line.
-  The protocol is in [POLICY-SPEC §7](POLICY-SPEC.md).
+  The protocol is in [CONTROL-PROTOCOL](CONTROL-PROTOCOL.md); POLICY-SPEC §7
+  is the earlier, shorter contract.
+- **Version.** A 0.4.3 client that never sends `client.protocol_version`
+  behaves exactly as before against a 0.5.0 supervisor (the 8 existing ops
+  are byte-identical). The 0.5.0 CLI reads `hisn_version` from
+  `session.json` and does not send a new field or op to a supervisor that
+  does not declare 0.5.0. See [CONTROL-PROTOCOL](CONTROL-PROTOCOL.md).
 - **Stop and clean up.** `hisn stop --session N`, then
   `hisn ls --prune --name-prefix <prefix>` to archive and remove only your own
   sessions.

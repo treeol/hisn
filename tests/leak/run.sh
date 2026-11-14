@@ -3810,7 +3810,9 @@ if needs_host; then
   L88_CWD=$(new_cwd l88)
   L88_POL="$WORK/l88.toml"
   write_policy "$L88_POL" "$L88_CWD"
-  if start_session l88-$$ "$L88_CWD" "$L88_POL" --detach; then
+  # Normal probe completion removes the session dir; `stop` keeps it.
+  if start_session l88-$$ "$L88_CWD" "$L88_POL"; then
+    L88_PID=$S_PID
     L88_OTHER=$(new_cwd l88other)
     L88_DIR=$(session_dir "l88-$$")
     if "$HISN" note --session "l88-$$" "L88-NOTE-TEXT" >"$WORK/l88-note.out" 2>"$WORK/l88-note.err"; then
@@ -3819,13 +3821,13 @@ if needs_host; then
         *"L88-NOTE-TEXT"*) pass "L88 journal --session from unrelated directory (running)" ;;
         *) fail "L88 journal --session from unrelated directory (running)" "note absent: [$(printf '%s' "$J" | head -c 400)]" ;;
       esac
-      "$HISN" stop --session "l88-$$" >/dev/null 2>"$WORK/l88-stop.err"
+      end_session "$L88_CWD" "$L88_PID"
       for _ in $(seq 1 100); do
         [ ! -d "$L88_DIR" ] && break
         sleep 0.1
       done
       if [ -d "$L88_DIR" ]; then
-        fail "L88 journal --session from unrelated directory (ended)" "session directory still exists after stop"
+        fail "L88 journal --session from unrelated directory (ended)" "session directory still exists after normal completion"
       else
         J=$(cd "$L88_OTHER" && "$HISN" journal --session "l88-$$" --json 2>"$WORK/l88-ended.err")
         case "$J" in

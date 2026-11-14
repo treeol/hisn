@@ -21,6 +21,29 @@ decision (the session belongs to a workspace; state under
 - Every event written to `grants.jsonl` today is also journaled (same
   information, journal shape) — the audit log is unchanged. Plus session
   start/stop, notes and markers, and the git-change records.
+- **Exec records answer "what ran and how it ended".** The journal's exec
+  request record carries the argv (512 bytes total across all elements,
+  whole elements only, `truncated` flag + original count/byte length when
+  capped) and the cwd when the request has one. The journal can contain
+  whatever a command line contains — argv is recorded verbatim, with no
+  pattern-based redaction, and the docs say so. The audit log never
+  carries argv. One `exec/exit` record follows each finished exec (same
+  `seq`/`req_id` as its request): exit code or terminating signal,
+  cancelled/lost, duration in milliseconds. Readable output collapses an
+  exec's request/result/exit into one line; a request without result/exit
+  in the selected window shows alone as open.
+- **A short git-change record.** An unchanged repo journals the cwd, an
+  explicit `unchanged` marker and the hook/config-key counts — no
+  snapshots. A changed repo journals the change lists plus before/after
+  only for what was added, removed or modified, plus everything flagged.
+  Truncated/skipped stay explicit.
+- `hisn journal --session` resolves the workspace from the session's
+  `session.json` (any cwd); when the session is gone it falls back to the
+  cwd-derived workspace and the error names the workspace searched and
+  points to `--workspace`.
+- When the state home falls back to `/tmp/hisn-state-unset-<uid>`, the
+  supervisor warns once at session start that the journal will not
+  survive a reboot.
 - **It is a record, not a replay mechanism.** Nothing re-executes it. It is
   queryable per seat and per task (`hisn journal …`), so an agent can ask
   what it did recently. `hisn journal` reads host-side, so it works for

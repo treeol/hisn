@@ -115,8 +115,34 @@ git-change records. It is a **record, not a replay mechanism**: nothing
 re-executes it. Queries read the host-side files directly
 (`hisn journal [--workspace W | --session S] [--seat LABEL] [--kind K]
 [--since TS] [--last N] [--json]`), so they also work for stopped and pruned
-sessions. Default output is one readable line per record; `--json` prints
+sessions. Default output is one readable line per event; `--json` prints
 the records unchanged.
+
+**What an exec records.** The journal's exec request record carries the
+argv (capped at 512 bytes in total across all elements, with a `truncated`
+flag and the original element count/byte length when capped) and the
+working directory when the request has one — so the journal answers *what
+ran*. **The journal can contain whatever a command line contains**: argv is
+recorded verbatim, without pattern-based redaction (redaction of free text
+gives false safety). This is journal-only — `grants.jsonl` never carries
+argv. When an exec finishes, one `exec/exit` record follows it (same `seq`
+and `req_id` as its request), carrying the exit code or terminating
+signal, whether it was cancelled or lost, and the duration in
+milliseconds. In readable output, an exec's request, result and exit
+collapse into one line; a request with no result or exit in the selected
+window is shown alone and marked open.
+
+`hisn journal --session S` (an id or a name) resolves the workspace from
+that session's `session.json`, so it works from any directory. If the
+session is gone, it falls back to the workspace of the current directory
+and the error names the workspace searched and points to `--workspace`.
+
+**Git-change records.** When nothing changed, nothing was flagged, nothing
+was truncated and nothing was skipped, the record is short: the cwd, an
+explicit `unchanged` marker and the counts of hooks and config keys seen —
+no snapshots. Otherwise it holds the change lists and the before/after
+entries only for what was added, removed or modified, plus everything
+flagged.
 
 **Failure handling.** A journal write that fails does not fail the operation
 it records (nothing new blocks). The failure is logged to `supervisor.log`,

@@ -180,6 +180,18 @@ exit `{"exit":{"code":N}}` / `{"exit":{"signal":"TERM"}}` /
 connection cancels: `TERM`, then `KILL` after 5 s. Confinement is re-applied
 identically to `execve` (DESIGN §14.4).
 
+**Journal (0.5.0 polish).** The workspace journal's exec request record
+carries the argv (512 bytes total across all elements, whole elements only,
+with `argv_truncated` and the original `argv_count`/`argv_bytes` when
+capped) and the `cwd` when the request has one, so the journal answers
+*what ran*; when the exec finishes, an `exec/exit` record follows it with
+the same `seq`/`req_id` (exit code or terminating signal, `cancelled`/
+`lost`, `duration_ms`). The journal can contain whatever a command line
+contains — argv is recorded verbatim, without pattern-based redaction.
+This is journal-only: the audit log (`grants.jsonl`) never carries argv
+and its format is unchanged, so a 0.4.3 client sees exactly what it saw
+before. The wire above is unchanged.
+
 ### `signal`
 
 ```json

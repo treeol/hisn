@@ -35,7 +35,7 @@ use crate::exec::{self, ExecClient, ExecContext, ExecRules, NsFds};
 use crate::gitreport;
 use crate::grant::{self, Grant, GrantTable, HelperClient, Holder, HolderKind, Rules};
 use crate::init::{self, InitConfig, MSG_ERROR, MSG_GO, MSG_READY, MSG_START};
-use crate::journal::{Journal, JournalClient, journal_files};
+use crate::journal::{Journal, JournalClient, cap_argv, journal_files};
 use crate::landlock;
 use crate::mounts::{self, HostFacts};
 use crate::policy::{Network, Overrides, Policy, ResolvedPolicy, is_valid_session_id};
@@ -576,6 +576,43 @@ impl Shared {
         );
     }
 
+    /// Journal one exec request with the argv (capped) and cwd (item 1).
+    /// Journal-only: it never touches the audit log. The `seq`/`authz` match
+    /// the audit line for the same event (mirrored through `log_client`'s
+    /// shape) so a reader can correlate the two; a journal failure never
+    /// fails the exec (rule 5).
+    fn journal_exec_request(
+        &self,
+        client: &authz::ClientRecord,
+        op: &str,
+        argv_json: &Value,
+        cwd: Option<&str>,
+    ) {
+        let mut data = json!({
+            "op": op,
+            "stage": "request",
+            "argv": argv_json["argv"],
+            "argv_truncated": argv_json["argv_truncated"],
+            "argv_count": argv_json["argv_count"],
+            "argv_bytes": argv_json["argv_bytes"],
+        });
+        if let Some(cwd) = cwd {
+            data["cwd"] = json!(cwd);
+        }
+        data["seq"] = json!(client.seq);
+        data["authz"] = json!({ "allow": true });
+        let _ = self.journal.append(
+            &format!("{op}/request"),
+            Some(JournalClient {
+                uid: client.uid,
+                label: client.label.clone(),
+                label_source: client.label_source.clone(),
+                req_id: client.req_id.clone(),
+            }),
+            data,
+        );
+    }
+
     fn log(
         &self,
         op: &str,
@@ -1073,6 +1110,14 @@ impl Shared {
         let argv0 = req.argv.first().cloned().unwrap_or_default();
         let op = if req.attach { "attach" } else { "exec" };
         self.log_client(op, "request", Some(&argv0), None, None, client, true);
+        // Journal-only (rule 4): the exec request record also carries the
+        // argv (capped) and the cwd, so the journal can answer "what ran".
+        // The audit entry above is byte-identical to 0.4.3 — it never
+        // carries argv. No redaction (item 1): the journal can contain
+        // whatever a command line contains, and docs say so.
+        let argv_json = cap_argv(&req.argv);
+        let req_cwd = req.cwd.clone();
+        self.journal_exec_request(client, op, &argv_json, req_cwd.as_deref());
         let fail = |code: &str, msg: String| {
             self.log_client(op, "result", Some(&argv0), None, Some(code), client, true);
             err(code, msg)

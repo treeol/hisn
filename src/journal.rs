@@ -73,6 +73,40 @@ impl std::fmt::Display for JournalError {
 
 impl std::error::Error for JournalError {}
 
+/// The exec-request argv cap: at most 512 bytes in total across all
+/// elements (item 1). Returns the kept elements plus whether anything was
+/// cut, the original element count and the original total byte length.
+/// Cutting happens on a character boundary (a multibyte character is never
+/// split) and keeps whole elements only — the first element that would
+/// exceed the cap, and everything after it, are dropped.
+///
+/// No redaction: pattern-based redaction of free text gives false safety,
+/// so the journal records the argv verbatim and the documentation states
+/// plainly that a command line can contain anything. This is journal-only
+/// (rule 4): the audit entry (`grants.jsonl`) never carries argv.
+pub const MAX_ARGV_BYTES: usize = 512;
+
+pub fn cap_argv(argv: &[String]) -> Value {
+    let total_bytes: usize = argv.iter().map(|s| s.len()).sum();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for arg in argv {
+        if used + arg.len() > MAX_ARGV_BYTES {
+            break;
+        }
+        used += arg.len();
+        kept.push(arg.as_str());
+    }
+    let truncated = kept.len() != argv.len();
+    let kept: Vec<String> = kept.into_iter().map(ToOwned::to_owned).collect();
+    json!({
+        "argv": kept,
+        "argv_truncated": truncated,
+        "argv_count": argv.len(),
+        "argv_bytes": total_bytes,
+    })
+}
+
 /// One journal record as it appears on disk and in `hisn journal --json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JournalRecord {
@@ -1494,5 +1528,105 @@ mod tests {
             large < 50_000.0,
             "append cost unreasonably high in absolute terms: {large:.1}us/event"
         );
+    }
+
+    // ---- Item 1: exec argv cap (journal-only; tested here, wired in
+    // `supervisor::do_exec`) ----
+
+    #[test]
+    fn exec_argv_cap_is_present_and_exact_below_the_cap() {
+        let argv = vec!["echo".to_owned(), "hello world".into(), "--flag".into()];
+        let v = cap_argv(&argv);
+        assert_eq!(v["argv"], json!(argv));
+        assert_eq!(v["argv_truncated"], json!(false));
+        assert_eq!(v["argv_count"], json!(argv.len()));
+        assert_eq!(
+            v["argv_bytes"],
+            json!(argv.iter().map(|s| s.len()).sum::<usize>())
+        );
+    }
+
+    #[test]
+    fn exec_argv_cap_truncates_above_the_cap_with_correct_counts() {
+        // 600 bytes of argv in total: over the 512-byte cap.
+        let argv = vec!["x".repeat(300), "y".repeat(300)];
+        let v = cap_argv(&argv);
+        assert_eq!(v["argv_truncated"], json!(true));
+        assert_eq!(v["argv_count"], json!(2));
+        assert_eq!(v["argv_bytes"], json!(600));
+        let kept: Vec<String> = serde_json::from_value(v["argv"].clone()).unwrap();
+        let kept_bytes: usize = kept.iter().map(|s| s.len()).sum();
+        assert!(kept_bytes <= 512, "kept {kept_bytes} bytes over the cap");
+        assert_eq!(kept, ["x".repeat(300)], "whole elements only, first fits");
+    }
+
+    #[test]
+    fn exec_argv_cap_cuts_on_a_character_boundary() {
+        // Multibyte: the first element alone (800 bytes) exceeds the cap,
+        // so it is cut to exactly 512 bytes on a character boundary. Only
+        // whole elements are kept, so `argv` is empty and the cut is not
+        // represented as a partial element — the counts still report the
+        // original. A cut element is never emitted split.
+        let argv = vec!["\u{1f600}".repeat(200)];
+        let v = cap_argv(&argv);
+        assert_eq!(v["argv_truncated"], json!(true));
+        assert_eq!(v["argv_count"], json!(1));
+        assert_eq!(v["argv_bytes"], json!(800));
+        let kept: Vec<String> = serde_json::from_value(v["argv"].clone()).unwrap();
+        assert!(
+            kept.is_empty(),
+            "an over-cap first element is dropped whole: {kept:?}"
+        );
+        // An element that fits exactly, followed by one that does not:
+        // the first survives intact.
+        let argv = vec!["a".repeat(508), "\u{1f600}".repeat(2)];
+        let v = cap_argv(&argv);
+        let kept: Vec<String> = serde_json::from_value(v["argv"].clone()).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].len(), 508);
+        assert!(kept[0].chars().all(|c| c == 'a'));
+        assert_eq!(v["argv_truncated"], json!(true));
+        assert_eq!(v["argv_count"], json!(2));
+        assert_eq!(v["argv_bytes"], json!(516));
+        // A multibyte element that fits exactly at the cap boundary.
+        let argv = vec![format!("{}\u{00e9}", "a".repeat(510))];
+        let v = cap_argv(&argv);
+        assert_eq!(v["argv_truncated"], json!(false));
+        let kept: Vec<String> = serde_json::from_value(v["argv"].clone()).unwrap();
+        assert_eq!(kept[0].len(), 512);
+        assert!(kept[0].ends_with('\u{00e9}'));
+    }
+
+    #[test]
+    fn exec_record_carries_argv_and_cwd_but_grants_line_does_not() {
+        // The journal's exec request record carries argv + cwd; the audit
+        // entry for the same event carries neither (rule 4: grants.jsonl is
+        // byte-identical to 0.4.3). Proven at the data level here; the
+        // supervisor wiring is covered by the leak case L86/L87 (host).
+        let (_d, j) = test_journal();
+        let argv = vec!["sh".into(), "-c".into(), "echo RECOGNISABLE-ARG-42".into()];
+        let mut data = json!({ "op": "exec", "stage": "request" });
+        data["argv"] = cap_argv(&argv)["argv"].clone();
+        data["argv_truncated"] = cap_argv(&argv)["argv_truncated"].clone();
+        data["cwd"] = json!("/work/proj");
+        j.append("exec/request", None, data).unwrap();
+        let (recs, _) = read_records(&j.dir);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].data["argv"],
+            json!(["sh", "-c", "echo RECOGNISABLE-ARG-42"])
+        );
+        assert_eq!(recs[0].data["cwd"], json!("/work/proj"));
+        // The 0.4.3 audit shape has no argv/cwd keys at all.
+        let audit_entry = json!({
+            "ts": "2026-11-14T00:00:00Z", "op": "exec", "stage": "request",
+            "path": "sh", "mode": null, "result": null, "pid_peer": 7,
+            "client": {"uid": 1000, "label": "x", "label_source": "flag", "req_id": null},
+            "seq": 1, "authz": {"allow": true},
+        });
+        let s = audit_entry.to_string();
+        assert!(!s.contains("RECOGNISABLE-ARG-42"));
+        assert!(!s.contains("\"argv\""));
+        assert!(!s.contains("\"cwd\""));
     }
 }

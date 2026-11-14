@@ -110,16 +110,24 @@ pub struct Journal {
     dir: PathBuf,
     session: String,
     failures: FailureCount,
+    rotate_after: u64,
 }
 
 impl Journal {
     /// Create a writer for `dir` (the workspace dir), for `session` (the
     /// session id stamped on every record).
     pub fn new(dir: PathBuf, session: String) -> Self {
+        Self::with_rotate_after(dir, session, ROTATE_AFTER)
+    }
+
+    /// Create a writer with an explicit rotation threshold (tests; the
+    /// production threshold is [`ROTATE_AFTER`]).
+    pub fn with_rotate_after(dir: PathBuf, session: String, rotate_after: u64) -> Self {
         Self {
             dir,
             session,
             failures: Arc::new(AtomicU64::new(0)),
+            rotate_after,
         }
     }
 
@@ -140,10 +148,16 @@ impl Journal {
     }
 
     fn sync_inner(&self) -> std::io::Result<()> {
-        let f = File::open(self.dir.join(JOURNAL_FILE))?;
-        f.sync_all()?;
-        let d = File::open(&self.dir)?;
-        d.sync_all()
+        // A missing journal file (or workspace dir) is not a failure
+        // (nothing to sync — e.g. sync-on-stop for a session that never
+        // journaled); counting it would report phantom failures.
+        if let Ok(f) = File::open(self.dir.join(JOURNAL_FILE)) {
+            f.sync_all()?;
+        }
+        if let Ok(d) = File::open(&self.dir) {
+            d.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Journal session start (B3). Best-effort; a failure is counted. Used at
@@ -187,8 +201,13 @@ impl Journal {
         client: Option<JournalClient>,
         data: Value,
     ) -> Result<(), JournalError> {
-        fs::create_dir_all(&self.dir).map_err(|e| JournalError {
-            message: format!("create workspace dir: {e}"),
+        // Validate (and create if missing) the workspace dir with the same
+        // discipline the supervisor uses at startup — never fall back to a
+        // bare create_dir_all that would bypass the symlink/owner/0700
+        // refusals. A refusal is a counted journal failure and the
+        // recorded operation still succeeds (rule 5).
+        crate::workspace::ensure_workspace(&self.dir).map_err(|e| JournalError {
+            message: format!("workspace dir: {e}"),
         })?;
         let lock_file = OpenOptions::new()
             .write(true)
@@ -204,21 +223,15 @@ impl Journal {
         let mut seq = last_wseq(&path).unwrap_or(0) + 1;
         // Rotate before writing when the current file is already oversize.
         if let Some(meta) = fs::metadata(&path).ok()
-            && meta.len() > ROTATE_AFTER
+            && meta.len() > self.rotate_after
         {
             rotate(&self.dir).map_err(|e| JournalError {
                 message: format!("rotate: {e}"),
             })?;
-            // `wseq` is recovered from the rotated file's tail by `last_wseq`
-            // on the next append (the new file is empty, so it falls through).
+            // `wseq` is recovered from the rotated file's tail (the new
+            // file is empty, so `last_wseq` falls through to it).
             seq = last_wseq(&path).unwrap_or(0) + 1;
-            // Durability point: sync the rotated file and the directory so
-            // the rename itself survives a crash (module docs).
-            let _ = sync_dir(&self.dir);
         }
-        // Recompute after the torn-tail check below can only add a newline,
-        // never a new record, so `seq` is stable here.
-        let _ = seq;
         // Torn-tail guard: if the file does not end in `\n`, the last writer
         // died mid-line. Emit the newline first so this record is not glued
         // onto the torn bytes (which would lose this record entirely).
@@ -264,12 +277,6 @@ fn flock(f: &File) -> Result<FlockGuard, JournalError> {
     flock_mode(f, libc::LOCK_EX)
 }
 
-/// Take a shared flock on an open file (readers, so a rotation cannot move a
-/// file mid-read).
-fn flock_shared(f: &File) -> Result<FlockGuard, JournalError> {
-    flock_mode(f, libc::LOCK_SH)
-}
-
 fn flock_mode(f: &File, mode: libc::c_int) -> Result<FlockGuard, JournalError> {
     use std::os::fd::AsRawFd;
     loop {
@@ -287,20 +294,33 @@ fn flock_mode(f: &File, mode: libc::c_int) -> Result<FlockGuard, JournalError> {
     Ok(FlockGuard(_fd_of(f)))
 }
 
-/// fsync a directory (for the durability of a rename inside it).
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    File::open(dir)?.sync_all()
-}
-
-/// Best-effort shared lock on `dir/journal.lock` for a reader. `None` when
-/// the lock file cannot be opened (nothing to protect yet). The returned
-/// guard owns the File, so the fd stays open for the lock's lifetime.
+/// Best-effort shared lock on `dir/journal.lock` for a reader. The lock is
+/// held by this struct for its whole lifetime: `flock_shared` in `take`
+/// does NOT return a droppable guard here — the explicit LOCK_UN in `Drop`
+/// releases it. (A previous version mapped the guard and dropped it in
+/// `take`, releasing the lock immediately — the "exactly once" reader then
+/// ran unlocked. The reader now pins its file descriptors under this lock
+/// and reads unlocked from them, so it holds the shared lock only briefly:
+/// see `read_records`.)
 struct SharedLock(Option<File>);
 
 impl SharedLock {
     fn take(dir: &Path) -> Self {
         let f = OpenOptions::new().read(true).open(dir.join(LOCK_FILE)).ok();
-        let _ = f.as_ref().map(flock_shared);
+        if let Some(file) = &f {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the File is still open; the lock is released in Drop.
+            loop {
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+                if rc == 0 {
+                    break;
+                }
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINTR) {
+                    break; // best-effort reader: proceed unlocked
+                }
+            }
+        }
         Self(f)
     }
 }
@@ -449,25 +469,31 @@ fn last_wseq_in_file(path: &Path) -> Option<u64> {
 
 /// Rotate `journal.jsonl` to the next free `journal.<n>.jsonl` in `dir`,
 /// using max+1 (a deleted `journal.1.jsonl` must not be reused, or readers
-/// would see newer records before older ones). Caller holds the flock.
+/// would see newer records before older ones). Caller holds the flock. A
+/// failure to list the directory is an error, never a silent `max = 0` —
+/// renaming onto an existing `journal.1.jsonl` would silently overwrite a
+/// rotated file and lose records. After the rename, the rotated file and
+/// the directory are fsynced, so the rename itself is durable (the
+/// durability point promised in the module docs).
 fn rotate(dir: &Path) -> io::Result<()> {
     let mut max: u32 = 0;
-    if let Ok(rd) = fs::read_dir(dir) {
-        for e in rd.flatten() {
-            if let Some(name) = e.path().file_name().and_then(|n| n.to_str())
-                && let Some(num) = name
-                    .strip_prefix("journal.")
-                    .and_then(|n| n.strip_suffix(".jsonl"))
-                && let Ok(n) = num.parse::<u32>()
-            {
-                max = max.max(n);
-            }
+    let rd = fs::read_dir(dir)?;
+    for e in rd.flatten() {
+        if let Some(name) = e.path().file_name().and_then(|n| n.to_str())
+            && let Some(num) = name
+                .strip_prefix("journal.")
+                .and_then(|n| n.strip_suffix(".jsonl"))
+            && let Ok(n) = num.parse::<u32>()
+        {
+            max = max.max(n);
         }
     }
-    fs::rename(
-        dir.join(JOURNAL_FILE),
-        dir.join(format!("journal.{}.jsonl", max + 1)),
-    )
+    let renamed = dir.join(format!("journal.{}.jsonl", max + 1));
+    fs::rename(dir.join(JOURNAL_FILE), &renamed)?;
+    // Durability point (module docs): fsync the rotated file, then the dir.
+    File::open(&renamed)?.sync_all()?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 /// All journal files in a workspace dir, oldest first: rotated files in
@@ -493,26 +519,53 @@ pub fn journal_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Consume the rest of the current (over-long) line, up to and including
+/// the newline. Best-effort.
+fn drain_to_newline<R: BufRead>(r: &mut R) {
+    let mut sink = Vec::new();
+    loop {
+        sink.clear();
+        match r.read_until(b'\n', &mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if sink.last() == Some(&b'\n') {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Read every record in a workspace (rotated files first, then the current
 /// one), skipping any unparseable line (a torn tail never breaks the whole
 /// read). Returns the records and the number of skipped lines.
 ///
-/// A shared lock on the journal lock file is taken for the whole read, so a
-/// concurrent rotation (which takes the exclusive lock) cannot rename a file
-/// out from under the file list: every record is seen exactly once. If the
-/// lock file cannot be opened (e.g. the dir does not exist yet), the read
-/// proceeds unlocked — there is nothing to read yet in that case.
+/// Exactly-once under rotation: the file list is enumerated and every file
+/// is **opened under a shared lock** (writers take the exclusive lock when
+/// appending/rotating), then the lock is released and the records are read
+/// unlocked from the already-open descriptors. A rotation after the open
+/// cannot move a file out from under the reader (the descriptor pins the
+/// inode), so every record is seen exactly once — and a slow reader never
+/// blocks writers, since it holds no lock while reading. If the lock file
+/// cannot be opened (e.g. the dir does not exist yet), the read proceeds
+/// unlocked — there is nothing to read yet in that case.
 /// Max bytes in a single journal line read back. A longer "line" is not
 /// read into memory; it is counted as skipped (a hostile or corrupt file
 /// cannot OOM the reader). 16 MiB mirrors the control response cap.
 pub const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn read_records(dir: &Path) -> (Vec<JournalRecord>, usize) {
-    let _shared = shared_lock(dir);
+    // Pin the file descriptors under the shared lock, then read unlocked.
+    let files: Vec<File> = {
+        let _shared = shared_lock(dir);
+        journal_files(dir)
+            .into_iter()
+            .filter_map(|p| File::open(&p).ok())
+            .collect()
+    };
     let mut out = Vec::new();
     let mut skipped = 0usize;
-    for path in journal_files(dir) {
-        let Ok(f) = File::open(&path) else { continue };
+    for f in files {
         let mut reader = BufReader::new(f);
         loop {
             let mut buf = Vec::new();
@@ -522,13 +575,20 @@ pub fn read_records(dir: &Path) -> (Vec<JournalRecord>, usize) {
                 .read_until(b'\n', &mut buf)
             {
                 Ok(n) => n,
-                Err(_) => break,
+                Err(_) => {
+                    // A read error mid-file: count it, drop the rest of
+                    // this file, do not silently treat it as EOF.
+                    skipped += 1;
+                    break;
+                }
             };
             if n == 0 {
                 break;
             }
             if buf.len() > MAX_RECORD_BYTES {
-                // Over-long line: skip it without parsing (counted).
+                // Over-long line: drain to the newline so the remainder is
+                // not misparsed as a new line, then count it once.
+                drain_to_newline(&mut reader);
                 skipped += 1;
                 continue;
             }
@@ -608,8 +668,10 @@ fn escape_terminal(s: &str) -> String {
 
 /// One readable line for a record (the default `hisn journal` output).
 /// `session`, `kind` and the client label are terminal-escaped; `data` is
-/// a JSON value whose `Display` already escapes control characters inside
-/// strings (serde_json). `--json` output is unaffected (exact).
+/// a JSON value whose `Display` escapes C0 controls inside strings
+/// (serde_json) but passes C1 controls (U+0080..=U+009F, e.g. U+009B CSI)
+/// through raw — so the serialized form is escaped as well. `--json`
+/// output is unaffected (exact).
 pub fn render(rec: &JournalRecord) -> String {
     let client = rec
         .client
@@ -623,7 +685,7 @@ pub fn render(rec: &JournalRecord) -> String {
         escape_terminal(&rec.session),
         escape_terminal(&rec.kind),
         client,
-        rec.data
+        escape_terminal(&rec.data.to_string())
     )
 }
 
@@ -646,12 +708,26 @@ fn dir_bytes(dir: &Path) -> u64 {
     total
 }
 
-/// A sink for tests: a journal in a fresh temp dir.
+/// A sink for tests: a journal in a fresh temp dir. The workspace dir is
+/// created 0700, as production always is (the supervisor ensures it before
+/// the Journal exists and `append` now validates it).
 #[cfg(test)]
 fn test_journal() -> (tempfile::TempDir, Journal) {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("ws");
     (d, Journal::new(path, "s1".into()))
+}
+
+/// Create a test workspace dir with mode 0700 (production dirs are always
+/// 0700 — the journal validates).
+#[cfg(test)]
+fn create_test_ws_dir(dir: &Path) {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .unwrap();
 }
 
 #[cfg(test)]
@@ -693,7 +769,7 @@ mod tests {
     fn concurrent_writers_keep_wseq_strictly_increasing_with_no_lost_line() {
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("ws");
-        fs::create_dir_all(&dir).unwrap();
+        create_test_ws_dir(&dir);
         let mut handles = Vec::new();
         for t in 0..4 {
             let dir = dir.clone();
@@ -944,7 +1020,7 @@ mod tests {
         for cut in 0..=full.len() {
             let d = tempfile::tempdir().unwrap();
             let dir = d.path().join("ws");
-            fs::create_dir_all(&dir).unwrap();
+            create_test_ws_dir(&dir);
             fs::write(dir.join(JOURNAL_FILE), &full[..cut]).unwrap();
             // Ensure the lock file exists so readers/writers agree (append
             // creates it; read_records tolerates its absence).
@@ -1007,7 +1083,7 @@ mod tests {
         }
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("ws");
-        fs::create_dir_all(&dir).unwrap();
+        create_test_ws_dir(&dir);
         let exe = std::env::current_exe().unwrap();
         let mut children = Vec::new();
         for t in 0..4 {
@@ -1071,16 +1147,18 @@ mod tests {
 
     #[test]
     fn reader_during_rotation_sees_every_record_exactly_once() {
-        // Item 3: a reader running while another thread appends (and
-        // rotation may trigger) must see each wseq exactly once — no misses
-        // from a file renamed out from under the list, no duplicates.
+        // Item 3 + review R1: a reader running while another thread appends
+        // through MANY rotations must see each wseq exactly once in every
+        // snapshot — no misses from a file renamed out from under the
+        // list, no duplicates. The threshold is tiny so rotation really
+        // happens during the reads.
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("ws");
-        fs::create_dir_all(&dir).unwrap();
+        create_test_ws_dir(&dir);
         let writer_dir = dir.clone();
         let writer = std::thread::spawn(move || {
-            let j = Journal::new(writer_dir, "writer".into());
-            for i in 0..200 {
+            let j = Journal::with_rotate_after(writer_dir, "writer".into(), 1024);
+            for i in 0..400 {
                 j.append("note", None, json!({"i": i})).unwrap();
             }
         });
@@ -1088,33 +1166,47 @@ mod tests {
         for _ in 0..3 {
             let rd = dir.clone();
             readers.push(std::thread::spawn(move || {
-                let mut seen = Vec::new();
-                for _ in 0..50 {
+                let mut snapshots = Vec::new();
+                for _ in 0..30 {
                     let (recs, _) = read_records(&rd);
-                    for r in recs {
-                        seen.push(r.wseq);
-                    }
+                    snapshots.push(recs.iter().map(|r| r.wseq).collect::<Vec<_>>());
                 }
-                seen
+                snapshots
             }));
         }
         writer.join().unwrap();
-        // Every reader's final full scan must contain 1..=200 exactly once
-        // at the end (the last read_records call in each thread covers the
-        // whole file). Assert on one final read instead: strict increase
-        // and completeness.
         for r in readers {
-            let seen = r.join().unwrap();
-            // Each individual read_records snapshot is strictly increasing
-            // is not observable across calls; just require no panic and a
-            // bounded size.
-            assert!(!seen.is_empty());
+            let snaps = r.join().unwrap();
+            for seqs in &snaps {
+                // Every snapshot is exactly 1..=max with no duplicates and
+                // no gaps: a missed rotated file would show as a gap, a
+                // double-read file as a duplicate.
+                if seqs.is_empty() {
+                    continue;
+                }
+                let max = *seqs.iter().max().unwrap();
+                assert_eq!(*seqs, (1..=max).collect::<Vec<_>>());
+            }
         }
+        // At least one rotation must have happened.
+        let files = existing_files(&dir);
+        assert!(files.len() > 1, "rotation must have occurred: {files:?}");
         let (recs, skipped) = read_records(&dir);
         assert_eq!(skipped, 0);
-        assert_eq!(recs.len(), 200);
+        assert_eq!(recs.len(), 400);
         let seqs: Vec<u64> = recs.iter().map(|r| r.wseq).collect();
-        assert_eq!(seqs, (1..=200).collect::<Vec<_>>());
+        assert_eq!(seqs, (1..=400).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn sync_on_missing_journal_file_is_not_a_failure() {
+        // R1: sync() before any write must not count a spurious failure.
+        let (_d, j) = test_journal();
+        j.sync();
+        assert_eq!(j.failures(), 0);
+        j.append("note", None, data("x")).unwrap();
+        j.sync();
+        assert_eq!(j.failures(), 0);
     }
 
     #[test]

@@ -169,7 +169,18 @@ pub fn workspace_dir(id: &str) -> PathBuf {
 /// group-readable `hisn/` dir is the user's choice — the 0700 leaf still
 /// protects the contents).
 pub fn ensure_workspace(dir: &Path) -> std::io::Result<()> {
-    ensure_workspace_under(&state_home(), dir)
+    let home = state_home();
+    // Production dirs live under the state home and are validated from it.
+    // A dir outside it (tests, scratch) is validated from its immediate
+    // parent — the leaf still gets the full 0700/owner/no-symlink check.
+    let root = if dir.starts_with(&home) {
+        home
+    } else {
+        dir.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| dir.to_path_buf())
+    };
+    ensure_workspace_under(&root, dir)
 }
 
 /// `ensure_workspace` with an explicit state root (tests).

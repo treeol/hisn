@@ -245,10 +245,12 @@ directions**:
 
 `hisn ls --json` prints `{"schema":"hisn-ls/v2","sessions":[…]}`.
 The v1 fields are kept unchanged; v2 adds `clients`, live `execs` (with
-`attach`), `services`, `rootfs`, `members`, `lease`. 0.5.0 adds three additive
+`attach`), `services`, `rootfs`, `members`, `lease`. 0.5.0 adds five additive
 fields per session: `hisn_version` (the recorded version, information only,
-or `null`), `protocol_revision` (the recorded revision, or `null`) and
-`workspace` (`{"id","name"}`) plus a `journal` summary (`{dir,files,bytes}`).
+or `null`), `protocol_revision` (the recorded revision, or `null`),
+`workspace` (`{"id","name"}`), a `journal` summary (`{dir,files,bytes}`)
+and `journal_failures` (the supervisor's failed-journal-write count, or
+`null`).
 No field is renamed, retyped or removed, so a 0.4.3 client reading a 0.5.0
 `ls --json` sees the same keys and values for the ones it knows.
 

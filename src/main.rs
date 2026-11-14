@@ -651,6 +651,7 @@ fn session_v2_json(
         "name": meta.and_then(|m| m.name.clone()).map(Value::String).unwrap_or(Value::Null),
         "rootfs": meta.and_then(|m| m.rootfs.clone()).map(Value::String).unwrap_or(Value::Null),
         "hisn_version": meta.and_then(|m| m.hisn_version.clone()).map(Value::String).unwrap_or(Value::Null),
+        "protocol_revision": meta.and_then(|m| m.protocol_revision).map(Value::from).unwrap_or(Value::Null),
         "workspace": meta.and_then(|m| m.workspace.as_ref().map(|w| json!({"id": w.id, "name": w.name}))).unwrap_or(Value::Null),
         "journal": meta.and_then(|m| m.workspace.as_ref().map(|w| {
             let dir = hisn::workspace::workspace_dir(&w.id);
@@ -802,11 +803,17 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
     let dir = workspace::workspace_dir(&id);
     let (recs, skipped) = journal::read_records(&dir);
     // `--since` is enforced: an unparseable timestamp is an error, not a
-    // silent "show everything" (item 5).
+    // silent "show everything" (item 5). Only Zulu (Z) timestamps are
+    // accepted: an offset like +02:00 would otherwise be silently parsed
+    // as UTC (R2).
     let since_secs = match a.since.as_deref() {
         Some(s) => Some(
-            parse_rfc3339_secs(s)
-                .with_context(|| format!("--since {s:?} is not an RFC 3339 timestamp"))?,
+            if s.ends_with('Z') {
+                parse_rfc3339_secs(s)
+            } else {
+                None
+            }
+            .with_context(|| format!("--since {s:?} is not an RFC 3339 UTC (Z) timestamp"))?,
         ),
         None => None,
     };

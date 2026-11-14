@@ -270,26 +270,31 @@ impl Journal {
     }
 }
 
-/// Take an exclusive flock on an open file. Retries on EINTR: the supervisor
-/// installs signal handlers, so a signal during a contended wait can
-/// interrupt it.
+/// Take an exclusive flock on an open file, with a bounded wait: an
+/// unbounded blocking flock would let a hung lock holder (e.g. a SIGSTOPped
+/// supervisor) stall every audited operation in the workspace — rule 5
+/// covers failure, not hang (R2). Waits at most ~1 s, then fails (the
+/// caller counts it; the recorded operation still succeeds). EINTR is
+/// retried within the budget (the supervisor has signal handlers).
 fn flock(f: &File) -> Result<FlockGuard, JournalError> {
-    flock_mode(f, libc::LOCK_EX)
-}
-
-fn flock_mode(f: &File, mode: libc::c_int) -> Result<FlockGuard, JournalError> {
     use std::os::fd::AsRawFd;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
-        let rc = unsafe { libc::flock(f.as_raw_fd(), mode) };
+        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
             break;
         }
         let e = io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EINTR) {
-            return Err(JournalError {
-                message: format!("lock: {e}"),
-            });
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
         }
+        if e.raw_os_error() == Some(libc::EINTR) && std::time::Instant::now() < deadline {
+            continue;
+        }
+        return Err(JournalError {
+            message: format!("lock: {e}"),
+        });
     }
     Ok(FlockGuard(_fd_of(f)))
 }
@@ -306,19 +311,38 @@ struct SharedLock(Option<File>);
 
 impl SharedLock {
     fn take(dir: &Path) -> Self {
-        let f = OpenOptions::new().read(true).open(dir.join(LOCK_FILE)).ok();
+        // Create the lock file if missing, so the writer's lock and ours
+        // are always the same inode (R2: without create, a concurrent
+        // first writer could create it after we "took" a missing lock and
+        // rotate under us). Mode 0600 like the writer's.
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(dir.join(LOCK_FILE))
+            .ok();
         if let Some(file) = &f {
             use std::os::fd::AsRawFd;
+            // Bounded wait (see flock): give up to ~1 s, then proceed
+            // unlocked — a hung writer must not hang the reader forever.
             // SAFETY: the File is still open; the lock is released in Drop.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             loop {
-                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
                 if rc == 0 {
                     break;
                 }
                 let e = std::io::Error::last_os_error();
-                if e.raw_os_error() != Some(libc::EINTR) {
-                    break; // best-effort reader: proceed unlocked
+                if (e.raw_os_error() == Some(libc::EWOULDBLOCK)
+                    || e.raw_os_error() == Some(libc::EINTR))
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
                 }
+                break; // best-effort reader: proceed unlocked
             }
         }
         Self(f)
@@ -491,8 +515,10 @@ fn rotate(dir: &Path) -> io::Result<()> {
     let renamed = dir.join(format!("journal.{}.jsonl", max + 1));
     fs::rename(dir.join(JOURNAL_FILE), &renamed)?;
     // Durability point (module docs): fsync the rotated file, then the dir.
-    File::open(&renamed)?.sync_all()?;
-    File::open(dir)?.sync_all()?;
+    // Best-effort: a sync failure must not fail the append (the record
+    // being written is worth more than the rename's durability — R2).
+    let _ = File::open(&renamed).and_then(|f| f.sync_all());
+    let _ = File::open(dir).and_then(|f| f.sync_all());
     Ok(())
 }
 
@@ -585,14 +611,19 @@ pub fn read_records(dir: &Path) -> (Vec<JournalRecord>, usize) {
             if n == 0 {
                 break;
             }
-            if buf.len() > MAX_RECORD_BYTES {
+            // Strip the newline first, then enforce the cap on content
+            // (a line of exactly MAX_RECORD_BYTES of content + newline is
+            // valid; comparing before the strip would wrongly drain it and
+            // swallow the following record — R2 off-by-one).
+            let has_nl = buf.last() == Some(&b'\n');
+            if buf.len() - has_nl as usize > MAX_RECORD_BYTES {
                 // Over-long line: drain to the newline so the remainder is
                 // not misparsed as a new line, then count it once.
                 drain_to_newline(&mut reader);
                 skipped += 1;
                 continue;
             }
-            if buf.last() == Some(&b'\n') {
+            if has_nl {
                 buf.pop();
             }
             if buf.is_empty() {
@@ -648,10 +679,14 @@ pub fn query(records: &[JournalRecord], q: &Query) -> Vec<JournalRecord> {
 }
 
 /// Escape every agent-supplied string for terminal display: control
-/// characters (including ESC, the start of terminal escape sequences) and
-/// DEL are shown as `\xNN` / `\n` / `\r` / `\t`, so journal content can
-/// never drive the reader's terminal. Printable Unicode passes through.
-/// Used by the readable `hisn journal` output only — `--json` stays exact.
+/// characters (including ESC, the start of terminal escape sequences),
+/// DEL, and Unicode format characters (bidi overrides U+202A..=U+202E,
+/// isolates U+2066..=U+2069, zero-width U+200B..=U+200F, BOM U+FEFF,
+/// line/paragraph separators U+2028/U+2029) are shown as `\xNN` / `\n` /
+/// `\r` / `\t`, so journal content can neither drive the reader's
+/// terminal nor visually reorder its text. Printable Unicode passes
+/// through. Used by the readable `hisn journal` output only — `--json`
+/// stays exact.
 fn escape_terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -659,11 +694,27 @@ fn escape_terminal(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if c.is_control() || is_format_char(c) => {
+                out.push_str(&format!("\\x{:02x}", c as u32))
+            }
             c => out.push(c),
         }
     }
     out
+}
+
+/// Unicode format (Cf) characters with visual-ordering or invisible-text
+/// effects. `char::is_control` covers Cc only, so these need an explicit
+/// list (R2).
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}' // zero-width space/joiner, LRM/RLM
+        | '\u{202A}'..='\u{202E}' // bidi embeddings/overrides
+        | '\u{2028}' | '\u{2029}' // line/paragraph separators
+        | '\u{2066}'..='\u{2069}' // bidi isolates
+        | '\u{FEFF}' // zero-width no-break space / BOM
+    )
 }
 
 /// One readable line for a record (the default `hisn journal` output).

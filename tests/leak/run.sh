@@ -3535,6 +3535,8 @@ if needs_host; then
   L82_CWD=$(new_cwd l82)
   L82_POL="$WORK/l82.toml"
   write_policy "$L82_POL" "$L82_CWD"
+  # (Restore any pre-existing value afterwards — do not clobber the env.)
+  L82_SAVED_XDG_STATE_HOME=${XDG_STATE_HOME:-}
   export XDG_STATE_HOME="$WORK"
   if start_session l82-$$ "$L82_CWD" "$L82_POL"; then
     L82_ID=$(ls_workspace_id "l82-$$")
@@ -3563,7 +3565,11 @@ if needs_host; then
   else
     skip "L82 workspace journal unreadable from inside a session" "session did not start"
   fi
-  unset XDG_STATE_HOME
+  if [ -n "$L82_SAVED_XDG_STATE_HOME" ]; then
+    export XDG_STATE_HOME="$L82_SAVED_XDG_STATE_HOME"
+  else
+    unset XDG_STATE_HOME
+  fi
   rm -rf "$L82_CWD" "$WORK/hisn/workspaces"
 else
   skip "L82 workspace journal unreadable from inside a session" "hisn check failed (no userns)"

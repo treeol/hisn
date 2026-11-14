@@ -619,6 +619,14 @@ impl Shared {
         }
     }
 
+    /// Sync the journal to disk (durability point — see
+    /// `journal_session`). Called after the stop-time `git-change` append,
+    /// which happens after `journal_session("stop")` and would otherwise
+    /// never be synced.
+    fn sync_journal(&self) {
+        self.journal.sync();
+    }
+
     /// Session start is journaled (B3): the journal outlives the session dir,
     /// so a start/stop trail is queryable after the session is gone. The
     /// single durable start record is written by the standalone journal at
@@ -2835,8 +2843,12 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
 
     // 0.5.0 (B3, C2): session stop and the git-change report, journaled after
     // the sandbox has exited. Report only (Part C): nothing is reverted.
+    // `journal_session("stop")` syncs; the git-change append after it must
+    // be synced too, or the stop record can be lost on a power failure
+    // right after exit (R2).
     shared.journal_session("stop");
     shared.journal_git_change(&policy.cwd);
+    shared.sync_journal();
 
     // Phase: teardown (host services, in-sandbox services, drain).
     teardown_services(&host_pids, &service_handles);

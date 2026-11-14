@@ -76,9 +76,12 @@ pub const DANGEROUS_KEYS: &[&str] = &[
     "gpg.program",
     "include.path",
     "includeif",
-    "url.insteadOf",
+    "url.insteadof",
     "difftool",
     "mergetool",
+    "pager",
+    "browser",
+    "man",
 ];
 
 /// Is `key` (a `section.subsection.key` or `section.key`) a dangerous key?
@@ -109,7 +112,31 @@ pub fn is_dangerous_key(key: &str) -> bool {
     // (insteadOf), difftool.*, mergetool.* — any key under those.
     if matches!(
         section,
-        "alias" | "filter" | "includeif" | "url" | "difftool" | "mergetool"
+        "alias"
+            | "filter"
+            | "includeif"
+            | "url"
+            | "difftool"
+            | "mergetool"
+            | "pager"
+            | "browser"
+            | "man"
+    ) {
+        return true;
+    }
+    // Composite (section, leaf) rules for keys that run commands under
+    // otherwise-safe sections (R2, checked against git-config(1)):
+    // diff.<d>.command, remote.<n>.uploadpack/receivepack,
+    // interactive.diffFilter, core.alternateRefsCommand,
+    // submodule.<n>.update (!cmd), man.<tool>.cmd is covered by section.
+    if matches!(
+        (section, last),
+        ("diff", "command")
+            | ("remote", "uploadpack")
+            | ("remote", "receivepack")
+            | ("interactive", "difffilter")
+            | ("core", "alternaterefscommand")
+            | ("submodule", "update")
     ) {
         return true;
     }
@@ -123,6 +150,8 @@ pub fn is_dangerous_key(key: &str) -> bool {
             | "editor"
             | "askpass"
             | "gitproxy"
+            | "alternaterefscommand"
+            | "difffilter"
             | "textconv"
             | "external"
             | "driver"
@@ -460,10 +489,12 @@ fn parse_git_config(text: &str, out: &mut BTreeMap<String, Vec<String>>) {
         if line.starts_with('[') {
             // `[section] key = value` on one line is legal (verified with
             // git 2.39.5): parse the header, then treat the remainder as a
-            // key line.
+            // key line. A remainder that is a comment (`[sec] ; note`) is
+            // NOT a key — without this check `parse_key_line` inserts a
+            // bogus `sec.; note` key (R2).
             if let Some((sec, rest)) = parse_section_header(line) {
                 section = Some(sec);
-                if rest.is_empty() {
+                if rest.is_empty() || rest.starts_with([';', '#']) {
                     continue;
                 }
                 parse_key_line(&rest, &section, out);
@@ -817,6 +848,15 @@ mod tests {
             "core.gitProxy",
             "difftool.mydiff.cmd",
             "mergetool.mytool.cmd",
+            "pager.log",
+            "browser.firefox.cmd",
+            "man.man.cmd",
+            "diff.mydriver.command",
+            "remote.origin.uploadpack",
+            "remote.origin.receivepack",
+            "interactive.diffFilter",
+            "core.alternateRefsCommand",
+            "submodule.x.update",
         ] {
             assert!(is_dangerous_key(k), "{k} must be flagged");
         }
@@ -956,6 +996,24 @@ mod tests {
         std::os::unix::fs::symlink(d.path().join("nope"), &cfg).unwrap();
         let s = snapshot(&cwd);
         assert!(s.truncated, "dangling config symlink must be truncation");
+    }
+
+    #[test]
+    fn section_header_trailing_comment_is_not_a_key() {
+        // R2: `[sec] ; trailing comment` must not insert a bogus key.
+        let d = tempfile::tempdir().unwrap();
+        let cwd = git_dir(&d);
+        write(
+            &cwd.join(".git/config"),
+            b"[core] ; trailing comment\nbare = true\n",
+        );
+        let s = snapshot(&cwd);
+        assert_eq!(s.config["core.bare"], ["true"]);
+        assert!(
+            s.config.keys().all(|k| !k.contains(';')),
+            "bogus key from header comment: {:?}",
+            s.config.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

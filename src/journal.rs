@@ -176,9 +176,10 @@ impl Journal {
     /// content for audit-derived records, so the journal carries the same
     /// information `grants.jsonl` carries).
     ///
-    /// On failure the caller decides: audit/session records swallow and
-    /// count, a `note` returns the error. A failure is also written to
-    /// stderr, which for a detached supervisor is `supervisor.log`.
+    /// On failure the caller decides: audit/session records swallow the
+    /// returned error, but this method always counts it and writes it to
+    /// stderr first; a `note` additionally returns the error. For a detached
+    /// supervisor, stderr is `supervisor.log`.
     pub fn append(
         &self,
         kind: &str,

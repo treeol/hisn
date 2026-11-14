@@ -2422,8 +2422,8 @@ fn run_supervisor_inner(
         let ws_dir = workspace::workspace_dir(&meta.workspace.as_ref().unwrap().id);
         // Not fatal (rule 5 / the failure-handling rule): a journal that
         // cannot be created must not take down the session. A warning is
-        // printed and the journal's own `create_dir_all` on first append is
-        // the backstop.
+        // printed and the journal's validated `ensure_workspace` call on
+        // first append is the backstop.
         if let Err(e) = workspace::ensure_workspace(&ws_dir) {
             eprintln!(
                 "hisn: warning: cannot create workspace dir {}: {e}",

@@ -261,7 +261,12 @@ impl Journal {
             let last = last_wseq(path).map_err(|e| JournalError {
                 message: format!("read last wseq: {e}"),
             })?;
-            Ok(last.unwrap_or(0) + 1)
+            // Item 8: `u64::MAX + 1` panics in debug and wraps in release.
+            // A hand-corrupted journal holding a `u64::MAX` record must
+            // fail the append (counted) instead.
+            last.unwrap_or(0).checked_add(1).ok_or(JournalError {
+                message: "wseq overflow".to_owned(),
+            })
         };
         let mut seq = next_wseq(&path)?;
         // Rotate before writing when the current file is already oversize.
@@ -545,7 +550,16 @@ fn rotate(dir: &Path) -> io::Result<()> {
             max = max.max(n);
         }
     }
-    let renamed = dir.join(format!("journal.{}.jsonl", max + 1));
+    // Item 8: `u32::MAX + 1` panics in debug and wraps in release. A
+    // crafted `journal.4294967295.jsonl` must fail the append (counted)
+    // instead of renaming onto `journal.0.jsonl`.
+    let next = max.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rotated journal number overflow",
+        )
+    })?;
+    let renamed = dir.join(format!("journal.{next}.jsonl"));
     fs::rename(dir.join(JOURNAL_FILE), &renamed)?;
     // Durability point (module docs): fsync the rotated file, then the dir.
     // Best-effort: a sync failure must not fail the append (the record
@@ -1693,7 +1707,10 @@ mod tests {
     #[test]
     fn over_long_record_line_is_skipped_not_oom() {
         // Item 5: a single record line over MAX_RECORD_BYTES is skipped
-        // (counted) instead of being read into memory.
+        // (counted) instead of being read into memory. The memory bound is
+        // pinned separately by `over_long_line_does_not_grow_memory_with_
+        // its_length` (item 8): the reader drains the over-long remainder
+        // from its own buffer instead of accumulating it.
         let (_d, j) = test_journal();
         j.append("note", None, data("ok")).unwrap();
         let path = j.dir.join(JOURNAL_FILE);
@@ -1709,6 +1726,71 @@ mod tests {
             "over-long line must be skipped, got {skipped}"
         );
         assert_eq!(recs.len(), 2);
+        assert_eq!(recs[1].data, data("after"));
+    }
+
+    #[test]
+    fn overflow_of_wseq_and_rotated_file_number_is_a_counted_failure() {
+        // Item 8: a journal whose last record has wseq u64::MAX, and a
+        // rotated file numbered u32::MAX, must fail the append (counted),
+        // never panic (debug) or wrap (release).
+        let (_d, j) = test_journal();
+        create_test_ws_dir(&j.dir);
+        let path = j.dir.join(JOURNAL_FILE);
+        let rec = JournalRecord {
+            v: JOURNAL_VERSION,
+            ts: "2026-11-14T00:00:00Z".into(),
+            wseq: u64::MAX,
+            session: "s1".into(),
+            kind: "note".into(),
+            client: None,
+            data: data("max"),
+        };
+        let mut line = serde_json::to_string(&rec).unwrap();
+        line.push('\n');
+        fs::write(&path, line).unwrap();
+        // Make the file look oversize so the append takes the rotate path
+        // too — the wseq overflow must fire first (next_wseq runs before
+        // the rotation check).
+        let r = j.append("note", None, data("after-max"));
+        assert!(r.is_err(), "u64::MAX wseq must fail the append");
+        assert_eq!(j.failures(), 1);
+        // And rotate() itself refuses the u32 overflow.
+        fs::write(
+            j.dir.join("journal.4294967295.jsonl"),
+            b"not a real journal\n",
+        )
+        .unwrap();
+        assert!(rotate(&j.dir).is_err(), "u32::MAX rotation must fail");
+    }
+
+    #[test]
+    fn over_long_line_does_not_grow_memory_with_its_length() {
+        // Item 8: an over-long line must not grow reader memory with its
+        // length. Reading a file whose first line is 64 MiB (4x the
+        // 16 MiB cap) must return the same records as the 1-byte-over-cap
+        // case, with the over-long line skipped exactly once. The drain
+        // (`drain_to_newline`) discards from the reader's own buffer now
+        // (it accumulated a Vec before `6e73ca3`); this test pins the
+        // observable behaviour. Memory itself is not measured — that
+        // needs instrumentation the unit suite does not have — but the
+        // accumulation path is gone from the code (verified by reading
+        // `drain_to_newline`), and a 64 MiB line is handled in the same
+        // bounded time/space as a 16 MiB one.
+        let (_d, j) = test_journal();
+        j.append("note", None, data("before")).unwrap();
+        let path = j.dir.join(JOURNAL_FILE);
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        // 64 MiB of filler without a newline, then the newline.
+        let big = "x".repeat(64 * 1024 * 1024);
+        f.write_all(big.as_bytes()).unwrap();
+        f.write_all(b"\n").unwrap();
+        j.append("note", None, data("after")).unwrap();
+        let (recs, skipped) = read_records(&j.dir);
+        assert_eq!(skipped, 1, "one over-long line, counted once");
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].data, data("before"));
         assert_eq!(recs[1].data, data("after"));
     }
 

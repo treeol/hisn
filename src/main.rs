@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use hisn::cli::{Cli, Command, PolicyCommand, ProfileCommand, RootfsCommand};
 use hisn::policy::{self, Overrides, Policy};
 use hisn::profile;
-use hisn::{attach, execcli, mounts, rootfs_store, session, supervisor};
+use hisn::{attach, execcli, journal, mounts, rootfs_store, session, supervisor, workspace};
 
 /// Exit code for hisn-internal errors (policy, host); distinct from a
 /// command's own exit status.
@@ -307,6 +307,35 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+        Command::Note(a) => {
+            let text = if a.text == "-" {
+                use std::io::Read;
+                let mut t = String::new();
+                std::io::stdin().read_to_string(&mut t)?;
+                t.trim_end_matches('\n').to_owned()
+            } else {
+                a.text
+            };
+            let kind = if a.marker { "marker" } else { "note" };
+            // Version-gated (A2/B6): the new CLI sends `protocol_version` and,
+            // only when the session declares 0.5.0, the `note` op. A
+            // pre-0.5.0 session never sees an unknown op; the CLI prints that
+            // the session predates the feature.
+            if !session_supports_version(&a.session) {
+                eprintln!(
+                    "hisn: session {} predates the note op (hisn_version < 0.5.0); not sent",
+                    a.session
+                );
+                return Ok(ExitCode::from(2));
+            }
+            let r = supervisor::client_request(
+                &a.session,
+                &json!({"op":"note","kind":kind,"text":text,
+                        "client":{"protocol_version":hisn::sessionmeta::PROTOCOL_VERSION}}),
+            )?;
+            print_response(&r)
+        }
+        Command::Journal(a) => journal_cmd(a),
     }
 }
 
@@ -600,6 +629,14 @@ fn session_v2_json(
         "network": policy.map(|p| p["network"].clone()).unwrap_or(Value::Null),
         "name": meta.and_then(|m| m.name.clone()).map(Value::String).unwrap_or(Value::Null),
         "rootfs": meta.and_then(|m| m.rootfs.clone()).map(Value::String).unwrap_or(Value::Null),
+        "hisn_version": meta.and_then(|m| m.hisn_version.clone()).map(Value::String).unwrap_or(Value::Null),
+        "workspace": meta.and_then(|m| m.workspace.as_ref().map(|w| json!({"id": w.id, "name": w.name}))).unwrap_or(Value::Null),
+        "journal": meta.and_then(|m| m.workspace.as_ref().map(|w| {
+            let dir = hisn::workspace::workspace_dir(&w.id);
+            let files = hisn::journal::journal_files(&dir);
+            let bytes: u64 = files.iter().map(|p| std::fs::metadata(p).map(|mm| mm.len()).unwrap_or(0)).sum();
+            json!({ "dir": dir.display().to_string(), "files": files.len(), "bytes": bytes })
+        })).unwrap_or(Value::Null),
         "pid": Value::Null,
         "started": meta.map(|m| Value::String(m.created.ts.clone())).unwrap_or(Value::Null),
         "execs": execs,
@@ -692,6 +729,92 @@ fn read_session_policy(path: &Path) -> Option<Value> {
     serde_json::from_str(&json_str).ok()
 }
 
+/// 0.5.0 (A2): does the session's `session.json` declare a hisn version that
+/// introduced `protocol_version`/new ops? Absent or older than 0.5.0 ⇒ the
+/// new CLI must not send the new field/op to that supervisor (A2b/A5).
+fn session_supports_version(session_arg: &str) -> bool {
+    session_version(session_arg).is_some_and(|v| version_at_least_05(&v))
+}
+
+/// The `hisn_version` recorded in the session's `session.json`, if present.
+fn session_version(session_arg: &str) -> Option<String> {
+    let uid = rustix::process::getuid().as_raw();
+    let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
+    let reg_root = hisn::registry::registry_root(uid);
+    let id = session::resolve_session_arg(&roots, &reg_root, session_arg).ok()?;
+    let dir = session::find_session(&roots, &id).ok()?;
+    hisn::sessionmeta::read(&dir).and_then(|m| m.hisn_version)
+}
+
+/// Is `v` ("0.5.0" or later)? Unknown shapes are treated as older (never send
+/// a new field on doubt).
+fn version_at_least_05(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let major: u32 = parts[0].parse().unwrap_or(0);
+    let minor: u32 = parts[1].parse().unwrap_or(0);
+    (major, minor) >= (0, 5)
+}
+
+/// `hisn journal` (B7): read the workspace journal host-side and print it.
+/// Works for stopped and pruned sessions (the journal lives in the workspace
+/// dir, not the session dir).
+fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
+    // Resolve the workspace: explicit name/id, else derive from the canonical
+    // current directory (the same default `run` uses).
+    let id = match a.workspace.as_deref() {
+        Some(w) => {
+            if workspace::workspace_id_for_name(w) == w || w.len() == 16 && w.chars().all(|c| c.is_ascii_hexdigit()) {
+                // A bare 16-hex id (or a name that coincides) — prefer the id
+                // when it names an existing dir, else the name's id.
+                let by_id = workspace::workspace_dir(w);
+                if by_id.is_dir() {
+                    w.to_owned()
+                } else {
+                    workspace::workspace_id_for_name(w)
+                }
+            } else {
+                workspace::workspace_id_for_name(w)
+            }
+        }
+        None => {
+            let cwd = std::env::current_dir().context("current dir")?;
+            let canon = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+            workspace::workspace_id_for_path(&canon)
+        }
+    };
+    let dir = workspace::workspace_dir(&id);
+    let (recs, skipped) = journal::read_records(&dir);
+    let since_secs = match a.since.as_deref() {
+        Some(s) => parse_rfc3339_secs(s),
+        None => None,
+    };
+    let q = journal::Query {
+        session: a.session,
+        seat: a.seat,
+        kind: a.kind,
+        since_secs,
+        last: a.last,
+    };
+    let out = journal::query(&recs, &q);
+    for r in &out {
+        if a.json {
+            println!("{}", serde_json::to_string(r)?);
+        } else {
+            println!("{}", journal::render(r));
+        }
+    }
+    if skipped > 0 {
+        eprintln!("hisn: skipped {skipped} unparseable journal line(s)");
+    }
+    if out.is_empty() && !dir.exists() {
+        eprintln!("hisn: no journal for workspace {id} (dir {})", dir.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `hisn rootfs import`: thin wrapper over [`hisn::rootfs_import::import`].
 fn rootfs_import(args: hisn::cli::ImportArgs) -> Result<ExitCode> {
     let root = rootfs_store::store_root()?;
@@ -708,6 +831,9 @@ fn rootfs_import(args: hisn::cli::ImportArgs) -> Result<ExitCode> {
     );
     Ok(ExitCode::SUCCESS)
 }
+
+/// `parse_rfc3339_secs` lives in `hisn::session` and is imported at the top
+/// of this file's scope for the journal CLI (see `journal_cmd`).
 
 /// 0.4.0 step 5: archive `grants.jsonl` and the final `session.json` from
 /// `dir` into `$XDG_STATE_HOME/hisn/audit/<id>.jsonl` (0600, dir 0700) before

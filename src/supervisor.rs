@@ -32,8 +32,10 @@ use crate::cli::{RunArgs, parse_grant_spec};
 use crate::control::{self, ConnId, Handler, Mode, Request, err, ok};
 use crate::env as senv;
 use crate::exec::{self, ExecClient, ExecContext, ExecRules, NsFds};
+use crate::gitreport;
 use crate::grant::{self, Grant, GrantTable, HelperClient, Holder, HolderKind, Rules};
 use crate::init::{self, InitConfig, MSG_ERROR, MSG_GO, MSG_READY, MSG_START};
+use crate::journal::{Journal, JournalClient, journal_files};
 use crate::landlock;
 use crate::mounts::{self, HostFacts};
 use crate::policy::{Network, Overrides, Policy, ResolvedPolicy, is_valid_session_id};
@@ -41,6 +43,7 @@ use crate::profile::{self, Profile as ProfileDoc};
 use crate::services::{self, ServiceHandle};
 use crate::session::{self, Audit, SessionDir};
 use crate::sessionmeta;
+use crate::workspace::{self, WorkspaceRef, workspace_id_for, workspace_name_for};
 use crate::{seccomp, sig, sys};
 
 // ---------------------------------------------------------------- R5 decision
@@ -128,6 +131,17 @@ pub struct Shared {
     held: Mutex<std::collections::BTreeMap<PathBuf, Held>>,
     helper: Mutex<HelperClient>,
     audit: Audit,
+    /// 0.5.0 (B2–B3): the workspace journal writer for this session, and the
+    /// git snapshot taken at start (for the stop-time `git-change` diff).
+    journal: Journal,
+    /// The directory of the workspace (for `ls --json`'s journal count and the
+    /// journal-failure field; also where the journal lives).
+    workspace_dir: std::path::PathBuf,
+    /// The workspace reference (`session.json`'s `workspace` field).
+    workspace: WorkspaceRef,
+    /// The git snapshot taken at session start (before the sandbox runs), so
+    /// the stop-time diff sees only what changed during this session.
+    git_before: gitreport::Snapshot,
     /// Serialises grant/revoke so audit order = execution order.
     op_lock: Mutex<()>,
     // ---- exec (DESIGN §14)
@@ -518,6 +532,9 @@ impl Shared {
     }
 
     /// Audit a line that carries the client record and the authz decision.
+    /// The same event is mirrored into the workspace journal (same
+    /// information, journal shape); a journal failure never fails the
+    /// operation (B4) — it is counted and reported.
     #[allow(clippy::too_many_arguments)]
     fn log_client(
         &self,
@@ -543,7 +560,20 @@ impl Shared {
             o.insert("seq".into(), json!(client.seq));
             o.insert("authz".into(), json!({ "allow": allowed }));
         }
-        let _ = self.audit.log(entry);
+        let _ = self.audit.log(entry.clone());
+        // Mirror into the journal: identical information, journal shape. The
+        // kind is `<op>/<stage>`. A journal failure neither fails the op nor
+        // stops the audit (rule 5); `append` counts it.
+        let _ = self.journal.append(
+            &format!("{op}/{stage}"),
+            Some(JournalClient {
+                uid: client.uid,
+                label: client.label.clone(),
+                label_source: client.label_source.clone(),
+                req_id: client.req_id.clone(),
+            }),
+            entry,
+        );
     }
 
     fn log(
@@ -555,9 +585,49 @@ impl Shared {
         result: Option<&str>,
         peer: Option<i32>,
     ) {
+        let entry = Audit::entry(op, stage, path, mode, result, peer);
+        let _ = self.audit.log(entry.clone());
+        // Mirror into the journal (no client: a plain log carries none).
         let _ = self
-            .audit
-            .log(Audit::entry(op, stage, path, mode, result, peer));
+            .journal
+            .append(&format!("{op}/{stage}"), None, entry);
+    }
+
+    /// Journal one `git-change` record: the diff between the snapshot taken
+    /// at start and a fresh snapshot now (Part C). At stop the supervisor
+    /// calls this once. Report only: nothing is blocked or reverted.
+    fn journal_git_change(&self, cwd: &Path) {
+        let after = gitreport::snapshot(cwd);
+        let mut data = gitreport::change_record(&self.git_before, &after);
+        if let Some(o) = data.as_object_mut() {
+            o.insert("cwd".into(), json!(cwd.display().to_string()));
+        }
+        self.journal
+            .append("git-change", None, data)
+            .unwrap_or_else(|_| {
+                // A failed git-change write is not the operation, so it is
+                // swallowed and counted by `append` (rule 5). No-op here.
+            });
+    }
+
+    /// Journal session start / stop (B3). Best-effort (rule 5).
+    fn journal_session(&self, which: &str) {
+        let _ = self.journal.append(
+            &format!("session/{which}"),
+            None,
+            json!({ "workspace": self.workspace.id }),
+        );
+    }
+
+    /// Session start is journaled (B3): the journal outlives the session dir,
+    /// so a start/stop trail is queryable after the session is gone.
+    fn journal_session_start(&self) {
+        self.journal_session("start");
+        let _ = self.journal.append(
+            "git-change",
+            None,
+            json!({ "phase": "start", "snapshot": self.git_before }),
+        );
     }
 
     fn do_grant(
@@ -1152,6 +1222,13 @@ impl Shared {
     /// connected clients and live execs (including attaches). Never blocks; a
     /// client with no requests yet is still listed (label "connected").
     fn session_info(&self, _auth: &authz::Authorized) -> Value {
+        // 0.5.0 (B4): the failed-journal-write count for `ls --json` (additive).
+        // A caller that does not know it ignores it (Value → JSON object).
+        let journal_failures = self.journal.failures();
+        let journal_bytes: u64 = journal_files(&self.workspace_dir)
+            .iter()
+            .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .sum();
         let clients: Vec<Value> = self
             .conns
             .lock()
@@ -1204,10 +1281,64 @@ impl Shared {
                 })
             })
             .collect();
-        ok(json!({ "clients": clients, "execs": execs, "services": services }))
+        ok(json!({ "clients": clients, "execs": execs, "services": services,
+                   "journal_failures": journal_failures, "journal_bytes": journal_bytes,
+                   "workspace": self.workspace.id }))
+    }
+
+    /// 0.5.0 (B6): handle a `note` op. The text is stored in the journal
+    /// verbatim (never parsed, interpreted or executed, here or anywhere) and
+    /// the record is returned. The journal write *is* the operation, so a
+    /// failure returns an error to the caller (the one exception to rule 5).
+    /// `kind` is validated to `note` or `marker` and the text is capped at
+    /// 8 KiB.
+    fn do_note(
+        &self,
+        _auth: &authz::Authorized,
+        client: &authz::ClientRecord,
+        kind: &str,
+        text: &str,
+    ) -> Value {
+        if !matches!(kind, "note" | "marker") {
+            return err(
+                control::E_BAD_REQUEST,
+                format!("note kind must be \"note\" or \"marker\", not {kind:?}"),
+            );
+        }
+        if text.len() > 8 * 1024 {
+            return err(
+                control::E_BAD_REQUEST,
+                format!("note text is {} bytes (max 8192)", text.len()),
+            );
+        }
+        let data = json!({ "kind": kind, "text": text });
+        match self.journal.append(
+            kind,
+            Some(JournalClient {
+                uid: client.uid,
+                label: client.label.clone(),
+                label_source: client.label_source.clone(),
+                req_id: client.req_id.clone(),
+            }),
+            data,
+        ) {
+            Ok(()) => {
+                // The record's `wseq` is assigned under the flock in `append`;
+                // the response echoes only what the caller sent, so the caller
+                // can find it with `hisn journal --kind note --last 1`.
+                ok(json!({ "kind": kind, "text": text }))
+            }
+            Err(e) => err(control::E_INTERNAL, e.to_string()),
+        }
     }
 
     fn inspect(&self, _auth: &authz::Authorized) -> Value {
+        // 0.5.0 (B4): the failed-journal-write count for `ls --json` (additive).
+        let journal_failures = self.journal.failures();
+        let journal_bytes: u64 = journal_files(&self.workspace_dir)
+            .iter()
+            .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .sum();
         let services = {
             let mut svcs = self.services.lock().expect("services");
             // Update service states: check if each service is still alive
@@ -1262,6 +1393,9 @@ impl Shared {
                 // cannot read /proc/<supervisor>/fd (non-dumpable after the
                 // userns change), so the supervisor reports it itself.
                 "supervisor_fds": open_fd_count().ok(),
+                // 0.5.0 (B4): the failed-journal-write count (additive).
+                "journal_failures": journal_failures,
+                "journal_bytes": journal_bytes,
             })),
             Err(e) => err(
                 control::E_INTERNAL,
@@ -1493,6 +1627,11 @@ impl Handler for Ctl {
             }
             Request::Inspect { client: _ } => self.sh.inspect(&auth),
             Request::SessionInfo { client: _ } => self.sh.session_info(&auth),
+            Request::Note {
+                kind,
+                text,
+                client: _,
+            } => self.sh.do_note(&auth, &client, &kind, &text),
             Request::Kill { signal, client: _ } => {
                 self.sh
                     .log_client("kill", "request", None, None, Some(&signal), &client, true);
@@ -2253,6 +2392,21 @@ fn run_supervisor_inner(
             },
         );
         meta.env_declared = declared_env_disk.clone();
+        // 0.5.0 (A1): record the supervisor's own version at creation, so the
+        // CLI can gate new fields/ops for still-running old sessions.
+        meta.hisn_version = Some(sessionmeta::HISN_VERSION.to_owned());
+        // 0.5.0 (B1): the workspace this session belongs to. Derived from the
+        // canonical cwd (policy.cwd is already canonicalised by `resolve`),
+        // or the --workspace override. The dir is created here (0700, never
+        // inside the working tree) so a detached supervisor finds it.
+        meta.workspace = Some(workspace::WorkspaceRef {
+            id: workspace_id_for(policy.cwd.clone(), args.workspace.as_deref()),
+            name: workspace_name_for(policy.cwd.clone(), args.workspace.as_deref()),
+        });
+        let ws_dir = workspace::workspace_dir(&meta.workspace.as_ref().unwrap().id);
+        workspace::ensure_workspace(&ws_dir).with_context(|| {
+            format!("creating workspace dir {}", ws_dir.display())
+        })?;
         // 0.4.1 step 3: record the rootfs (name or path as given) so `ls`
         // shows it whether it came from a profile name or a path.
         meta.rootfs = prep.rootfs_display.clone();
@@ -2520,6 +2674,23 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     // Phase: prepare.
     prepare_session_files(sdir, &policy, risk_entries)?;
     let (audit, tty, root_dir) = prepare_session_dirs(sdir, args)?;
+    // 0.5.0 (B3, C1): the workspace this session belongs to and the git
+    // snapshot taken *before* the sandbox runs, so the stop-time diff sees
+    // only what changed during this session. The workspace was recorded in
+    // session.json at creation (local override); re-read it here so the
+    // supervisor and the record agree.
+    let workspace = sessionmeta::read(&sdir.path).and_then(|m| m.workspace);
+    let workspace = match workspace {
+        Some(w) => w,
+        None => workspace::WorkspaceRef {
+            id: workspace_id_for(policy.cwd.clone(), args.workspace.as_deref()),
+            name: workspace_name_for(policy.cwd.clone(), args.workspace.as_deref()),
+        },
+    };
+    let workspace_dir = workspace::workspace_dir(&workspace.id);
+    let journal = crate::journal::Journal::new(workspace_dir.clone(), session_id.to_owned());
+    journal.journal_session_start();
+    let git_before = gitreport::snapshot(&policy.cwd);
     let mut rules = static_rules(&plan, &policy, &roots);
     let prepared = prepare_session_env(
         &mut PrepareEnvArgs {
@@ -2590,6 +2761,10 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
         rules,
         helper: Some(helper),
         audit: Some(audit),
+        journal: Some(journal),
+        workspace_dir: workspace_dir.clone(),
+        workspace: workspace.clone(),
+        git_before: git_before.clone(),
         exec_client: Some(exec_client),
         exec_rules: Some(exec_rules),
         sdir,
@@ -2601,6 +2776,10 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
         session_id,
     })?;
     let shared = control.shared;
+    // Session start is journaled through Shared (the in-memory failure
+    // counter lives here); the standalone journal above already wrote the
+    // durable start record with the same append.
+    shared.journal_session_start();
     let listener = control.listener;
     let handler = control.handler;
     let ssh_agent_expose = control.ssh_agent_expose;
@@ -2637,6 +2816,11 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     // paths below own the remaining cleanup.
     guard.disarm();
     let idle_expired_after = idle_timer.and_then(|t| t.join().ok().flatten());
+
+    // 0.5.0 (B3, C2): session stop and the git-change report, journaled after
+    // the sandbox has exited. Report only (Part C): nothing is reverted.
+    shared.journal_session("stop");
+    shared.journal_git_change(&policy.cwd);
 
     // Phase: teardown (host services, in-sandbox services, drain).
     teardown_services(&host_pids, &service_handles);
@@ -2945,6 +3129,10 @@ struct SessionControlArgs<'a> {
     rules: Rules,
     helper: Option<HelperClient>,
     audit: Option<Audit>,
+    journal: Option<crate::journal::Journal>,
+    workspace_dir: std::path::PathBuf,
+    workspace: WorkspaceRef,
+    git_before: gitreport::Snapshot,
     exec_client: Option<ExecClient>,
     exec_rules: Option<ExecRules>,
     sdir: &'a SessionDir,
@@ -2978,6 +3166,10 @@ fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
         held: Mutex::new(Default::default()),
         helper: Mutex::new(a.helper.take().expect("helper moved into control")),
         audit: a.audit.take().expect("audit moved into control"),
+        journal: a.journal.take().expect("journal moved into control"),
+        workspace_dir: a.workspace_dir.clone(),
+        workspace: a.workspace.clone(),
+        git_before: a.git_before.clone(),
         op_lock: Mutex::new(()),
         exec: a
             .exec_client
@@ -3978,6 +4170,7 @@ mod tests {
             command: vec!["true".into()],
             env: vec![],
             env_files: vec![],
+            workspace: None,
         };
         let p = prepare(&args, 1000).unwrap();
         assert_eq!(p.policy.cwd, cwd);

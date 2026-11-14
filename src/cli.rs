@@ -38,6 +38,11 @@ pub enum Command {
     Attach(AttachArgs),
     /// Signal the sandbox of a session.
     Kill(KillArgs),
+    /// Append a note or marker to a session's workspace journal (0.5.0).
+    Note(NoteArgs),
+    /// Query a workspace journal (0.5.0). Reads host-side, so it works for
+    /// stopped and pruned sessions too.
+    Journal(JournalArgs),
     /// Stop a session: set state stopped, keep the dir, audit the stop
     /// (0.4.0 step 5). The session's shell and execs are terminated.
     Stop(StopArgs),
@@ -136,6 +141,12 @@ pub struct RunArgs {
     /// cache vars) are refused. Repeatable.
     #[arg(long = "env", value_name = "K=V")]
     pub env: Vec<String>,
+    /// Workspace name (0.5.0). The session belongs to this workspace: its
+    /// state (the journal) is kept under
+    /// `$XDG_STATE_HOME/hisn/workspaces/<id>/`, never inside the working
+    /// tree. Without it, the workspace is derived from the canonical cwd.
+    #[arg(long, value_name = "NAME")]
+    pub workspace: Option<String>,
     /// Read session env from a file of `KEY=VALUE` lines (blank lines and lines
     /// starting with `#` are ignored). Values are validated exactly like
     /// `--env`; use this (not `--env K=V`) for secret-shaped values so they do
@@ -315,6 +326,44 @@ pub struct StopArgs {
     /// Session name or id.
     #[arg(long)]
     pub session: String,
+}
+
+#[derive(Debug, Args)]
+pub struct NoteArgs {
+    /// Session name or id.
+    #[arg(long)]
+    pub session: String,
+    /// Record a marker instead of a note.
+    #[arg(long)]
+    pub marker: bool,
+    /// The text. `-` reads it from stdin.
+    pub text: String,
+}
+
+#[derive(Debug, Args)]
+pub struct JournalArgs {
+    /// The workspace to query (a workspace name or id). Without it, the
+    /// workspace is derived from the current directory's canonical path.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Only records from this session id.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Only records carrying this client label (the "seat").
+    #[arg(long)]
+    pub seat: Option<String>,
+    /// Only records of this kind.
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Only records at or after this RFC 3339 timestamp.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Show only the newest N records.
+    #[arg(long, value_name = "N")]
+    pub last: Option<usize>,
+    /// Print the records unchanged as JSON (one per line).
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

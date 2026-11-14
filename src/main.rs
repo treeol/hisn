@@ -787,7 +787,9 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
     // current directory (the same default `run` uses).
     let id = match a.workspace.as_deref() {
         Some(w) => {
-            if workspace::workspace_id_for_name(w) == w || w.len() == 16 && w.chars().all(|c| c.is_ascii_hexdigit()) {
+            if workspace::workspace_id_for_name(w) == w
+                || w.len() == 16 && w.chars().all(|c| c.is_ascii_hexdigit())
+            {
                 // A bare 16-hex id (or a name that coincides) — prefer the id
                 // when it names an existing dir, else the name's id.
                 let by_id = workspace::workspace_dir(w);
@@ -831,7 +833,10 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
         eprintln!("hisn: skipped {skipped} unparseable journal line(s)");
     }
     if out.is_empty() && !dir.exists() {
-        eprintln!("hisn: no journal for workspace {id} (dir {})", dir.display());
+        eprintln!(
+            "hisn: no journal for workspace {id} (dir {})",
+            dir.display()
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -853,8 +858,8 @@ fn rootfs_import(args: hisn::cli::ImportArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `parse_rfc3339_secs` lives in `hisn::session` and is imported at the top
-/// of this file's scope for the journal CLI (see `journal_cmd`).
+// `parse_rfc3339_secs` lives in `hisn::session` and is imported at the top
+// of this file's scope for the journal CLI (see `journal_cmd`).
 
 /// 0.4.0 step 5: archive `grants.jsonl` and the final `session.json` from
 /// `dir` into `$XDG_STATE_HOME/hisn/audit/<id>.jsonl` (0600, dir 0700) before
@@ -937,6 +942,7 @@ fn archive_session(dir: &Path, id: &str, uid: u32) -> Result<(), anyhow::Error> 
 #[cfg(test)]
 mod ls_tests {
     use super::{archive_session, parse_rfc3339_secs, prune_prefix_matches, session_v2_json};
+    use serde_json::{Value, json};
     use std::path::Path;
 
     #[test]

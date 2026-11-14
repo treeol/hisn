@@ -165,6 +165,7 @@ impl Journal {
         let lock_file = OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(self.dir.join(LOCK_FILE))
             .map_err(|e| JournalError {
@@ -204,11 +205,9 @@ impl Journal {
         if needs_newline {
             line.push('\n');
         }
-        line.push_str(
-            &serde_json::to_string(&record).map_err(|e| JournalError {
-                message: format!("serialise: {e}"),
-            })?,
-        );
+        line.push_str(&serde_json::to_string(&record).map_err(|e| JournalError {
+            message: format!("serialise: {e}"),
+        })?);
         line.push('\n');
         let mut f = OpenOptions::new()
             .append(true)
@@ -220,10 +219,9 @@ impl Journal {
             })?;
         // A single write on an O_APPEND descriptor under the flock: a whole
         // (possibly multi-KiB) record cannot interleave with another writer's.
-        f.write_all(line.as_bytes())
-            .map_err(|e| JournalError {
-                message: format!("write: {e}"),
-            })?;
+        f.write_all(line.as_bytes()).map_err(|e| JournalError {
+            message: format!("write: {e}"),
+        })?;
         Ok(())
     }
 }
@@ -306,10 +304,10 @@ fn last_wseq(path: &Path) -> Option<u64> {
             .and_then(|n| n.strip_suffix(".jsonl"))
             .and_then(|n| n.parse().ok())
             .unwrap_or(0);
-        if let Some(w) = last_wseq_in_file(&p) {
-            if best.is_none_or(|(n, _)| num > n) {
-                best = Some((num, w));
-            }
+        if let Some(w) = last_wseq_in_file(&p)
+            && best.is_none_or(|(n, _)| num > n)
+        {
+            best = Some((num, w));
         }
     }
     best.map(|(_, w)| w)
@@ -393,7 +391,10 @@ fn rotate(dir: &Path) -> io::Result<()> {
             }
         }
     }
-    fs::rename(dir.join(JOURNAL_FILE), dir.join(format!("journal.{}.jsonl", max + 1)))
+    fs::rename(
+        dir.join(JOURNAL_FILE),
+        dir.join(format!("journal.{}.jsonl", max + 1)),
+    )
 }
 
 /// All journal files in a workspace dir, oldest first: rotated files in
@@ -489,7 +490,7 @@ pub fn render(rec: &JournalRecord) -> String {
     let client = rec
         .client
         .as_ref()
-        .map(|c| format!("{}", c.label))
+        .map(|c| c.label.to_string())
         .unwrap_or_else(|| "-".to_owned());
     format!(
         "{} #{} {} {} {} {}",
@@ -584,7 +585,10 @@ mod tests {
         let seqs: Vec<u64> = recs.iter().map(|r| r.wseq).collect();
         let mut sorted = seqs.clone();
         sorted.sort_unstable();
-        assert_eq!(seqs, sorted, "wseq must be strictly increasing in file order");
+        assert_eq!(
+            seqs, sorted,
+            "wseq must be strictly increasing in file order"
+        );
         // The record for wseq 100 must be present and be the last one the
         // file carries — a tail-window undercount would duplicate 1..=100.
         let last = recs.iter().map(|r| r.wseq).max().unwrap();
@@ -615,7 +619,11 @@ mod tests {
         drop(f);
         j.append("note", None, data("after")).unwrap();
         let files = existing_files(&j.dir);
-        assert!(files.iter().any(|p| p.file_name().unwrap() == "journal.1.jsonl"));
+        assert!(
+            files
+                .iter()
+                .any(|p| p.file_name().unwrap() == "journal.1.jsonl")
+        );
         let (recs, skipped) = read_records(&j.dir);
         // Debug: what wseqs survived?
         // The 3 original + 1 after; the filler lines are unparseable and
@@ -742,9 +750,15 @@ mod tests {
         let (_d, j) = test_journal();
         j.append("session/start", None, data("x")).unwrap();
         let p = j.dir.join(JOURNAL_FILE);
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let text = fs::read_to_string(&p).unwrap();
-        let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["kind"], "session/start");
         // Reopening appends, never truncates.
@@ -761,8 +775,7 @@ mod tests {
         // the sequence must not duplicate because of the torn tail.
         let p = j.dir.join(JOURNAL_FILE);
         let mut f = OpenOptions::new().append(true).open(&p).unwrap();
-        f.write_all(b"{\"v\":1,\"ts\":\"x\",\"wseq\":99,")
-            .unwrap();
+        f.write_all(b"{\"v\":1,\"ts\":\"x\",\"wseq\":99,").unwrap();
         j.append("note", None, data("after-torn")).unwrap();
         let (recs, skipped) = read_records(&j.dir);
         assert!(skipped >= 1);

@@ -42,10 +42,7 @@ pub fn state_home() -> PathBuf {
         return PathBuf::from(x).join("hisn");
     }
     match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => PathBuf::from(h)
-            .join(".local")
-            .join("state")
-            .join("hisn"),
+        Ok(h) if !h.is_empty() => PathBuf::from(h).join(".local").join("state").join("hisn"),
         _ => PathBuf::from("/tmp/hisn-state-unset"),
     }
 }

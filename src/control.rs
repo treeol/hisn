@@ -1566,8 +1566,8 @@ mod tests {
         let r = parse_request(r#"{"op":"list"}"#).unwrap();
         assert_eq!(r.declared_version(), None);
         // 0.4.3 with a client (no protocol_version).
-        let r = parse_request(r#"{"op":"list","client":{"label":"x","label_source":"flag"}}"#)
-            .unwrap();
+        let r =
+            parse_request(r#"{"op":"list","client":{"label":"x","label_source":"flag"}}"#).unwrap();
         assert_eq!(r.declared_version(), None);
         // 0.5.0 shape: protocol_version present.
         let r = parse_request(
@@ -1577,10 +1577,12 @@ mod tests {
         assert_eq!(r.declared_version(), Some(1));
         // `protocol_version` is the one new field; anything else in `client`
         // is still refused (deny_unknown_fields kept).
-        assert!(parse_request(
-            r#"{"op":"list","client":{"label":"x","uid":1000,"protocol_version":1}}"#
-        )
-        .is_err());
+        assert!(
+            parse_request(
+                r#"{"op":"list","client":{"label":"x","uid":1000,"protocol_version":1}}"#
+            )
+            .is_err()
+        );
     }
 
     /// The version gate's own truth table (pure; over serve_conn's call).
@@ -1606,15 +1608,16 @@ mod tests {
     fn a_newer_version_is_answered_e_version_before_dispatch() {
         let (_d, sock, h) = start(true);
         // 0.5.0 shape declaring v2.
-        let v = request(
-            &sock,
-            &json!({"op":"list","client":{"protocol_version":2}}),
-        )
-        .unwrap();
+        let v = request(&sock, &json!({"op":"list","client":{"protocol_version":2}})).unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(v["error"], E_VERSION);
         // The message names the supported version (the protocol constant).
-        assert!(v["message"].as_str().unwrap().contains(&format!("{PROTOCOL_VERSION}")));
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{PROTOCOL_VERSION}"))
+        );
         // A 0.4.3-shaped request (no client) is dispatched and answered ok.
         let v = request(&sock, &json!({"op":"list"})).unwrap();
         assert_eq!(v["ok"], true);
@@ -1640,7 +1643,12 @@ mod tests {
         ] {
             let req = parse_request(line).unwrap_or_else(|e| panic!("{line}: {e}"));
             assert_eq!(req.declared_version(), None, "{line}");
-            assert!(!req.is_observer() || line.contains("list") || line.contains("inspect") || line.contains("sessioninfo"));
+            assert!(
+                !req.is_observer()
+                    || line.contains("list")
+                    || line.contains("inspect")
+                    || line.contains("sessioninfo")
+            );
         }
         // The note op parses too (the new op; it is not part of 0.4.3).
         let r = parse_request(r#"{"op":"note","kind":"note","text":"hi"}"#).unwrap();

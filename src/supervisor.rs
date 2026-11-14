@@ -588,9 +588,7 @@ impl Shared {
         let entry = Audit::entry(op, stage, path, mode, result, peer);
         let _ = self.audit.log(entry.clone());
         // Mirror into the journal (no client: a plain log carries none).
-        let _ = self
-            .journal
-            .append(&format!("{op}/{stage}"), None, entry);
+        let _ = self.journal.append(&format!("{op}/{stage}"), None, entry);
     }
 
     /// Journal one `git-change` record: the diff between the snapshot taken
@@ -602,12 +600,9 @@ impl Shared {
         if let Some(o) = data.as_object_mut() {
             o.insert("cwd".into(), json!(cwd.display().to_string()));
         }
-        self.journal
-            .append("git-change", None, data)
-            .unwrap_or_else(|_| {
-                // A failed git-change write is not the operation, so it is
-                // swallowed and counted by `append` (rule 5). No-op here.
-            });
+        // A failed git-change write is not the operation, so it is swallowed
+        // and counted by `append` (rule 5).
+        let _ = self.journal.append("git-change", None, data);
     }
 
     /// Journal session start / stop (B3). Best-effort (rule 5).
@@ -1284,9 +1279,11 @@ impl Shared {
                 })
             })
             .collect();
-        ok(json!({ "clients": clients, "execs": execs, "services": services,
+        ok(
+            json!({ "clients": clients, "execs": execs, "services": services,
                    "journal_failures": journal_failures, "journal_bytes": journal_bytes,
-                   "workspace": self.workspace.id }))
+                   "workspace": self.workspace.id }),
+        )
     }
 
     /// 0.5.0 (B6): handle a `note` op. The text is stored in the journal

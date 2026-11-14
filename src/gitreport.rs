@@ -82,16 +82,22 @@ pub fn is_dangerous_key(key: &str) -> bool {
     }
     // Section-wide dangerous families: alias.*, filter.*, includeIf.*, url.*
     // (insteadOf) — any key under those, and the dangerous leaf names.
-    if matches!(
-        section,
-        "alias" | "filter" | "includeif" | "url"
-    ) {
+    if matches!(section, "alias" | "filter" | "includeif" | "url") {
         return true;
     }
     // Dangerous leaf keys under a safe section.
     matches!(
         last,
-        "hookspath" | "fsmonitor" | "sshcommand" | "pager" | "editor" | "textconv" | "external" | "driver" | "helper" | "program"
+        "hookspath"
+            | "fsmonitor"
+            | "sshcommand"
+            | "pager"
+            | "editor"
+            | "textconv"
+            | "external"
+            | "driver"
+            | "helper"
+            | "program"
     )
 }
 
@@ -312,16 +318,10 @@ pub fn diff(before: &Snapshot, after: &Snapshot) -> Value {
     let mut hooks_added = Vec::new();
     let mut hooks_removed = Vec::new();
     let mut hooks_modified = Vec::new();
-    let bhooks: BTreeMap<&str, &HookEntry> = before
-        .hooks
-        .iter()
-        .map(|h| (h.name.as_str(), h))
-        .collect();
-    let ahooks: BTreeMap<&str, &HookEntry> = after
-        .hooks
-        .iter()
-        .map(|h| (h.name.as_str(), h))
-        .collect();
+    let bhooks: BTreeMap<&str, &HookEntry> =
+        before.hooks.iter().map(|h| (h.name.as_str(), h)).collect();
+    let ahooks: BTreeMap<&str, &HookEntry> =
+        after.hooks.iter().map(|h| (h.name.as_str(), h)).collect();
     for (name, h) in &ahooks {
         match bhooks.get(name) {
             None => hooks_added.push(*name),
@@ -331,7 +331,7 @@ pub fn diff(before: &Snapshot, after: &Snapshot) -> Value {
             _ => {}
         }
     }
-    for (name, _) in &bhooks {
+    for name in bhooks.keys() {
         if !ahooks.contains_key(name) {
             hooks_removed.push(*name);
         }
@@ -418,7 +418,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let cwd = git_dir(&d);
         write(&cwd.join(".git/hooks/pre-commit"), b"#!/bin/sh\nexit 0\n");
-        write(&cwd.join(".git/config"), b"[core]\n\trepositoryformatversion = 0\n");
+        write(
+            &cwd.join(".git/config"),
+            b"[core]\n\trepositoryformatversion = 0\n",
+        );
         let a = snapshot(&cwd);
         let b = snapshot(&cwd);
         let diff = diff(&a, &b);

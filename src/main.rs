@@ -801,8 +801,13 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
     };
     let dir = workspace::workspace_dir(&id);
     let (recs, skipped) = journal::read_records(&dir);
+    // `--since` is enforced: an unparseable timestamp is an error, not a
+    // silent "show everything" (item 5).
     let since_secs = match a.since.as_deref() {
-        Some(s) => parse_rfc3339_secs(s),
+        Some(s) => Some(
+            parse_rfc3339_secs(s)
+                .with_context(|| format!("--since {s:?} is not an RFC 3339 timestamp"))?,
+        ),
         None => None,
     };
     let q = journal::Query {

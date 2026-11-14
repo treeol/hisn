@@ -38,7 +38,7 @@
 //! `req_id`, mirroring the audit `client` object), and `data`.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read as _, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -502,18 +502,43 @@ pub fn journal_files(dir: &Path) -> Vec<PathBuf> {
 /// out from under the file list: every record is seen exactly once. If the
 /// lock file cannot be opened (e.g. the dir does not exist yet), the read
 /// proceeds unlocked — there is nothing to read yet in that case.
+/// Max bytes in a single journal line read back. A longer "line" is not
+/// read into memory; it is counted as skipped (a hostile or corrupt file
+/// cannot OOM the reader). 16 MiB mirrors the control response cap.
+pub const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
 pub fn read_records(dir: &Path) -> (Vec<JournalRecord>, usize) {
     let _shared = shared_lock(dir);
     let mut out = Vec::new();
     let mut skipped = 0usize;
     for path in journal_files(dir) {
         let Ok(f) = File::open(&path) else { continue };
-        for line in BufReader::new(f).lines() {
-            let Ok(line) = line else { continue };
-            if line.is_empty() {
+        let mut reader = BufReader::new(f);
+        loop {
+            let mut buf = Vec::new();
+            let n = match reader
+                .by_ref()
+                .take(MAX_RECORD_BYTES as u64 + 1)
+                .read_until(b'\n', &mut buf)
+            {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 {
+                break;
+            }
+            if buf.len() > MAX_RECORD_BYTES {
+                // Over-long line: skip it without parsing (counted).
+                skipped += 1;
                 continue;
             }
-            match serde_json::from_str::<JournalRecord>(&line) {
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+            }
+            if buf.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<JournalRecord>(&buf) {
                 Ok(r) => out.push(r),
                 Err(_) => skipped += 1,
             }
@@ -562,16 +587,43 @@ pub fn query(records: &[JournalRecord], q: &Query) -> Vec<JournalRecord> {
     out
 }
 
+/// Escape every agent-supplied string for terminal display: control
+/// characters (including ESC, the start of terminal escape sequences) and
+/// DEL are shown as `\xNN` / `\n` / `\r` / `\t`, so journal content can
+/// never drive the reader's terminal. Printable Unicode passes through.
+/// Used by the readable `hisn journal` output only — `--json` stays exact.
+fn escape_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// One readable line for a record (the default `hisn journal` output).
+/// `session`, `kind` and the client label are terminal-escaped; `data` is
+/// a JSON value whose `Display` already escapes control characters inside
+/// strings (serde_json). `--json` output is unaffected (exact).
 pub fn render(rec: &JournalRecord) -> String {
     let client = rec
         .client
         .as_ref()
-        .map(|c| c.label.to_string())
+        .map(|c| escape_terminal(&c.label))
         .unwrap_or_else(|| "-".to_owned());
     format!(
         "{} #{} {} {} {} {}",
-        rec.ts, rec.wseq, rec.session, rec.kind, client, rec.data
+        escape_terminal(&rec.ts),
+        rec.wseq,
+        escape_terminal(&rec.session),
+        escape_terminal(&rec.kind),
+        client,
+        rec.data
     )
 }
 
@@ -1063,6 +1115,145 @@ mod tests {
         assert_eq!(recs.len(), 200);
         let seqs: Vec<u64> = recs.iter().map(|r| r.wseq).collect();
         assert_eq!(seqs, (1..=200).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn render_escapes_terminal_sequences_but_json_stays_exact() {
+        // Item 5: ESC/newlines in agent-supplied strings must not reach the
+        // reader's terminal in readable mode; --json stays byte-exact.
+        let rec = JournalRecord {
+            v: 1,
+            ts: "2026-11-14T00:00:00Z".into(),
+            wseq: 7,
+            session: "ses\u{1b}[31m".into(),
+            kind: "note\nforged".into(),
+            client: Some(JournalClient {
+                uid: 1000,
+                label: "evil\u{1b}]0;pwned\u{07}".into(),
+                label_source: "flag".into(),
+                req_id: None,
+            }),
+            data: json!({"text": "line1\nline2\u{1b}[0m"}),
+        };
+        let r = render(&rec);
+        assert!(!r.contains('\u{1b}'), "raw ESC in readable output: {r:?}");
+        assert!(
+            !r.contains('\n') || r.ends_with('}'),
+            "raw newline in readable output: {r:?}"
+        );
+        // The readable line is a single line.
+        assert_eq!(
+            r.matches('\n').count(),
+            0,
+            "readable output must be one line: {r:?}"
+        );
+        // --json is byte-exact (serde escapes, nothing dropped).
+        let j = serde_json::to_string(&rec).unwrap();
+        assert!(j.contains("\\u001b") || j.contains("\\x1b") || !j.contains('\u{1b}'));
+        let back: JournalRecord = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, rec);
+        assert!(j.contains("pwned"));
+    }
+
+    #[test]
+    fn note_text_round_trips_verbatim_and_never_becomes_a_second_record() {
+        // Item 5: newlines, quotes, NUL, JSON-looking content and multibyte
+        // text round-trip unchanged; the record count stays one.
+        let texts = [
+            "line1\nline2\r\nline3",
+            "quote \" and ' and \\\\ backslash",
+            "nul\u{0}inside",
+            "{\"op\":\"exec\",\"argv\":[\"rm\",\"-rf\",\"/\"]}",
+            "$HOME `whoami` $(id)",
+            "multibyte: caf\u{00e9} \u{65e5}\u{672c}\u{8a9e} \u{1f600}",
+            "tab\tand\u{1b}esc",
+        ];
+        let (_d, j) = test_journal();
+        for t in texts {
+            j.append("note", None, json!({"kind": "note", "text": t}))
+                .unwrap();
+        }
+        let (recs, skipped) = read_records(&j.dir);
+        assert_eq!(skipped, 0);
+        assert_eq!(recs.len(), texts.len(), "one record per note, never two");
+        for (r, t) in recs.iter().zip(texts.iter()) {
+            assert_eq!(r.data["text"].as_str().unwrap(), *t);
+        }
+    }
+
+    #[test]
+    fn query_limits_last_and_since() {
+        // Item 5: --last caps the count, --since filters by time.
+        let (_d, j) = test_journal();
+        for _ in 0..5 {
+            j.append("note", None, data("x")).unwrap();
+        }
+        let (recs, _) = read_records(&j.dir);
+        assert_eq!(recs.len(), 5);
+        let last0 = query(
+            &recs,
+            &Query {
+                last: Some(0),
+                ..Default::default()
+            },
+        );
+        assert!(last0.is_empty());
+        let last2 = query(
+            &recs,
+            &Query {
+                last: Some(2),
+                ..Default::default()
+            },
+        );
+        assert_eq!(last2.len(), 2);
+        let last_big = query(
+            &recs,
+            &Query {
+                last: Some(100),
+                ..Default::default()
+            },
+        );
+        assert_eq!(last_big.len(), 5);
+        // --since with a future timestamp excludes everything; with an epoch
+        // timestamp includes everything (enforced filtering, item 5).
+        let future = query(
+            &recs,
+            &Query {
+                since_secs: Some(i64::MAX / 2),
+                ..Default::default()
+            },
+        );
+        assert!(future.is_empty());
+        let epoch = query(
+            &recs,
+            &Query {
+                since_secs: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(epoch.len(), 5);
+    }
+
+    #[test]
+    fn over_long_record_line_is_skipped_not_oom() {
+        // Item 5: a single record line over MAX_RECORD_BYTES is skipped
+        // (counted) instead of being read into memory.
+        let (_d, j) = test_journal();
+        j.append("note", None, data("ok")).unwrap();
+        let path = j.dir.join(JOURNAL_FILE);
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        let big = "x".repeat(MAX_RECORD_BYTES + 16);
+        f.write_all(big.as_bytes()).unwrap();
+        f.write_all(b"\n").unwrap();
+        j.append("note", None, data("after")).unwrap();
+        let (recs, skipped) = read_records(&j.dir);
+        assert!(
+            skipped >= 1,
+            "over-long line must be skipped, got {skipped}"
+        );
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[1].data, data("after"));
     }
 
     #[test]

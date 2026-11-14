@@ -265,7 +265,10 @@ mod tests {
 
     /// The seam must reach every request path. Each variant of Request is
     /// authorized through `authorize`; a refused foreign uid gets a refusal
-    /// for every variant (so none can bypass the decision).
+    /// for every variant (so none can bypass the decision). `note` is
+    /// included (item 5): an unauthorized peer's note is refused at the
+    /// seam — the supervisor audits the refusal in `handle` before any
+    /// journal write.
     #[test]
     fn every_variant_goes_through_authorize() {
         let reqs = [
@@ -287,15 +290,42 @@ mod tests {
                 signal: "TERM".into(),
                 client: None,
             },
+            Request::Exec {
+                argv: vec!["true".into()],
+                cwd: None,
+                env: BTreeMap::new(),
+                tty: false,
+                attach: false,
+                client: None,
+            },
             Request::Signal {
                 exec_id: None,
                 pid: None,
                 signal: "TERM".into(),
                 client: None,
             },
+            Request::SessionInfo { client: None },
+            Request::Note {
+                kind: "note".into(),
+                text: "hi".into(),
+                client: None,
+            },
         ];
         for r in &reqs {
             assert!(authorize(&client(999), &sess(), r).is_err());
         }
+        // The refusal names the op, so the supervisor's audit line does too.
+        let refusal = authorize(
+            &client(999),
+            &sess(),
+            &Request::Note {
+                kind: "note".into(),
+                text: "hi".into(),
+                client: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(refusal.op, Op::Note);
+        assert!(refusal.reason.contains("not the session owner"));
     }
 }

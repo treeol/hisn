@@ -15,8 +15,8 @@
 //!   `ls --json`. The one exception is a `note` request, where the journal
 //!   write *is* the operation: it returns an error to the caller.
 //! - Several supervisors can write to one workspace, so the `wseq`
-//!   (workspace-wide sequence) is assigned under an exclusive `flock` on the
-//!   journal dir, and each record is written with a single `write(2)` on an
+//!   (workspace-wide sequence) is assigned under an exclusive `flock` on
+//!   `journal.lock` in the workspace dir, and each record is written with a single `write(2)` on an
 //!   `O_APPEND` descriptor held under that lock — so two writers can never
 //!   interleave a line or duplicate a `wseq`.
 //! - Rotation (rotation from day one, O6): when `journal.jsonl` exceeds
@@ -150,12 +150,14 @@ impl Journal {
     fn sync_inner(&self) -> std::io::Result<()> {
         // A missing journal file (or workspace dir) is not a failure
         // (nothing to sync — e.g. sync-on-stop for a session that never
-        // journaled); counting it would report phantom failures.
-        if let Ok(f) = File::open(self.dir.join(JOURNAL_FILE)) {
-            f.sync_all()?;
-        }
-        if let Ok(d) = File::open(&self.dir) {
-            d.sync_all()?;
+        // journaled); counting it would report phantom failures. Any other
+        // open error means the sync did not happen, and is counted.
+        for path in [self.dir.join(JOURNAL_FILE), self.dir.clone()] {
+            match File::open(&path) {
+                Ok(f) => f.sync_all()?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -221,7 +223,13 @@ impl Journal {
             })?;
         let _guard = flock(&lock_file)?;
         let path = self.dir.join(JOURNAL_FILE);
-        let mut seq = last_wseq(&path).unwrap_or(0) + 1;
+        let next_wseq = |path: &Path| -> Result<u64, JournalError> {
+            let last = last_wseq(path).map_err(|e| JournalError {
+                message: format!("read last wseq: {e}"),
+            })?;
+            Ok(last.unwrap_or(0) + 1)
+        };
+        let mut seq = next_wseq(&path)?;
         // Rotate before writing when the current file is already oversize.
         if let Some(meta) = fs::metadata(&path).ok()
             && meta.len() > self.rotate_after
@@ -231,7 +239,7 @@ impl Journal {
             })?;
             // `wseq` is recovered from the rotated file's tail (the new
             // file is empty, so `last_wseq` falls through to it).
-            seq = last_wseq(&path).unwrap_or(0) + 1;
+            seq = next_wseq(&path)?;
         }
         // Torn-tail guard: if the file does not end in `\n`, the last writer
         // died mid-line. Emit the newline first so this record is not glued
@@ -301,9 +309,8 @@ fn flock(f: &File) -> Result<FlockGuard, JournalError> {
 }
 
 /// Best-effort shared lock on `dir/journal.lock` for a reader. The lock is
-/// held by this struct for its whole lifetime: `flock_shared` in `take`
-/// does NOT return a droppable guard here — the explicit LOCK_UN in `Drop`
-/// releases it. (A previous version mapped the guard and dropped it in
+/// held by this struct for its whole lifetime: `take` returns no separate
+/// droppable guard — the explicit LOCK_UN in `Drop` releases it. (A previous version mapped the guard and dropped it in
 /// `take`, releasing the lock immediately — the "exactly once" reader then
 /// ran unlocked. The reader now pins its file descriptors under this lock
 /// and reads unlocked from them, so it holds the shared lock only briefly:
@@ -405,91 +412,82 @@ fn file_ends_not_newline(path: &Path) -> bool {
 /// torn final line is skipped. After a rotation the new file is empty, so
 /// `wseq` is recovered from the rotated file's tail: the *last* parseable
 /// `wseq` of the newest rotated file (which is higher than any earlier one).
-fn last_wseq(path: &Path) -> Option<u64> {
-    if let Some(w) = last_wseq_in_file(path) {
-        return Some(w);
+///
+/// An I/O error (other than a missing file) is returned: the caller fails
+/// and counts the append rather than guessing a `wseq` that may duplicate
+/// an existing one.
+fn last_wseq(path: &Path) -> io::Result<Option<u64>> {
+    if let Some(w) = last_wseq_in_file(path)? {
+        return Ok(Some(w));
     }
-    let dir = path.parent()?;
+    let Some(dir) = path.parent() else {
+        return Ok(None);
+    };
     let mut best: Option<(u32, u64)> = None;
     for p in journal_files(dir) {
         if p == *path {
             continue;
         }
         // The rotated file's extension is its number; take the newest.
-        let name = p.file_name()?.to_str()?.to_owned();
-        let num: u32 = name
-            .strip_prefix("journal.")
+        let num: u32 = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("journal."))
             .and_then(|n| n.strip_suffix(".jsonl"))
             .and_then(|n| n.parse().ok())
             .unwrap_or(0);
-        if let Some(w) = last_wseq_in_file(&p)
+        if let Some(w) = last_wseq_in_file(&p)?
             && best.is_none_or(|(n, _)| num > n)
         {
             best = Some((num, w));
         }
     }
-    best.map(|(_, w)| w)
+    Ok(best.map(|(_, w)| w))
 }
 
 const TAIL_BYTES: u64 = 64 * 1024;
 
-fn last_wseq_in_file(path: &Path) -> Option<u64> {
-    let mut f = File::open(path).ok()?;
-    let meta = f.metadata().ok()?;
-    let size = meta.len();
-    if size == 0 {
-        return None;
-    }
+/// The highest `wseq` among the parseable lines of `bytes`.
+fn max_wseq(bytes: &[u8]) -> Option<u64> {
+    bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_slice::<JournalRecord>(line).ok())
+        .map(|rec| rec.wseq)
+        .max()
+}
+
+/// The highest `wseq` in one journal file: `Ok(None)` when the file is
+/// missing, empty or holds no parseable record. Any other I/O error is
+/// returned, never mapped to "no records" — that would restart `wseq` at 1
+/// on a file that does hold records.
+fn last_wseq_in_file(path: &Path) -> io::Result<Option<u64>> {
     use std::io::{Read, Seek, SeekFrom};
-    // A journal file is at most ~64 MiB + a record; with 100 small records the
-    // whole file fits the tail window, so one pass always finds the maximum.
-    // For a large file the tail window holds the newest records — the maximum
-    // is always among them, so the tail scan is *the* scan.
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let size = f.metadata()?.len();
+    if size == 0 {
+        return Ok(None);
+    }
+    // `wseq` only grows, so the maximum is among the newest records: scan
+    // the tail window (the whole file when it fits).
     let start = size.saturating_sub(TAIL_BYTES);
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut tail = Vec::new();
-    f.read_to_end(&mut tail).ok()?;
-    // If the file fits the window, parse every line.
-    if start == 0 {
-        let mut best = None;
-        for line in tail.split(|b| *b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(rec) = serde_json::from_slice::<JournalRecord>(line) {
-                best = Some(best.map_or(rec.wseq, |b: u64| b.max(rec.wseq)));
-            }
-        }
-        return best;
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    let best = max_wseq(&buf);
+    if best.is_some() || start == 0 {
+        return Ok(best);
     }
-    // Large file: find the last parseable record, then scan the whole file
-    // once for the maximum (the tail alone can miss a higher wseq if the
-    // window began mid-record and the tail is unparseable).
-    let mut best = None;
-    for line in tail.split(|b| *b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(rec) = serde_json::from_slice::<JournalRecord>(line) {
-            best = Some(best.map_or(rec.wseq, |b: u64| b.max(rec.wseq)));
-        }
-    }
-    f.seek(SeekFrom::Start(0)).ok()?;
-    // One full pass for correctness on a large file (rare: only when the tail
-    // window did not already contain the maximum).
-    if best.is_none() {
-        let mut all = Vec::new();
-        f.read_to_end(&mut all).ok()?;
-        for line in all.split(|b| *b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(rec) = serde_json::from_slice::<JournalRecord>(line) {
-                best = Some(best.map_or(rec.wseq, |b: u64| b.max(rec.wseq)));
-            }
-        }
-    }
-    best
+    // Rare: nothing in the tail window parses (a torn tail, or one record
+    // larger than the window). Fall back to one pass over the whole file.
+    f.seek(SeekFrom::Start(0))?;
+    buf.clear();
+    f.read_to_end(&mut buf)?;
+    Ok(max_wseq(&buf))
 }
 
 /// Rotate `journal.jsonl` to the next free `journal.<n>.jsonl` in `dir`,
@@ -548,20 +546,32 @@ pub fn journal_files(dir: &Path) -> Vec<PathBuf> {
 
 /// Consume the rest of the current (over-long) line, up to and including
 /// the newline. Best-effort.
+///
+/// The line is discarded straight from the reader's own buffer: it is never
+/// accumulated, so an arbitrarily long line costs no memory (accumulating it
+/// here would defeat [`MAX_RECORD_BYTES`]).
 fn drain_to_newline<R: BufRead>(r: &mut R) {
-    let mut sink = Vec::new();
     loop {
-        sink.clear();
-        match r.read_until(b'\n', &mut sink) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
-                if sink.last() == Some(&b'\n') {
-                    break;
-                }
-            }
+        let (found_newline, used) = match r.fill_buf() {
+            Ok([]) => return,
+            Ok(buf) => match buf.iter().position(|b| *b == b'\n') {
+                Some(i) => (true, i + 1),
+                None => (false, buf.len()),
+            },
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        r.consume(used);
+        if found_newline {
+            return;
         }
     }
 }
+
+/// Max bytes in a single journal line read back. A longer "line" is not
+/// read into memory; it is counted as skipped (a hostile or corrupt file
+/// cannot OOM the reader). 16 MiB mirrors the control response cap.
+pub const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Read every record in a workspace (rotated files first, then the current
 /// one), skipping any unparseable line (a torn tail never breaks the whole
@@ -576,11 +586,6 @@ fn drain_to_newline<R: BufRead>(r: &mut R) {
 /// blocks writers, since it holds no lock while reading. If the lock file
 /// cannot be opened (e.g. the dir does not exist yet), the read proceeds
 /// unlocked — there is nothing to read yet in that case.
-/// Max bytes in a single journal line read back. A longer "line" is not
-/// read into memory; it is counted as skipped (a hostile or corrupt file
-/// cannot OOM the reader). 16 MiB mirrors the control response cap.
-pub const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
-
 pub fn read_records(dir: &Path) -> (Vec<JournalRecord>, usize) {
     // Pin the file descriptors under the shared lock, then read unlocked.
     let files: Vec<File> = {
@@ -999,6 +1004,51 @@ mod tests {
         // A second failed attempt counts again and still does not panic.
         let _ = j.append("grant/result", None, data("y"));
         assert_eq!(j.failures(), 2);
+    }
+
+    #[test]
+    fn an_unreadable_journal_fails_the_append_instead_of_restarting_wseq() {
+        // A journal that can be appended to but not read back (mode 0200):
+        // the last `wseq` is unknown. The append must fail and be counted —
+        // treating "cannot read" as "no records" would write a second
+        // `wseq` 1.
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::getuid().is_root() {
+            return; // root ignores file modes; the condition cannot be built
+        }
+        let (_d, j) = test_journal();
+        j.append("note", None, data("one")).unwrap();
+        j.append("note", None, data("two")).unwrap();
+        let p = j.dir.join(JOURNAL_FILE);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o200)).unwrap();
+        let r = j.append("note", None, data("blind"));
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(r.is_err(), "append with an unreadable journal must fail");
+        assert_eq!(j.failures(), 1);
+        let (recs, skipped) = read_records(&j.dir);
+        assert_eq!(skipped, 0);
+        let seqs: Vec<u64> = recs.iter().map(|r| r.wseq).collect();
+        assert_eq!(seqs, [1, 2], "no record with a guessed wseq was written");
+        // Readable again: the sequence continues where it left off.
+        j.append("note", None, data("three")).unwrap();
+        assert_eq!(read_records(&j.dir).0.last().unwrap().wseq, 3);
+    }
+
+    #[test]
+    fn sync_counts_an_open_error_but_not_a_missing_journal() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::getuid().is_root() {
+            return; // root ignores file modes; the condition cannot be built
+        }
+        let (_d, j) = test_journal();
+        j.sync();
+        assert_eq!(j.failures(), 0, "nothing to sync is not a failure");
+        j.append("note", None, data("one")).unwrap();
+        let p = j.dir.join(JOURNAL_FILE);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o200)).unwrap();
+        j.sync();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(j.failures(), 1, "a sync that could not open the file");
     }
 
     #[test]

@@ -56,7 +56,41 @@ pub enum Refuse {
     Unknown(String),
 }
 
-/// R5 (DESIGN §9): decide from facts, failing closed on anything missing.
+/// The `exec/exit` data for one finished exec (item 2): the exit code or
+/// the terminating signal, whether it was cancelled or lost, and the
+/// duration in milliseconds. `lost` (no exit known) carries neither an
+/// exit code nor a signal. Extracted as a free function so the exact data
+/// shape is unit-testable without a supervisor.
+fn exit_record_data(
+    client: &authz::ClientRecord,
+    exit: Option<&exec::Exit>,
+    cancelled: bool,
+    lost: bool,
+    duration_ms: u128,
+) -> Value {
+    let mut data = json!({
+        "op": "exec",
+        "stage": "exit",
+        "duration_ms": duration_ms,
+        "cancelled": cancelled,
+        "lost": lost,
+        "seq": client.seq,
+        "authz": { "allow": true },
+    });
+    match exit {
+        Some(exec::Exit::Code(c)) => {
+            data["exit_code"] = json!(c);
+        }
+        Some(exec::Exit::Signal(n)) => {
+            data["signal"] = json!(n);
+            data["signal_name"] = json!(control::signal_name(*n));
+        }
+        None => {}
+    }
+    data
+}
+
+/// Decide from facts, failing closed on anything missing.
 ///
 /// Membership of the sandbox pid namespace is decided by `peer_in_tree` (the
 /// peer descends from the sandbox init, via world-readable `status` files).
@@ -573,6 +607,32 @@ impl Shared {
                 req_id: client.req_id.clone(),
             }),
             entry,
+        );
+    }
+
+    /// Journal one exec exit (item 2). Carries the same `seq` and `req_id`
+    /// as its request (via the `JournalClient`) so the request/result/exit
+    /// triple collapses by (session, seq) in readable output. Journal-only:
+    /// the audit `exec/result` line is unchanged (rule 4). A journal failure
+    /// never fails the exec (rule 5).
+    fn journal_exec_exit(
+        &self,
+        client: &authz::ClientRecord,
+        exit: Option<&exec::Exit>,
+        cancelled: bool,
+        lost: bool,
+        duration_ms: u128,
+    ) {
+        let data = exit_record_data(client, exit, cancelled, lost, duration_ms);
+        let _ = self.journal.append(
+            "exec/exit",
+            Some(JournalClient {
+                uid: client.uid,
+                label: client.label.clone(),
+                label_source: client.label_source.clone(),
+                req_id: client.req_id.clone(),
+            }),
+            data,
         );
     }
 
@@ -1189,13 +1249,24 @@ impl Shared {
             "{}",
             ok(json!({ "pid": sp.pid, "exec_id": format!("e-{exec_id}") }))
         );
+        // Item 2: duration is measured from just before the drive loop to
+        // the outcome — the whole "running" lifetime, including a cancel
+        // grace. `Instant` (not a wall clock) so it is monotonic.
+        let drive_started = std::time::Instant::now();
         let outcome = if started.is_ok() {
             exec::drive(&sp.status, sp.pending, conn.as_raw_fd(), exec::CANCEL_GRACE)
         } else {
             // Client already gone: cancel through the normal path.
             exec::drive_from(&sp.status, sp.pending, -1, std::time::Duration::ZERO, true)
         };
+        let duration_ms = drive_started.elapsed().as_millis();
         self.exec_table.lock().expect("exec_table").remove(exec_id);
+        // `cancelled` here means "the client was already gone when the
+        // exec started" — the one cancellation path `drive_from` was told
+        // about. A disconnect *during* drive() (TERM after POLLRDHUP) is
+        // indistinguishable from a signal exit in `Outcome` today (see the
+        // report); the exit record still fires on that path.
+        let cancelled = !started.is_ok();
         let (res, line) = match outcome {
             exec::Outcome::Exited(exec::Exit::Code(c)) => ("ok", json!({ "exit": { "code": c } })),
             exec::Outcome::Exited(exec::Exit::Signal(n)) => (
@@ -1213,6 +1284,20 @@ impl Shared {
             client,
             true,
         );
+        // Item 2: one `exec/exit` record on every post-spawn end path.
+        // `Outcome::Lost` (status socket EOF/poll error) covers session
+        // stop while running and monitor death; `Exited(Signal)` covers
+        // signal-op, client-cancel (TERM/KILL) and any other signal death.
+        // The spawn-failure paths above never reach here — they already
+        // write `exec/result` with the error code and ran nothing.
+        match outcome {
+            exec::Outcome::Exited(exit) => {
+                self.journal_exec_exit(client, Some(&exit), cancelled, false, duration_ms)
+            }
+            exec::Outcome::Lost => {
+                self.journal_exec_exit(client, None, cancelled, true, duration_ms)
+            }
+        }
         line
     }
 
@@ -4386,5 +4471,80 @@ mod tests {
         guard.host_pids.push(i32::MAX - 1);
         std::panic::catch_unwind(move || drop(guard))
             .expect("guard Drop must not panic for unknown pids");
+    }
+
+    // ---- Item 2: exec/exit record data shape (journal-only) ----
+
+    /// The `exec/exit` data for the three end shapes. Fail-first: before
+    /// item 2 there was no exit record at all; the leak case L87 (host)
+    /// proves the supervisor wiring end-to-end.
+    #[test]
+    fn exec_exit_record_carries_code_signal_lost_and_duration() {
+        use super::exec;
+        use serde_json::json;
+        // Code exit.
+        let d = super::exit_record_data(
+            &authz::ClientRecord {
+                uid: 1000,
+                pid: Some(7),
+                label: "local".into(),
+                label_source: "flag".into(),
+                req_id: Some("r1".into()),
+                principal: None,
+                seq: 5,
+            },
+            Some(&exec::Exit::Code(3)),
+            false,
+            false,
+            120,
+        );
+        assert_eq!(d["exit_code"], json!(3));
+        assert_eq!(d["lost"], json!(false));
+        assert_eq!(d["cancelled"], json!(false));
+        assert_eq!(d["duration_ms"], json!(120));
+        assert_eq!(d["seq"], json!(5));
+        assert!(d.get("signal").is_none());
+
+        // Signal death.
+        let d = super::exit_record_data(
+            &authz::ClientRecord {
+                uid: 1000,
+                pid: Some(7),
+                label: "local".into(),
+                label_source: "flag".into(),
+                req_id: None,
+                principal: None,
+                seq: 6,
+            },
+            Some(&exec::Exit::Signal(15)),
+            false,
+            false,
+            250,
+        );
+        assert_eq!(d["signal"], json!(15));
+        assert_eq!(d["signal_name"], json!("TERM"));
+        assert!(d.get("exit_code").is_none());
+
+        // Lost (session stop / monitor death): no code, no signal.
+        let d = super::exit_record_data(
+            &authz::ClientRecord {
+                uid: 1000,
+                pid: Some(7),
+                label: "local".into(),
+                label_source: "flag".into(),
+                req_id: Some("r9".into()),
+                principal: None,
+                seq: 9,
+            },
+            None,
+            true,
+            true,
+            12_000,
+        );
+        assert_eq!(d["lost"], json!(true));
+        assert_eq!(d["cancelled"], json!(true));
+        assert!(d.get("exit_code").is_none());
+        assert!(d.get("signal").is_none());
+        assert_eq!(d["duration_ms"], json!(12_000));
     }
 }

@@ -822,6 +822,18 @@ fn render_group(g: &[&JournalRecord]) -> String {
         .map(|c| escape_terminal(&c.label))
         .unwrap_or_else(|| "-".to_owned());
     let mut summary = String::new();
+    // Terminal failure: a spawn refusal / error result (e.g. E_EXEC) with
+    // no exit record. This is finished work, not an open exec — show the
+    // error, never "[open]" (Mashūra round 2, "collapsing hides failures").
+    let terminal_error: Option<String> = g.iter().find_map(|r| {
+        if r.kind == "exec/result" || r.kind == "attach/result" {
+            let result = r.data.get("result").and_then(|v| v.as_str()).unwrap_or("");
+            if result != "ok" {
+                return Some(escape_terminal(result).to_owned());
+            }
+        }
+        None
+    });
     if g.len() == 1 {
         // A lone record: the request shows as open when it is an exec
         // request (its result/exit are outside the selected window).
@@ -845,11 +857,15 @@ fn render_group(g: &[&JournalRecord]) -> String {
                 _ => {}
             }
         }
-        // A group with a request but no exit so far is still open.
         let has_exit = g
             .iter()
             .any(|r| r.kind == "exec/exit" || r.kind == "attach/exit");
-        if !has_exit {
+        if let Some(err) = terminal_error {
+            if !summary.is_empty() {
+                summary.push(' ');
+            }
+            summary.push_str(&format!("failed:{err}"));
+        } else if !has_exit {
             summary.push_str(" [open]");
         }
     }
@@ -956,6 +972,10 @@ fn exit_summary(rec: &JournalRecord) -> String {
 }
 
 fn git_change_summary(d: &Value) -> String {
+    // Read the change lists from the nested `changes` object (the shape
+    // `gitreport::change_record` produces), with the top-level keys as a
+    // fallback, so a real change never renders as "nothing changed"
+    // (Mashūra round 2).
     if d.get("unchanged").and_then(|v| v.as_bool()) == Some(true) {
         let hooks = d.get("hooks_count").and_then(|v| v.as_u64()).unwrap_or(0);
         let keys = d
@@ -966,6 +986,7 @@ fn git_change_summary(d: &Value) -> String {
     }
     let flagged: Vec<String> = d
         .get("flagged")
+        .or_else(|| d.get("changes").and_then(|c| c.get("flagged")))
         .and_then(|v| v.as_array())
         .map(|a| {
             a.iter()
@@ -974,14 +995,37 @@ fn git_change_summary(d: &Value) -> String {
                 .collect()
         })
         .unwrap_or_default();
+    let truncated_note = match (
+        d.get("truncated")
+            .and_then(|v| v.get("before"))
+            .and_then(|v| v.as_bool()),
+        d.get("truncated")
+            .and_then(|v| v.get("after"))
+            .and_then(|v| v.as_bool()),
+        d.get("changes")
+            .and_then(|c| c.get("truncated"))
+            .and_then(|v| v.get("before"))
+            .and_then(|v| v.as_bool()),
+        d.get("changes")
+            .and_then(|c| c.get("truncated"))
+            .and_then(|v| v.get("after"))
+            .and_then(|v| v.as_bool()),
+    ) {
+        (Some(true), _, _, _)
+        | (_, Some(true), _, _)
+        | (_, _, Some(true), _)
+        | (_, _, _, Some(true)) => " (truncated)",
+        _ => "",
+    };
     let mut s = format!(
-        "git hooks +{} -{} ~{}; config +{} -{} ~{}",
+        "git hooks +{} -{} ~{}; config +{} -{} ~{}{}",
         count_of(d, "hooks_added"),
         count_of(d, "hooks_removed"),
         count_of(d, "hooks_modified"),
         count_of(d, "config_added"),
         count_of(d, "config_removed"),
         count_of(d, "config_changed"),
+        truncated_note,
     );
     if !flagged.is_empty() {
         s.push_str(&format!(" flagged [{}]", flagged.join(",")));
@@ -989,8 +1033,20 @@ fn git_change_summary(d: &Value) -> String {
     s
 }
 
+/// Count one change list from the nested `changes` object (the shape
+/// `gitreport::change_record` produces) or from the top-level fallback
+/// keys. A missing list counts as 0 only in the top-level shape; the
+/// nested shape is read from `changes.*`.
 fn count_of(d: &Value, key: &str) -> usize {
-    d.get(key)
+    // `key` is the flat name ("hooks_added"); the nested shape splits it
+    // into section + verb.
+    let (section, verb) = key.split_once('_').unwrap_or((key, ""));
+    let nested = d
+        .get("changes")
+        .and_then(|c| c.get(section))
+        .and_then(|s| s.get(verb));
+    nested
+        .or_else(|| d.get(key))
         .and_then(|v| v.as_array())
         .map(|a| a.len())
         .unwrap_or(0)
@@ -1970,11 +2026,16 @@ mod tests {
             "abcdef0123456789",
             None,
             json!({
-                "unchanged": false,
-                "hooks_added": ["pre-commit"], "hooks_removed": [],
-                "hooks_modified": [], "config_added": [], "config_removed": [],
-                "config_changed": ["core.hookspath"],
-                "flagged": ["core.hookspath"],
+                "cwd": "/work/proj",
+                "before": {"hooks": [], "config": {"core.hookspath": ["/safe/hooks"]}},
+                "after": {"hooks": [{"name": "pre-commit"}], "config": {"core.hookspath": ["/evil/hooks"]}},
+                "changes": {
+                    "hooks": {"added": ["pre-commit"], "removed": [], "modified": []},
+                    "config": {"added": [], "removed": [], "changed": ["core.hookspath"]},
+                    "flagged": ["core.hookspath"],
+                    "truncated": {"before": false, "after": false},
+                    "skipped": {"before": null, "after": null},
+                },
             }),
         );
         let lines = render_collapsed(&[note, grant, git]);
@@ -1987,6 +2048,12 @@ mod tests {
             lines[2]
         );
         assert!(lines[2].contains("flagged"), "flagged marker: {}", lines[2]);
+        assert!(lines[2].contains("hooks +1"), "hook count: {}", lines[2]);
+        assert!(
+            !lines[2].contains("hooks +0"),
+            "must not read as unchanged: {}",
+            lines[2]
+        );
     }
 
     #[test]
@@ -2011,6 +2078,40 @@ mod tests {
             lines.len(),
             2,
             "different sessions must not collapse: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn readable_output_shows_a_spawn_failure_as_failed_not_open() {
+        // Mashūra round 2: a request + an error result (no exit record)
+        // is finished work that failed to spawn — it must not read as an
+        // open exec.
+        let req = rec(
+            1,
+            "exec/request",
+            "abcdef0123456789",
+            Some("local"),
+            json!({"op": "exec", "stage": "request", "seq": 7, "argv": ["nonexistent"]}),
+        );
+        let res = rec(
+            2,
+            "exec/result",
+            "abcdef0123456789",
+            Some("local"),
+            json!({"op": "exec", "stage": "result", "result": "E_EXEC", "seq": 7}),
+        );
+        let lines = render_collapsed(&[req, res]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("failed:E_EXEC"),
+            "error shown: {}",
+            lines[0]
+        );
+        assert!(!lines[0].contains("[open]"), "not open: {}", lines[0]);
+        assert!(
+            lines[0].contains("nonexistent"),
+            "command shown: {}",
+            lines[0]
         );
     }
 

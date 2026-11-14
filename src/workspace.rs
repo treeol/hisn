@@ -37,6 +37,10 @@ pub struct WorkspaceRef {
 /// i.e. inside the working tree). An empty/unset `HOME` with no
 /// `XDG_STATE_HOME` falls back to a per-uid path under `/tmp` (never the
 /// shared `/tmp/hisn-state-unset`, which would collide across users).
+///
+/// [`is_tmp_state_home`] / [`warn_if_tmp_state_home`] report that case
+/// (item 6): the journal lives under a tmp dir and does not survive a
+/// reboot.
 pub fn state_home() -> PathBuf {
     if let Ok(x) = std::env::var("XDG_STATE_HOME")
         && !x.is_empty()
@@ -50,6 +54,34 @@ pub fn state_home() -> PathBuf {
             let uid = rustix::process::getuid().as_raw();
             PathBuf::from(format!("/tmp/hisn-state-unset-{uid}"))
         }
+    }
+}
+
+/// Whether `state_home()` falls back to the per-uid directory under
+/// `/tmp` — i.e. `XDG_STATE_HOME` is missing, empty or relative **and**
+/// `HOME` is missing or empty (item 6).
+pub fn is_tmp_state_home() -> bool {
+    let xdg_ok = std::env::var("XDG_STATE_HOME")
+        .map(|x| !x.is_empty() && Path::new(&x).is_absolute())
+        .unwrap_or(false);
+    if xdg_ok {
+        return false;
+    }
+    std::env::var("HOME").map(|h| h.is_empty()).unwrap_or(true)
+}
+
+/// Print one warning line when the state home is the ephemeral `/tmp`
+/// fallback (item 6): the journal will not survive a reboot. Once per
+/// process, not per event — a `OnceLock` guards it. Called at supervisor
+/// start (and cheap to call elsewhere; the guard makes it one line).
+pub fn warn_if_tmp_state_home() {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if WARNED.set(()).is_ok() && is_tmp_state_home() {
+        eprintln!(
+            "hisn: warning: state home is {} (XDG_STATE_HOME and HOME are unset); \
+             the workspace journal will not survive a reboot",
+            state_home().display()
+        );
     }
 }
 
@@ -255,6 +287,10 @@ fn check_state_component(p: &Path, uid: u32, leaf: bool) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialises the env-mutating tests in this module.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn workspace_id_is_stable_for_the_same_path() {
@@ -294,6 +330,57 @@ mod tests {
         assert_eq!(w, workspace_for_path(Path::new("/work/proj")));
         let w = default_workspace(Path::new("/work/proj"), Some(""));
         assert_eq!(w, workspace_for_path(Path::new("/work/proj")));
+    }
+
+    #[test]
+    fn tmp_state_home_is_detected_only_when_both_env_vars_fail() {
+        // Item 6: the /tmp fallback happens only when XDG_STATE_HOME is
+        // missing/empty/relative AND HOME is missing/empty. Tested as a
+        // pure predicate over explicit env snapshots (the real env is
+        // restored immediately).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let save_xdg = std::env::var("XDG_STATE_HOME").ok();
+        let save_home = std::env::var("HOME").ok();
+        // SAFETY: guarded by ENV_LOCK for the whole restore window.
+        unsafe {
+            let set = |xdg: Option<&str>, home: Option<&str>| {
+                match xdg {
+                    Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                    None => std::env::remove_var("XDG_STATE_HOME"),
+                }
+                match home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            };
+            // Both present and good: not tmp.
+            set(Some("/real/state"), Some("/home/u"));
+            assert!(!is_tmp_state_home());
+            // XDG good, HOME missing: not tmp.
+            set(Some("/real/state"), None);
+            assert!(!is_tmp_state_home());
+            // XDG missing, HOME good: not tmp.
+            set(None, Some("/home/u"));
+            assert!(!is_tmp_state_home());
+            // Both missing: tmp.
+            set(None, None);
+            assert!(is_tmp_state_home());
+            // XDG relative, HOME empty: tmp.
+            set(Some("rel/state"), Some(""));
+            assert!(is_tmp_state_home());
+            // XDG empty, HOME empty: tmp.
+            set(Some(""), Some(""));
+            assert!(is_tmp_state_home());
+            // Restore.
+            match save_xdg {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match save_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     #[test]

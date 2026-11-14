@@ -2841,6 +2841,10 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
         },
     };
     let workspace_dir = workspace::workspace_dir(&workspace.id);
+    // Item 6: warn once per process when the state home is the ephemeral
+    // /tmp fallback. (For a detached supervisor this lands in
+    // supervisor.log like the other startup warnings.)
+    workspace::warn_if_tmp_state_home();
     let journal = crate::journal::Journal::new(workspace_dir.clone(), session_id.to_owned());
     journal.journal_session_start();
     let git_before = gitreport::snapshot(&policy.cwd);

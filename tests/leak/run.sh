@@ -205,6 +205,15 @@ ls_field() {
   "$HISN" ls --json 2>/dev/null | $PY ls-field "$1" "$2"
 }
 
+# ls_workspace_id ID: the workspace id of session ID (the form
+# `hisn journal --workspace` accepts); empty when not listed. The
+# `workspace` field of ls --json is an object {"id","name"} — passing its
+# string form through `ls_field ... workspace` mangles it (L83-L85 bug,
+# fixed by parsing the JSON properly here).
+ls_workspace_id() {
+  "$HISN" ls --json 2>/dev/null | $PY ls-workspace-id "$1"
+}
+
 # session_dir ID: the session dir as hisn reports it (`dir` in ls --json),
 # never a root assumed by the harness. Falls back to $RUNTIME_ROOT/ID only
 # for a dir that ls cannot see (e.g. after the supervisor removed it).
@@ -3512,27 +3521,50 @@ fi
 
 # ================================================ L82: workspace state dir + journal invisible inside a session (0.5.0, HOST)
 # The workspace dir ($XDG_STATE_HOME/hisn/workspaces/<id>/) and its
-# journal.jsonl must be neither readable nor writable from inside a session,
-# even when the state home is under an exposed path. Mirrors L72.
+# journal.jsonl must be neither readable nor writable from inside a session.
+# Mirrors L72.
+#
+# Fixed in the follow-up: the step-1 version probed a FAKE path
+# ($WORK/l82-ws/journal.jsonl) that is never the workspace dir, so the pass
+# was vacuous (the file is simply not mounted). This version resolves the
+# REAL workspace id from `ls --json` and probes the real journal path
+# $XDG_STATE_HOME/hisn/workspaces/<id>/journal.jsonl. XDG_STATE_HOME is
+# exported into the shell environment (reaching `hisn run`, the
+# supervisor and the CLI alike) rather than relying on the prefix form.
 if needs_host; then
   L82_CWD=$(new_cwd l82)
   L82_POL="$WORK/l82.toml"
   write_policy "$L82_POL" "$L82_CWD"
-  L82_WS="$WORK/l82-ws"
-  mkdir -p "$L82_WS"
-  echo '{"test":"ws-journal"}' >"$L82_WS/journal.jsonl"
-  if XDG_STATE_HOME="$WORK" HISN_XDG_STATE_HOME="$WORK" start_session l82-$$ "$L82_CWD" "$L82_POL"; then
-    r=$(q "$L82_CWD" "exec-out /bin/cat $L82_WS/journal.jsonl")
-    case "$r" in
-      "OK exit=0"*) fail "L82 workspace journal unreadable from inside a session" "journal readable: [${r%%$'\n'*}]" ;;
-      "OK exit="*) pass "L82 workspace journal unreadable from inside a session" ;;
-      *) fail "L82 journal probe" "no result [$r]" ;;
-    esac
+  export XDG_STATE_HOME="$WORK"
+  if start_session l82-$$ "$L82_CWD" "$L82_POL"; then
+    L82_ID=$(ls_workspace_id "l82-$$")
+    # The session start journaled a session/start record, so the real
+    # journal file exists on the host.
+    L82_JOURNAL="$WORK/hisn/workspaces/$L82_ID/journal.jsonl"
+    if [ -n "$L82_ID" ] && [ -f "$L82_JOURNAL" ]; then
+      r=$(q "$L82_CWD" "exec-out /bin/cat $L82_JOURNAL")
+      case "$r" in
+        "OK exit=0"*) fail "L82 workspace journal unreadable from inside a session" "journal readable: [${r%%$'\n'*}]" ;;
+        "OK exit="*) pass "L82 workspace journal unreadable from inside a session" ;;
+        *) fail "L82 journal probe" "no result [$r]" ;;
+      esac
+      # Writability: touching the journal from inside must fail too (a
+      # writable mount would let the touch succeed).
+      r=$(q "$L82_CWD" "exec-out /bin/touch $L82_JOURNAL")
+      case "$r" in
+        "OK exit=0"*) fail "L82 workspace journal unwritable from inside a session" "journal writable: [${r%%$'\n'*}]" ;;
+        "OK exit="*) pass "L82 workspace journal unwritable from inside a session" ;;
+        *) fail "L82 journal write probe" "no result [$r]" ;;
+      esac
+    else
+      fail "L82 real workspace journal" "workspace id=[$L82_ID] journal=[$L82_JOURNAL] missing"
+    fi
     end_session "$L82_CWD" "$S_PID"
   else
     skip "L82 workspace journal unreadable from inside a session" "session did not start"
   fi
-  rm -rf "$L82_CWD" "$L82_WS"
+  unset XDG_STATE_HOME
+  rm -rf "$L82_CWD" "$WORK/hisn/workspaces"
 else
   skip "L82 workspace journal unreadable from inside a session" "hisn check failed (no userns)"
 fi
@@ -3541,26 +3573,33 @@ fi
 # A note whose text looks like a command or JSON is stored verbatim; nothing
 # in it is parsed or executed. The host sends a note whose text is a shell
 # command payload and a JSON payload, then asserts both appear verbatim in
-# the journal and that no file the payload would create exists.
+# the journal and that the payloads did not execute.
+#
+# Fixed in the follow-up: (1) the workspace was resolved by mangling the
+# `ls --json` object with cut/tr, which never yielded a real id; (2) the
+# no-execute check was vacuous — the marker was deleted and the payload
+# only removed a nonexistent path, so its absence proved nothing. Now the
+# marker is CREATED first and must still exist afterwards (the payloads
+# would delete it if executed).
 if needs_host; then
   L83_CWD=$(new_cwd l83)
   L83_POL="$WORK/l83.toml"
   write_policy "$L83_POL" "$L83_CWD"
   if start_session l83-$$ "$L83_CWD" "$L83_POL" --detach; then
-    L83_MARKER=$(mktemp "$WORK/l83_marker.XXXXXX")
-    rm -f "$L83_MARKER"
+    L83_MARKER="$WORK/l83_marker.$$"
+    : >"$L83_MARKER"
     "$HISN" note --session "l83-$$" '$(rm -rf '"$L83_MARKER"')' >/dev/null 2>&1 || true
     "$HISN" note --session "l83-$$" '{"op":"exec","argv":["rm","-rf",'"$L83_MARKER"']}' >/dev/null 2>&1 || true
-    L83_WS=$(ls_field "l83-$$" workspace | cut -d',' -f1 | tr -d '[]" {}' || true)
+    L83_WS=$(ls_workspace_id "l83-$$")
     J=$("$HISN" journal --workspace "${L83_WS:-x}" --json 2>/dev/null || echo '[]')
     case "$J" in
       *"$L83_MARKER"*) pass "L83 note stored verbatim" ;;
       *) fail "L83 note stored verbatim" "payload absent from journal: [$(printf '%s' "$J" | head -c 400)]" ;;
     esac
     if [ -e "$L83_MARKER" ]; then
-      fail "L83 note must not execute (no file created)" "marker exists"
+      pass "L83 note must not execute (marker still exists)"
     else
-      pass "L83 note must not execute (no file created)"
+      fail "L83 note must not execute (marker still exists)" "marker deleted: payload executed"
     fi
     "$HISN" stop --session "l83-$$" >/dev/null 2>&1 || true
   else
@@ -3581,9 +3620,18 @@ if needs_host; then
   if start_session l84-$$ "$L84_CWD" "$L84_POL" --detach; then
     printf '#!/bin/sh\necho hi\n' >"$L84_CWD/.git/hooks/pre-commit"
     printf '[core]\n\thooksPath = /evil/hooks\n' >"$L84_CWD/.git/config"
+    L84_WS=$(ls_workspace_id "l84-$$")
     "$HISN" stop --session "l84-$$" >/dev/null 2>&1 || true
-    L84_WS=$(ls_field "l84-$$" workspace | cut -d',' -f1 | tr -d '[]" {}' || true)
-    J=$("$HISN" journal --workspace "${L84_WS:-x}" --json 2>/dev/null || echo '[]')
+    # The git-change record is journaled after the supervisor unwinds
+    # (post relay_and_wait), so poll for it instead of querying once.
+    J=""
+    for _ in $(seq 1 50); do
+      J=$("$HISN" journal --workspace "${L84_WS:-x}" --json 2>/dev/null || echo '[]')
+      case "$J" in
+        *pre-commit*) break ;;
+      esac
+      sleep 0.2
+    done
     case "$J" in
       *pre-commit*) pass "L84 git-change names the new hook" ;;
       *) fail "L84 git-change names the new hook" "no pre-commit in journal: [$(printf '%s' "$J" | head -c 400)]" ;;
@@ -3612,7 +3660,7 @@ if needs_host; then
     start_session l85b-$$ "$L85_CWD" "$L85_POL" --detach && {
       "$HISN" note --session "l85a-$$" "note from a" >/dev/null 2>&1 || true
       "$HISN" note --session "l85b-$$" "note from b" >/dev/null 2>&1 || true
-      L85_WS=$(ls_field "l85a-$$" workspace | cut -d',' -f1 | tr -d '[]" {}' || true)
+      L85_WS=$(ls_workspace_id "l85a-$$")
       J=$("$HISN" journal --workspace "${L85_WS:-x}" --json 2>/dev/null || echo '[]')
       # Two sessions in one workspace produce one journal with strictly
       # increasing wseq. The host asserts both notes are present; the

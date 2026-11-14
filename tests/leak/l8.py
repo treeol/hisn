@@ -6,6 +6,7 @@
   l8.py json-has FILE KEY VALUE      exit 0 iff top-level KEY == VALUE
   l8.py ls-field ID FIELD < LS.json  print FIELD of session ID (hisn-ls/v2);
                                      empty if not listed / null
+  l8.py ls-workspace-id ID < LS.json print workspace.id of session ID
   l8.py ls-count ID FIELD < LS.json  print the length of the array FIELD of
                                      session ID (0 if absent/null/non-array)
   l8.py ls-client-fields ID < LS.json  print `label=L pid=N` of the first client
@@ -175,6 +176,24 @@ def ls_client_fields(doc_text, want):
     return "label=%s pid=%s" % (c.get("label", ""), "" if pid is None else pid)
 
 
+def ls_workspace_id(doc_text, want):
+    """The workspace id of session WANT ("" if absent). `ls --json` emits the
+    workspace as an object {"id","name"}; this prints the id — the form
+    `hisn journal --workspace` accepts. (L82-L85; ls-field would print the
+    Python repr of the object, which is not a usable identifier.)"""
+    try:
+        doc = json.loads(doc_text)
+    except ValueError:
+        return ""
+    s = find_session(doc, want)
+    if s is None:
+        return ""
+    ws = s.get("workspace")
+    if not isinstance(ws, dict):
+        return ""
+    return str(ws.get("id") or "")
+
+
 def ls_count(doc_text, want, field):
     """Length of the array FIELD of session WANT (0 for absent/null/non-array).
 
@@ -233,6 +252,9 @@ def main(argv):
         return 0 if str(load_json(argv[2]).get(argv[3])) == argv[4] else 1
     if cmd == "ls-field":
         print(ls_field(sys.stdin.read(), argv[2], argv[3]))
+        return 0
+    if cmd == "ls-workspace-id":
+        print(ls_workspace_id(sys.stdin.read(), argv[2]))
         return 0
     if cmd == "ls-count":
         print(ls_count(sys.stdin.read(), argv[2], argv[3]))

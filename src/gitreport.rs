@@ -759,14 +759,85 @@ pub fn diff(before: &Snapshot, after: &Snapshot) -> Value {
 }
 
 /// The `git-change` record data for a start snapshot and a stop snapshot.
+///
+/// Item 5: when nothing changed, nothing was flagged, nothing was
+/// truncated and nothing was skipped, the record is short — the cwd, an
+/// explicit `unchanged` marker and the counts of hooks and config keys
+/// seen, and **no snapshots**. The full before/after snapshots (the ~3 KB
+/// payload an unchanged repo used to produce) are only carried when
+/// something changed: then the record holds the change lists, the
+/// before/after entries for the hooks and config keys that were added,
+/// removed or modified, and everything flagged. Truncated and skipped
+/// states stay explicit exactly as before.
 pub fn change_record(before: &Snapshot, after: &Snapshot) -> Value {
     let d = diff(before, after);
+    let empty = |v: &Value| v.as_array().is_none_or(|a| a.is_empty());
+    let nothing_changed = empty(&d["hooks"]["added"])
+        && empty(&d["hooks"]["removed"])
+        && empty(&d["hooks"]["modified"])
+        && empty(&d["config"]["added"])
+        && empty(&d["config"]["removed"])
+        && empty(&d["config"]["changed"])
+        && empty(&d["flagged"])
+        && !before.truncated
+        && !after.truncated
+        && before.skipped.is_none()
+        && after.skipped.is_none();
+    if nothing_changed {
+        return json!({
+            "cwd": "",
+            "unchanged": true,
+            "hooks_count": before.hooks.len(),
+            "config_keys_count": before.config.len(),
+        });
+    }
     json!({
         "cwd": "",
-        "before": before,
-        "after": after,
+        "before": changed_subset(before, after),
+        "after": changed_subset(after, before),
         "changes": d,
     })
+}
+
+/// The snapshot entries of `this` that belong to a change against
+/// `other`: hooks added/removed/modified plus everything flagged, and
+/// the config keys added/removed/changed plus everything flagged.
+fn changed_subset(this: &Snapshot, other: &Snapshot) -> Snapshot {
+    fn hook_changed(b: &HookEntry, a: &HookEntry) -> bool {
+        b.sha256 != a.sha256 || b.mode != a.mode || b.size != a.size
+    }
+    let other_hooks: std::collections::BTreeMap<&str, &HookEntry> =
+        other.hooks.iter().map(|h| (h.name.as_str(), h)).collect();
+    let mut hooks = Vec::new();
+    for h in &this.hooks {
+        match other_hooks.get(h.name.as_str()) {
+            None => hooks.push(h.clone()),
+            Some(o) if hook_changed(o, h) => hooks.push(h.clone()),
+            _ => {}
+        }
+    }
+    // Entries removed from `other`'s side are not in `this` at all; the
+    // after-side subset of a removal is empty by construction, and the
+    // before-side subset carries them (they are in `this` when `this` is
+    // the before snapshot). Nothing more to add here.
+    let mut config = std::collections::BTreeMap::new();
+    for (k, v) in &this.config {
+        match other.config.get(k) {
+            None => {
+                config.insert(k.clone(), v.clone());
+            }
+            Some(ov) if ov != v => {
+                config.insert(k.clone(), v.clone());
+            }
+            _ => {}
+        }
+    }
+    Snapshot {
+        skipped: this.skipped.clone(),
+        hooks,
+        config,
+        truncated: this.truncated,
+    }
 }
 
 #[cfg(test)]
@@ -1181,5 +1252,106 @@ mod tests {
         assert_eq!(s.config["core.bare"], ["true"]);
         assert_eq!(s.config["alias.st"], ["status"]);
         assert_eq!(s.config["filter.lfs.clean"], ["git lfs clean"]);
+    }
+
+    // ---- Item 5: short git-change record ----
+
+    #[test]
+    fn unchanged_record_is_short_and_explicit() {
+        // Item 5: an unchanged repo produces the cwd, an explicit
+        // `unchanged` marker and the counts — and no snapshots at all.
+        let d = tempfile::tempdir().unwrap();
+        let cwd = git_dir(&d);
+        write(&cwd.join(".git/hooks/pre-commit"), b"#!/bin/sh\nexit 0\n");
+        write(
+            &cwd.join(".git/config"),
+            b"[core]\n\trepositoryformatversion = 0\n",
+        );
+        let a = snapshot(&cwd);
+        let b = snapshot(&cwd);
+        let rec = change_record(&a, &b);
+        assert_eq!(rec["unchanged"], json!(true));
+        assert_eq!(rec["hooks_count"], json!(1));
+        assert_eq!(rec["config_keys_count"], json!(1));
+        assert!(rec.get("before").is_none(), "no snapshot: {rec}");
+        assert!(rec.get("after").is_none(), "no snapshot: {rec}");
+        assert!(rec.get("changes").is_none(), "no change lists: {rec}");
+        // Size: the whole record must be tiny (the old record was ~3 KB).
+        let s = rec.to_string();
+        assert!(s.len() < 256, "unchanged record is { } bytes: {s}", s.len());
+    }
+
+    #[test]
+    fn one_hook_added_record_carries_only_the_changed_entry() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = git_dir(&d);
+        write(&cwd.join(".git/hooks/pre-commit"), b"#!/bin/sh\nexit 0\n");
+        write(
+            &cwd.join(".git/config"),
+            b"[core]\n\trepositoryformatversion = 0\n",
+        );
+        let before = snapshot(&cwd);
+        write(&cwd.join(".git/hooks/post-commit"), b"#!/bin/sh\necho hi\n");
+        let after = snapshot(&cwd);
+        let rec = change_record(&before, &after);
+        assert!(rec.get("unchanged").is_none(), "not unchanged: {rec}");
+        assert_eq!(rec["changes"]["hooks"]["added"], json!(["post-commit"]));
+        // Only the added hook appears in the after subset; the unchanged
+        // pre-commit hook does not.
+        let after_hooks = rec["after"]["hooks"].as_array().unwrap();
+        assert_eq!(after_hooks.len(), 1);
+        assert_eq!(after_hooks[0]["name"], "post-commit");
+        assert!(rec["before"]["hooks"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn flagged_key_changed_record_carries_both_values() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = git_dir(&d);
+        write(
+            &cwd.join(".git/config"),
+            b"[core]\n\thooksPath = /safe/hooks\n",
+        );
+        let before = snapshot(&cwd);
+        write(
+            &cwd.join(".git/config"),
+            b"[core]\n\thooksPath = /evil/hooks\n",
+        );
+        let after = snapshot(&cwd);
+        let rec = change_record(&before, &after);
+        assert_eq!(rec["changes"]["flagged"], json!(["core.hookspath"]));
+        assert_eq!(
+            rec["before"]["config"]["core.hookspath"],
+            json!(["/safe/hooks"])
+        );
+        assert_eq!(
+            rec["after"]["config"]["core.hookspath"],
+            json!(["/evil/hooks"])
+        );
+    }
+
+    #[test]
+    fn truncated_record_stays_explicit() {
+        // Item 5: a truncated side is not "unchanged" — the record keeps
+        // the truncated flags explicit.
+        let d = tempfile::tempdir().unwrap();
+        let cwd = git_dir(&d);
+        let cfg = cwd.join(".git/config");
+        let mut f = fs::File::create(&cfg).unwrap();
+        use std::io::Write;
+        let chunk = vec![b'x'; 65536];
+        let mut written = 0u64;
+        while written <= MAX_FILE_BYTES {
+            f.write_all(&chunk).unwrap();
+            written += chunk.len() as u64;
+        }
+        let after = snapshot(&cwd);
+        let rec = change_record(&Snapshot::default(), &after);
+        assert!(
+            rec.get("unchanged").is_none(),
+            "truncated is not unchanged: {rec}"
+        );
+        assert_eq!(rec["changes"]["truncated"]["after"], true);
+        assert_eq!(rec["after"]["truncated"], true);
     }
 }

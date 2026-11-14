@@ -129,8 +129,19 @@ argv. When an exec finishes, one `exec/exit` record follows it (same `seq`
 and `req_id` as its request), carrying the exit code or terminating
 signal, whether it was cancelled or lost, and the duration in
 milliseconds. In readable output, an exec's request, result and exit
-collapse into one line; a request with no result or exit in the selected
-window is shown alone and marked open.
+collapse into one line. `--last N` counts displayed lines after merging;
+`--json --last N` still counts raw records. Readable queries select events
+with the other filters, then retrieve their complete exec groups from all
+retained files, even if a request predates `--since`. Events are ordered by
+their newest record; the line header identifies the request. A request with
+no exit or terminal error is marked `[open]`; a result/exit with no retained
+request is marked `[orphan: request unavailable]`. Legacy requests show the
+quoted executable path when argv was not recorded.
+
+The reader looks back through all retained journal files once, bounded by
+their sizes when opened (it never follows growing EOF); individual records
+remain capped at 16 MiB. Total history is not capped: retaining more files
+increases query work. No query holds the journal lock while reading.
 
 `hisn journal --session S` (an id or a name) resolves the workspace from
 that session's `session.json`, so it works from any directory. If the

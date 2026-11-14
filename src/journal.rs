@@ -636,17 +636,21 @@ pub const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 /// unlocked — there is nothing to read yet in that case.
 pub fn read_records(dir: &Path) -> (Vec<JournalRecord>, usize) {
     // Pin the file descriptors under the shared lock, then read unlocked.
-    let files: Vec<File> = {
+    let files: Vec<(File, u64)> = {
         let _shared = shared_lock(dir);
         journal_files(dir)
             .into_iter()
-            .filter_map(|p| File::open(&p).ok())
+            .filter_map(|p| {
+                let f = File::open(&p).ok()?;
+                let len = f.metadata().ok()?.len();
+                Some((f, len))
+            })
             .collect()
     };
     let mut out = Vec::new();
     let mut skipped = 0usize;
-    for f in files {
-        let mut reader = BufReader::new(f);
+    for (f, len) in files {
+        let mut reader = BufReader::new(f.take(len));
         loop {
             let mut buf = Vec::new();
             let n = match reader
@@ -732,6 +736,40 @@ pub fn query(records: &[JournalRecord], q: &Query) -> Vec<JournalRecord> {
     out
 }
 
+/// Readable query (separate from JSON's raw-record query).
+pub fn query_readable(records: &[JournalRecord], q: &Query) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let raw = Query {
+        session: q.session.clone(),
+        seat: q.seat.clone(),
+        kind: q.kind.clone(),
+        since_secs: q.since_secs,
+        last: None,
+    };
+    let selected = query(records, &raw);
+    let keys: BTreeSet<_> = selected.iter().filter_map(collapse_key).collect();
+    let singletons: BTreeSet<_> = selected
+        .iter()
+        .filter(|r| collapse_key(r).is_none())
+        .map(|r| r.wseq)
+        .collect();
+    // Pull complete groups from the retained history, even across --since or
+    // raw-kind filters. No repeated backwards scan per displayed event.
+    let complete: Vec<_> = records
+        .iter()
+        .filter(|r| match collapse_key(r) {
+            Some(k) => keys.contains(&k),
+            None => singletons.contains(&r.wseq),
+        })
+        .cloned()
+        .collect();
+    let mut lines = render_collapsed(&complete);
+    if let Some(n) = q.last {
+        lines.drain(..lines.len().saturating_sub(n));
+    }
+    lines
+}
+
 /// Escape every agent-supplied string for terminal display: control
 /// characters (including ESC, the start of terminal escape sequences),
 /// DEL, and Unicode format characters (bidi overrides U+202A..=U+202E,
@@ -809,6 +847,9 @@ pub fn render_collapsed(recs: &[JournalRecord]) -> Vec<String> {
             None => groups.push(vec![r]),
         }
     }
+    // Order events by their newest record, so a long-running exec that just
+    // ended is not hidden among old starts. Header still identifies request.
+    groups.sort_by_key(|g| g.iter().map(|r| r.wseq).max().unwrap_or(0));
     groups.iter().map(|g| render_group(g)).collect()
 }
 
@@ -873,6 +914,13 @@ fn render_group(g: &[&JournalRecord]) -> String {
         } else if !has_exit {
             summary.push_str(" [open]");
         }
+    }
+    if collapse_key(head).is_some()
+        && !g
+            .iter()
+            .any(|r| matches!(r.kind.as_str(), "exec/request" | "attach/request"))
+    {
+        summary.push_str(" [orphan: request unavailable]");
     }
     format!(
         "{} #{} {} {} {} {}",
@@ -1966,6 +2014,74 @@ mod tests {
                 "2026-11-14T12:00:00Z #3 abcdef01 note local hello",
                 "2026-11-14T12:00:00Z #4 abcdef01 session/stop - session stopped",
                 "2026-11-14T12:00:00Z #5 abcdef01 git-change - git hooks +0 -0 ~0; config +0 -0 ~0",
+            ]
+        );
+    }
+
+    #[test]
+    fn polish2_last_five_are_complete_events() {
+        let mut records = Vec::new();
+        for seq in 1..=20 {
+            records.push(rec(
+                seq,
+                "exec/request",
+                "abcdef0123456789",
+                Some("local"),
+                json!({"seq":seq,"argv":["echo",format!("job-{seq}")]}),
+            ));
+        }
+        // Every request is older than every completion: --last must look back.
+        for seq in 1..=20 {
+            records.push(rec(
+                20 + seq * 2 - 1,
+                "exec/result",
+                "abcdef0123456789",
+                Some("local"),
+                json!({"seq":seq,"result":"ok"}),
+            ));
+            records.push(rec(
+                20 + seq * 2,
+                "exec/exit",
+                "abcdef0123456789",
+                Some("local"),
+                json!({"seq":seq,"exit_code":0,"duration_ms":seq}),
+            ));
+        }
+        let q = Query {
+            last: Some(5),
+            ..Query::default()
+        };
+        let lines = query_readable(&records, &q);
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        for (line, seq) in lines.iter().zip(16..=20) {
+            assert_eq!(
+                line,
+                &format!(
+                    "2026-11-14T12:00:00Z #{seq} abcdef01 exec/request local \"echo\" \"job-{seq}\" exit:0 {seq}ms"
+                )
+            );
+            println!("{line}");
+        }
+        assert_eq!(
+            query(&records, &q).len(),
+            5,
+            "JSON keeps counting raw records"
+        );
+    }
+
+    #[test]
+    fn polish2_orphan_exit_is_marked() {
+        let records = [rec(
+            1,
+            "exec/exit",
+            "abcdef0123456789",
+            Some("local"),
+            json!({"seq":9,"exit_code":3,"duration_ms":4}),
+        )];
+        assert_eq!(
+            query_readable(&records, &Query::default()),
+            vec![
+                "2026-11-14T12:00:00Z #1 abcdef01 exec/exit local exit:3 4ms [orphan: request unavailable]"
             ]
         );
     }

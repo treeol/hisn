@@ -30,8 +30,12 @@ decision (the session belongs to a workspace; state under
   carries argv. One `exec/exit` record follows each finished exec (same
   `seq`/`req_id` as its request): exit code or terminating signal,
   cancelled/lost, duration in milliseconds. Readable output collapses an
-  exec's request/result/exit into one line; a request without result/exit
-  in the selected window shows alone as open.
+  exec's request/result/exit into one line. Readable `--last N` counts
+  merged events; JSON counts raw records. Matching exec groups are retrieved
+  from all retained files, including requests before the filter window.
+  Missing requests are explicitly marked orphan; unfinished requests open.
+  Queries scan each retained file once, bounded by its size at open and a
+  16 MiB per-record cap (no fixed total-history limit).
 - **A short git-change record.** An unchanged repo journals the cwd, an
   explicit `unchanged` marker and the hook/config-key counts — no
   snapshots. A changed repo journals the change lists plus before/after

@@ -854,7 +854,7 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
             println!("{}", serde_json::to_string(r)?);
         }
     } else {
-        for line in journal::render_collapsed(&out) {
+        for line in journal::query_readable(&recs, &q) {
             println!("{line}");
         }
     }

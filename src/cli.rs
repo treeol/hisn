@@ -368,7 +368,7 @@ pub struct JournalArgs {
     /// Only records at or after this RFC 3339 timestamp.
     #[arg(long)]
     pub since: Option<String>,
-    /// Show only the newest N records.
+    /// Show the newest N displayed events; with --json, N raw records.
     #[arg(long, value_name = "N")]
     pub last: Option<usize>,
     /// Print the records unchanged as JSON (one per line).

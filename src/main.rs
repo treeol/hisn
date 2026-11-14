@@ -328,6 +328,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 );
                 return Ok(ExitCode::from(2));
             }
+            // A note is a client mutation (its connection registers, its seat
+            // is a member, the lease is touched) *and* writes the journal.
+            // Documented in CONTROL-PROTOCOL.md and sessions.md.
             let r = supervisor::client_request(
                 &a.session,
                 &json!({"op":"note","kind":kind,"text":text,

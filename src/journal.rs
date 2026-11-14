@@ -206,6 +206,15 @@ impl Journal {
         );
     }
 
+    /// Session-start lookup marker is best-effort, like the start record.
+    pub fn session_start_with_marker(&self, name: Option<&str>) {
+        self.journal_session_start();
+        if let Err(e) = crate::workspace::write_session_marker(&self.dir, &self.session, name) {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+            eprintln!("hisn: journal session marker write failed: {e}");
+        }
+    }
+
     /// Append one record. `kind` is the record kind (an audit `op` plus
     /// stage, a session start/stop, a note, a git-change, …); `client` is
     /// the identity when one exists; `data` is the payload (the audit entry
@@ -2153,6 +2162,20 @@ mod tests {
             vec!["2026-11-14T12:00:00Z #1 abcdef01 exec local \"true\" exit:0 1ms"]
         );
         assert!(query(&records, &q).is_empty(), "JSON filter remains exact");
+    }
+
+    #[test]
+    fn polish2_marker_failure_is_counted_without_failing_start() {
+        let d = tempfile::tempdir_in("target").unwrap();
+        let dir = d.path().join("workspace");
+        crate::workspace::ensure_workspace(&dir).unwrap();
+        std::fs::write(dir.join("sessions"), b"not a directory").unwrap();
+        let journal = Journal::new(dir.clone(), "id".into());
+        journal.session_start_with_marker(Some("chat"));
+        assert_eq!(journal.failures(), 1);
+        let (records, _) = read_records(&dir);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, "session/start");
     }
 
     // ---- Item 3: collapsed readable output ----

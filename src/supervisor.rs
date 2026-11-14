@@ -2895,7 +2895,8 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     // supervisor.log like the other startup warnings.)
     workspace::warn_if_tmp_state_home();
     let journal = crate::journal::Journal::new(workspace_dir.clone(), session_id.to_owned());
-    journal.journal_session_start();
+    let session_name = sessionmeta::read(&sdir.path).and_then(|m| m.name);
+    journal.session_start_with_marker(session_name.as_deref());
     let git_before = gitreport::snapshot(&policy.cwd);
     let mut rules = static_rules(&plan, &policy, &roots);
     let prepared = prepare_session_env(

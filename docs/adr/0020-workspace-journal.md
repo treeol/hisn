@@ -44,9 +44,13 @@ decision (the session belongs to a workspace; state under
   only for what was added, removed or modified, plus everything flagged.
   Truncated/skipped stay explicit.
 - `hisn journal --session` resolves the workspace from the session's
-  `session.json` (any cwd); when the session is gone it falls back to the
-  cwd-derived workspace and the error names the workspace searched and
-  points to `--workspace`.
+  live `session.json` first, then markers across all workspaces (any cwd,
+  even after normal cleanup). Each start atomically writes a 0600
+  `sessions/<session-id>` name line in a 0700 workspace subdirectory,
+  owner-checked and no-symlink. Writes are best-effort/count failures.
+  Reused names choose newest mtime and report the chosen ID; markers are
+  lookup hints only, never control authority. Finally fall back to cwd,
+  naming the workspace searched and pointing to `--workspace`.
 - When the state home falls back to `/tmp/hisn-state-unset-<uid>`, the
   supervisor warns once at session start that the journal will not
   survive a reboot.

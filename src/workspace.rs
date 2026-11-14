@@ -284,10 +284,290 @@ fn check_state_component(p: &Path, uid: u32, leaf: bool) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Persistent journal lookup result. Marker names/ids are validated, not paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMarker {
+    pub workspace: String,
+    pub session: String,
+    pub name: String,
+    pub ambiguous: bool,
+}
+
+/// Write only at session start. Publication is atomic, with no per-event work.
+pub fn write_session_marker(dir: &Path, id: &str, name: Option<&str>) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    if !crate::policy::is_valid_session_id(id)
+        || name.is_some_and(|n| !crate::policy::is_valid_session_id(n))
+    {
+        return Err(std::io::Error::other("invalid session marker id/name"));
+    }
+    ensure_workspace(dir)?;
+    let uid = rustix::process::getuid().as_raw();
+    let ws = open_marker_dir(libc::AT_FDCWD, dir, uid, true)?;
+    let sessions = crate::sys::cstr(Path::new("sessions"))?;
+    rustix::fs::mkdirat(
+        &ws,
+        sessions.as_c_str(),
+        rustix::fs::Mode::from_raw_mode(0o700),
+    )
+    .or_else(|e| {
+        if e == rustix::io::Errno::EXIST {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    })?;
+    let fd = open_marker_dir(ws.as_raw_fd(), Path::new("sessions"), uid, true)?;
+    // Refuse unsafe existing markers rather than following or replacing them.
+    let dest = crate::sys::cstr(Path::new(id))?;
+    match rustix::fs::statat(&fd, dest.as_c_str(), rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st)
+            if st.st_uid != uid
+                || st.st_mode & libc::S_IFMT != libc::S_IFREG
+                || st.st_mode & 0o777 != 0o600
+                || st.st_nlink != 1 =>
+        {
+            return Err(std::io::Error::other("unsafe existing session marker"));
+        }
+        Err(e) if e != rustix::io::Errno::NOENT => return Err(e.into()),
+        _ => {}
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let tmp = crate::sys::cstr(Path::new(&format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )))?;
+    let raw = crate::sys::openat2(
+        fd.as_raw_fd(),
+        &tmp,
+        (libc::O_WRONLY
+            | libc::O_CREAT
+            | libc::O_EXCL
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK) as u64,
+        0o600,
+        crate::sys::RESOLVE_BENEATH
+            | crate::sys::RESOLVE_NO_SYMLINKS
+            | crate::sys::RESOLVE_NO_MAGICLINKS,
+    )?;
+    let mut file = fs::File::from(raw);
+    let result = (|| {
+        file.write_all(format!("{}\n", name.unwrap_or("")).as_bytes())?;
+        rustix::fs::renameat(&fd, tmp.as_c_str(), &fd, dest.as_c_str())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = rustix::fs::unlinkat(&fd, tmp.as_c_str(), rustix::fs::AtFlags::empty());
+    }
+    result
+}
+
+fn open_marker_dir(
+    parent: std::os::fd::RawFd,
+    path: &Path,
+    uid: u32,
+    private: bool,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    let c = crate::sys::cstr(path)?;
+    let resolve = crate::sys::RESOLVE_NO_SYMLINKS
+        | crate::sys::RESOLVE_NO_MAGICLINKS
+        | if path.is_absolute() {
+            0
+        } else {
+            crate::sys::RESOLVE_BENEATH
+        };
+    let fd = crate::sys::openat2(
+        parent,
+        &c,
+        (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            as u64,
+        0,
+        resolve,
+    )?;
+    let st = rustix::fs::fstat(&fd)?;
+    if st.st_uid != uid || (private && st.st_mode & 0o777 != 0o700) {
+        return Err(std::io::Error::other("unsafe marker directory owner/mode"));
+    }
+    Ok(fd)
+}
+
+fn marker_names(fd: &std::os::fd::OwnedFd) -> std::io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(fd)? {
+        let entry = entry?;
+        if let Ok(name) = entry.file_name().to_str() {
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+pub fn find_session_marker(root: &Path, arg: &str) -> Option<SessionMarker> {
+    find_session_marker_for_uid(root, arg, rustix::process::getuid().as_raw())
+}
+
+fn find_session_marker_for_uid(root: &Path, arg: &str, uid: u32) -> Option<SessionMarker> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    if !crate::policy::is_valid_session_id(arg) {
+        return None;
+    }
+    let root = open_marker_dir(libc::AT_FDCWD, root, uid, false).ok()?;
+    let workspaces = open_marker_dir(root.as_raw_fd(), Path::new("workspaces"), uid, false).ok()?;
+    let mut candidates = Vec::new();
+    for wid in marker_names(&workspaces).ok()? {
+        if !is_valid_workspace_id(&wid) {
+            continue;
+        }
+        let Ok(ws) = open_marker_dir(workspaces.as_raw_fd(), Path::new(&wid), uid, true) else {
+            continue;
+        };
+        let Ok(sessions) = open_marker_dir(ws.as_raw_fd(), Path::new("sessions"), uid, true) else {
+            continue;
+        };
+        for id in marker_names(&sessions).unwrap_or_default() {
+            if !crate::policy::is_valid_session_id(&id) {
+                continue;
+            }
+            let Ok(c) = crate::sys::cstr(Path::new(&id)) else {
+                continue;
+            };
+            let Ok(fd) = crate::sys::openat2(
+                sessions.as_raw_fd(),
+                &c,
+                (libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64,
+                0,
+                crate::sys::RESOLVE_BENEATH
+                    | crate::sys::RESOLVE_NO_SYMLINKS
+                    | crate::sys::RESOLVE_NO_MAGICLINKS,
+            ) else {
+                continue;
+            };
+            let file = fs::File::from(fd);
+            let Ok(md) = file.metadata() else {
+                continue;
+            };
+            if !md.is_file()
+                || md.uid() != uid
+                || md.mode() & 0o777 != 0o600
+                || md.nlink() != 1
+                || md.len() > 65
+            {
+                continue;
+            }
+            let mut body = String::new();
+            if file.take(66).read_to_string(&mut body).is_err() {
+                continue;
+            }
+            let Some(name) = body.strip_suffix('\n') else {
+                continue;
+            };
+            if !name.is_empty() && !crate::policy::is_valid_session_id(name) {
+                continue;
+            }
+            if id != arg && name != arg {
+                continue;
+            }
+            let Ok(time) = md.modified() else {
+                continue;
+            };
+            candidates.push((
+                id == arg,
+                time,
+                SessionMarker {
+                    workspace: wid.clone(),
+                    session: id,
+                    name: name.to_owned(),
+                    ambiguous: false,
+                },
+            ));
+        }
+    }
+    // Exact id beats a name; newest mtime wins name reuse, with deterministic ties.
+    candidates.sort_by(|a, b| {
+        (a.0, a.1, &a.2.session, &a.2.workspace).cmp(&(b.0, b.1, &b.2.session, &b.2.workspace))
+    });
+    let (is_id, _, mut chosen) = candidates.pop()?;
+    chosen.ambiguous = !is_id && candidates.iter().any(|c| !c.0);
+    Some(chosen)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    fn marker_tree() -> (tempfile::TempDir, PathBuf) {
+        let d = tempfile::tempdir_in("target").unwrap();
+        let root = d.path().join("hisn");
+        (d, root)
+    }
+
+    #[test]
+    fn polish2_ended_marker_found_by_id_and_name() {
+        let (_d, root) = marker_tree();
+        let ws = root.join("workspaces/0123456789abcdef");
+        write_session_marker(&ws, "ended-1", Some("chat")).unwrap();
+        // No live session directory or cwd-based workspace involved.
+        let expected = SessionMarker {
+            workspace: "0123456789abcdef".into(),
+            session: "ended-1".into(),
+            name: "chat".into(),
+            ambiguous: false,
+        };
+        assert_eq!(
+            find_session_marker(&root, "ended-1"),
+            Some(expected.clone())
+        );
+        assert_eq!(find_session_marker(&root, "chat"), Some(expected));
+        assert_eq!(
+            fs::symlink_metadata(ws.join("sessions")).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::symlink_metadata(ws.join("sessions/ended-1"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn polish2_reused_name_chooses_newest_and_reports_id() {
+        let (_d, root) = marker_tree();
+        let a = root.join("workspaces/0123456789abcdef");
+        let b = root.join("workspaces/fedcba9876543210");
+        write_session_marker(&a, "old", Some("chat")).unwrap();
+        write_session_marker(&b, "new", Some("chat")).unwrap();
+        for (dir, id, secs) in [(&a, "old", 1), (&b, "new", 2)] {
+            fs::File::open(dir.join("sessions").join(id))
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+                )
+                .unwrap();
+        }
+        let m = find_session_marker(&root, "chat").unwrap();
+        assert_eq!(m.session, "new");
+        assert!(m.ambiguous, "caller must report chosen id");
+    }
+
+    #[test]
+    fn polish2_unsafe_markers_are_ignored() {
+        let (_d, root) = marker_tree();
+        let ws = root.join("workspaces/0123456789abcdef");
+        write_session_marker(&ws, "real", Some("chat")).unwrap();
+        std::os::unix::fs::symlink("real", ws.join("sessions/link")).unwrap();
+        assert!(find_session_marker(&root, "link").is_none());
+        let owner = fs::metadata(ws.join("sessions/real")).unwrap().uid();
+        assert!(find_session_marker_for_uid(&root, "real", owner.wrapping_add(1)).is_none());
+    }
 
     /// Serialises the env-mutating tests in this module.
     static ENV_LOCK: Mutex<()> = Mutex::new(());

@@ -356,7 +356,7 @@ pub struct JournalArgs {
     /// workspace is derived from the current directory's canonical path.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// Only records from this session id.
+    /// Session id or name (live metadata, then persistent workspace markers).
     #[arg(long)]
     pub session: Option<String>,
     /// Only records carrying this client label (the "seat").

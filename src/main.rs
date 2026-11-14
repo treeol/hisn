@@ -771,18 +771,45 @@ fn session_revision(session_arg: &str) -> Option<u32> {
     hisn::sessionmeta::read(&dir).and_then(|m| m.protocol_revision)
 }
 
-/// The workspace id of a session (an id or a name), looked up through its
-/// `session.json` (item 4): the session directory must still exist and
-/// carry a `workspace` record. `None` when the session is gone, was pruned
-/// or predates workspaces — the caller then falls back to the
-/// cwd-derived workspace, and the "no journal" message names it.
-fn workspace_for_session(session_arg: &str) -> Option<String> {
+/// Resolve a journal session through live metadata, then persistent markers.
+fn journal_session_lookup_under(
+    roots: &[PathBuf],
+    registry: &Path,
+    state: &Path,
+    arg: &str,
+) -> Option<workspace::SessionMarker> {
+    let live = (|| {
+        let id = session::resolve_session_arg(roots, registry, arg).ok()?;
+        let dir = session::find_session(roots, &id).ok()?;
+        let meta = hisn::sessionmeta::read(&dir)?;
+        let workspace = meta.workspace?.id;
+        if !workspace::is_valid_workspace_id(&workspace) {
+            return None;
+        }
+        Some(workspace::SessionMarker {
+            workspace,
+            session: id,
+            name: meta.name.unwrap_or_default(),
+            ambiguous: false,
+        })
+    })();
+    live.or_else(|| workspace::find_session_marker(state, arg))
+}
+
+fn journal_session_lookup(arg: &str) -> Option<workspace::SessionMarker> {
     let uid = rustix::process::getuid().as_raw();
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
-    let reg_root = hisn::registry::registry_root(uid);
-    let id = session::resolve_session_arg(&roots, &reg_root, session_arg).ok()?;
-    let dir = session::find_session(&roots, &id).ok()?;
-    hisn::sessionmeta::read(&dir)?.workspace.map(|w| w.id)
+    journal_session_lookup_under(
+        &roots,
+        &hisn::registry::registry_root(uid),
+        &workspace::state_home(),
+        arg,
+    )
+}
+
+#[cfg(test)]
+fn workspace_for_session(arg: &str) -> Option<String> {
+    journal_session_lookup(arg).map(|m| m.workspace)
 }
 
 /// `hisn journal` (B7): read the workspace journal host-side and print it.
@@ -791,10 +818,24 @@ fn workspace_for_session(session_arg: &str) -> Option<String> {
 fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
     // Resolve the workspace (item 4): `--session` (an id or a name) takes
     // the workspace from that session's `session.json` when its directory
-    // still exists, so the command works from any cwd. Otherwise fall back
+    // still exists, then from persistent markers. Otherwise fall back
     // to `--workspace` / the cwd-derived workspace. `--workspace` given
     // explicitly alongside `--session` wins (as before).
     let session_arg = a.session.clone();
+    // Resolve once: no race from re-querying after the session stops.
+    let resolved = session_arg.as_deref().and_then(journal_session_lookup);
+    if let Some(m) = &resolved
+        && m.ambiguous
+    {
+        eprintln!(
+            "hisn: session name matched several markers; chose newest session {} (workspace {})",
+            m.session, m.workspace
+        );
+    }
+    let session_filter = resolved
+        .as_ref()
+        .map(|m| m.session.clone())
+        .or_else(|| a.session.clone());
     let id = match a.workspace.as_deref() {
         Some(w) => {
             if workspace::workspace_id_for_name(w) == w
@@ -813,10 +854,8 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
             }
         }
         None => {
-            if let Some(s) = session_arg.as_deref()
-                && let Some(wid) = workspace_for_session(s)
-            {
-                wid
+            if let Some(m) = &resolved {
+                m.workspace.clone()
             } else {
                 let cwd = std::env::current_dir().context("current dir")?;
                 let canon = std::fs::canonicalize(&cwd).unwrap_or(cwd);
@@ -842,7 +881,7 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
         None => None,
     };
     let q = journal::Query {
-        session: a.session,
+        session: session_filter,
         seat: a.seat,
         kind: a.kind,
         since_secs,
@@ -865,9 +904,7 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
     // fallback must be visible even when the cwd's workspace *has* a
     // journal (empty output would otherwise look like success with no
     // records). Print the fallback note whenever resolution fell through.
-    let session_fell_back = session_arg.is_some()
-        && a.workspace.is_none()
-        && workspace_for_session(session_arg.as_deref().unwrap()).is_none();
+    let session_fell_back = session_arg.is_some() && a.workspace.is_none() && resolved.is_none();
     if session_fell_back {
         eprintln!(
             "hisn: no session {} found (or it has no workspace record); \
@@ -1134,6 +1171,68 @@ mod ls_tests {
         // archive file is created at the symlinked location.
         let _ = r;
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn polish2_ended_lookup_uses_marker_and_resolved_id() {
+        let d = tempfile::tempdir_in("target").unwrap();
+        let state = d.path().join("state");
+        hisn::workspace::write_session_marker(
+            &state.join("workspaces/0123456789abcdef"),
+            "ended-1",
+            Some("chat"),
+        )
+        .unwrap();
+        for arg in ["ended-1", "chat"] {
+            let found =
+                super::journal_session_lookup_under(&[], &d.path().join("registry"), &state, arg)
+                    .unwrap();
+            assert_eq!(found.workspace, "0123456789abcdef");
+            assert_eq!(
+                found.session, "ended-1",
+                "query must filter by resolved id, not name"
+            );
+        }
+    }
+
+    #[test]
+    fn polish2_live_metadata_precedes_markers() {
+        let d = tempfile::tempdir_in("target").unwrap();
+        let state = d.path().join("state");
+        let runtime = d.path().join("runtime");
+        let live = runtime.join("live-1");
+        std::fs::create_dir_all(&live).unwrap();
+        use hisn::sessionmeta::{Owner, SessionMeta};
+        let mut meta = SessionMeta::new(
+            "live-1",
+            None,
+            Owner {
+                uid: rustix::process::getuid().as_raw(),
+                label: "local".into(),
+                client_id: "c".into(),
+            },
+            "/w",
+            "none",
+        );
+        meta.workspace = Some(hisn::workspace::WorkspaceRef {
+            id: "0123456789abcdef".into(),
+            name: "live".into(),
+        });
+        meta.write_to(&live).unwrap();
+        hisn::workspace::write_session_marker(
+            &state.join("workspaces/fedcba9876543210"),
+            "live-1",
+            None,
+        )
+        .unwrap();
+        let found = super::journal_session_lookup_under(
+            &[runtime],
+            &d.path().join("registry"),
+            &state,
+            "live-1",
+        )
+        .unwrap();
+        assert_eq!(found.workspace, "0123456789abcdef");
     }
 
     #[test]

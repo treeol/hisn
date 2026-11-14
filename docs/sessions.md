@@ -151,9 +151,25 @@ remain capped at 16 MiB. Total history is not capped: retaining more files
 increases query work. No query holds the journal lock while reading.
 
 `hisn journal --session S` (an id or a name) resolves the workspace from
-that session's `session.json`, so it works from any directory. If the
-session is gone, it falls back to the workspace of the current directory
-and the error names the workspace searched and points to `--workspace`.
+the live session's `session.json` first, then persistent session markers
+across all workspaces, so it works from any directory after the session
+ends. At start, `workspaces/<workspace-id>/sessions/<session-id>` (0600 in a
+0700 directory) records the session name on one line (empty for unnamed).
+Markers are owned by the current user, regular files, never symlinks; the
+reader ignores unsafe owners/modes and overlong/invalid names. A reused
+name selects the newest marker by modification time (deterministic ID and
+workspace tie-break), and reports which ID it chose when ambiguous. The
+resolved ID filters records. Explicit `--workspace` still chooses the
+workspace. If neither live metadata nor markers resolve the session, the
+reader falls back to the current-directory workspace and names the searched
+workspace with a pointer to `--workspace`.
+
+Marker writes are atomic and best-effort at start only; failure is logged
+and counted as a journal failure, never a session-start error. Markers are
+not control authority and do not revive ended sessions. They persist until
+workspace state is removed; pre-marker builds still need `--workspace` or
+the current-directory fallback. Marker mtime is a lookup hint, not evidence
+of session chronology against a same-UID actor able to modify state.
 
 **Git-change records.** When nothing changed, nothing was flagged, nothing
 was truncated and nothing was skipped, the record is short: the cwd, an

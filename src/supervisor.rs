@@ -3976,7 +3976,7 @@ mod tests {
         assert_eq!(
             crate::journal::render_collapsed(&records),
             vec![
-                "2026-11-14T12:00:00Z #1 abcdef01 exec/request local \"sh\" \"-c\" \"echo \\x1b[31mRED\" exit:0 120ms"
+                "2026-11-14T12:00:00Z #1 abcdef01 exec local \"sh\" \"-c\" \"echo \\x1b[31mRED\" exit:0 120ms"
             ]
         );
         let audit_lines = fs::read_to_string(audit_path).unwrap();

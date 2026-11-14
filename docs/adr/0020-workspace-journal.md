@@ -31,7 +31,9 @@ decision (the session belongs to a workspace; state under
   `seq`/`req_id` as its request): exit code or terminating signal,
   cancelled/lost, duration in milliseconds. Readable output collapses an
   exec's request/result/exit into one line. Readable `--last N` counts
-  merged events; JSON counts raw records. Matching exec groups are retrieved
+  merged events with kind `exec`; JSON counts raw records and keeps raw
+  kinds. Readable `--kind exec` selects the exec family; JSON matches exact
+  raw kinds. Matching exec groups are retrieved
   from all retained files, including requests before the filter window.
   Missing requests are explicitly marked orphan; unfinished requests open.
   Queries scan each retained file once, bounded by its size at open and a

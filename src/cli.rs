@@ -362,7 +362,7 @@ pub struct JournalArgs {
     /// Only records carrying this client label (the "seat").
     #[arg(long)]
     pub seat: Option<String>,
-    /// Only records of this kind.
+    /// Select a raw kind; readable --kind exec selects the exec family.
     #[arg(long)]
     pub kind: Option<String>,
     /// Only records at or after this RFC 3339 timestamp.

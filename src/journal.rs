@@ -746,7 +746,22 @@ pub fn query_readable(records: &[JournalRecord], q: &Query) -> Vec<String> {
         since_secs: q.since_secs,
         last: None,
     };
-    let selected = query(records, &raw);
+    let family = q.kind.as_deref() == Some("exec");
+    let raw = if family {
+        Query { kind: None, ..raw }
+    } else {
+        raw
+    };
+    let selected: Vec<_> = query(records, &raw)
+        .into_iter()
+        .filter(|r| {
+            !family
+                || matches!(
+                    r.kind.as_str(),
+                    "exec/request" | "exec/result" | "exec/exit"
+                )
+        })
+        .collect();
     let keys: BTreeSet<_> = selected.iter().filter_map(collapse_key).collect();
     let singletons: BTreeSet<_> = selected
         .iter()
@@ -927,7 +942,11 @@ fn render_group(g: &[&JournalRecord]) -> String {
         escape_terminal(&head.ts),
         head.wseq,
         escape_terminal(&head.session.chars().take(8).collect::<String>()),
-        escape_terminal(&head.kind),
+        escape_terminal(if g.iter().any(|r| r.kind == "exec/request") {
+            "exec"
+        } else {
+            &head.kind
+        }),
         client,
         summary,
     )
@@ -2010,7 +2029,7 @@ mod tests {
         assert_eq!(
             render_collapsed(&records),
             vec![
-                "2026-11-14T12:00:00Z #1 abcdef01 exec/request local \"sh\" [open]",
+                "2026-11-14T12:00:00Z #1 abcdef01 exec local \"sh\" [open]",
                 "2026-11-14T12:00:00Z #3 abcdef01 note local hello",
                 "2026-11-14T12:00:00Z #4 abcdef01 session/stop - session stopped",
                 "2026-11-14T12:00:00Z #5 abcdef01 git-change - git hooks +0 -0 ~0; config +0 -0 ~0",
@@ -2057,7 +2076,7 @@ mod tests {
             assert_eq!(
                 line,
                 &format!(
-                    "2026-11-14T12:00:00Z #{seq} abcdef01 exec/request local \"echo\" \"job-{seq}\" exit:0 {seq}ms"
+                    "2026-11-14T12:00:00Z #{seq} abcdef01 exec local \"echo\" \"job-{seq}\" exit:0 {seq}ms"
                 )
             );
             println!("{line}");
@@ -2084,6 +2103,56 @@ mod tests {
                 "2026-11-14T12:00:00Z #1 abcdef01 exec/exit local exit:3 4ms [orphan: request unavailable]"
             ]
         );
+    }
+
+    #[test]
+    fn polish2_exec_kind_and_open_kind() {
+        let records = [rec(
+            1,
+            "exec/request",
+            "abcdef0123456789",
+            Some("local"),
+            json!({"seq":1,"argv":["sleep","30"]}),
+        )];
+        assert_eq!(
+            query_readable(&records, &Query::default()),
+            vec!["2026-11-14T12:00:00Z #1 abcdef01 exec local \"sleep\" \"30\" [open]"]
+        );
+    }
+    #[test]
+    fn polish2_kind_exec_selects_family_only_in_readable_mode() {
+        let records = [
+            rec(
+                1,
+                "exec/request",
+                "abcdef0123456789",
+                Some("local"),
+                json!({"seq":1,"argv":["true"]}),
+            ),
+            rec(
+                2,
+                "note",
+                "abcdef0123456789",
+                None,
+                json!({"text":"not exec"}),
+            ),
+            rec(
+                3,
+                "exec/exit",
+                "abcdef0123456789",
+                Some("local"),
+                json!({"seq":1,"exit_code":0,"duration_ms":1}),
+            ),
+        ];
+        let q = Query {
+            kind: Some("exec".into()),
+            ..Query::default()
+        };
+        assert_eq!(
+            query_readable(&records, &q),
+            vec!["2026-11-14T12:00:00Z #1 abcdef01 exec local \"true\" exit:0 1ms"]
+        );
+        assert!(query(&records, &q).is_empty(), "JSON filter remains exact");
     }
 
     // ---- Item 3: collapsed readable output ----

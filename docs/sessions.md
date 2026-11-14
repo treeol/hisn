@@ -138,6 +138,13 @@ no exit or terminal error is marked `[open]`; a result/exit with no retained
 request is marked `[orphan: request unavailable]`. Legacy requests show the
 quoted executable path when argv was not recorded.
 
+Request-bearing exec lines have kind `exec` (including open ones). Raw
+kinds are unchanged in JSON. In readable mode, `--kind exec` selects
+`exec/request`, `exec/result` and `exec/exit`; a specific raw kind selects
+matching events, still displayed with their complete exec group. With
+`--json`, every `--kind` match is exact (so `--kind exec` matches no raw
+records). Orphans keep their raw result/exit kind.
+
 The reader looks back through all retained journal files once, bounded by
 their sizes when opened (it never follows growing EOF); individual records
 remain capped at 16 MiB. Total history is not capped: retaining more files

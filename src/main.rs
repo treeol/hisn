@@ -771,12 +771,30 @@ fn session_revision(session_arg: &str) -> Option<u32> {
     hisn::sessionmeta::read(&dir).and_then(|m| m.protocol_revision)
 }
 
+/// The workspace id of a session (an id or a name), looked up through its
+/// `session.json` (item 4): the session directory must still exist and
+/// carry a `workspace` record. `None` when the session is gone, was pruned
+/// or predates workspaces — the caller then falls back to the
+/// cwd-derived workspace, and the "no journal" message names it.
+fn workspace_for_session(session_arg: &str) -> Option<String> {
+    let uid = rustix::process::getuid().as_raw();
+    let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
+    let reg_root = hisn::registry::registry_root(uid);
+    let id = session::resolve_session_arg(&roots, &reg_root, session_arg).ok()?;
+    let dir = session::find_session(&roots, &id).ok()?;
+    hisn::sessionmeta::read(&dir)?.workspace.map(|w| w.id)
+}
+
 /// `hisn journal` (B7): read the workspace journal host-side and print it.
 /// Works for stopped and pruned sessions (the journal lives in the workspace
 /// dir, not the session dir).
 fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
-    // Resolve the workspace: explicit name/id, else derive from the canonical
-    // current directory (the same default `run` uses).
+    // Resolve the workspace (item 4): `--session` (an id or a name) takes
+    // the workspace from that session's `session.json` when its directory
+    // still exists, so the command works from any cwd. Otherwise fall back
+    // to `--workspace` / the cwd-derived workspace. `--workspace` given
+    // explicitly alongside `--session` wins (as before).
+    let session_arg = a.session.clone();
     let id = match a.workspace.as_deref() {
         Some(w) => {
             if workspace::workspace_id_for_name(w) == w
@@ -795,9 +813,15 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
             }
         }
         None => {
-            let cwd = std::env::current_dir().context("current dir")?;
-            let canon = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-            workspace::workspace_id_for_path(&canon)
+            if let Some(s) = session_arg.as_deref()
+                && let Some(wid) = workspace_for_session(s)
+            {
+                wid
+            } else {
+                let cwd = std::env::current_dir().context("current dir")?;
+                let canon = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+                workspace::workspace_id_for_path(&canon)
+            }
         }
     };
     let dir = workspace::workspace_dir(&id);
@@ -838,10 +862,25 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
         eprintln!("hisn: skipped {skipped} unparseable journal line(s)");
     }
     if out.is_empty() && !dir.exists() {
-        eprintln!(
-            "hisn: no journal for workspace {id} (dir {})",
-            dir.display()
-        );
+        // Item 4: when the session lookup failed, say which workspace was
+        // searched (the cwd-derived one) and point at `--workspace`.
+        if session_arg.is_some()
+            && a.workspace.is_none()
+            && workspace_for_session(session_arg.as_deref().unwrap()).is_none()
+        {
+            eprintln!(
+                "hisn: no session {} found (or it has no workspace record); \
+                 searched workspace {id} (dir {}); use --workspace <name-or-id> \
+                 to choose the workspace explicitly",
+                session_arg.as_deref().unwrap(),
+                dir.display()
+            );
+        } else {
+            eprintln!(
+                "hisn: no journal for workspace {id} (dir {})",
+                dir.display()
+            );
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1094,5 +1133,55 @@ mod ls_tests {
         // archive file is created at the symlinked location.
         let _ = r;
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn workspace_for_session_reads_session_json_or_returns_none() {
+        // Item 4: the lookup reads the workspace id from session.json;
+        // every failure branch (missing dir, no workspace, bad id) is
+        // `None`, never a panic. The full CLI path (resolve via registry,
+        // fallback error text) is covered by leak L88 on the host.
+        use super::workspace_for_session;
+        // A session dir that does not exist anywhere under the roots.
+        assert_eq!(workspace_for_session("nonexistent-xyz-123"), None);
+        // A dir with a workspace record, built by hand.
+        let d = std::env::temp_dir().join(format!("hisn-ws-lookup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        use hisn::sessionmeta::{Owner, SessionMeta};
+        let owner = Owner {
+            uid: 1000,
+            label: "local".into(),
+            client_id: "c".into(),
+        };
+        let mut m = SessionMeta::new("abc", Some("nm"), owner, "/w", "none");
+        m.workspace = Some(hisn::workspace::WorkspaceRef {
+            id: "0123456789abcdef".into(),
+            name: "proj".into(),
+        });
+        m.write_to(&d).unwrap();
+        assert_eq!(
+            hisn::sessionmeta::read(&d).unwrap().workspace.unwrap().id,
+            "0123456789abcdef"
+        );
+        // A session.json without a workspace reads back as None.
+        let d2 = std::env::temp_dir().join(format!("hisn-ws-lookup2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d2);
+        std::fs::create_dir_all(&d2).unwrap();
+        let m2 = SessionMeta::new(
+            "abc",
+            None,
+            Owner {
+                uid: 1000,
+                label: "local".into(),
+                client_id: "c".into(),
+            },
+            "/w",
+            "none",
+        );
+        m2.write_to(&d2).unwrap();
+        assert!(hisn::sessionmeta::read(&d2).unwrap().workspace.is_none());
+        std::fs::remove_dir_all(&d).unwrap();
+        std::fs::remove_dir_all(&d2).unwrap();
     }
 }

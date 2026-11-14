@@ -32,18 +32,22 @@ pub struct WorkspaceRef {
 }
 
 /// `$XDG_STATE_HOME/hisn` with the `$HOME/.local/state/hisn` fallback — the
-/// same resolution `main.rs` uses for the audit archive.
+/// same resolution `main.rs` uses for the audit archive. An empty/unset
+/// `HOME` with no `XDG_STATE_HOME` is forbidden (it would otherwise yield a
+/// relative `.local/state/hisn` inside the working tree).
 pub fn state_home() -> PathBuf {
     if let Ok(x) = std::env::var("XDG_STATE_HOME")
         && !x.is_empty()
     {
         return PathBuf::from(x).join("hisn");
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home)
-        .join(".local")
-        .join("state")
-        .join("hisn")
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => PathBuf::from(h)
+            .join(".local")
+            .join("state")
+            .join("hisn"),
+        _ => PathBuf::from("/tmp/hisn-state-unset"),
+    }
 }
 
 /// Total order of workspace resolution: explicit name wins; else the default
@@ -120,12 +124,16 @@ pub fn workspace_dir(id: &str) -> PathBuf {
 
 /// Create (or verify) the workspace dir, mode `0700`, not a symlink — the
 /// same discipline as a session runtime root (`session::ensure_root`). The
-/// parent `workspaces/` dir is created `0700` too.
+/// parent `workspaces/` dir is created `0700` too. Recursive (the workspace
+/// dir is three levels under the state home).
 pub fn ensure_workspace(dir: &Path) -> std::io::Result<()> {
     let parent = dir
         .parent()
         .ok_or_else(|| std::io::Error::other("workspace has no parent"))?;
-    fs::DirBuilder::new().mode(0o700).create(parent)
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
         .or_else(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 Ok(())

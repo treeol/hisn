@@ -115,6 +115,15 @@ pub struct Snapshot {
     pub hooks: Vec<HookEntry>,
     #[serde(default)]
     pub config: BTreeMap<String, String>,
+    /// Set when the enumeration hit a bound (too many hook files) or a file
+    /// was too large to hash fully — an empty map with this flag is "some
+    /// data was not read", not "nothing there".
+    #[serde(default, skip_serializing_if = "is_true")]
+    pub truncated: bool,
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// Snapshot `<cwd>/.git`. Returns the snapshot; never errors (an unreadable
@@ -138,22 +147,34 @@ pub fn snapshot(cwd: &Path) -> Snapshot {
             ..Default::default()
         };
     }
-    let hooks = snapshot_hooks(&git.join("hooks"));
-    let config = snapshot_config(&git.join("config"));
+    // `hooks` itself must not be a symlink: `read_dir` follows it, so a
+    // symlinked hooks dir would list an arbitrary host directory. Same for
+    // `config` — it is opened with O_NOFOLLOW below.
+    let (hooks, hooks_truncated) = {
+        let hd = git.join("hooks");
+        match fs::symlink_metadata(&hd) {
+            Ok(md) if md.file_type().is_symlink() || !md.is_dir() => (Vec::new(), false),
+            _ => snapshot_hooks(&hd),
+        }
+    };
+    let (config, config_truncated) = snapshot_config(&git.join("config"));
     Snapshot {
         skipped: None,
         hooks,
         config,
+        truncated: hooks_truncated || config_truncated,
     }
 }
 
-fn snapshot_hooks(dir: &Path) -> Vec<HookEntry> {
+fn snapshot_hooks(dir: &Path) -> (Vec<HookEntry>, bool) {
     let mut out = Vec::new();
+    let mut truncated = false;
     let Ok(rd) = fs::read_dir(dir) else {
-        return out; // no hooks dir: empty
+        return (out, truncated); // no hooks dir: empty
     };
     for e in rd.flatten() {
         if out.len() >= MAX_HOOK_FILES {
+            truncated = true;
             break;
         }
         let path = e.path();
@@ -176,52 +197,80 @@ fn snapshot_hooks(dir: &Path) -> Vec<HookEntry> {
             continue; // directories and specials are not hooks
         }
         let sha = hash_file(&path, md.len());
+        let oversized = sha.is_none();
         out.push(HookEntry {
             name,
             size: md.len(),
             mode: md.mode() & 0o7777,
             sha256: sha,
         });
+        if oversized {
+            truncated = true;
+        }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    (out, truncated)
 }
 
 /// SHA-256 of a plain file, bounded: a file larger than [`MAX_FILE_BYTES`]
 /// is not read in full (returns `None`, size still recorded). The caller
-/// already checked the entry is not a symlink.
+/// already checked the entry is not a symlink, and the file is opened with
+/// `O_NOFOLLOW|O_NONBLOCK` so a FIFO or a swapped-in symlink cannot hang or
+/// redirect the read.
 fn hash_file(path: &Path, size: u64) -> Option<String> {
     if size > MAX_FILE_BYTES {
         return None;
     }
-    let bytes = fs::read(path).ok()?;
-    if bytes.len() as u64 != size {
-        // The file changed size while reading; hash what we got, it will
-        // differ from the next snapshot (which is the signal we want).
-    }
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).ok()?;
     let mut h = Sha256::new();
     h.update(&bytes);
     Some(format!("{:x}", h.finalize()))
 }
 
-/// Parse `.git/config` into a flat `section.subsection.key = value` map.
-/// A deliberately small parser: it understands the INI-ish shape git writes
-/// (`[section]`, `[section "subsection"]`, `key = value`, `;`/`#` comments,
-/// bare keys). It does not invoke git and does not need to be a full TOML/INI
-/// implementation — it only needs the keys git would act on.
-fn snapshot_config(path: &Path) -> BTreeMap<String, String> {
+/// Parse `.git/config` into a flat `section.subsection.key = value` map, plus
+/// a truncation flag. The file is opened `O_NOFOLLOW` and read with a byte
+/// cap, so a symlink, a FIFO or a huge file cannot redirect or OOM the
+/// report. A deliberately small parser: it understands the INI-ish shape git
+/// writes (`[section]`, `[section "subsection"]`, `key = value`, `;`/`#`
+/// comments, bare keys). It does not invoke git and does not need to be a
+/// full TOML/INI implementation — it only needs the keys git would act on.
+/// Values are journaled verbatim (the journal is the user's own state home).
+fn snapshot_config(path: &Path) -> (BTreeMap<String, String>, bool) {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
     let mut out = BTreeMap::new();
-    let Ok(text) = fs::read_to_string(path) else {
-        return out;
+    let mut truncated = false;
+    let Ok(mut f) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    else {
+        return (out, truncated);
     };
-    if text.as_bytes().len() as u64 > MAX_FILE_BYTES {
-        // Oversized config: record nothing (the caller sees an empty map,
-        // which the diff will show as "all keys removed" only if a later
-        // snapshot reads it — safer to hash and report just the hash is not
-        // adequate; the size bound keeps the report bounded, and a changed
-        // oversized config still changes the next snapshot's read).
-        return out;
+    let Ok(md) = f.metadata() else {
+        return (out, truncated);
+    };
+    if !md.is_file() {
+        return (out, truncated);
     }
+    // Read the file through the O_NOFOLLOW handle, capped at
+    // MAX_FILE_BYTES + 1 so an oversize (or hostile) file cannot OOM the
+    // report; the cap is a flag, not silence.
+    let mut buf = Vec::new();
+    let _ = f.by_ref().take(MAX_FILE_BYTES + 1).read_to_end(&mut buf);
+    if buf.len() as u64 > MAX_FILE_BYTES {
+        truncated = true;
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let text = &text[..(text.len().min(MAX_FILE_BYTES as usize))];
     let mut section: Option<String> = None;
     for raw in text.lines() {
         let line = raw.trim();
@@ -255,7 +304,7 @@ fn snapshot_config(path: &Path) -> BTreeMap<String, String> {
             }
         }
     }
-    out
+    (out, truncated)
 }
 
 /// The diff between two snapshots, as a JSON value for the journal record.

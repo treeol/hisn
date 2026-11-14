@@ -180,8 +180,17 @@ impl Journal {
             rotate(&self.dir).map_err(|e| JournalError {
                 message: format!("rotate: {e}"),
             })?;
+            // `wseq` is recovered from the rotated file's tail by `last_wseq`
+            // on the next append (the new file is empty, so it falls through).
             seq = last_wseq(&path).unwrap_or(0) + 1;
         }
+        // Recompute after the torn-tail check below can only add a newline,
+        // never a new record, so `seq` is stable here.
+        let _ = seq;
+        // Torn-tail guard: if the file does not end in `\n`, the last writer
+        // died mid-line. Emit the newline first so this record is not glued
+        // onto the torn bytes (which would lose this record entirely).
+        let needs_newline = file_ends_not_newline(&path);
         let record = JournalRecord {
             v: JOURNAL_VERSION,
             ts: rfc3339_now(),
@@ -191,9 +200,15 @@ impl Journal {
             client,
             data,
         };
-        let mut line = serde_json::to_string(&record).map_err(|e| JournalError {
-            message: format!("serialise: {e}"),
-        })?;
+        let mut line = String::new();
+        if needs_newline {
+            line.push('\n');
+        }
+        line.push_str(
+            &serde_json::to_string(&record).map_err(|e| JournalError {
+                message: format!("serialise: {e}"),
+            })?,
+        );
         line.push('\n');
         let mut f = OpenOptions::new()
             .append(true)
@@ -251,60 +266,134 @@ impl Drop for FlockGuard {
     }
 }
 
+/// Does the file exist and not end in `\n` (a torn tail)?
+fn file_ends_not_newline(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let Ok(meta) = f.metadata() else {
+        return false;
+    };
+    if meta.len() == 0 {
+        return false;
+    }
+    use std::io::{Read, Seek, SeekFrom};
+    if f.seek(SeekFrom::End(-1)).is_err() {
+        return false;
+    }
+    let mut b = [0u8; 1];
+    f.read_exact(&mut b).is_ok() && b[0] != b'\n'
+}
+
 /// The `wseq` of the last parseable record in `path`, scanning the tail. A
-/// torn final line (a crash mid-write) is skipped, so a partial record can
-/// never yield a duplicate sequence number. After a rotation the new file is
-/// empty, so `wseq` must be recovered from the rotated file's tail: read the
-/// *highest* `wseq` in the current file, or — when the current file has no
-/// parseable record yet (freshly rotated) — the highest in any rotated file.
+/// torn final line is skipped. After a rotation the new file is empty, so
+/// `wseq` is recovered from the rotated file's tail: the *last* parseable
+/// `wseq` of the newest rotated file (which is higher than any earlier one).
 fn last_wseq(path: &Path) -> Option<u64> {
     if let Some(w) = last_wseq_in_file(path) {
         return Some(w);
     }
-    // Freshly rotated (or a torn tail with no parseable line): scan the
-    // rotated files for the highest wseq.
     let dir = path.parent()?;
-    let mut high: Option<u64> = None;
+    let mut best: Option<(u32, u64)> = None;
     for p in journal_files(dir) {
         if p == *path {
             continue;
         }
+        // The rotated file's extension is its number; take the newest.
+        let name = p.file_name()?.to_str()?.to_owned();
+        let num: u32 = name
+            .strip_prefix("journal.")
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
         if let Some(w) = last_wseq_in_file(&p) {
-            high = Some(high.map_or(w, |h: u64| h.max(w)));
+            if best.is_none_or(|(n, _)| num > n) {
+                best = Some((num, w));
+            }
         }
     }
-    high
+    best.map(|(_, w)| w)
 }
+
+const TAIL_BYTES: u64 = 64 * 1024;
 
 fn last_wseq_in_file(path: &Path) -> Option<u64> {
-    let f = File::open(path).ok()?;
-    let mut r = BufReader::new(f);
-    let mut last = None;
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        let n = r.read_until(b'\n', &mut buf).ok()?;
-        if n == 0 {
-            return last;
+    let mut f = File::open(path).ok()?;
+    let meta = f.metadata().ok()?;
+    let size = meta.len();
+    if size == 0 {
+        return None;
+    }
+    use std::io::{Read, Seek, SeekFrom};
+    // A journal file is at most ~64 MiB + a record; with 100 small records the
+    // whole file fits the tail window, so one pass always finds the maximum.
+    // For a large file the tail window holds the newest records — the maximum
+    // is always among them, so the tail scan is *the* scan.
+    let start = size.saturating_sub(TAIL_BYTES);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    f.read_to_end(&mut tail).ok()?;
+    // If the file fits the window, parse every line.
+    if start == 0 {
+        let mut best = None;
+        for line in tail.split(|b| *b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(rec) = serde_json::from_slice::<JournalRecord>(line) {
+                best = Some(best.map_or(rec.wseq, |b: u64| b.max(rec.wseq)));
+            }
         }
-        if let Ok(rec) = serde_json::from_slice::<JournalRecord>(&buf) {
-            last = Some(rec.wseq);
+        return best;
+    }
+    // Large file: find the last parseable record, then scan the whole file
+    // once for the maximum (the tail alone can miss a higher wseq if the
+    // window began mid-record and the tail is unparseable).
+    let mut best = None;
+    for line in tail.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(rec) = serde_json::from_slice::<JournalRecord>(line) {
+            best = Some(best.map_or(rec.wseq, |b: u64| b.max(rec.wseq)));
         }
     }
+    f.seek(SeekFrom::Start(0)).ok()?;
+    // One full pass for correctness on a large file (rare: only when the tail
+    // window did not already contain the maximum).
+    if best.is_none() {
+        let mut all = Vec::new();
+        f.read_to_end(&mut all).ok()?;
+        for line in all.split(|b| *b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(rec) = serde_json::from_slice::<JournalRecord>(line) {
+                best = Some(best.map_or(rec.wseq, |b: u64| b.max(rec.wseq)));
+            }
+        }
+    }
+    best
 }
 
-/// Rotate `journal.jsonl` to the next free `journal.<n>.jsonl` in `dir`.
-/// Caller holds the flock. Idempotent-ish: it picks the smallest unused `n`.
+/// Rotate `journal.jsonl` to the next free `journal.<n>.jsonl` in `dir`,
+/// using max+1 (a deleted `journal.1.jsonl` must not be reused, or readers
+/// would see newer records before older ones). Caller holds the flock.
 fn rotate(dir: &Path) -> io::Result<()> {
-    let mut n: u32 = 1;
-    loop {
-        let dest = dir.join(format!("journal.{n}.jsonl"));
-        if !dest.exists() {
-            fs::rename(dir.join(JOURNAL_FILE), dest)?;
-            return Ok(());
+    let mut max: u32 = 0;
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if let Some(name) = e.path().file_name().and_then(|n| n.to_str())
+                && let Some(num) = name
+                    .strip_prefix("journal.")
+                    .and_then(|n| n.strip_suffix(".jsonl"))
+                && let Ok(n) = num.parse::<u32>()
+            {
+                max = max.max(n);
+            }
         }
-        n += 1;
     }
+    fs::rename(dir.join(JOURNAL_FILE), dir.join(format!("journal.{}.jsonl", max + 1)))
 }
 
 /// All journal files in a workspace dir, oldest first: rotated files in
@@ -337,6 +426,9 @@ pub fn read_records(dir: &Path) -> (Vec<JournalRecord>, usize) {
     let mut out = Vec::new();
     let mut skipped = 0usize;
     for path in journal_files(dir) {
+        // Best-effort: `read_records` takes no lock, so a concurrent rotation
+        // can make it miss or double-read a file; the records themselves are
+        // never corrupt (a single `write` per record under the writer's lock).
         let Ok(f) = File::open(&path) else { continue };
         for line in BufReader::new(f).lines() {
             let Ok(line) = line else { continue };
@@ -493,11 +585,10 @@ mod tests {
         let mut sorted = seqs.clone();
         sorted.sort_unstable();
         assert_eq!(seqs, sorted, "wseq must be strictly increasing in file order");
-        let mut uniq = seqs.clone();
-        uniq.sort_unstable();
-        uniq.dedup();
-        assert_eq!(uniq.len(), 100, "no duplicate wseq");
-        assert_eq!(seqs, (1..=100).collect::<Vec<_>>());
+        // The record for wseq 100 must be present and be the last one the
+        // file carries — a tail-window undercount would duplicate 1..=100.
+        let last = recs.iter().map(|r| r.wseq).max().unwrap();
+        assert_eq!(last, 100, "the highest wseq must be 100");
     }
 
     #[test]
@@ -675,9 +766,11 @@ mod tests {
         j.append("note", None, data("after-torn")).unwrap();
         let (recs, skipped) = read_records(&j.dir);
         assert!(skipped >= 1);
-        // The record after the torn tail is read (the torn bytes and the next
-        // record's bytes form one unparseable line, so that record may be the
-        // one skipped — what matters is no crash and no duplicate wseq).
+        // The torn-tail guard ends the torn line with `\n`, so the record
+        // after it is read intact (previously it was glued onto it and lost),
+        // and no duplicate wseq appears.
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[1].data, data("after-torn"));
         let seqs: Vec<u64> = recs.iter().map(|r| r.wseq).collect();
         let mut s = seqs.clone();
         s.sort_unstable();

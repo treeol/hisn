@@ -620,9 +620,12 @@ impl Shared {
     }
 
     /// Session start is journaled (B3): the journal outlives the session dir,
-    /// so a start/stop trail is queryable after the session is gone.
+    /// so a start/stop trail is queryable after the session is gone. The
+    /// single durable start record is written by the standalone journal at
+    /// session creation; this method records only the start-time git snapshot
+    /// (kept under kind `git-change` so the start snapshot is not a second
+    /// session/start).
     fn journal_session_start(&self) {
-        self.journal_session("start");
         let _ = self.journal.append(
             "git-change",
             None,
@@ -2404,9 +2407,16 @@ fn run_supervisor_inner(
             name: workspace_name_for(policy.cwd.clone(), args.workspace.as_deref()),
         });
         let ws_dir = workspace::workspace_dir(&meta.workspace.as_ref().unwrap().id);
-        workspace::ensure_workspace(&ws_dir).with_context(|| {
-            format!("creating workspace dir {}", ws_dir.display())
-        })?;
+        // Not fatal (rule 5 / the failure-handling rule): a journal that
+        // cannot be created must not take down the session. A warning is
+        // printed and the journal's own `create_dir_all` on first append is
+        // the backstop.
+        if let Err(e) = workspace::ensure_workspace(&ws_dir) {
+            eprintln!(
+                "hisn: warning: cannot create workspace dir {}: {e}",
+                ws_dir.display()
+            );
+        }
         // 0.4.1 step 3: record the rootfs (name or path as given) so `ls`
         // shows it whether it came from a profile name or a path.
         meta.rootfs = prep.rootfs_display.clone();
@@ -2776,9 +2786,10 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
         session_id,
     })?;
     let shared = control.shared;
-    // Session start is journaled through Shared (the in-memory failure
-    // counter lives here); the standalone journal above already wrote the
-    // durable start record with the same append.
+    // Session start is journaled once, by the standalone journal above (the
+    // durable record). Shared's `journal_session_start` is kept for the
+    // start-time git-change snapshot; calling both recorded a duplicate
+    // session/start, which the review flagged.
     shared.journal_session_start();
     let listener = control.listener;
     let handler = control.handler;

@@ -507,6 +507,11 @@ fn ls(
                         } else {
                             (Vec::new(), Vec::new(), Vec::new())
                         };
+                        let journal_failures = if *live {
+                            live_journal_failures(n)
+                        } else {
+                            None
+                        };
                         session_v2_json(
                             n,
                             p,
@@ -516,6 +521,7 @@ fn ls(
                             clients,
                             execs,
                             services,
+                            journal_failures,
                         )
                     })
                     .collect();
@@ -579,6 +585,16 @@ fn live_session_view(session: &str) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
     (arr("clients"), arr("execs"), arr("services"))
 }
 
+/// The `journal_failures` count reported by a live session's `sessioninfo`
+/// (0.5.0, B4). `None` for a session that does not report it (pre-0.5.0).
+fn live_journal_failures(session: &str) -> Option<u64> {
+    let r = supervisor::client_request(session, &json!({"op":"sessioninfo"})).ok()?;
+    if r["ok"] != true {
+        return None;
+    }
+    r["journal_failures"].as_u64()
+}
+
 /// 0.4.1 step 3: one session's `hisn-ls/v2` JSON object. The v1 fields are
 /// kept unchanged; `clients`, live `execs` (with `attach`), `services`,
 /// `rootfs`, `members` and `lease` are additive v2 fields.
@@ -595,6 +611,7 @@ fn session_v2_json(
     clients: Vec<Value>,
     execs: Vec<Value>,
     services: Vec<Value>,
+    journal_failures: Option<u64>,
 ) -> Value {
     let members: Vec<Value> = meta
         .map(|m| {
@@ -639,6 +656,7 @@ fn session_v2_json(
         })).unwrap_or(Value::Null),
         "pid": Value::Null,
         "started": meta.map(|m| Value::String(m.created.ts.clone())).unwrap_or(Value::Null),
+        "journal_failures": journal_failures.map_or(Value::Null, Value::from),
         "execs": execs,
         "services": services,
         "clients": clients,
@@ -916,7 +934,6 @@ fn archive_session(dir: &Path, id: &str, uid: u32) -> Result<(), anyhow::Error> 
 #[cfg(test)]
 mod ls_tests {
     use super::{archive_session, parse_rfc3339_secs, prune_prefix_matches, session_v2_json};
-    use serde_json::{Value, json};
     use std::path::Path;
 
     #[test]
@@ -985,6 +1002,7 @@ mod ls_tests {
             clients.clone(),
             execs.clone(),
             Vec::new(),
+            Some(3),
         );
         // v1 fields are kept.
         assert_eq!(v["id"], "abc");
@@ -997,6 +1015,7 @@ mod ls_tests {
         assert_eq!(v["clients"].as_array().unwrap().len(), 1);
         assert_eq!(v["execs"][0]["attach"], true);
         assert_eq!(v["members"].as_array().unwrap().len(), 1);
+        assert_eq!(v["journal_failures"], 3);
 
         // A stopped session: no clients, no execs.
         let stopped = session_v2_json(
@@ -1008,6 +1027,7 @@ mod ls_tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
         );
         assert!(stopped["clients"].as_array().unwrap().is_empty());
         assert!(stopped["execs"].as_array().unwrap().is_empty());

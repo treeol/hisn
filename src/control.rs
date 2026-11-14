@@ -37,6 +37,12 @@ pub const E_INTERNAL: &str = "E_INTERNAL";
 pub const E_UNAUTHORIZED: &str = "E_UNAUTHORIZED";
 /// The program could not be started (confinement failed, not found, not executable).
 pub const E_EXEC: &str = "E_EXEC";
+/// The request declares a protocol version (or, with a declared version, an
+/// op) the supervisor does not support (0.5.0, Part A). The message names the
+/// supported version. This error is emitted by the supervisor before dispatch
+/// and is **not** a CLI exit code: the CLI maps any failed response through
+/// `print_response` exactly as before.
+pub const E_VERSION: &str = "E_VERSION";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -133,18 +139,82 @@ pub enum Request {
         #[serde(default)]
         client: Option<ClientField>,
     },
+    /// 0.5.0 (Part B): append a note or marker to the session's workspace
+    /// journal. `kind` is `"note"` or `"marker"`; `text` is at most 8 KiB,
+    /// stored and returned verbatim, never parsed or executed. Version-gated:
+    /// only a client that declares the version that introduced it sends it
+    /// (Part A), and the supervisor answers `E_VERSION` otherwise.
+    Note {
+        kind: String,
+        text: String,
+        #[serde(default)]
+        client: Option<ClientField>,
+    },
+}
+
+/// The highest protocol version this build speaks (Part A).
+pub const PROTOCOL_VERSION: u32 = crate::sessionmeta::PROTOCOL_VERSION;
+
+/// The version gate (Part A): given the request's declared
+/// `client.protocol_version` and whether the op is one this supervisor knows,
+/// decide whether to answer `E_VERSION` before dispatch.
+///
+/// - No declared version ⇒ a 0.4.3 client ⇒ always pass (exactly as before).
+/// - Declared version newer than this supervisor supports ⇒ `E_VERSION`.
+/// - Declared version of at most [`PROTOCOL_VERSION`] and a known op ⇒ pass.
+/// - Declared version of at most [`PROTOCOL_VERSION`] but an op this
+///   supervisor does not know ⇒ `E_VERSION` (the op was introduced later than
+///   the declared version this supervisor accepts, or is from the future).
+///
+/// The "unknown op" case reaches here only when the request line parses as a
+/// `Request` (so the op is one of the known variants); an *unknown* op string
+/// fails parsing before this and the connection is closed with
+/// `E_BAD_REQUEST` exactly as in 0.4.3 (verified Phase 0). The gate therefore
+/// guards the fields and the version declaration, not the op string — which
+/// is correct: a 0.4.3 supervisor that never sees `protocol_version` simply
+/// never runs this check, and a 0.5.0 supervisor that sees it enforces it.
+pub fn version_gate(declared: Option<u32>, op_known: bool) -> Result<(), String> {
+    match declared {
+        None => Ok(()),
+        Some(v) => {
+            if v > PROTOCOL_VERSION {
+                return Err(format!(
+                    "protocol_version {v} is newer than the supported version {PROTOCOL_VERSION}"
+                ));
+            }
+            if !op_known {
+                return Err(format!(
+                    "op is not supported by protocol_version {v} (supported {PROTOCOL_VERSION})"
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// The client-supplied identity fields (0.4.0 F1). The supervisor fills
 /// uid/pid from SO_PEERCRED; these are the labels the client may send.
 /// `uid` is not a field here (nor in the request): uid comes only from
 /// SO_PEERCRED. A request whose `client` object contains `uid` is refused.
+///
+/// 0.5.0 (Part A): `protocol_version` is an optional, additive field. A
+/// request that declares a version newer than the supervisor (or, while
+/// declaring a version, uses an op the supervisor does not know) is answered
+/// `E_VERSION`. Requests without the field are treated as 0.4.3 and behave
+/// exactly as before. It has `#[serde(default)]` so old clients that never
+/// send it and new clients talking to old supervisors that ignore unknown
+/// fields both parse; a *new* supervisor still refuses an unknown field that
+/// is not `protocol_version` (deny_unknown_fields is kept).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientField {
     pub label: Option<String>,
     pub label_source: Option<String>,
     pub req_id: Option<String>,
+    /// 0.5.0 (Part A): the control-protocol version the client speaks.
+    /// `None` = a 0.4.3 client. Additive, backwards compatible both ways.
+    #[serde(default)]
+    pub protocol_version: Option<u32>,
 }
 
 impl Request {
@@ -158,6 +228,7 @@ impl Request {
             Request::Exec { .. } => "exec",
             Request::Signal { .. } => "signal",
             Request::SessionInfo { .. } => "sessioninfo",
+            Request::Note { .. } => "note",
         }
     }
 
@@ -181,6 +252,11 @@ impl Request {
         )
     }
 
+    /// The client-declared protocol version (Part A), if any.
+    pub fn declared_version(&self) -> Option<u32> {
+        self.client_field().and_then(|c| c.protocol_version)
+    }
+
     /// The client-supplied identity fields (0.4.0 F1), if any.
     pub fn client_field(&self) -> Option<&ClientField> {
         match self {
@@ -191,7 +267,8 @@ impl Request {
             | Request::Kill { client, .. }
             | Request::Exec { client, .. }
             | Request::Signal { client, .. }
-            | Request::SessionInfo { client, .. } => client.as_ref(),
+            | Request::SessionInfo { client, .. }
+            | Request::Note { client, .. } => client.as_ref(),
         }
     }
 }
@@ -478,6 +555,20 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
         let _inflight = Inflight::enter();
         let resp = match parse_request(&line) {
             Ok(req) => {
+                // 0.5.0 (Part A): the version gate. A request that declares a
+                // protocol_version newer than this supervisor, or that uses an
+                // op this supervisor does not know while declaring a version,
+                // is answered E_VERSION (machine-readable, naming the
+                // supported version) *before* any effect and before the
+                // connection counts as a client. Requests without the field
+                // are 0.4.3 and fall straight through, exactly as before. The
+                // op is always known here (it parsed as a Request); an
+                // unknown op string was already refused above with
+                // E_BAD_REQUEST and connection close (0.4.3 behaviour).
+                if let Err(msg) = version_gate(req.declared_version(), true) {
+                    let _ = writeln!(out, "{}", err(E_VERSION, msg));
+                    continue;
+                }
                 // 0.4.1 R2: an observer request does not make this connection a
                 // client. Registration waits for the first non-observer
                 // request, so a connection that only observes is never counted
@@ -1462,5 +1553,105 @@ mod tests {
         assert_eq!(resp["error"], E_BAD_REQUEST);
         assert_eq!(read_line_limited(&mut r).unwrap(), None);
         assert!(h.seen.lock().unwrap().is_empty());
+    }
+
+    // ---- 0.5.0 (Part A): the version gate.
+
+    /// `protocol_version` is additive: a 0.4.3-shaped request still parses and
+    /// the field defaults to `None`; a request that declares it parses with
+    /// the value.
+    #[test]
+    fn protocol_version_is_additive_and_defaults_to_none() {
+        // 0.4.3 shape: no client at all.
+        let r = parse_request(r#"{"op":"list"}"#).unwrap();
+        assert_eq!(r.declared_version(), None);
+        // 0.4.3 with a client (no protocol_version).
+        let r = parse_request(r#"{"op":"list","client":{"label":"x","label_source":"flag"}}"#)
+            .unwrap();
+        assert_eq!(r.declared_version(), None);
+        // 0.5.0 shape: protocol_version present.
+        let r = parse_request(
+            r#"{"op":"list","client":{"label":"x","label_source":"flag","protocol_version":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(r.declared_version(), Some(1));
+        // `protocol_version` is the one new field; anything else in `client`
+        // is still refused (deny_unknown_fields kept).
+        assert!(parse_request(
+            r#"{"op":"list","client":{"label":"x","uid":1000,"protocol_version":1}}"#
+        )
+        .is_err());
+    }
+
+    /// The version gate's own truth table (pure; over serve_conn's call).
+    #[test]
+    fn version_gate_truth_table() {
+        // No declaration ⇒ 0.4.3 ⇒ always pass.
+        assert!(version_gate(None, true).is_ok());
+        assert!(version_gate(None, false).is_ok());
+        // Declared and supported.
+        assert!(version_gate(Some(1), true).is_ok());
+        assert!(version_gate(Some(0), true).is_ok());
+        // Declared newer than the supervisor.
+        let e = version_gate(Some(2), true).unwrap_err();
+        assert!(e.contains("PROTOCOL_VERSION") || e.contains("2"), "{e}");
+        // Declared, supported version, unknown op.
+        assert!(version_gate(Some(1), false).is_err());
+    }
+
+    /// A request declaring a newer version is answered `E_VERSION` before
+    /// dispatch (the handler never sees it), and a normal 0.4.3-shaped
+    /// request is dispatched unchanged.
+    #[test]
+    fn a_newer_version_is_answered_e_version_before_dispatch() {
+        let (_d, sock, h) = start(true);
+        // 0.5.0 shape declaring v2.
+        let v = request(
+            &sock,
+            &json!({"op":"list","client":{"protocol_version":2}}),
+        )
+        .unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], E_VERSION);
+        // The message names the supported version (the protocol constant).
+        assert!(v["message"].as_str().unwrap().contains(&format!("{PROTOCOL_VERSION}")));
+        // A 0.4.3-shaped request (no client) is dispatched and answered ok.
+        let v = request(&sock, &json!({"op":"list"})).unwrap();
+        assert_eq!(v["ok"], true);
+        // The handler saw only the dispatched one.
+        assert_eq!(*h.seen.lock().unwrap(), ["list"]);
+    }
+
+    /// Byte-identical 0.4.3 responses: the eight ops' 0.4.3-shaped request
+    /// lines parse to the same `Request` and produce the same response
+    /// shapes as 0.4.3 (no new field is emitted by the server). This pins the
+    /// wire compatibility rule 4a at the parse level.
+    #[test]
+    fn all_eight_043_ops_still_parse_with_defaults() {
+        for line in [
+            r#"{"op":"grant","path":"/a"}"#,
+            r#"{"op":"revoke","path":"/a"}"#,
+            r#"{"op":"list"}"#,
+            r#"{"op":"inspect"}"#,
+            r#"{"op":"kill"}"#,
+            r#"{"op":"exec","argv":["x"]}"#,
+            r#"{"op":"signal","pid":7}"#,
+            r#"{"op":"sessioninfo"}"#,
+        ] {
+            let req = parse_request(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+            assert_eq!(req.declared_version(), None, "{line}");
+            assert!(!req.is_observer() || line.contains("list") || line.contains("inspect") || line.contains("sessioninfo"));
+        }
+        // The note op parses too (the new op; it is not part of 0.4.3).
+        let r = parse_request(r#"{"op":"note","kind":"note","text":"hi"}"#).unwrap();
+        assert_eq!(r.op_name(), "note");
+        match r {
+            Request::Note { kind, text, client } => {
+                assert_eq!(kind, "note");
+                assert_eq!(text, "hi");
+                assert_eq!(client, None);
+            }
+            _ => panic!("expected Note"),
+        }
     }
 }

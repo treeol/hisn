@@ -25,6 +25,19 @@ use serde::{Deserialize, Serialize};
 pub const SCHEMA: &str = "hisn-session/v1";
 pub const FILE: &str = "session.json";
 
+/// 0.5.0: the supervisor's own version (A1), written at session creation as
+/// the optional `hisn_version` field. The CLI reads it to gate new fields and
+/// ops (Part A), so a new CLI talking to a still-running 0.4.3 supervisor
+/// keeps working. Set by the supervisor after construction (the constructor
+/// stays binary-agnostic for tests).
+pub const HISN_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 0.5.0: the control-protocol version this build speaks (Part A). A request
+/// that declares a higher `client.protocol_version` — or an op it does not
+/// know while declaring a version — is answered `E_VERSION`. Requests without
+/// the field are 0.4.3 and behave exactly as before.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
@@ -93,6 +106,19 @@ pub struct SessionMeta {
     pub members: Vec<Member>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<Lease>,
+    /// 0.5.0: the supervisor's version (`HISN_VERSION`), written at creation.
+    /// `None` on a pre-0.5.0 session (absent ⇒ the CLI treats the session as
+    /// 0.4.3 and gates new fields/ops; serialised as `null` like `rootfs`
+    /// — the CLI accepts both a missing field and `null`).
+    #[serde(default)]
+    pub hisn_version: Option<String>,
+    /// 0.5.0 (B1): the workspace this session belongs to (its id and readable
+    /// name). `None` on a pre-0.5.0 session. Additive only; old files without
+    /// it load unchanged (unknown/new fields are ignored by `SessionMeta`,
+    /// which deliberately has no `deny_unknown_fields` — the read side is
+    /// forward-compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::workspace::WorkspaceRef>,
     /// Session env snapshot: keys declared at `run --env K=V` (0.4.0 step 4).
     /// Values matching `looks_secret` are stored as `"<redacted>"` on disk;
     /// the real values are held in supervisor memory.
@@ -118,6 +144,8 @@ impl SessionMeta {
             members: Vec::new(),
             lease: None,
             env_declared: std::collections::BTreeMap::new(),
+            hisn_version: None,
+            workspace: None,
         }
     }
 
@@ -258,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_and_state_change() {
+    fn runtime_roots_are_the_documented_setup() {
         let d = std::env::temp_dir().join(format!("hisn-meta-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
@@ -270,6 +298,34 @@ mod tests {
         assert_eq!(back.state, State::Running);
         assert_eq!(back.schema, SCHEMA);
         assert_eq!(back.name.as_deref(), Some("nm"));
+        // 0.5.0: a fresh meta has no hisn_version (the supervisor sets it at
+        // creation) and no workspace ( likewise); both are optional on read.
+        assert_eq!(back.hisn_version, None);
+        assert_eq!(back.workspace, None);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn hisn_version_and_workspace_roundtrip() {
+        let d = std::env::temp_dir().join(format!("hisn- ver-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let mut m = SessionMeta::new("abc", None, owner(), "/w", "none");
+        m.hisn_version = Some(HISN_VERSION.to_owned());
+        m.workspace = Some(crate::workspace::WorkspaceRef {
+            id: "abc123".into(),
+            name: "proj".into(),
+        });
+        m.write_to(&d).unwrap();
+        let back = read(&d).unwrap();
+        assert_eq!(back.hisn_version.as_deref(), Some(HISN_VERSION));
+        assert_eq!(back.workspace.as_ref().unwrap().name, "proj");
+        // A meta without them (0.4.3 shape on disk) loads with None.
+        let old = r#"{"schema":"hisn-session/v1","id":"abc","name":"nm","owner":{"uid":1000,"label":"local","client_id":"c1"},"created":{"ts":"2026-11-07T12:00:00Z","by":"local"},"cwd":"/w","rootfs":null,"network":"host","state":"running"}"#;
+        fs::write(d.join(FILE), old).unwrap();
+        let m2 = read(&d).unwrap();
+        assert_eq!(m2.hisn_version, None);
+        assert_eq!(m2.workspace, None);
         fs::remove_dir_all(&d).unwrap();
     }
 

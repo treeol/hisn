@@ -73,6 +73,7 @@ pub enum Op {
     Exec,
     Signal,
     SessionInfo,
+    Note,
 }
 
 impl Op {
@@ -86,6 +87,7 @@ impl Op {
             Request::Exec { .. } => Op::Exec,
             Request::Signal { .. } => Op::Signal,
             Request::SessionInfo { .. } => Op::SessionInfo,
+            Request::Note { .. } => Op::Note,
         }
     }
 
@@ -99,6 +101,7 @@ impl Op {
             Op::Exec => "exec",
             Op::Signal => "signal",
             Op::SessionInfo => "sessioninfo",
+            Op::Note => "note",
         }
     }
 }

@@ -720,22 +720,7 @@ pub struct Query {
 pub fn query(records: &[JournalRecord], q: &Query) -> Vec<JournalRecord> {
     let mut out: Vec<JournalRecord> = records
         .iter()
-        .filter(|r| match &q.session {
-            Some(s) => &r.session == s,
-            None => true,
-        })
-        .filter(|r| match &q.seat {
-            Some(seat) => r.client.as_ref().is_some_and(|c| &c.label == seat),
-            None => true,
-        })
-        .filter(|r| match &q.kind {
-            Some(k) => &r.kind == k,
-            None => true,
-        })
-        .filter(|r| match q.since_secs {
-            Some(t) => crate::session::parse_rfc3339_secs(&r.ts).is_some_and(|s| s >= t),
-            None => true,
-        })
+        .filter(|r| matches_query(r, q))
         .cloned()
         .collect();
     if let Some(n) = q.last {
@@ -745,9 +730,18 @@ pub fn query(records: &[JournalRecord], q: &Query) -> Vec<JournalRecord> {
     out
 }
 
+fn matches_query(r: &JournalRecord, q: &Query) -> bool {
+    q.session.as_ref().is_none_or(|s| &r.session == s)
+        && q.seat
+            .as_ref()
+            .is_none_or(|seat| r.client.as_ref().is_some_and(|c| &c.label == seat))
+        && q.kind.as_ref().is_none_or(|k| &r.kind == k)
+        && q.since_secs
+            .is_none_or(|t| crate::session::parse_rfc3339_secs(&r.ts).is_some_and(|s| s >= t))
+}
+
 /// Readable query (separate from JSON's raw-record query).
 pub fn query_readable(records: &[JournalRecord], q: &Query) -> Vec<String> {
-    use std::collections::BTreeSet;
     let raw = Query {
         session: q.session.clone(),
         seat: q.seat.clone(),
@@ -761,33 +755,22 @@ pub fn query_readable(records: &[JournalRecord], q: &Query) -> Vec<String> {
     } else {
         raw
     };
-    let selected: Vec<_> = query(records, &raw)
-        .into_iter()
-        .filter(|r| {
-            !family
-                || matches!(
-                    r.kind.as_str(),
-                    "exec/request" | "exec/result" | "exec/exit"
-                )
-        })
-        .collect();
-    let keys: BTreeSet<_> = selected.iter().filter_map(collapse_key).collect();
-    let singletons: BTreeSet<_> = selected
+    // Build groups before filtering: session/start boundaries may be outside
+    // the selected time/kind window. Complete only groups with a matching record.
+    let mut lines: Vec<_> = record_groups(records)
         .iter()
-        .filter(|r| collapse_key(r).is_none())
-        .map(|r| r.wseq)
-        .collect();
-    // Pull complete groups from the retained history, even across --since or
-    // raw-kind filters. No repeated backwards scan per displayed event.
-    let complete: Vec<_> = records
-        .iter()
-        .filter(|r| match collapse_key(r) {
-            Some(k) => keys.contains(&k),
-            None => singletons.contains(&r.wseq),
+        .filter(|g| {
+            g.iter().any(|r| {
+                matches_query(r, &raw)
+                    && (!family
+                        || matches!(
+                            r.kind.as_str(),
+                            "exec/request" | "exec/result" | "exec/exit"
+                        ))
+            })
         })
-        .cloned()
+        .map(|g| render_group(g))
         .collect();
-    let mut lines = render_collapsed(&complete);
     if let Some(n) = q.last {
         lines.drain(..lines.len().saturating_sub(n));
     }
@@ -835,10 +818,9 @@ fn is_format_char(c: char) -> bool {
 
 /// The grouping key for collapsing readable output (item 3): records of
 /// one exec — its request, its result and its exit — collapse into a
-/// single line. The key is the (`session`, `seq`) pair: `seq` is the
-/// client sequence mirrored into the job-carrying records' `data`, and
-/// `session` is the record's session id. Only `exec`-family records ever
-/// carry a `seq` in `data`, so other kinds never group.
+/// single line. The base key is (`session`, `seq`), scoped by record_groups
+/// to an incarnation: ids can be reused and seq restarts on a new session.
+/// Other kinds remain singletons.
 fn collapse_key(rec: &JournalRecord) -> Option<(String, u64)> {
     let seq = rec.data.get("seq")?.as_u64()?;
     match rec.kind.as_str() {
@@ -855,26 +837,59 @@ fn collapse_key(rec: &JournalRecord) -> Option<(String, u64)> {
 /// (`--last` etc.) have already been applied by the caller, to the raw
 /// records, before collapsing.
 pub fn render_collapsed(recs: &[JournalRecord]) -> Vec<String> {
+    record_groups(recs)
+        .iter()
+        .map(|g| render_group(g))
+        .collect()
+}
+
+fn record_groups(recs: &[JournalRecord]) -> Vec<Vec<&JournalRecord>> {
     use std::collections::BTreeMap;
-    // Ordered groups: first-seen order of the collapse key / singleton.
     let mut groups: Vec<Vec<&JournalRecord>> = Vec::new();
-    let mut by_key: BTreeMap<(String, u64), usize> = BTreeMap::new();
-    for r in recs {
+    let mut incarnations: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut by_key: BTreeMap<(String, usize, u64), usize> = BTreeMap::new();
+    for (index, r) in recs.iter().enumerate() {
+        if r.kind == "session/start" {
+            incarnations.insert(&r.session, index + 1);
+        }
         match collapse_key(r) {
-            Some(k) => match by_key.get(&k) {
-                Some(&i) => groups[i].push(r),
-                None => {
-                    by_key.insert(k, groups.len());
-                    groups.push(vec![r]);
+            Some((session, seq)) => {
+                let incarnation = *incarnations.get(session.as_str()).unwrap_or(&0);
+                let key = (session, incarnation, seq);
+                let old = by_key.get(&key).copied();
+                // A missing start marker must not let a second request borrow
+                // an old exit. The actual writer's audit+argv pair is one request.
+                let new_request = old.is_some_and(|i| {
+                    matches!(r.kind.as_str(), "exec/request" | "attach/request")
+                        && groups[i].iter().any(|prior| {
+                            matches!(prior.kind.as_str(), "exec/request" | "attach/request")
+                        })
+                        && (r.data.get("argv").is_none()
+                            || groups[i].iter().any(|prior| {
+                                prior.data.get("argv").is_some()
+                                    || matches!(
+                                        prior.kind.as_str(),
+                                        "exec/result"
+                                            | "exec/exit"
+                                            | "attach/result"
+                                            | "attach/exit"
+                                    )
+                            }))
+                });
+                match old.filter(|_| !new_request) {
+                    Some(i) => groups[i].push(r),
+                    None => {
+                        by_key.insert(key, groups.len());
+                        groups.push(vec![r]);
+                    }
                 }
-            },
+            }
             None => groups.push(vec![r]),
         }
     }
-    // Order events by their newest record, so a long-running exec that just
-    // ended is not hidden among old starts. Header still identifies request.
+    // Order by newest record, not request age.
     groups.sort_by_key(|g| g.iter().map(|r| r.wseq).max().unwrap_or(0));
-    groups.iter().map(|g| render_group(g)).collect()
+    groups
 }
 
 fn render_group(g: &[&JournalRecord]) -> String {
@@ -2162,6 +2177,58 @@ mod tests {
             vec!["2026-11-14T12:00:00Z #1 abcdef01 exec local \"true\" exit:0 1ms"]
         );
         assert!(query(&records, &q).is_empty(), "JSON filter remains exact");
+    }
+
+    #[test]
+    fn polish2_reused_session_id_does_not_borrow_an_old_exit() {
+        let records = vec![
+            rec(1, "session/start", "same", None, json!({})),
+            rec(
+                2,
+                "exec/request",
+                "same",
+                Some("local"),
+                json!({"seq":1,"argv":["old"]}),
+            ),
+            rec(
+                3,
+                "exec/exit",
+                "same",
+                Some("local"),
+                json!({"seq":1,"exit_code":0,"duration_ms":1}),
+            ),
+            rec(4, "session/stop", "same", None, json!({})),
+            rec(5, "session/start", "same", None, json!({})),
+            rec(
+                6,
+                "exec/request",
+                "same",
+                Some("local"),
+                json!({"seq":1,"argv":["new"]}),
+            ),
+        ];
+        let q = Query {
+            kind: Some("exec".into()),
+            ..Query::default()
+        };
+        assert_eq!(
+            query_readable(&records, &q),
+            vec![
+                "2026-11-14T12:00:00Z #2 same exec local \"old\" exit:0 1ms",
+                "2026-11-14T12:00:00Z #6 same exec local \"new\" [open]",
+            ]
+        );
+        let q = Query { last: Some(1), ..q };
+        assert_eq!(
+            query_readable(&records, &q),
+            vec!["2026-11-14T12:00:00Z #6 same exec local \"new\" [open]",]
+        );
+        // Also separate repeated requests when a start marker was lost.
+        let no_starts: Vec<_> = records
+            .into_iter()
+            .filter(|r| r.kind.starts_with("exec/"))
+            .collect();
+        assert_eq!(render_collapsed(&no_starts).len(), 2);
     }
 
     #[test]

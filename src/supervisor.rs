@@ -2392,9 +2392,12 @@ fn run_supervisor_inner(
             },
         );
         meta.env_declared = declared_env_disk.clone();
-        // 0.5.0 (A1): record the supervisor's own version at creation, so the
-        // CLI can gate new fields/ops for still-running old sessions.
+        // 0.5.0 (A1): record the supervisor's own version (information only)
+        // and its protocol revision (the number the CLI actually compares)
+        // at creation, so the CLI can gate new fields/ops for still-running
+        // old sessions.
         meta.hisn_version = Some(sessionmeta::HISN_VERSION.to_owned());
+        meta.protocol_revision = Some(sessionmeta::PROTOCOL_REVISION);
         // 0.5.0 (B1): the workspace this session belongs to. Derived from the
         // canonical cwd (policy.cwd is already canonicalised by `resolve`),
         // or the --workspace override. The dir is created here (0700, never

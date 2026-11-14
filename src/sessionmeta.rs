@@ -26,17 +26,25 @@ pub const SCHEMA: &str = "hisn-session/v1";
 pub const FILE: &str = "session.json";
 
 /// 0.5.0: the supervisor's own version (A1), written at session creation as
-/// the optional `hisn_version` field. The CLI reads it to gate new fields and
-/// ops (Part A), so a new CLI talking to a still-running 0.4.3 supervisor
-/// keeps working. Set by the supervisor after construction (the constructor
-/// stays binary-agnostic for tests).
+/// the optional `hisn_version` field. **Information only**: it is never
+/// compared by the CLI or the supervisor (see [`PROTOCOL_REVISION`]). Set by
+/// the supervisor after construction (the constructor stays binary-agnostic
+/// for tests).
 pub const HISN_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 0.5.0: the control-protocol version this build speaks (Part A). A request
-/// that declares a higher `client.protocol_version` — or an op it does not
-/// know while declaring a version — is answered `E_VERSION`. Requests without
-/// the field are 0.4.3 and behave exactly as before.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 0.5.0: the control-protocol revision this build speaks (Part A, revised in
+/// the step-1 follow-up). This integer is the *only* version the CLI and the
+/// supervisor compare: `client.protocol_version` on the wire carries it, and
+/// `session.json` records `protocol_revision` beside `hisn_version`. A
+/// request that declares a higher revision is answered `E_VERSION`; absent
+/// means revision 1 (0.4.3 behaviour). The release version string must
+/// never be compared, so a `-dev` build can use its own feature.
+pub const PROTOCOL_REVISION: u32 = 2;
+
+/// The wire field name for the revision (`client.protocol_version`).
+/// Kept as the historical field name; there is one concept — the protocol
+/// revision — and one number, declared here.
+pub const PROTOCOL_VERSION: u32 = PROTOCOL_REVISION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -107,11 +115,17 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<Lease>,
     /// 0.5.0: the supervisor's version (`HISN_VERSION`), written at creation.
-    /// `None` on a pre-0.5.0 session (absent ⇒ the CLI treats the session as
-    /// 0.4.3 and gates new fields/ops; serialised as `null` like `rootfs`
-    /// — the CLI accepts both a missing field and `null`).
+    /// **Information only** — never compared (see [`PROTOCOL_REVISION`]).
+    /// `None` on a pre-0.5.0 session (serialised as `null` like `rootfs` —
+    /// the CLI accepts both a missing field and `null`).
     #[serde(default)]
     pub hisn_version: Option<String>,
+    /// 0.5.0: the supervisor's protocol revision (`PROTOCOL_REVISION`),
+    /// written at creation beside `hisn_version`. This integer — not the
+    /// version string — is what the CLI compares to decide whether it may
+    /// send `protocol_version`/new ops. `None`/absent = revision 1 (0.4.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_revision: Option<u32>,
     /// 0.5.0 (B1): the workspace this session belongs to (its id and readable
     /// name). `None` on a pre-0.5.0 session. Additive only; old files without
     /// it load unchanged (unknown/new fields are ignored by `SessionMeta`,
@@ -145,6 +159,7 @@ impl SessionMeta {
             lease: None,
             env_declared: std::collections::BTreeMap::new(),
             hisn_version: None,
+            protocol_revision: None,
             workspace: None,
         }
     }
@@ -312,6 +327,7 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         let mut m = SessionMeta::new("abc", None, owner(), "/w", "none");
         m.hisn_version = Some(HISN_VERSION.to_owned());
+        m.protocol_revision = Some(PROTOCOL_REVISION);
         m.workspace = Some(crate::workspace::WorkspaceRef {
             id: "abc123".into(),
             name: "proj".into(),
@@ -319,14 +335,27 @@ mod tests {
         m.write_to(&d).unwrap();
         let back = read(&d).unwrap();
         assert_eq!(back.hisn_version.as_deref(), Some(HISN_VERSION));
+        assert_eq!(back.protocol_revision, Some(PROTOCOL_REVISION));
         assert_eq!(back.workspace.as_ref().unwrap().name, "proj");
         // A meta without them (0.4.3 shape on disk) loads with None.
         let old = r#"{"schema":"hisn-session/v1","id":"abc","name":"nm","owner":{"uid":1000,"label":"local","client_id":"c1"},"created":{"ts":"2026-11-07T12:00:00Z","by":"local"},"cwd":"/w","rootfs":null,"network":"host","state":"running"}"#;
         fs::write(d.join(FILE), old).unwrap();
         let m2 = read(&d).unwrap();
         assert_eq!(m2.hisn_version, None);
+        assert_eq!(m2.protocol_revision, None);
         assert_eq!(m2.workspace, None);
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn protocol_revision_is_two_and_the_version_string_is_never_the_gate() {
+        // Item 1: the gate is the integer revision, not the release version.
+        // This build is `0.5.0-dev` (Cargo.toml) and must still declare
+        // revision 2 so its own CLI can use its own feature.
+        assert_eq!(PROTOCOL_REVISION, 2);
+        assert_eq!(crate::control::PROTOCOL_VERSION, 2);
+        // A dev version string does not lower the revision.
+        assert!(HISN_VERSION.contains("0.5.0"));
     }
 
     #[test]

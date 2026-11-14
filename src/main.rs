@@ -317,13 +317,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 a.text
             };
             let kind = if a.marker { "marker" } else { "note" };
-            // Version-gated (A2/B6): the new CLI sends `protocol_version` and,
-            // only when the session declares 0.5.0, the `note` op. A
-            // pre-0.5.0 session never sees an unknown op; the CLI prints that
-            // the session predates the feature.
-            if !session_supports_version(&a.session) {
+            // Revision-gated (A2/B6): the new CLI sends `protocol_version`
+            // and, only when the session declares protocol revision 2, the
+            // `note` op. A revision-1 (0.4.3) session never sees an unknown
+            // op; the CLI prints that the session predates the feature.
+            // `hisn_version` is never compared (information only).
+            if !session_supports_revision(&a.session) {
                 eprintln!(
-                    "hisn: session {} predates the note op (hisn_version < 0.5.0); not sent",
+                    "hisn: session {} predates the note op (protocol revision < 2); not sent",
                     a.session
                 );
                 return Ok(ExitCode::from(2));
@@ -750,33 +751,23 @@ fn read_session_policy(path: &Path) -> Option<Value> {
     serde_json::from_str(&json_str).ok()
 }
 
-/// 0.5.0 (A2): does the session's `session.json` declare a hisn version that
-/// introduced `protocol_version`/new ops? Absent or older than 0.5.0 ⇒ the
-/// new CLI must not send the new field/op to that supervisor (A2b/A5).
-fn session_supports_version(session_arg: &str) -> bool {
-    session_version(session_arg).is_some_and(|v| version_at_least_05(&v))
+/// 0.5.0 (A2): does the session's `session.json` declare protocol revision 2
+/// (the revision that introduced `protocol_version`/new ops)? Absent = revision
+/// 1 (0.4.3) ⇒ the new CLI must not send the new field/op (A2b/A5). The
+/// `hisn_version` string is never compared — a `-dev` build declares
+/// revision 2 regardless of its version string.
+fn session_supports_revision(session_arg: &str) -> bool {
+    session_revision(session_arg).is_some_and(|r| r >= 2)
 }
 
-/// The `hisn_version` recorded in the session's `session.json`, if present.
-fn session_version(session_arg: &str) -> Option<String> {
+/// The `protocol_revision` recorded in the session's `session.json`, if present.
+fn session_revision(session_arg: &str) -> Option<u32> {
     let uid = rustix::process::getuid().as_raw();
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     let reg_root = hisn::registry::registry_root(uid);
     let id = session::resolve_session_arg(&roots, &reg_root, session_arg).ok()?;
     let dir = session::find_session(&roots, &id).ok()?;
-    hisn::sessionmeta::read(&dir).and_then(|m| m.hisn_version)
-}
-
-/// Is `v` ("0.5.0" or later)? Unknown shapes are treated as older (never send
-/// a new field on doubt).
-fn version_at_least_05(v: &str) -> bool {
-    let parts: Vec<&str> = v.split('.').collect();
-    if parts.len() < 2 {
-        return false;
-    }
-    let major: u32 = parts[0].parse().unwrap_or(0);
-    let minor: u32 = parts[1].parse().unwrap_or(0);
-    (major, minor) >= (0, 5)
+    hisn::sessionmeta::read(&dir).and_then(|m| m.protocol_revision)
 }
 
 /// `hisn journal` (B7): read the workspace journal host-side and print it.

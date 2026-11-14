@@ -37,11 +37,11 @@ pub const E_INTERNAL: &str = "E_INTERNAL";
 pub const E_UNAUTHORIZED: &str = "E_UNAUTHORIZED";
 /// The program could not be started (confinement failed, not found, not executable).
 pub const E_EXEC: &str = "E_EXEC";
-/// The request declares a protocol version (or, with a declared version, an
-/// op) the supervisor does not support (0.5.0, Part A). The message names the
-/// supported version. This error is emitted by the supervisor before dispatch
-/// and is **not** a CLI exit code: the CLI maps any failed response through
-/// `print_response` exactly as before.
+/// The request declares a protocol revision the supervisor does not support
+/// (0.5.0, Part A). The message names the supported revision. This error is
+/// emitted by the supervisor before dispatch and is **not** a CLI exit code:
+/// the CLI maps any failed response through `print_response` exactly as
+/// before.
 pub const E_VERSION: &str = "E_VERSION";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -141,9 +141,10 @@ pub enum Request {
     },
     /// 0.5.0 (Part B): append a note or marker to the session's workspace
     /// journal. `kind` is `"note"` or `"marker"`; `text` is at most 8 KiB,
-    /// stored and returned verbatim, never parsed or executed. Version-gated:
-    /// only a client that declares the version that introduced it sends it
-    /// (Part A), and the supervisor answers `E_VERSION` otherwise.
+    /// stored and returned verbatim, never parsed or executed. Revision-gated
+    /// at the CLI (Part A): only a client whose session declares protocol
+    /// revision 2 sends it. The supervisor itself accepts the op from any
+    /// caller that passes the authorization seam.
     Note {
         kind: String,
         text: String,
@@ -152,43 +153,33 @@ pub enum Request {
     },
 }
 
-/// The highest protocol version this build speaks (Part A).
-pub const PROTOCOL_VERSION: u32 = crate::sessionmeta::PROTOCOL_VERSION;
+/// The highest protocol revision this build speaks (Part A). One concept,
+/// one number: `crate::sessionmeta::PROTOCOL_REVISION`.
+pub const PROTOCOL_VERSION: u32 = crate::sessionmeta::PROTOCOL_REVISION;
 
-/// The version gate (Part A): given the request's declared
-/// `client.protocol_version` and whether the op is one this supervisor knows,
-/// decide whether to answer `E_VERSION` before dispatch.
+/// The version gate (Part A): decide, from the request's declared
+/// `client.protocol_version`, whether to answer `E_VERSION` before dispatch.
 ///
 /// - No declared version ⇒ a 0.4.3 client ⇒ always pass (exactly as before).
-/// - Declared version newer than this supervisor supports ⇒ `E_VERSION`.
-/// - Declared version of at most [`PROTOCOL_VERSION`] and a known op ⇒ pass.
-/// - Declared version of at most [`PROTOCOL_VERSION`] but an op this
-///   supervisor does not know ⇒ `E_VERSION` (the op was introduced later than
-///   the declared version this supervisor accepts, or is from the future).
+/// - Declared revision newer than this supervisor supports ⇒ `E_VERSION`.
+/// - Declared revision at most [`PROTOCOL_VERSION`] ⇒ pass.
 ///
-/// The "unknown op" case reaches here only when the request line parses as a
-/// `Request` (so the op is one of the known variants); an *unknown* op string
-/// fails parsing before this and the connection is closed with
-/// `E_BAD_REQUEST` exactly as in 0.4.3 (verified Phase 0). The gate therefore
-/// guards the fields and the version declaration, not the op string — which
-/// is correct: a 0.4.3 supervisor that never sees `protocol_version` simply
-/// never runs this check, and a 0.5.0 supervisor that sees it enforces it.
-pub fn version_gate(declared: Option<u32>, op_known: bool) -> Result<(), String> {
+/// An *unknown op string* never reaches this gate: it fails `parse_request`
+/// first and the connection is closed with `E_BAD_REQUEST` exactly as in
+/// 0.4.3. There is therefore no "`E_VERSION` for an unknown op" rule — the
+/// earlier spec claimed one, but the branch was unreachable (the only
+/// caller passed `op_known = true` unconditionally), so the rule was
+/// removed rather than made reachable: teaching the gate to peek at an
+/// unparseable line would be new machinery serving no client that can
+/// declare a revision today (a 0.4.3 client declares nothing, and gets
+/// `E_BAD_REQUEST` + close either way, unchanged).
+pub fn version_gate(declared: Option<u32>) -> Result<(), String> {
     match declared {
         None => Ok(()),
-        Some(v) => {
-            if v > PROTOCOL_VERSION {
-                return Err(format!(
-                    "protocol_version {v} is newer than the supported version {PROTOCOL_VERSION}"
-                ));
-            }
-            if !op_known {
-                return Err(format!(
-                    "op is not supported by protocol_version {v} (supported {PROTOCOL_VERSION})"
-                ));
-            }
-            Ok(())
-        }
+        Some(v) if v > PROTOCOL_VERSION => Err(format!(
+            "protocol_version {v} is newer than the supported revision {PROTOCOL_VERSION}"
+        )),
+        Some(_) => Ok(()),
     }
 }
 
@@ -197,11 +188,12 @@ pub fn version_gate(declared: Option<u32>, op_known: bool) -> Result<(), String>
 /// `uid` is not a field here (nor in the request): uid comes only from
 /// SO_PEERCRED. A request whose `client` object contains `uid` is refused.
 ///
-/// 0.5.0 (Part A): `protocol_version` is an optional, additive field. A
-/// request that declares a version newer than the supervisor (or, while
-/// declaring a version, uses an op the supervisor does not know) is answered
-/// `E_VERSION`. Requests without the field are treated as 0.4.3 and behave
-/// exactly as before. It has `#[serde(default)]` so old clients that never
+/// 0.5.0 (Part A): `protocol_version` is an optional, additive field carrying
+/// the protocol revision (one concept, one number —
+/// `sessionmeta::PROTOCOL_REVISION`). A request that declares a revision
+/// newer than the supervisor's is answered `E_VERSION`. Requests without the
+/// field are treated as revision 1 (0.4.3) and behave exactly as before. It
+/// has `#[serde(default)]` so old clients that never
 /// send it and new clients talking to old supervisors that ignore unknown
 /// fields both parse; a *new* supervisor still refuses an unknown field that
 /// is not `protocol_version` (deny_unknown_fields is kept).
@@ -211,8 +203,8 @@ pub struct ClientField {
     pub label: Option<String>,
     pub label_source: Option<String>,
     pub req_id: Option<String>,
-    /// 0.5.0 (Part A): the control-protocol version the client speaks.
-    /// `None` = a 0.4.3 client. Additive, backwards compatible both ways.
+    /// 0.5.0 (Part A): the protocol revision the client speaks.
+    /// `None` = revision 1 (a 0.4.3 client). Additive, both directions.
     #[serde(default)]
     pub protocol_version: Option<u32>,
 }
@@ -557,15 +549,14 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
             Ok(req) => {
                 // 0.5.0 (Part A): the version gate. A request that declares a
                 // protocol_version newer than this supervisor, or that uses an
-                // op this supervisor does not know while declaring a version,
                 // is answered E_VERSION (machine-readable, naming the
-                // supported version) *before* any effect and before the
+                // supported revision) *before* any effect and before the
                 // connection counts as a client. Requests without the field
-                // are 0.4.3 and fall straight through, exactly as before. The
-                // op is always known here (it parsed as a Request); an
-                // unknown op string was already refused above with
-                // E_BAD_REQUEST and connection close (0.4.3 behaviour).
-                if let Err(msg) = version_gate(req.declared_version(), true) {
+                // are 0.4.3 and fall straight through, exactly as before.
+                // An unknown op string never reaches this gate: it fails
+                // parsing above with E_BAD_REQUEST and connection close
+                // (0.4.3 behaviour, unchanged).
+                if let Err(msg) = version_gate(req.declared_version()) {
                     let _ = writeln!(out, "{}", err(E_VERSION, msg));
                     continue;
                 }
@@ -1558,8 +1549,8 @@ mod tests {
     // ---- 0.5.0 (Part A): the version gate.
 
     /// `protocol_version` is additive: a 0.4.3-shaped request still parses and
-    /// the field defaults to `None`; a request that declares it parses with
-    /// the value.
+    /// the field defaults to `None` (revision 1); a request that declares
+    /// the current revision parses with the value.
     #[test]
     fn protocol_version_is_additive_and_defaults_to_none() {
         // 0.4.3 shape: no client at all.
@@ -1569,12 +1560,13 @@ mod tests {
         let r =
             parse_request(r#"{"op":"list","client":{"label":"x","label_source":"flag"}}"#).unwrap();
         assert_eq!(r.declared_version(), None);
-        // 0.5.0 shape: protocol_version present.
+        // Current revision declared.
         let r = parse_request(
-            r#"{"op":"list","client":{"label":"x","label_source":"flag","protocol_version":1}}"#,
+            r#"{"op":"list","client":{"label":"x","label_source":"flag","protocol_version":2}}"#,
         )
         .unwrap();
-        assert_eq!(r.declared_version(), Some(1));
+        assert_eq!(r.declared_version(), Some(2));
+        assert_eq!(PROTOCOL_VERSION, 2, "this build declares revision 2");
         // `protocol_version` is the one new field; anything else in `client`
         // is still refused (deny_unknown_fields kept).
         assert!(
@@ -1586,29 +1578,31 @@ mod tests {
     }
 
     /// The version gate's own truth table (pure; over serve_conn's call).
+    /// Absent declares revision 1 (0.4.3); this build declares 2.
     #[test]
     fn version_gate_truth_table() {
-        // No declaration ⇒ 0.4.3 ⇒ always pass.
-        assert!(version_gate(None, true).is_ok());
-        assert!(version_gate(None, false).is_ok());
-        // Declared and supported.
-        assert!(version_gate(Some(1), true).is_ok());
-        assert!(version_gate(Some(0), true).is_ok());
+        // No declaration ⇒ 0.4.3 (revision 1) ⇒ always pass.
+        assert!(version_gate(None).is_ok());
+        // Declared and supported (1 and the current revision).
+        assert!(version_gate(Some(1)).is_ok());
+        assert!(version_gate(Some(PROTOCOL_VERSION)).is_ok());
         // Declared newer than the supervisor.
-        let e = version_gate(Some(2), true).unwrap_err();
-        assert!(e.contains("PROTOCOL_VERSION") || e.contains("2"), "{e}");
-        // Declared, supported version, unknown op.
-        assert!(version_gate(Some(1), false).is_err());
+        let e = version_gate(Some(PROTOCOL_VERSION + 1)).unwrap_err();
+        assert!(e.contains(&format!("{PROTOCOL_VERSION}")), "{e}");
     }
 
-    /// A request declaring a newer version is answered `E_VERSION` before
+    /// A request declaring a newer revision is answered `E_VERSION` before
     /// dispatch (the handler never sees it), and a normal 0.4.3-shaped
     /// request is dispatched unchanged.
     #[test]
     fn a_newer_version_is_answered_e_version_before_dispatch() {
         let (_d, sock, h) = start(true);
-        // 0.5.0 shape declaring v2.
-        let v = request(&sock, &json!({"op":"list","client":{"protocol_version":2}})).unwrap();
+        // Declaring a revision newer than this build's.
+        let v = request(
+            &sock,
+            &json!({"op":"list","client":{"protocol_version": PROTOCOL_VERSION + 1}}),
+        )
+        .unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(v["error"], E_VERSION);
         // The message names the supported version (the protocol constant).

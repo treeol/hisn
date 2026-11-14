@@ -78,7 +78,7 @@ Error response: `{"ok":false,"error":"<CODE>","message":"…"}`.
 | `E_INTERNAL` | the sandbox failed (setup, a hard revoke that could not complete — the session is then killed, a supervisor error). |
 | `E_UNAUTHORIZED` | the authorization seam refused the request (the peer was not the session owner in 0.4; see DESIGN §9). |
 | `E_EXEC` | the program could not be started (confinement failed, not found, not executable). |
-| `E_VERSION` | **0.5.0**: the request declares a version or, while declaring a version, an op the supervisor does not support. The message names the supported version. See "Version rule". |
+| `E_VERSION` | **0.5.0**: the request declares a protocol revision newer than the supervisor supports. The message names the supported revision. See "Version rule". An unknown op string is never `E_VERSION`: it fails parsing first and is answered `E_BAD_REQUEST` + close, exactly as in 0.4.3. |
 
 There are no CLI exit codes for these wire errors: a client maps a failed
 response through its own exit-code policy (the `hisn` CLI prints the response
@@ -194,7 +194,7 @@ program's process group. `E_NOT_FOUND` for a stale `exec_id`, a recycled
 ### `note` (0.5.0)
 
 ```json
-{"op":"note","kind":"note","text":"…","client":{"protocol_version":1}}
+{"op":"note","kind":"note","text":"…","client":{"protocol_version":2}}
 ```
 
 `kind` is `"note"` or `"marker"`; `text` is at most 8 KiB (8192 bytes).
@@ -207,35 +207,47 @@ response, because the journal write *is* the operation). A `kind` other than
 
 ## Version rule (0.5.0)
 
-`client.protocol_version` is an optional integer. It is **additive and
-backwards compatible in both directions**:
+`client.protocol_version` is an optional integer: the **protocol revision**.
+One concept, one number (declared once, as `PROTOCOL_REVISION` in
+`src/sessionmeta.rs`; the wire field keeps the historical name
+`protocol_version`). It is **additive and backwards compatible in both
+directions**:
 
 - The supervisor records its own version in `session.json` as the optional
-  `hisn_version` field (e.g. `"0.5.0"`), written at session creation. A
-  pre-0.5.0 `session.json` has no such field (or a `null`).
-- The CLI reads that field **before** talking to a session. When it is absent
-  or older than the version that introduced a field or op, the CLI does not
-  send the field/op and prints that the session predates the feature. So a
-  0.5.0 CLI against a still-running 0.4.3 supervisor behaves exactly as 0.4.3
-  for the old ops, and for a new op (`note`) it refuses locally rather than
-  sending an op the old supervisor would close.
-- The supervisor speaks protocol version `1` (`PROTOCOL_VERSION` in
-  `sessionmeta.rs`). A request that declares a version **newer** than the
-  supervisor, or that — while declaring a version — uses an op the supervisor
-  does not know, is answered `{"ok":false,"error":"E_VERSION", …}` naming the
-  supported version, before any effect and before the connection counts as a
-  client. Requests without the field are treated as 0.4.3 and behave exactly
-  as before.
+  `hisn_version` field (e.g. `"0.5.0-dev"`) and its protocol revision as
+  `protocol_revision` (this build: `2`), both written at session creation.
+  A pre-0.5.0 `session.json` has neither field (or a `null`).
+- `hisn_version` is **information only and is never compared** — not by the
+  CLI, not by the supervisor. The gate is the integer revision: that is what
+  lets a `-dev` build use its own feature (a version-string comparison would
+  refuse `note` on every session a pre-bump build creates).
+- The CLI reads `protocol_revision` **before** talking to a session. When it
+  is absent (= revision 1, i.e. 0.4.3) or below the revision that
+  introduced a field or op, the CLI does not send the field/op and prints
+  that the session predates the feature. So a 0.5.0 CLI against a
+  still-running 0.4.3 supervisor behaves exactly as 0.4.3 for the old ops,
+  and for a new op (`note`) it refuses locally rather than sending an op the
+  old supervisor would close.
+- The supervisor speaks protocol revision `2`. A request that declares a
+  revision **newer** than the supervisor's is answered
+  `{"ok":false,"error":"E_VERSION", …}` naming the supported revision,
+  before any effect and before the connection counts as a client. Requests
+  without the field are treated as revision 1 (0.4.3) and behave exactly as
+  before. There is no "`E_VERSION` for an unknown op" case: an unknown op
+  string fails parsing before the gate and is answered `E_BAD_REQUEST` +
+  close, unchanged from 0.4.3.
 - `session.json` itself is forward-compatible on the read side: it has no
-  `deny_unknown_fields`, so a 0.4.3 reader ignores the new `hisn_version` and
-  `workspace` fields, and a 0.5.0 reader loads a 0.4.3 file with `None`.
+  `deny_unknown_fields`, so a 0.4.3 reader ignores the new `hisn_version`,
+  `protocol_revision` and `workspace` fields, and a 0.5.0 reader loads a
+  0.4.3 file with `None`.
 
 ## `ls --json` (the on-disk schema)
 
 `hisn ls --json` prints `{"schema":"hisn-ls/v2","sessions":[…]}`.
 The v1 fields are kept unchanged; v2 adds `clients`, live `execs` (with
-`attach`), `services`, `rootfs`, `members`, `lease`. 0.5.0 adds two additive
-fields per session: `hisn_version` (the recorded version, or `null`) and
+`attach`), `services`, `rootfs`, `members`, `lease`. 0.5.0 adds three additive
+fields per session: `hisn_version` (the recorded version, information only,
+or `null`), `protocol_revision` (the recorded revision, or `null`) and
 `workspace` (`{"id","name"}`) plus a `journal` summary (`{dir,files,bytes}`).
 No field is renamed, retyped or removed, so a 0.4.3 client reading a 0.5.0
 `ls --json` sees the same keys and values for the ones it knows.
@@ -245,7 +257,7 @@ No field is renamed, retyped or removed, so a 0.4.3 client reading a 0.5.0
 | direction | behaviour |
 | --- | --- |
 | 0.4.3 client → 0.5.0 supervisor | Same request and response bytes for the 8 existing ops. `E_VERSION` is only ever answered to a request that declares a version, which a 0.4.3 client never sends. |
-| 0.5.0 CLI → 0.4.3 supervisor | The CLI reads `hisn_version` (absent) and so does not send `protocol_version` nor the `note` op. The 8 old ops are byte-identical. |
+| 0.5.0 CLI → 0.4.3 supervisor | The CLI reads `protocol_revision` (absent = 1) and so does not send `protocol_version` nor the `note` op. The 8 old ops are byte-identical. |
 | `grants.jsonl` | Unchanged in format and path. The journal is written *in addition*, never instead. |
 | `session.json` | Additive optional fields only; old files load unchanged. |
 | `ls --json` | Additive keys only; no field changed or removed. |

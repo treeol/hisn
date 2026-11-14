@@ -1656,4 +1656,121 @@ mod tests {
             _ => panic!("expected Note"),
         }
     }
+
+    // ---- Item 7: spec and code cannot drift.
+    //
+    // Every fenced JSON example in docs/CONTROL-PROTOCOL.md is extracted
+    // from the document text itself (via include_str!) and parsed through
+    // the real types: a block carrying `"op"` must parse as a `Request`
+    // whose `op_name()` matches the `### `op`` heading above it; the one
+    // op-less block (the `client` field example) must parse as a
+    // `ClientField`. If the doc names an op the code does not know (or
+    // vice versa), this fails.
+
+    const PROTOCOL_DOC: &str = include_str!("../docs/CONTROL-PROTOCOL.md");
+
+    /// All fenced ```json blocks, in document order.
+    fn doc_json_blocks(doc: &str) -> Vec<&str> {
+        let mut blocks = Vec::new();
+        let mut rest = doc;
+        while let Some(start) = rest.find("```json") {
+            let after = &rest[start + "```json".len()..];
+            let Some(end) = after.find("```") else {
+                break;
+            };
+            blocks.push(after[..end].trim());
+            rest = &after[end + "```".len()..];
+        }
+        blocks
+    }
+
+    #[test]
+    fn every_documented_request_example_parses_through_the_real_types() {
+        let blocks = doc_json_blocks(PROTOCOL_DOC);
+        let mut ops_seen = Vec::new();
+        let mut client_blocks = 0;
+        for block in &blocks {
+            let v: Value = serde_json::from_str(block)
+                .unwrap_or_else(|e| panic!("doc block is not JSON: {block:?}: {e}"));
+            if let Some(op) = v.get("op").and_then(|o| o.as_str()) {
+                let req = parse_request(block).unwrap_or_else(|e| {
+                    panic!("documented {op} example must parse: {block:?}: {e}")
+                });
+                assert_eq!(
+                    req.op_name(),
+                    op,
+                    "op_name must match the example: {block:?}"
+                );
+                ops_seen.push(op.to_owned());
+                if op == "note" {
+                    assert_eq!(
+                        req.declared_version(),
+                        Some(PROTOCOL_VERSION),
+                        "the documented note example must declare this build's revision"
+                    );
+                }
+            } else {
+                client_blocks += 1;
+                let field: crate::control::ClientField = serde_json::from_str(block)
+                    .unwrap_or_else(|e| {
+                        panic!("client-field example must parse as ClientField: {block:?}: {e}")
+                    });
+                assert_eq!(field.label.as_deref(), Some("wakil@rubin"));
+                assert_eq!(field.label_source.as_deref(), Some("ssh"));
+                assert_eq!(field.req_id.as_deref(), Some("7f3a"));
+            }
+        }
+        // The doc documents exactly the 9 ops (8 of 0.4.3 + note) and one
+        // client field example. Adding an op to either side without the
+        // other fails here.
+        assert_eq!(
+            ops_seen,
+            [
+                "grant",
+                "revoke",
+                "list",
+                "inspect",
+                "sessioninfo",
+                "kill",
+                "exec",
+                "signal",
+                "note"
+            ],
+            "documented ops must be exactly the code's ops"
+        );
+        assert_eq!(client_blocks, 1, "exactly one client-field example");
+    }
+
+    #[test]
+    fn documented_error_codes_match_the_real_constants() {
+        // The error table in the doc must name exactly the E_* constants
+        // in this module — no more, no fewer.
+        let real = [
+            E_BAD_REQUEST,
+            E_PATH_FORBIDDEN,
+            E_NOT_FOUND,
+            E_NOT_GRANTABLE,
+            E_EXISTS,
+            E_NOT_GRANTED,
+            E_HELD,
+            E_INTERNAL,
+            E_UNAUTHORIZED,
+            E_EXEC,
+            E_VERSION,
+        ];
+        for code in real {
+            assert!(
+                PROTOCOL_DOC.contains(&format!("`{code}`")),
+                "error table must document {code}"
+            );
+        }
+        // And no table row may name a code this module does not define:
+        // every `` `E_...` `` token in the doc must be one of `real`.
+        for token in PROTOCOL_DOC.split('`').filter(|t| t.starts_with("E_")) {
+            assert!(
+                real.contains(&token),
+                "doc names unknown error code {token:?}"
+            );
+        }
+    }
 }

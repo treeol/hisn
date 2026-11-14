@@ -880,9 +880,23 @@ fn render_group(g: &[&JournalRecord]) -> String {
     )
 }
 
-/// The per-kind short summary for one record (all agent-supplied strings
-/// terminal-escaped; `escape_terminal` is the only thing between journal
-/// content and the reader's terminal).
+/// Quote one argv element for readable output (Mashūra round 2, "argv
+/// can forge the rest of the line"): every element is wrapped in double
+/// quotes with `\` and `"` escaped, so a command line can never fake an
+/// `exit:0`, `[open]` or `(cwd …)` annotation, and element boundaries
+/// survive. Control characters are terminal-escaped on top.
+fn quote_arg(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    escape_terminal(&out)
+}
 fn summary_for(rec: &JournalRecord) -> String {
     let d = &rec.data;
     match rec.kind.as_str() {
@@ -893,11 +907,12 @@ fn summary_for(rec: &JournalRecord) -> String {
                 .map(|a| {
                     a.iter()
                         .filter_map(|v| v.as_str())
+                        .map(quote_arg)
                         .collect::<Vec<_>>()
                         .join(" ")
                 })
                 .unwrap_or_default();
-            let mut s = escape_terminal(&cmd);
+            let mut s = cmd;
             if d.get("argv_truncated").and_then(|v| v.as_bool()) == Some(true) {
                 s.push_str(" …(truncated)");
             }
@@ -1962,7 +1977,9 @@ mod tests {
             "triple must collapse to one line: {lines:?}"
         );
         let l = &lines[0];
-        assert!(l.contains("sh -c echo hi"), "command line: {l}");
+        assert!(l.contains("\"sh\""), "quoted argv: {l}");
+        assert!(l.contains("\"-c\""), "quoted argv: {l}");
+        assert!(l.contains("\"echo hi\""), "quoted argv: {l}");
         assert!(l.contains("/work/proj"), "cwd: {l}");
         assert!(l.contains("exit:0"), "exit code: {l}");
         assert!(l.contains("120ms"), "duration: {l}");
@@ -1983,7 +2000,7 @@ mod tests {
         let lines = render_collapsed(&[req]);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("[open]"), "open marker: {}", lines[0]);
-        assert!(lines[0].contains("sleep 30"), "command: {}", lines[0]);
+        assert!(lines[0].contains("\"sleep\""), "command: {}", lines[0]);
     }
 
     #[test]
@@ -2111,6 +2128,75 @@ mod tests {
         assert!(
             lines[0].contains("nonexistent"),
             "command shown: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn readable_argv_cannot_forge_renderer_annotations() {
+        // Mashūra round 2: an argument that looks like an annotation must
+        // stay inside the quotes, and element boundaries must survive.
+        let req = rec(
+            1,
+            "exec/request",
+            "abcdef0123456789",
+            Some("local"),
+            json!({
+                "op": "exec", "stage": "request", "seq": 7,
+                "argv": ["sh", "-c", "echo exit:0 [open] (cwd /safe)"],
+            }),
+        );
+        let lines = render_collapsed(&[req]);
+        let l = &lines[0];
+        assert!(
+            l.contains("\"echo exit:0 [open] (cwd /safe)\""),
+            "forged text stays quoted: {l}"
+        );
+        assert_eq!(
+            l.matches("[open]").count(),
+            2,
+            "one in the quoted argv, one the renderer's open marker: {l}"
+        );
+        assert!(l.ends_with(" [open]"), "renderer marker is the suffix: {l}");
+        assert!(
+            l.contains("\"echo exit:0 [open] (cwd /safe)\" [open]"),
+            "quoted argv ends, then the renderer marker: {l}"
+        );
+        let req = rec(
+            2,
+            "exec/request",
+            "abcdef0123456789",
+            Some("local"),
+            json!({
+                "op": "exec", "stage": "request", "seq": 8,
+                "argv": ["a\"b", "c\\d"],
+            }),
+        );
+        let lines = render_collapsed(&[req]);
+        assert!(
+            lines[0].contains("\"a\\\"b\""),
+            "quote escaped: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("\"c\\\\d\""),
+            "backslash escaped: {}",
+            lines[0]
+        );
+        let req = rec(
+            3,
+            "exec/request",
+            "abcdef0123456789",
+            Some("local"),
+            json!({
+                "op": "exec", "stage": "request", "seq": 9,
+                "argv": ["", "x"],
+            }),
+        );
+        let lines = render_collapsed(&[req]);
+        assert!(
+            lines[0].contains("\"\" \"x\""),
+            "empty element: {}",
             lines[0]
         );
     }

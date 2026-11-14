@@ -825,11 +825,13 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
         last: a.last,
     };
     let out = journal::query(&recs, &q);
-    for r in &out {
-        if a.json {
+    if a.json {
+        for r in &out {
             println!("{}", serde_json::to_string(r)?);
-        } else {
-            println!("{}", journal::render(r));
+        }
+    } else {
+        for line in journal::render_collapsed(&out) {
+            println!("{line}");
         }
     }
     if skipped > 0 {

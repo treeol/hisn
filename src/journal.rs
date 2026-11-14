@@ -757,12 +757,240 @@ fn is_format_char(c: char) -> bool {
     )
 }
 
+/// The grouping key for collapsing readable output (item 3): records of
+/// one exec — its request, its result and its exit — collapse into a
+/// single line. The key is the (`session`, `seq`) pair: `seq` is the
+/// client sequence mirrored into the job-carrying records' `data`, and
+/// `session` is the record's session id. Only `exec`-family records ever
+/// carry a `seq` in `data`, so other kinds never group.
+fn collapse_key(rec: &JournalRecord) -> Option<(String, u64)> {
+    let seq = rec.data.get("seq")?.as_u64()?;
+    match rec.kind.as_str() {
+        "exec/request" | "exec/result" | "exec/exit" | "attach/request" | "attach/result"
+        | "attach/exit" => Some((rec.session.clone(), seq)),
+        _ => None,
+    }
+}
+
+/// Render the selected records for readable output (item 3): one compact
+/// line per event. A request, its result and its exit with the same
+/// session and `seq` collapse into one line; a request with no result or
+/// exit in the selected window is shown alone and marked open. Filters
+/// (`--last` etc.) have already been applied by the caller, to the raw
+/// records, before collapsing.
+pub fn render_collapsed(recs: &[JournalRecord]) -> Vec<String> {
+    use std::collections::BTreeMap;
+    // Ordered groups: first-seen order of the collapse key / singleton.
+    let mut groups: Vec<Vec<&JournalRecord>> = Vec::new();
+    let mut by_key: BTreeMap<(String, u64), usize> = BTreeMap::new();
+    for r in recs {
+        match collapse_key(r) {
+            Some(k) => match by_key.get(&k) {
+                Some(&i) => groups[i].push(r),
+                None => {
+                    by_key.insert(k, groups.len());
+                    groups.push(vec![r]);
+                }
+            },
+            None => groups.push(vec![r]),
+        }
+    }
+    groups.iter().map(|g| render_group(g)).collect()
+}
+
+fn render_group(g: &[&JournalRecord]) -> String {
+    // The head record defines time, wseq, session and seat. With several
+    // records, the first is the request (or the oldest present).
+    let head = g[0];
+    let client = head
+        .client
+        .as_ref()
+        .map(|c| escape_terminal(&c.label))
+        .unwrap_or_else(|| "-".to_owned());
+    let mut summary = String::new();
+    if g.len() == 1 {
+        // A lone record: the request shows as open when it is an exec
+        // request (its result/exit are outside the selected window).
+        summary.push_str(&summary_for(head));
+        if head.kind == "exec/request" || head.kind == "attach/request" {
+            summary.push_str(" [open]");
+        }
+    } else {
+        // Collapsed: request summary, then exit code/duration when known.
+        for r in g {
+            match r.kind.as_str() {
+                "exec/request" | "attach/request" => {
+                    summary.push_str(&summary_for(r));
+                }
+                "exec/exit" | "attach/exit" => {
+                    if !summary.is_empty() {
+                        summary.push(' ');
+                    }
+                    summary.push_str(&exit_summary(r));
+                }
+                _ => {}
+            }
+        }
+        // A group with a request but no exit so far is still open.
+        let has_exit = g
+            .iter()
+            .any(|r| r.kind == "exec/exit" || r.kind == "attach/exit");
+        if !has_exit {
+            summary.push_str(" [open]");
+        }
+    }
+    format!(
+        "{} #{} {} {} {} {}",
+        escape_terminal(&head.ts),
+        head.wseq,
+        escape_terminal(&head.session.chars().take(8).collect::<String>()),
+        escape_terminal(&head.kind),
+        client,
+        summary,
+    )
+}
+
+/// The per-kind short summary for one record (all agent-supplied strings
+/// terminal-escaped; `escape_terminal` is the only thing between journal
+/// content and the reader's terminal).
+fn summary_for(rec: &JournalRecord) -> String {
+    let d = &rec.data;
+    match rec.kind.as_str() {
+        "exec/request" | "attach/request" => {
+            let cmd = d
+                .get("argv")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            let mut s = escape_terminal(&cmd);
+            if d.get("argv_truncated").and_then(|v| v.as_bool()) == Some(true) {
+                s.push_str(" …(truncated)");
+            }
+            if let Some(cwd) = d.get("cwd").and_then(|v| v.as_str()) {
+                s.push_str(&format!(" (cwd {})", escape_terminal(cwd)));
+            }
+            if s.is_empty() {
+                s = escape_terminal(&d.to_string());
+            }
+            s
+        }
+        "exec/exit" | "attach/exit" => exit_summary(rec),
+        "exec/result" | "attach/result" => format!(
+            "result:{}",
+            escape_terminal(d.get("result").and_then(|v| v.as_str()).unwrap_or("?"))
+        ),
+        "note" | "marker" => {
+            let text = d
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| d.to_string());
+            escape_terminal(&text)
+        }
+        "grant/request" | "revoke/request" => {
+            let path = d.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let mode = d.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            format!(
+                "{}{}",
+                escape_terminal(path),
+                if mode.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", escape_terminal(mode))
+                }
+            )
+        }
+        "grant/result" | "revoke/result" => {
+            let path = d.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let result = d.get("result").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("{} {}", escape_terminal(path), escape_terminal(result))
+        }
+        "session/start" => "session started".to_owned(),
+        "session/stop" => "session stopped".to_owned(),
+        "git-change" => git_change_summary(d),
+        _ => escape_terminal(&d.to_string()),
+    }
+}
+
+fn exit_summary(rec: &JournalRecord) -> String {
+    let d = &rec.data;
+    let mut s = String::from("exit:");
+    if d.get("lost").and_then(|v| v.as_bool()) == Some(true) {
+        s.push_str("lost");
+    } else if let Some(c) = d.get("exit_code").and_then(|v| v.as_i64()) {
+        s.push_str(&c.to_string());
+    } else if let Some(name) = d.get("signal_name").and_then(|v| v.as_str()) {
+        s.push_str("signal ");
+        s.push_str(&escape_terminal(name));
+    } else if let Some(n) = d.get("signal").and_then(|v| v.as_i64()) {
+        s.push_str(&format!("signal {n}"));
+    } else {
+        s.push('?');
+    }
+    if d.get("cancelled").and_then(|v| v.as_bool()) == Some(true) {
+        s.push_str(" cancelled");
+    }
+    if let Some(ms) = d.get("duration_ms").and_then(|v| v.as_u64()) {
+        s.push_str(&format!(" {ms}ms"));
+    }
+    s
+}
+
+fn git_change_summary(d: &Value) -> String {
+    if d.get("unchanged").and_then(|v| v.as_bool()) == Some(true) {
+        let hooks = d.get("hooks_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let keys = d
+            .get("config_keys_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        return format!("git unchanged (hooks {hooks}, config keys {keys})");
+    }
+    let flagged: Vec<String> = d
+        .get("flagged")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(escape_terminal)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut s = format!(
+        "git hooks +{} -{} ~{}; config +{} -{} ~{}",
+        count_of(d, "hooks_added"),
+        count_of(d, "hooks_removed"),
+        count_of(d, "hooks_modified"),
+        count_of(d, "config_added"),
+        count_of(d, "config_removed"),
+        count_of(d, "config_changed"),
+    );
+    if !flagged.is_empty() {
+        s.push_str(&format!(" flagged [{}]", flagged.join(",")));
+    }
+    s
+}
+
+fn count_of(d: &Value, key: &str) -> usize {
+    d.get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0)
+}
+
 /// One readable line for a record (the default `hisn journal` output).
-/// `session`, `kind` and the client label are terminal-escaped; `data` is
-/// a JSON value whose `Display` escapes C0 controls inside strings
-/// (serde_json) but passes C1 controls (U+0080..=U+009F, e.g. U+009B CSI)
-/// through raw — so the serialized form is escaped as well. `--json`
-/// output is unaffected (exact).
+/// Kept for the single-record case and tests: prefer
+/// [`render_collapsed`] for the CLI output, which groups an exec's
+/// request/result/exit by (session, seq). `session`, `kind` and the
+/// client label are terminal-escaped; `data` is a JSON value whose
+/// `Display` escapes C0 controls inside strings (serde_json) but passes
+/// C1 controls (U+0080..=U+009F, e.g. U+009B CSI) through raw — so the
+/// serialized form is escaped as well. `--json` output is unaffected
+/// (exact).
 pub fn render(rec: &JournalRecord) -> String {
     let client = rec
         .client
@@ -1530,8 +1758,179 @@ mod tests {
         );
     }
 
-    // ---- Item 1: exec argv cap (journal-only; tested here, wired in
-    // `supervisor::do_exec`) ----
+    // ---- Item 3: collapsed readable output ----
+
+    fn rec(
+        wseq: u64,
+        kind: &str,
+        session: &str,
+        label: Option<&str>,
+        data: Value,
+    ) -> JournalRecord {
+        JournalRecord {
+            v: 1,
+            ts: "2026-11-14T12:00:00Z".into(),
+            wseq,
+            session: session.into(),
+            kind: kind.into(),
+            client: label.map(|l| JournalClient {
+                uid: 1000,
+                label: l.into(),
+                label_source: "flag".into(),
+                req_id: Some("r1".into()),
+            }),
+            data,
+        }
+    }
+
+    #[test]
+    fn readable_output_collapses_an_exec_triple_into_one_line() {
+        // Item 3: a request, its result and its exit with the same session
+        // and `seq` collapse into one line; the exit code and duration are
+        // shown once known.
+        let req = rec(
+            1,
+            "exec/request",
+            "abcdef0123456789",
+            Some("local"),
+            json!({
+                "op": "exec", "stage": "request", "seq": 7,
+                "argv": ["sh", "-c", "echo hi"], "argv_truncated": false,
+                "argv_count": 3, "argv_bytes": 9, "cwd": "/work/proj",
+            }),
+        );
+        let res = rec(
+            2,
+            "exec/result",
+            "abcdef0123456789",
+            Some("local"),
+            json!({"op": "exec", "stage": "result", "result": "ok", "seq": 7}),
+        );
+        let exit = rec(
+            3,
+            "exec/exit",
+            "abcdef0123456789",
+            Some("local"),
+            json!({
+                "op": "exec", "stage": "exit", "seq": 7,
+                "exit_code": 0, "cancelled": false, "lost": false,
+                "duration_ms": 120,
+            }),
+        );
+        let lines = render_collapsed(&[req, res, exit]);
+        assert_eq!(
+            lines.len(),
+            1,
+            "triple must collapse to one line: {lines:?}"
+        );
+        let l = &lines[0];
+        assert!(l.contains("sh -c echo hi"), "command line: {l}");
+        assert!(l.contains("/work/proj"), "cwd: {l}");
+        assert!(l.contains("exit:0"), "exit code: {l}");
+        assert!(l.contains("120ms"), "duration: {l}");
+        assert!(l.contains("abcdef01"), "first 8 of session: {l}");
+        assert!(l.contains("#1"), "head wseq: {l}");
+        assert!(l.contains("local"), "seat label: {l}");
+    }
+
+    #[test]
+    fn readable_output_marks_a_request_without_exit_as_open() {
+        let req = rec(
+            1,
+            "exec/request",
+            "abcdef0123456789",
+            Some("local"),
+            json!({"op": "exec", "stage": "request", "seq": 7, "argv": ["sleep", "30"]}),
+        );
+        let lines = render_collapsed(&[req]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("[open]"), "open marker: {}", lines[0]);
+        assert!(lines[0].contains("sleep 30"), "command: {}", lines[0]);
+    }
+
+    #[test]
+    fn readable_output_escapes_an_escape_sequence_inside_the_command_line() {
+        // Item 3: an ESC inside argv must not reach the reader's terminal;
+        // the judge is the raw output bytes (no ESC), not a pattern match.
+        let req = rec(
+            1,
+            "exec/request",
+            "abcdef0123456789",
+            Some("local"),
+            json!({"op": "exec", "stage": "request", "seq": 7, "argv": ["sh", "-c", "echo \u{1b}[31mRED"]}),
+        );
+        let lines = render_collapsed(&[req]);
+        let l = &lines[0];
+        assert!(!l.contains('\u{1b}'), "raw ESC reached terminal: {l:?}");
+        assert!(l.contains("\\x1b"), "escaped form present: {l:?}");
+        assert_eq!(l.matches('\n').count(), 0, "one line: {l:?}");
+    }
+
+    #[test]
+    fn readable_output_summarises_note_grant_and_git_change() {
+        let note = rec(
+            1,
+            "note",
+            "abcdef0123456789",
+            Some("local"),
+            json!({"text": "hello world"}),
+        );
+        let grant = rec(
+            2,
+            "grant/request",
+            "abcdef0123456789",
+            Some("local"),
+            json!({"path": "/srv/data", "mode": "rw", "result": null}),
+        );
+        let git = rec(
+            3,
+            "git-change",
+            "abcdef0123456789",
+            None,
+            json!({
+                "unchanged": false,
+                "hooks_added": ["pre-commit"], "hooks_removed": [],
+                "hooks_modified": [], "config_added": [], "config_removed": [],
+                "config_changed": ["core.hookspath"],
+                "flagged": ["core.hookspath"],
+            }),
+        );
+        let lines = render_collapsed(&[note, grant, git]);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("hello world"), "note text: {}", lines[0]);
+        assert!(lines[1].contains("/srv/data rw"), "grant: {}", lines[1]);
+        assert!(
+            lines[2].contains("core.hookspath"),
+            "flagged key: {}",
+            lines[2]
+        );
+        assert!(lines[2].contains("flagged"), "flagged marker: {}", lines[2]);
+    }
+
+    #[test]
+    fn readable_output_does_not_collapse_records_from_different_sessions() {
+        // Same seq, different session: two lines, not one.
+        let a = rec(
+            1,
+            "exec/request",
+            "aaaaaaaa11111111",
+            Some("l"),
+            json!({"argv": ["x"], "seq": 7}),
+        );
+        let b = rec(
+            2,
+            "exec/request",
+            "bbbbbbbb22222222",
+            Some("l"),
+            json!({"argv": ["y"], "seq": 7}),
+        );
+        let lines = render_collapsed(&[a, b]);
+        assert_eq!(
+            lines.len(),
+            2,
+            "different sessions must not collapse: {lines:?}"
+        );
+    }
 
     #[test]
     fn exec_argv_cap_is_present_and_exact_below_the_cap() {

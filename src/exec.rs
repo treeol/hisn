@@ -608,11 +608,26 @@ pub fn drive(status: &OwnedFd, lines: Lines, conn: RawFd, grace: Duration) -> Ou
 /// that a dead connection can never produce.
 pub fn drive_from(
     status: &OwnedFd,
-    mut lines: Lines,
+    lines: Lines,
     conn: RawFd,
     grace: Duration,
     already_cancelled: bool,
 ) -> Outcome {
+    drive_from_with_flag(status, lines, conn, grace, already_cancelled).0
+}
+
+/// [`drive_from`] with the cancellation state threaded out: `Outcome`
+/// alone cannot say whether a signal death was a client disconnect (the
+/// journal's `cancelled` flag, item 2 / Mashūra round 2). Returns the
+/// outcome and whether the client disconnected (or was already gone)
+/// during the run.
+pub fn drive_from_with_flag(
+    status: &OwnedFd,
+    mut lines: Lines,
+    conn: RawFd,
+    grace: Duration,
+    already_cancelled: bool,
+) -> (Outcome, bool) {
     let mut cancelled: Option<Instant> = None;
     let mut sent_term = false;
     if already_cancelled {
@@ -628,7 +643,7 @@ pub fn drive_from(
     loop {
         while let Some(l) = lines.pop_line() {
             if let Some(Status::Exited(x)) = parse_status(&l) {
-                return Outcome::Exited(x);
+                return (Outcome::Exited(x), cancelled.is_some());
             }
         }
         let timeout = match cancelled {
@@ -651,7 +666,7 @@ pub fn drive_from(
             },
         ];
         if sys::poll(&mut fds, timeout).is_err() {
-            return Outcome::Lost;
+            return (Outcome::Lost, cancelled.is_some());
         }
         if let Some(t0) = cancelled
             && !killed
@@ -667,7 +682,7 @@ pub fn drive_from(
         }
         if fds[0].revents != 0 {
             match read_some(status.as_raw_fd(), &mut buf) {
-                Ok(0) | Err(_) => return Outcome::Lost,
+                Ok(0) | Err(_) => return (Outcome::Lost, cancelled.is_some()),
                 Ok(n) => lines.push(&buf[..n]),
             }
         }

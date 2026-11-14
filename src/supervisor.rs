@@ -1253,20 +1253,23 @@ impl Shared {
         // the outcome — the whole "running" lifetime, including a cancel
         // grace. `Instant` (not a wall clock) so it is monotonic.
         let drive_started = std::time::Instant::now();
-        let outcome = if started.is_ok() {
-            exec::drive(&sp.status, sp.pending, conn.as_raw_fd(), exec::CANCEL_GRACE)
+        let (outcome, cancelled) = if started.is_ok() {
+            // `drive_from_with_flag` (Mashūra round 2): a disconnect
+            // *during* the run (TERM after POLLRDHUP) is reported as
+            // cancelled, not just a signal death.
+            exec::drive_from_with_flag(
+                &sp.status,
+                sp.pending,
+                conn.as_raw_fd(),
+                exec::CANCEL_GRACE,
+                false,
+            )
         } else {
             // Client already gone: cancel through the normal path.
-            exec::drive_from(&sp.status, sp.pending, -1, std::time::Duration::ZERO, true)
+            exec::drive_from_with_flag(&sp.status, sp.pending, -1, std::time::Duration::ZERO, true)
         };
         let duration_ms = drive_started.elapsed().as_millis();
         self.exec_table.lock().expect("exec_table").remove(exec_id);
-        // `cancelled` here means "the client was already gone when the
-        // exec started" — the one cancellation path `drive_from` was told
-        // about. A disconnect *during* drive() (TERM after POLLRDHUP) is
-        // indistinguishable from a signal exit in `Outcome` today (see the
-        // report); the exit record still fires on that path.
-        let cancelled = !started.is_ok();
         let (res, line) = match outcome {
             exec::Outcome::Exited(exec::Exit::Code(c)) => ("ok", json!({ "exit": { "code": c } })),
             exec::Outcome::Exited(exec::Exit::Signal(n)) => (

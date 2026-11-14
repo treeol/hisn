@@ -18,7 +18,7 @@
 # lacked the fixture that would make the check meaningful -- e.g. no ~/.ssh).
 set -u
 
-HISN=${1:-./target/release/hisn}
+HISN=$(realpath -e -- "${1:-./target/release/hisn}") || exit 1
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 PROBE_SRC=${PROBE:-$ROOT/target/release/examples/leakprobe}
@@ -3811,14 +3811,33 @@ if needs_host; then
   L88_POL="$WORK/l88.toml"
   write_policy "$L88_POL" "$L88_CWD"
   if start_session l88-$$ "$L88_CWD" "$L88_POL" --detach; then
-    "$HISN" note --session "l88-$$" "L88-NOTE-TEXT" >/dev/null 2>&1 || true
     L88_OTHER=$(new_cwd l88other)
-    J=$(cd "$L88_OTHER" && "$HISN" journal --session "l88-$$" --json 2>/dev/null || echo '[]')
-    case "$J" in
-      *"L88-NOTE-TEXT"*) pass "L88 journal --session from unrelated directory" ;;
-      *) fail "L88 journal --session from unrelated directory" "note absent: [$(printf '%s' "$J" | head -c 400)]" ;;
-    esac
-    "$HISN" stop --session "l88-$$" >/dev/null 2>&1 || true
+    L88_DIR=$(session_dir "l88-$$")
+    if "$HISN" note --session "l88-$$" "L88-NOTE-TEXT" >"$WORK/l88-note.out" 2>"$WORK/l88-note.err"; then
+      J=$(cd "$L88_OTHER" && "$HISN" journal --session "l88-$$" --json 2>"$WORK/l88-journal.err")
+      case "$J" in
+        *"L88-NOTE-TEXT"*) pass "L88 journal --session from unrelated directory (running)" ;;
+        *) fail "L88 journal --session from unrelated directory (running)" "note absent: [$(printf '%s' "$J" | head -c 400)]" ;;
+      esac
+      "$HISN" stop --session "l88-$$" >/dev/null 2>"$WORK/l88-stop.err"
+      for _ in $(seq 1 100); do
+        [ ! -d "$L88_DIR" ] && break
+        sleep 0.1
+      done
+      if [ -d "$L88_DIR" ]; then
+        fail "L88 journal --session from unrelated directory (ended)" "session directory still exists after stop"
+      else
+        J=$(cd "$L88_OTHER" && "$HISN" journal --session "l88-$$" --json 2>"$WORK/l88-ended.err")
+        case "$J" in
+          *"L88-NOTE-TEXT"*) pass "L88 journal --session from unrelated directory (ended)" ;;
+          *) fail "L88 journal --session from unrelated directory (ended)" "note absent: [$(printf '%s' "$J" | head -c 400)]" ;;
+        esac
+      fi
+    else
+      fail "L88 journal --session from unrelated directory (running)" "note command failed; see $WORK/l88-note.err"
+      fail "L88 journal --session from unrelated directory (ended)" "note setup failed"
+      "$HISN" stop --session "l88-$$" >/dev/null 2>&1 || true
+    fi
     rm -rf "$L88_OTHER"
   else
     skip "L88 journal --session from unrelated directory" "session did not start"

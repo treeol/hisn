@@ -842,12 +842,17 @@ fn render_group(g: &[&JournalRecord]) -> String {
             summary.push_str(" [open]");
         }
     } else {
-        // Collapsed: request summary, then exit code/duration when known.
+        // Older polish writers emit both an audit-shaped request and an
+        // argv request. Prefer the richest request, and summarize it once.
+        if let Some(request) = g
+            .iter()
+            .filter(|r| matches!(r.kind.as_str(), "exec/request" | "attach/request"))
+            .max_by_key(|r| r.data.get("argv").is_some())
+        {
+            summary.push_str(&summary_for(request));
+        }
         for r in g {
             match r.kind.as_str() {
-                "exec/request" | "attach/request" => {
-                    summary.push_str(&summary_for(r));
-                }
                 "exec/exit" | "attach/exit" => {
                     if !summary.is_empty() {
                         summary.push(' ');
@@ -920,7 +925,11 @@ fn summary_for(rec: &JournalRecord) -> String {
                 s.push_str(&format!(" (cwd {})", escape_terminal(cwd)));
             }
             if s.is_empty() {
-                s = escape_terminal(&d.to_string());
+                s = d
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(quote_arg)
+                    .unwrap_or_else(|| "[command unavailable]".into());
             }
             s
         }
@@ -1908,6 +1917,56 @@ mod tests {
         assert!(
             large < 50_000.0,
             "append cost unreasonably high in absolute terms: {large:.1}us/event"
+        );
+    }
+
+    #[test]
+    fn polish2_legacy_sequence_stays_compact() {
+        let records = vec![
+            rec(
+                1,
+                "exec/request",
+                "abcdef0123456789",
+                Some("local"),
+                json!({"op":"exec","stage":"request","seq":7,"path":"sh","result":null}),
+            ),
+            rec(
+                2,
+                "exec/result",
+                "abcdef0123456789",
+                Some("local"),
+                json!({"seq":7,"result":"ok"}),
+            ),
+            rec(
+                3,
+                "note",
+                "abcdef0123456789",
+                Some("local"),
+                json!({"text":"hello"}),
+            ),
+            rec(
+                4,
+                "session/stop",
+                "abcdef0123456789",
+                None,
+                json!({"workspace":"ws"}),
+            ),
+            rec(
+                5,
+                "git-change",
+                "abcdef0123456789",
+                None,
+                json!({"before":{"hooks":[],"config":{}},"after":{"hooks":[],"config":{}},"changes":{"hooks":{"added":[],"removed":[],"modified":[]},"config":{"added":[],"removed":[],"changed":[]}}}),
+            ),
+        ];
+        assert_eq!(
+            render_collapsed(&records),
+            vec![
+                "2026-11-14T12:00:00Z #1 abcdef01 exec/request local \"sh\" [open]",
+                "2026-11-14T12:00:00Z #3 abcdef01 note local hello",
+                "2026-11-14T12:00:00Z #4 abcdef01 session/stop - session stopped",
+                "2026-11-14T12:00:00Z #5 abcdef01 git-change - git hooks +0 -0 ~0; config +0 -0 ~0",
+            ]
         );
     }
 

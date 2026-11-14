@@ -46,6 +46,101 @@ use crate::sessionmeta;
 use crate::workspace::{self, WorkspaceRef, workspace_id_for, workspace_name_for};
 use crate::{seccomp, sig, sys};
 
+#[allow(clippy::too_many_arguments)]
+fn log_client_record(
+    audit: &Audit,
+    journal: &Journal,
+    op: &str,
+    stage: &str,
+    path: Option<&str>,
+    mode: Option<&str>,
+    result: Option<&str>,
+    client: &authz::ClientRecord,
+    allowed: bool,
+) {
+    let mut entry = Audit::entry(op, stage, path, mode, result, client.pid);
+    if let Some(o) = entry.as_object_mut() {
+        o.insert(
+            "client".into(),
+            json!({
+                "uid": client.uid,
+                "label": client.label,
+                "label_source": client.label_source,
+                "req_id": client.req_id,
+            }),
+        );
+        o.insert("seq".into(), json!(client.seq));
+        o.insert("authz".into(), json!({ "allow": allowed }));
+    }
+    let _ = audit.log(entry.clone());
+    // Mirror into the journal: identical information, journal shape. The
+    // kind is `<op>/<stage>`. A journal failure neither fails the op nor
+    // stops the audit (rule 5); `append` counts it.
+    let _ = journal.append(
+        &format!("{op}/{stage}"),
+        Some(JournalClient {
+            uid: client.uid,
+            label: client.label.clone(),
+            label_source: client.label_source.clone(),
+            req_id: client.req_id.clone(),
+        }),
+        entry,
+    );
+}
+
+fn journal_exec_exit_record(
+    journal: &Journal,
+    client: &authz::ClientRecord,
+    exit: Option<&exec::Exit>,
+    cancelled: bool,
+    lost: bool,
+    duration_ms: u128,
+) {
+    let data = exit_record_data(client, exit, cancelled, lost, duration_ms);
+    let _ = journal.append(
+        "exec/exit",
+        Some(JournalClient {
+            uid: client.uid,
+            label: client.label.clone(),
+            label_source: client.label_source.clone(),
+            req_id: client.req_id.clone(),
+        }),
+        data,
+    );
+}
+
+fn journal_exec_request_record(
+    journal: &Journal,
+    client: &authz::ClientRecord,
+    op: &str,
+    argv_json: &Value,
+    cwd: Option<&str>,
+) {
+    let mut data = json!({
+        "op": op,
+        "stage": "request",
+        "argv": argv_json["argv"],
+        "argv_truncated": argv_json["argv_truncated"],
+        "argv_count": argv_json["argv_count"],
+        "argv_bytes": argv_json["argv_bytes"],
+    });
+    if let Some(cwd) = cwd {
+        data["cwd"] = json!(cwd);
+    }
+    data["seq"] = json!(client.seq);
+    data["authz"] = json!({ "allow": true });
+    let _ = journal.append(
+        &format!("{op}/request"),
+        Some(JournalClient {
+            uid: client.uid,
+            label: client.label.clone(),
+            label_source: client.label_source.clone(),
+            req_id: client.req_id.clone(),
+        }),
+        data,
+    );
+}
+
 // ---------------------------------------------------------------- R5 decision
 
 /// Why a control-socket peer was refused (never shown to the peer).
@@ -580,33 +675,16 @@ impl Shared {
         client: &authz::ClientRecord,
         allowed: bool,
     ) {
-        let mut entry = Audit::entry(op, stage, path, mode, result, client.pid);
-        if let Some(o) = entry.as_object_mut() {
-            o.insert(
-                "client".into(),
-                json!({
-                    "uid": client.uid,
-                    "label": client.label,
-                    "label_source": client.label_source,
-                    "req_id": client.req_id,
-                }),
-            );
-            o.insert("seq".into(), json!(client.seq));
-            o.insert("authz".into(), json!({ "allow": allowed }));
-        }
-        let _ = self.audit.log(entry.clone());
-        // Mirror into the journal: identical information, journal shape. The
-        // kind is `<op>/<stage>`. A journal failure neither fails the op nor
-        // stops the audit (rule 5); `append` counts it.
-        let _ = self.journal.append(
-            &format!("{op}/{stage}"),
-            Some(JournalClient {
-                uid: client.uid,
-                label: client.label.clone(),
-                label_source: client.label_source.clone(),
-                req_id: client.req_id.clone(),
-            }),
-            entry,
+        log_client_record(
+            &self.audit,
+            &self.journal,
+            op,
+            stage,
+            path,
+            mode,
+            result,
+            client,
+            allowed,
         );
     }
 
@@ -623,17 +701,7 @@ impl Shared {
         lost: bool,
         duration_ms: u128,
     ) {
-        let data = exit_record_data(client, exit, cancelled, lost, duration_ms);
-        let _ = self.journal.append(
-            "exec/exit",
-            Some(JournalClient {
-                uid: client.uid,
-                label: client.label.clone(),
-                label_source: client.label_source.clone(),
-                req_id: client.req_id.clone(),
-            }),
-            data,
-        );
+        journal_exec_exit_record(&self.journal, client, exit, cancelled, lost, duration_ms);
     }
 
     /// Journal one exec request with the argv (capped) and cwd (item 1).
@@ -648,29 +716,7 @@ impl Shared {
         argv_json: &Value,
         cwd: Option<&str>,
     ) {
-        let mut data = json!({
-            "op": op,
-            "stage": "request",
-            "argv": argv_json["argv"],
-            "argv_truncated": argv_json["argv_truncated"],
-            "argv_count": argv_json["argv_count"],
-            "argv_bytes": argv_json["argv_bytes"],
-        });
-        if let Some(cwd) = cwd {
-            data["cwd"] = json!(cwd);
-        }
-        data["seq"] = json!(client.seq);
-        data["authz"] = json!({ "allow": true });
-        let _ = self.journal.append(
-            &format!("{op}/request"),
-            Some(JournalClient {
-                uid: client.uid,
-                label: client.label.clone(),
-                label_source: client.label_source.clone(),
-                req_id: client.req_id.clone(),
-            }),
-            data,
-        );
+        journal_exec_request_record(&self.journal, client, op, argv_json, cwd);
     }
 
     fn log(
@@ -3867,6 +3913,78 @@ pub fn client_request(session_arg: &str, req: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::{ClientInfo, ConnRegistry};
+
+    #[test]
+    fn polish2_real_exec_writers_render_one_compact_line() {
+        use super::*;
+        let d = tempfile::tempdir_in("target").unwrap();
+        let journal = Journal::new(d.path().join("workspace"), "abcdef0123456789".into());
+        let audit_path = d.path().join("grants.jsonl");
+        let audit = Audit::open(&audit_path).unwrap();
+        let client = authz::ClientRecord {
+            principal: None,
+            uid: 1000,
+            pid: Some(7),
+            label: "local".into(),
+            label_source: "flag".into(),
+            req_id: Some("r1".into()),
+            seq: 7,
+        };
+        log_client_record(
+            &audit,
+            &journal,
+            "exec",
+            "request",
+            Some("sh"),
+            None,
+            None,
+            &client,
+            true,
+        );
+        journal_exec_request_record(
+            &journal,
+            &client,
+            "exec",
+            &cap_argv(&["sh".into(), "-c".into(), "echo \u{1b}[31mRED".into()]),
+            None,
+        );
+        log_client_record(
+            &audit,
+            &journal,
+            "exec",
+            "result",
+            Some("sh"),
+            None,
+            Some("ok"),
+            &client,
+            true,
+        );
+        journal_exec_exit_record(
+            &journal,
+            &client,
+            Some(&exec::Exit::Code(0)),
+            false,
+            false,
+            120,
+        );
+        let (mut records, skipped) = crate::journal::read_records(&d.path().join("workspace"));
+        assert_eq!(skipped, 0);
+        assert_eq!(records.len(), 4);
+        for r in &mut records {
+            r.ts = "2026-11-14T12:00:00Z".into();
+        }
+        assert_eq!(
+            crate::journal::render_collapsed(&records),
+            vec![
+                "2026-11-14T12:00:00Z #1 abcdef01 exec/request local \"sh\" \"-c\" \"echo \\x1b[31mRED\" exit:0 120ms"
+            ]
+        );
+        let audit_lines = fs::read_to_string(audit_path).unwrap();
+        assert_eq!(audit_lines.lines().count(), 2);
+        assert!(!audit_lines.contains("argv"));
+        assert!(!audit_lines.contains("exec/exit"));
+        assert!(!audit_lines.contains("RED"));
+    }
 
     fn info() -> ClientInfo {
         ClientInfo {

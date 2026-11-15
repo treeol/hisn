@@ -7,6 +7,48 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-15
+
+0.5.1 gives the journal's "who" substance: named **seats** with a
+credential and a role, per workspace. Under one Unix user a seat is
+attribution and a guard against mistakes, not a security boundary.
+
+**Verification in this session:** `cargo fmt --check` and `cargo clippy
+--all-targets -- -D warnings` clean; `cargo test --lib` 522 passed with
+only the two known environmental failures. The leak suite (including the
+new L89), the integration tests and `make release-gate` were not run here
+(this session runs inside a live hisn session); the release is tagged after
+the release gate passes on the release host.
+
+### Added
+- **`hisn seat add|ls|set-role|revoke`** with `--workspace` or `--session`.
+  `add` prints the credential once; `ls` never shows one. The store is
+  `seats.json` in the workspace state directory (0600, flock + atomic
+  publish, fails closed for credentials on a corrupt store).
+- **Roles.** `owner` (everything, including seat management), `member`
+  (exec/attach/signal/note and the read-only ops), `observer` (read-only
+  ops only) — one table in `src/authz.rs`, every op assigned. A client
+  without a credential is the owner, exactly as before; a presented
+  credential that is unknown, revoked or expired is refused, never falling
+  back to owner. Role refusals name the seat, op and required role and are
+  journaled.
+- **Protocol revision 3.** `client.seat_token` and the ops `seat-add`,
+  `seat-ls`, `seat-set-role`, `seat-revoke` exist only at revision 3; the
+  CLI refuses with exit 2 and sends nothing below it when a credential is
+  configured. The credential comes from `HISN_SEAT_TOKEN` or
+  `--seat-token-file`, never from a command-line argument and never into a
+  session's environment.
+- **Journal and listings.** Credentialed records carry the server-set seat
+  name and role with `label_source` `"seat"`; `journal --seat` filters on
+  it (label match stays for older records). Seat management is journaled.
+  `ls --json` gains an additive `seats` key; `grants.jsonl` is unchanged.
+
+### Changed
+- `session.json`: unknown fields nested inside `owner`, `lease` and
+  `members` survive rewrites like the top-level ones.
+- Unknown `expires` values on the wire `seat-add` are rejected instead of
+  stored verbatim.
+
 ## [0.5.0] - 2026-11-15
 
 0.5.0 adds the workspace journal: each workspace keeps an append-only

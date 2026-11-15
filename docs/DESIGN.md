@@ -1,6 +1,6 @@
 # hisn — design
 
-Status: current as of hisn 0.5.0. §1–§14
+Status: current as of hisn 0.5.1. §1–§14
 describe the sandbox core (0.2 exec
 included); §15–§19 describe the 0.3 orchestration layer; §20 and §20.1
 describe named sessions, attach, leases and the 0.4.1 changes; §21 and

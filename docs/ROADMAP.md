@@ -31,6 +31,11 @@
   `--seat`, `--kind`, `--since`, `--last` and `--json` filters, the
   `hisn note` subcommand, workspaces and `--workspace`, and a report-only
   git-change report). See [releases/v0.5.0.md](releases/v0.5.0.md).
+- **0.5.1**: seats with credentials and roles (protocol revision 3):
+  `hisn seat add|ls|set-role|revoke` per workspace, the one role table
+  (owner/member/observer), server-set seat attribution in the journal, and
+  the credential transport (`HISN_SEAT_TOKEN`/`--seat-token-file`).
+  See [releases/v0.5.1.md](releases/v0.5.1.md).
 
 ## Planned, not yet scheduled
 

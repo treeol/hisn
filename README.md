@@ -42,6 +42,12 @@ only when it is granted, and every grant ends with the session.
   start and stop, each command with its command line, exit code and duration,
   grants and revokes, and notes. `hisn journal` reads the record back, and
   `hisn note` adds a note to it.
+- **Seats.** A workspace can name its clients: `hisn seat add NAME --role
+  owner|member|observer` creates a seat with a one-time credential (stored
+  as a hash, valid in every session of the workspace). Members may exec and
+  observe but may not grant, revoke, kill or manage seats; observers may
+  only observe. Under one Unix user a seat is attribution and a guard
+  against mistakes, not a security boundary.
 - **Git change report.** When a session stops, hisn records whether
   `.git/hooks` or `.git/config` changed during the session and flags
   configuration keys that can run programs. This is a report; nothing is
@@ -200,26 +206,33 @@ In short:
 
 - `hisn run --name N --detach` prints `<id> <name|-> ready` and exits 0 when
   the session is ready; a failed start exits 125. The control protocol
-  revision (this release: 2, absent on a pre-0.5.0 session) is recorded in
+  revision (this release: 3, absent on a pre-0.5.0 session) is recorded in
   `session.json` as `protocol_revision`.
 - Exit codes: the command's status, `128+N` for signal `N`, `125` for a hisn
   error, `126` not executable, `127` not found.
 - `hisn ls --json` returns `{"schema":"hisn-ls/v2","sessions":[...]}` with live
   `clients` and `execs`; fields are only added (0.5.0 adds `hisn_version`,
-  `protocol_revision`, `workspace`, `journal` and `journal_failures`).
+  `protocol_revision`, `workspace`, `journal` and `journal_failures`; 0.5.1
+  adds `seats` — names and roles, never credentials).
 - The `sessioninfo` control op supplies that live view; observers do not count
   as clients.
 - `hisn journal --json` prints journal records unchanged, one per line.
-- The control socket has 8 operations; a 0.4.3 client works unchanged against
-  this release (six ops are byte-identical answers; `sessioninfo` and
-  `inspect` gained additive fields).
+- The control socket has 12 operations (8 existing plus `seat-add`,
+  `seat-ls`, `seat-set-role` and `seat-revoke` at protocol revision 3); a
+  0.4.3 client works unchanged against this release (six ops are
+  byte-identical answers; `sessioninfo` and `inspect` gained additive
+  fields).
+- A seat credential travels in `client.seat_token` (protocol revision 3)
+  and is taken from `HISN_SEAT_TOKEN` or `--seat-token-file`, never from a
+  command-line argument; below revision 3 the CLI sends nothing and exits
+  2 when a credential is configured.
 
 [Wakil](docs/WAKIL-INTEGRATION.md) is the reference driver.
 
 ## Status
 
-The current release is hisn 0.5.0. Release notes, including compatibility and
-known limitations, are in [docs/releases/v0.5.0.md](docs/releases/v0.5.0.md);
+The current release is hisn 0.5.1. Release notes, including compatibility and
+known limitations, are in [docs/releases/v0.5.1.md](docs/releases/v0.5.1.md);
 earlier releases are in the [CHANGELOG](CHANGELOG.md).
 
 CI runs the leak suite on Ubuntu 22.04 and 24.04 (x86_64). aarch64 and musl

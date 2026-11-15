@@ -26,6 +26,11 @@
   findings are fixed, and session startup is restructured so the egress
   proxy, cgroup v2 limits and the pty work can be added safely. See
   [releases/v0.4.3.md](releases/v0.4.3.md).
+- **0.5.0**: the workspace journal and `hisn journal` (exec argv capped at
+  512 bytes, exec exit/duration and session start/stop, `--kind`/`--last`
+  filters, `--note`, `--session` lookup, workspaces and `--workspace`, and a
+  report-only git-change report). See
+  [releases/v0.5.0.md](releases/v0.5.0.md).
 
 ## Planned, not yet scheduled
 

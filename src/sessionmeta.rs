@@ -74,6 +74,10 @@ pub struct Owner {
     pub uid: u32,
     pub label: String,
     pub client_id: String,
+    /// 0.5.1 (Part 6): unknown fields nested inside `owner`, captured
+    /// verbatim like [`SessionMeta::extra`] and emitted back unchanged.
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -90,6 +94,9 @@ pub struct Member {
     pub label: String,
     pub first_seen: String,
     pub last_seen: String,
+    /// 0.5.1 (Part 6): unknown fields nested inside `members[]` entries.
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Lease state for idle expiry (step 5). Absent on sessions created before
@@ -98,6 +105,9 @@ pub struct Member {
 pub struct Lease {
     pub idle_timeout_s: Option<u64>,
     pub last_activity: Option<String>,
+    /// 0.5.1 (Part 6): unknown fields nested inside `lease`.
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -251,6 +261,7 @@ pub fn record_member(dir: &Path, uid: u32, label: &str, now: &str) -> std::io::R
             label: label.to_owned(),
             first_seen: now.to_owned(),
             last_seen: now.to_owned(),
+            extra: std::collections::BTreeMap::new(),
         });
     }
     rewrite(dir, &m)
@@ -314,6 +325,8 @@ mod tests {
             uid: 1000,
             label: "local".into(),
             client_id: "c1".into(),
+
+            extra: std::collections::BTreeMap::new(),
         }
     }
 
@@ -387,6 +400,8 @@ mod tests {
         m.lease = Some(Lease {
             idle_timeout_s: Some(300),
             last_activity: Some("2026-11-07T12:00:00Z".into()),
+
+            extra: std::collections::BTreeMap::new(),
         });
         // Write with an extra unknown field by hand (as a newer build would).
         let mut body = serde_json::to_value(&m).unwrap();
@@ -416,6 +431,85 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
+    /// 0.5.1 (Part 6): unknown fields **nested** inside `owner`, `lease`
+    /// and `members[]` survive rewrites, like the top-level ones. Every
+    /// rewrite of `session.json` goes through `read` → `rewrite`, so the
+    /// nested maps are the single source of truth.
+    #[test]
+    fn unknown_nested_fields_survive_every_rewrite() {
+        let d = std::env::temp_dir().join(format!("hisn-nested-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let mut m = SessionMeta::new("abc", Some("nm"), owner(), "/w", "none");
+        m.lease = Some(Lease {
+            idle_timeout_s: Some(300),
+            last_activity: Some("2026-11-07T12:00:00Z".into()),
+            extra: std::collections::BTreeMap::new(),
+        });
+        m.members.push(Member {
+            uid: 1000,
+            label: "local".into(),
+            first_seen: "2026-11-07T12:00:00Z".into(),
+            last_seen: "2026-11-07T12:00:00Z".into(),
+            extra: std::collections::BTreeMap::new(),
+        });
+        let mut body = serde_json::to_value(&m).unwrap();
+        let o = body.as_object_mut().unwrap();
+        o.get_mut("owner")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("future_owner_field".into(), serde_json::json!("keep-owner"));
+        o.get_mut("lease")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("future_lease_field".into(), serde_json::json!({"x": 1}));
+        o.get_mut("members").unwrap().as_array_mut().unwrap()[0]
+            .as_object_mut()
+            .unwrap()
+            .insert("future_member_field".into(), serde_json::json!([1, 2]));
+        fs::write(d.join(FILE), serde_json::to_string_pretty(&body).unwrap()).unwrap();
+        let has = |needle: &str| fs::read_to_string(d.join(FILE)).unwrap().contains(needle);
+        for needle in [
+            "future_owner_field",
+            "future_lease_field",
+            "future_member_field",
+        ] {
+            assert!(has(needle), "setup dropped {needle}");
+        }
+        set_state(&d, State::Running).unwrap();
+        record_member(&d, 1000, "local", "2026-11-07T12:01:00Z").unwrap();
+        touch_lease(&d, "2026-11-07T12:02:00Z").unwrap();
+        for needle in [
+            "future_owner_field",
+            "future_lease_field",
+            "future_member_field",
+        ] {
+            assert!(has(needle), "a rewrite dropped {needle}");
+        }
+        // And the known fields still updated.
+        let back = read(&d).unwrap();
+        assert_eq!(back.state, State::Running);
+        assert_eq!(
+            back.lease.as_ref().unwrap().last_activity.as_deref(),
+            Some("2026-11-07T12:02:00Z")
+        );
+        assert_eq!(
+            back.owner.extra.get("future_owner_field"),
+            Some(&serde_json::json!("keep-owner"))
+        );
+        assert_eq!(
+            back.lease.as_ref().unwrap().extra.get("future_lease_field"),
+            Some(&serde_json::json!({"x": 1}))
+        );
+        assert_eq!(
+            back.members[0].extra.get("future_member_field"),
+            Some(&serde_json::json!([1, 2]))
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn cleared_known_fields_do_not_resurrect() {
         // R2: a known `skip_serializing_if` field cleared in memory must
@@ -432,6 +526,8 @@ mod tests {
         m.lease = Some(Lease {
             idle_timeout_s: Some(300),
             last_activity: Some("2026-11-07T12:00:00Z".into()),
+
+            extra: std::collections::BTreeMap::new(),
         });
         m.write_to(&d).unwrap();
         // Sanity: the lease is on disk.
@@ -512,6 +608,8 @@ mod tests {
         m.lease = Some(Lease {
             idle_timeout_s: Some(300),
             last_activity: Some("2026-11-07T12:00:00Z".into()),
+
+            extra: std::collections::BTreeMap::new(),
         });
         m.write_to(&d).unwrap();
         let back = read(&d).unwrap();
@@ -579,6 +677,8 @@ mod tests {
         m.lease = Some(Lease {
             idle_timeout_s: Some(300),
             last_activity: Some("2026-11-07T12:00:00Z".into()),
+
+            extra: std::collections::BTreeMap::new(),
         });
         m.write_to(&d).unwrap();
         record_member(&d, 1000, "local", "2026-11-07T12:00:00Z").unwrap();
@@ -651,6 +751,8 @@ mod tests {
         m.lease = Some(Lease {
             idle_timeout_s: Some(300),
             last_activity: Some("2026-11-07T12:00:00Z".into()),
+
+            extra: std::collections::BTreeMap::new(),
         });
         m.write_to(&d).unwrap();
         let d = Arc::new(d);

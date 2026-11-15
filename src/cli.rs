@@ -40,6 +40,10 @@ pub enum Command {
     Kill(KillArgs),
     /// Append a note or marker to a session's workspace journal (0.5.0).
     Note(NoteArgs),
+    /// Manage workspace seats (0.5.1): named clients with a credential and
+    /// a role. Under one Unix user a seat is attribution and a guard
+    /// against mistakes, not a security boundary (ADR 0021).
+    Seat(SeatArgs),
     /// Query a workspace journal (0.5.0). Reads host-side, so it works for
     /// stopped and pruned sessions too.
     Journal(JournalArgs),
@@ -220,6 +224,10 @@ pub struct ExecArgs {
     /// "local"). Same as `hisn attach --client` (0.4.1).
     #[arg(long)]
     pub client: Option<String>,
+    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    /// Never a command-line credential value.
+    #[arg(long, value_name = "PATH")]
+    pub seat_token_file: Option<PathBuf>,
     /// Command and arguments.
     #[arg(last = true, required = true, value_name = "CMD")]
     pub command: Vec<String>,
@@ -236,6 +244,9 @@ pub struct AttachArgs {
     /// Label for this client in the audit log (default: derived from SSH or "local").
     #[arg(long)]
     pub client: Option<String>,
+    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    #[arg(long, value_name = "PATH")]
+    pub seat_token_file: Option<PathBuf>,
 }
 
 /// Parse `K=V` (the value may contain `=`; the name must be non-empty).
@@ -271,6 +282,9 @@ pub struct InspectArgs {
     /// Print the raw control-socket response (JSON) instead of text.
     #[arg(long)]
     pub json: bool,
+    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    #[arg(long, value_name = "PATH")]
+    pub seat_token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -285,6 +299,9 @@ pub struct GrantArgs {
     /// Also expose mounts below the directory.
     #[arg(long)]
     pub recursive: bool,
+    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    #[arg(long, value_name = "PATH")]
+    pub seat_token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -298,6 +315,9 @@ pub struct RevokeArgs {
     /// Kill processes found holding the mount open (soft revoke only).
     #[arg(long)]
     pub kill_holders: bool,
+    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    #[arg(long, value_name = "PATH")]
+    pub seat_token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -321,6 +341,10 @@ pub struct LsArgs {
     /// (0.4.1).
     #[arg(long)]
     pub dry_run: bool,
+    /// Seat credential file (0.5.1), for `ls --session S`. Alternatively
+    /// `HISN_SEAT_TOKEN`.
+    #[arg(long, value_name = "PATH")]
+    pub seat_token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -329,6 +353,9 @@ pub struct KillArgs {
     pub session: String,
     #[arg(long, default_value = "TERM")]
     pub signal: String,
+    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    #[arg(long, value_name = "PATH")]
+    pub seat_token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -348,6 +375,49 @@ pub struct NoteArgs {
     pub marker: bool,
     /// The text. `-` reads it from stdin.
     pub text: String,
+    /// Seat credential (0.5.1), from `HISN_SEAT_TOKEN` or a file. Never a
+    /// command-line value; never passed into a session's environment.
+    #[arg(long, value_name = "PATH")]
+    pub seat_token_file: Option<PathBuf>,
+}
+
+/// The `seat` subcommand (0.5.1, ADR 0021).
+#[derive(Debug, Args)]
+pub struct SeatArgs {
+    /// The workspace to manage: a workspace name or id, or a session whose
+    /// workspace is used. Without either, the current directory's workspace.
+    #[arg(long, value_name = "WORKSPACE")]
+    pub workspace: Option<String>,
+    /// Session name or id whose workspace is managed.
+    #[arg(long)]
+    pub session: Option<String>,
+    #[command(subcommand)]
+    pub op: SeatOp,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SeatOp {
+    /// Create a seat. Prints the credential once; it cannot be shown again.
+    Add {
+        /// Seat name (letters, digits, '.', '_', '-', no leading '.').
+        name: String,
+        /// Role: owner, member (default) or observer.
+        #[arg(long, value_name = "ROLE")]
+        role: Option<String>,
+        /// Optional expiry, RFC 3339 UTC (e.g. 2027-01-01T00:00:00Z).
+        #[arg(long, value_name = "TIMESTAMP")]
+        expires: Option<String>,
+    },
+    /// List the workspace seats (names and roles, never credentials).
+    Ls,
+    /// Change a seat's role.
+    SetRole {
+        name: String,
+        #[arg(value_name = "ROLE")]
+        role: String,
+    },
+    /// Revoke a seat: its credential is refused from the next request on.
+    Revoke { name: String },
 }
 
 #[derive(Debug, Args)]

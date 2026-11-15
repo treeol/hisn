@@ -3849,6 +3849,167 @@ else
   skip "L88 journal --session from unrelated directory" "hisn check failed (no userns)"
 fi
 
+# ================================================ L89: seats with credentials and roles (0.5.1, HOST)
+# Seat round trip, role refusals journaled with the seat name, revoked and
+# expired credentials refused, a credentialless client unchanged, the
+# credential in none of journal/grants.jsonl/session.json/ls --json/
+# supervisor.log, the seat store unreachable from inside a session,
+# HISN_SEAT_TOKEN absent from a session's environment, and set-role/revoke
+# taking effect in an already running session. (0.5.1: written against the
+# neighbouring passing L86/L87 cases; bash -n only, unexecuted here.)
+if needs_host; then
+  L89_CWD=$(new_cwd l89)
+  L89_POL="$WORK/l89.toml"
+  write_policy "$L89_POL" "$L89_CWD"
+  if start_session l89-$$ "$L89_CWD" "$L89_POL" --detach; then
+    L89_WS=$(ls_workspace_id "l89-$$")
+    L89_DIR=$(session_dir "l89-$$")
+    # --- round trip: add, list, use -------------------------------------
+    if L89_TOK=$("$HISN" seat --session "l89-$$" add rubin --role member 2>"$WORK/l89-add.err"); then
+      pass "L89 seat add prints a credential"
+      [ -n "$L89_TOK" ] || fail "L89 seat credential is non-empty" "add printed nothing"
+    else
+      fail "L89 seat add prints a credential" "exit $?; see $WORK/l89-add.err"
+      L89_TOK=""
+    fi
+    if "$HISN" seat --workspace "${L89_WS:-x}" ls 2>/dev/null | grep -q "rubin"; then
+      pass "L89 seat ls names the member"
+    else
+      fail "L89 seat ls names the member" "ls output: [$(cd "$L89_CWD" && "$HISN" seat ls 2>&1 | head -c 200)]"
+    fi
+    if [ -n "$L89_TOK" ] && HISN_SEAT_TOKEN="$L89_TOK" timeout 10 "$HISN" exec --no-tty --session "l89-$$" -- sh -c 'echo L89-EXEC-OK' 2>"$WORK/l89-exec.err" | grep -q "L89-EXEC-OK"; then
+      pass "L89 member exec works with the credential"
+    else
+      fail "L89 member exec works with the credential" "see $WORK/l89-exec.err"
+    fi
+    # --- refusal: member may not grant, revoke or kill ------------------
+    mkdir -p "$WORK/l89-grant"
+    if HISN_SEAT_TOKEN="$L89_TOK" "$HISN" grant --session "l89-$$" -- "$WORK/l89-grant" 2>/dev/null | grep -q '"ok":false'; then
+      pass "L89 member grant is refused"
+    else
+      fail "L89 member grant is refused" "grant was not refused"
+    fi
+    if HISN_SEAT_TOKEN="$L89_TOK" "$HISN" kill --session "l89-$$" 2>/dev/null | grep -q '"ok":false'; then
+      pass "L89 member kill is refused"
+    else
+      fail "L89 member kill is refused" "kill was not refused"
+    fi
+    if HISN_SEAT_TOKEN="$L89_TOK" "$HISN" revoke --session "l89-$$" -- "$WORK/l89-grant" 2>/dev/null | grep -q '"ok":false'; then
+      pass "L89 member revoke is refused"
+    else
+      fail "L89 member revoke is refused" "revoke was not refused"
+    fi
+    # The refusal is journaled with the seat name (not the label).
+    L89_J=""
+    for _ in $(seq 1 50); do
+      L89_J=$("$HISN" journal --workspace "${L89_WS:-x}" --json 2>/dev/null || echo '[]')
+      case "$L89_J" in
+        *"refused"*rubin*) break ;;
+      esac
+      sleep 0.2
+    done
+    case "$L89_J" in
+      *"refused"*rubin*) pass "L89 refusal is journaled with the seat name" ;;
+      *) fail "L89 refusal is journaled with the seat name" "journal: [$(printf '%s' "$L89_J" | head -c 400)]" ;;
+    esac
+    # --- observer: exec refused, read-only op allowed -------------------
+    if L89_OBS=$("$HISN" seat --session "l89-$$" add watcher --role observer 2>/dev/null); then
+      if HISN_SEAT_TOKEN="$L89_OBS" timeout 10 "$HISN" exec --no-tty --session "l89-$$" -- sh -c 'echo L89-SHOULD-NOT-RUN' >/dev/null 2>&1; then
+        fail "L89 observer exec is refused" "exec ran under an observer seat"
+      else
+        pass "L89 observer exec is refused"
+      fi
+      if HISN_SEAT_TOKEN="$L89_OBS" "$HISN" ls --session "l89-$$" >/dev/null 2>&1; then
+        pass "L89 observer list works"
+      else
+        fail "L89 observer list works" "list refused for an observer"
+      fi
+    else
+      skip "L89 observer seat" "seat add failed"
+    fi
+    # --- unknown, revoked and expired credentials are refused -----------
+    if HISN_SEAT_TOKEN="not-a-credential" timeout 10 "$HISN" exec --no-tty --session "l89-$$" -- sh -c 'echo L89-SHOULD-NOT-RUN' >/dev/null 2>&1; then
+      fail "L89 unknown credential is refused" "exec ran with an unknown credential"
+    else
+      pass "L89 unknown credential is refused"
+    fi
+    if L89_EXP=$("$HISN" seat --session "l89-$$" add expiring --role member --expires 2000-01-01T00:00:00Z 2>/dev/null) \
+       && HISN_SEAT_TOKEN="$L89_EXP" timeout 10 "$HISN" exec --no-tty --session "l89-$$" -- sh -c 'echo L89-SHOULD-NOT-RUN' >/dev/null 2>&1; then
+      fail "L89 expired credential is refused" "exec ran with an expired credential"
+    else
+      pass "L89 expired credential is refused"
+    fi
+    # --- a client without a credential is the owner, unchanged ----------
+    if timeout 10 "$HISN" exec --no-tty --session "l89-$$" -- sh -c 'echo L89-OWNER-OK' 2>/dev/null | grep -q "L89-OWNER-OK"; then
+      pass "L89 credentialless client still has full access"
+    else
+      fail "L89 credentialless client still has full access" "exec without a credential failed"
+    fi
+    if "$HISN" grant --session "l89-$$" -- "$WORK/l89-grant" >/dev/null 2>&1; then
+      pass "L89 credentialless grant works"
+    else
+      fail "L89 credentialless grant works" "grant without a credential failed"
+    fi
+    # --- the credential appears in none of the recorded surfaces --------
+    L89_AUDIT="$L89_DIR/grants.jsonl"
+    L89_LS=$("$HISN" ls --json 2>/dev/null)
+    L89_JOURNAL=$("$HISN" journal --workspace "${L89_WS:-x}" --json 2>/dev/null)
+    L89_LEAK=""
+    [ -n "$L89_TOK" ] && grep -q "$L89_TOK" "$L89_AUDIT" 2>/dev/null && L89_LEAK="$L89_LEAK grants.jsonl"
+    [ -n "$L89_TOK" ] && grep -q "$L89_TOK" "$L89_DIR/session.json" 2>/dev/null && L89_LEAK="$L89_LEAK session.json"
+    [ -n "$L89_TOK" ] && printf '%s' "$L89_LS" | grep -q "$L89_TOK" && L89_LEAK="$L89_LEAK ls --json"
+    [ -n "$L89_TOK" ] && printf '%s' "$L89_JOURNAL" | grep -q "$L89_TOK" && L89_LEAK="$L89_LEAK journal"
+    [ -n "$L89_TOK" ] && grep -q "$L89_TOK" "$L89_DIR/supervisor.log" 2>/dev/null && L89_LEAK="$L89_LEAK supervisor.log"
+    [ -n "$L89_TOK" ] && grep -q "$L89_TOK" "$WORK/l89-$$.log" 2>/dev/null && L89_LEAK="$L89_LEAK supervisor log"
+    if [ -z "$L89_LEAK" ]; then
+      pass "L89 credential appears in no recorded surface"
+    else
+      fail "L89 credential appears in no recorded surface" "found in:$L89_LEAK"
+    fi
+    # The 0.5.0 grants.jsonl shape holds for credentialless lines.
+    if [ -f "$L89_AUDIT" ] && grep -q '"label": *"local"' "$L89_AUDIT"; then
+      pass "L89 credentialless grants.jsonl lines keep the 0.5.0 shape"
+    else
+      fail "L89 credentialless grants.jsonl lines keep the 0.5.0 shape" "no local-labelled line in $L89_AUDIT"
+    fi
+    # --- the seat store and the host variable do not reach the session --
+    if HISN_SEAT_TOKEN="$L89_TOK" timeout 10 "$HISN" exec --no-tty --session "l89-$$" -- sh -c 'echo "SEAT_TOKEN=[$HISN_SEAT_TOKEN]"; cat /proc/self/environ | tr "\0" "\n" | grep HISN_SEAT_TOKEN || echo NO-SEAT-TOKEN-IN-ENV' 2>/dev/null | grep -q "NO-SEAT-TOKEN-IN-ENV"; then
+      pass "L89 HISN_SEAT_TOKEN does not reach a session environment"
+    else
+      fail "L89 HISN_SEAT_TOKEN does not reach a session environment" "the token was visible inside the session"
+    fi
+    L89_STORE_DIR=$("$HISN" ls --json 2>/dev/null | $PY ls-workspace-id "l89-$$")
+    if timeout 10 "$HISN" exec --no-tty --session "l89-$$" -- sh -c 'test -r "$XDG_STATE_HOME/hisn/workspaces" && echo STORE-READABLE || echo STORE-UNREADABLE' 2>/dev/null | grep -q "STORE-UNREADABLE"; then
+      pass "L89 seat store is not readable from inside a session"
+    else
+      fail "L89 seat store is not readable from inside a session" "the workspace state dir was readable inside"
+    fi
+    # --- set-role and revoke take effect in the running session ---------
+    "$HISN" seat --session "l89-$$" set-role rubin observer >/dev/null 2>&1 || true
+    if HISN_SEAT_TOKEN="$L89_TOK" timeout 10 "$HISN" exec --no-tty --session "l89-$$" -- sh -c 'echo L89-SHOULD-NOT-RUN' >/dev/null 2>&1; then
+      fail "L89 set-role takes effect in a running session" "exec still ran after demotion to observer"
+    else
+      pass "L89 set-role takes effect in a running session"
+    fi
+    if "$HISN" seat --session "l89-$$" revoke rubin >/dev/null 2>&1; then
+      pass "L89 seat revoke works"
+    else
+      fail "L89 seat revoke works" "revoke failed"
+    fi
+    if HISN_SEAT_TOKEN="$L89_TOK" timeout 10 "$HISN" exec --no-tty --session "l89-$$" -- sh -c 'echo L89-SHOULD-NOT-RUN' >/dev/null 2>&1; then
+      fail "L89 revoked credential is refused" "exec ran with a revoked credential"
+    else
+      pass "L89 revoked credential is refused"
+    fi
+    "$HISN" stop --session "l89-$$" >/dev/null 2>&1 || true
+  else
+    skip "L89 seats with credentials and roles" "session did not start"
+  fi
+  rm -rf "$L89_CWD"
+else
+  skip "L89 seats with credentials and roles" "hisn check failed (no userns)"
+fi
+
 # Every id in MANIFEST must produce at least one line. A missing id means
 # the test was silently dropped from the suite — FAIL.
 MANIFEST="$HERE/MANIFEST"

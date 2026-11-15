@@ -122,13 +122,52 @@ pub struct JournalRecord {
 
 /// The `client` object carried on a record, when one exists: the client
 /// identity mirrors the audit `client` object (uid, label, label_source,
-/// req_id).
+/// req_id), plus — 0.5.1 (ADR 0021) — the server-set seat name and role when
+/// a credential was used. The seat fields are additive and skipped when
+/// absent, so a 0.5.0 reader ignores them and a 0.5.1 reader still parses
+/// a 0.5.0 record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JournalClient {
     pub uid: u32,
     pub label: String,
     pub label_source: String,
     pub req_id: Option<String>,
+    /// 0.5.1: the seat the credential authenticated, set by the supervisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
+    /// 0.5.1: the seat's role at the time of the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+impl JournalClient {
+    /// A client without a seat credential (0.5.0 shape, byte-identical).
+    pub fn plain(uid: u32, label: String, label_source: String, req_id: Option<String>) -> Self {
+        Self {
+            uid,
+            label,
+            label_source,
+            req_id,
+            seat: None,
+            role: None,
+        }
+    }
+
+    /// A client that presented a credential (ADR 0021): the seat name and
+    /// role are server-set from the authenticated credential, and
+    /// `label_source` is `"seat"`. The client's own label is never used as
+    /// the seat, so a credentialed client cannot impersonate another seat
+    /// in the journal by choosing `--client`.
+    pub fn seat(uid: u32, seat: String, role: String, req_id: Option<String>) -> Self {
+        Self {
+            uid,
+            label: seat.clone(),
+            label_source: "seat".into(),
+            req_id,
+            seat: Some(seat),
+            role: Some(role),
+        }
+    }
 }
 
 /// The failure counter, shared with the supervisor's read path so `ls
@@ -732,9 +771,16 @@ pub fn query(records: &[JournalRecord], q: &Query) -> Vec<JournalRecord> {
 
 fn matches_query(r: &JournalRecord, q: &Query) -> bool {
     q.session.as_ref().is_none_or(|s| &r.session == s)
-        && q.seat
-            .as_ref()
-            .is_none_or(|seat| r.client.as_ref().is_some_and(|c| &c.label == seat))
+        && q.seat.as_ref().is_none_or(|seat| {
+            // 0.5.1: the server-set seat field, never the client's label —
+            // a credentialed client must not impersonate another seat in the
+            // journal by choosing a label. The label match stays as the
+            // legacy behaviour for records without a seat field.
+            r.client.as_ref().is_some_and(|c| match &c.seat {
+                Some(s) => s == seat,
+                None => c.label == *seat,
+            })
+        })
         && q.kind.as_ref().is_none_or(|k| &r.kind == k)
         && q.since_secs
             .is_none_or(|t| crate::session::parse_rfc3339_secs(&r.ts).is_some_and(|s| s >= t))
@@ -1273,12 +1319,12 @@ mod tests {
         let (_d, j) = test_journal();
         j.append(
             "grant/request",
-            Some(JournalClient {
-                uid: 1000,
-                label: "local".into(),
-                label_source: "flag".into(),
-                req_id: None,
-            }),
+            Some(JournalClient::plain(
+                1000,
+                "local".into(),
+                "flag".into(),
+                None,
+            )),
             data("x"),
         )
         .unwrap();
@@ -1388,34 +1434,29 @@ mod tests {
         // append with explicit fields
         j.append(
             "grant/request",
-            Some(JournalClient {
-                uid: 1000,
-                label: "alice".into(),
-                label_source: "flag".into(),
-                req_id: None,
-            }),
+            Some(JournalClient::plain(
+                1000,
+                "alice".into(),
+                "flag".into(),
+                None,
+            )),
             data("a"),
         )
         .unwrap();
         j.append(
             "grant/result",
-            Some(JournalClient {
-                uid: 1000,
-                label: "alice".into(),
-                label_source: "flag".into(),
-                req_id: None,
-            }),
+            Some(JournalClient::plain(
+                1000,
+                "alice".into(),
+                "flag".into(),
+                None,
+            )),
             data("b"),
         )
         .unwrap();
         j.append(
             "exec/request",
-            Some(JournalClient {
-                uid: 1000,
-                label: "bob".into(),
-                label_source: "ssh".into(),
-                req_id: None,
-            }),
+            Some(JournalClient::plain(1000, "bob".into(), "ssh".into(), None)),
             data("c"),
         )
         .unwrap();
@@ -1461,6 +1502,101 @@ mod tests {
             since_secs: None,
             last: None,
         };
+    }
+
+    #[test]
+    fn seat_query_uses_server_set_seat_not_label() {
+        // 0.5.1 (ADR 0021): a credentialed client whose label is another
+        // seat's name must not be returned by `--seat <other>`. The filter
+        // matches the server-set seat field; the label is only the legacy
+        // fallback for records without one.
+        let (_d, j) = test_journal();
+        j.append(
+            "exec/request",
+            Some(JournalClient::seat(
+                1000,
+                "rubin".into(),
+                "member".into(),
+                None,
+            )),
+            data("a"),
+        )
+        .unwrap();
+        let (recs, _) = read_records(&j.dir);
+        let c = recs[0].client.as_ref().unwrap();
+        assert_eq!(c.seat.as_deref(), Some("rubin"));
+        assert_eq!(c.role.as_deref(), Some("member"));
+        assert_eq!(c.label, "rubin");
+        assert_eq!(c.label_source, "seat");
+        let by_rubin = query(
+            &recs,
+            &Query {
+                seat: Some("rubin".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(by_rubin.len(), 1);
+        // A label-chosen impersonation does not match when a seat is set.
+        let mut forged = recs.clone();
+        forged[0].client.as_mut().unwrap().label = "wakil".into();
+        let by_wakil = query(
+            &forged,
+            &Query {
+                seat: Some("wakil".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            by_wakil.is_empty(),
+            "label must not select a credentialed record"
+        );
+        // And a plain (credentialless) record still matches by label.
+        let (_d2, j2) = test_journal();
+        j2.append(
+            "exec/request",
+            Some(JournalClient::plain(
+                1000,
+                "wakil".into(),
+                "flag".into(),
+                None,
+            )),
+            data("a"),
+        )
+        .unwrap();
+        let (recs2, _) = read_records(&j2.dir);
+        assert_eq!(recs2[0].client.as_ref().unwrap().seat, None);
+        let by_wakil = query(
+            &recs2,
+            &Query {
+                seat: Some("wakil".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(by_wakil.len(), 1, "legacy label match must stay");
+    }
+
+    #[test]
+    fn seat_fields_round_trip_and_plain_stays_byte_identical() {
+        // The seat fields are additive: a credentialed record carries them,
+        // a plain one serializes exactly the 0.5.0 shape.
+        let seat = JournalClient::seat(1000, "rubin".into(), "observer".into(), None);
+        let json = serde_json::to_value(&seat).unwrap();
+        assert_eq!(json["seat"], "rubin");
+        assert_eq!(json["role"], "observer");
+        assert_eq!(json["label_source"], "seat");
+        let plain = JournalClient::plain(1000, "local".into(), "none".into(), None);
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("seat").is_none() && json.get("role").is_none());
+        assert_eq!(
+            json,
+            serde_json::json!({"uid":1000,"label":"local","label_source":"none","req_id":null})
+        );
+        // A 0.5.0 record (no seat fields) still parses.
+        let back: JournalClient = serde_json::from_str(
+            r#"{"uid":1000,"label":"local","label_source":"none","req_id":null}"#,
+        )
+        .unwrap();
+        assert_eq!(back, plain);
     }
 
     #[test]
@@ -1794,12 +1930,12 @@ mod tests {
             wseq: 7,
             session: "ses\u{1b}[31m".into(),
             kind: "note\nforged".into(),
-            client: Some(JournalClient {
-                uid: 1000,
-                label: "evil\u{1b}]0;pwned\u{07}".into(),
-                label_source: "flag".into(),
-                req_id: None,
-            }),
+            client: Some(JournalClient::plain(
+                1000,
+                "evil\u{1b}]0;pwned\u{07}".into(),
+                "flag".into(),
+                None,
+            )),
             data: json!({"text": "line1\nline2\u{1b}[0m"}),
         };
         let r = render(&rec);
@@ -2483,12 +2619,8 @@ mod tests {
             wseq,
             session: session.into(),
             kind: kind.into(),
-            client: label.map(|l| JournalClient {
-                uid: 1000,
-                label: l.into(),
-                label_source: "flag".into(),
-                req_id: Some("r1".into()),
-            }),
+            client: label
+                .map(|l| JournalClient::plain(1000, l.into(), "flag".into(), Some("r1".into()))),
             data,
         }
     }

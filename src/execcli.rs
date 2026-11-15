@@ -20,6 +20,94 @@ use crate::init::{EXIT_CANNOT_EXEC, EXIT_INTERNAL, EXIT_NOT_FOUND};
 use crate::supervisor::{self, RawTerm, resize_to};
 use crate::{control, sig, sys};
 
+/// The seat credential for the control requests a command issues (0.5.1,
+/// ADR 0021, decision H): from `HISN_SEAT_TOKEN` or a file, never from a
+/// command-line argument, and never into a session's environment. An
+/// unreadable file or both sources set at once is an error, never a silent
+/// "credential absent".
+pub fn seat_token(token_file: Option<&std::path::Path>) -> Result<Option<String>> {
+    match (std::env::var("HISN_SEAT_TOKEN").ok(), token_file) {
+        (Some(_), Some(_)) => {
+            bail!("both HISN_SEAT_TOKEN and --seat-token-file are set; set only one")
+        }
+        (Some(t), None) => {
+            let t = t.trim().to_owned();
+            if t.is_empty() {
+                bail!("HISN_SEAT_TOKEN is empty");
+            }
+            Ok(Some(t))
+        }
+        (None, Some(p)) => {
+            let body = fs::read_to_string(p)
+                .with_context(|| format!("reading --seat-token-file {}", p.display()))?;
+            let t = body.trim().to_owned();
+            if t.is_empty() {
+                bail!("--seat-token-file {} is empty", p.display());
+            }
+            Ok(Some(t))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// The `client` object for a request: the label when one was given, the
+/// seat credential when one was configured (both when both are given — the
+/// supervisor sets the journal seat from the credential, never from the
+/// label), and the protocol revision when talking to a supervisor that
+/// declares revision 3 or higher.
+pub fn client_field(
+    label: Option<&str>,
+    token: Option<&str>,
+    revision: Option<u32>,
+) -> Option<Value> {
+    if label.is_none() && token.is_none() && revision.is_none() {
+        return None;
+    }
+    let mut c = serde_json::Map::new();
+    if let Some(l) = label {
+        c.insert("label".into(), json!(l));
+        c.insert("label_source".into(), json!("flag"));
+    }
+    if let Some(v) = revision {
+        c.insert("protocol_version".into(), json!(v));
+    }
+    if let Some(t) = token {
+        c.insert("seat_token".into(), json!(t));
+    }
+    Some(Value::Object(c))
+}
+
+/// The protocol revision of a session (absent = revision 1, 0.4.3).
+pub fn session_revision(session: &str) -> Option<u32> {
+    let uid = rustix::process::getuid().as_raw();
+    let roots =
+        crate::session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
+    let reg_root = crate::registry::registry_root(uid);
+    let id = crate::session::resolve_session_arg(&roots, &reg_root, session).ok()?;
+    let dir = crate::session::find_session(&roots, &id).ok()?;
+    crate::sessionmeta::read(&dir).and_then(|m| m.protocol_revision)
+}
+
+/// The credential a command may send to `session`, and the revision it may
+/// declare. A configured credential against a session below revision 3 is
+/// refused here (exit 2, nothing sent) — dropping the token to preserve
+/// compatibility would silently run a member/observer request as the
+/// owner, which decision F forbids.
+pub fn seat_material(
+    session: &str,
+    token_file: Option<&std::path::Path>,
+) -> Result<(Option<String>, Option<u32>)> {
+    let token = seat_token(token_file)?;
+    let revision = session_revision(session);
+    if token.is_some() && !revision.is_some_and(|r| r >= 3) {
+        bail!("session {session} predates seat credentials (protocol revision < 3); not sent");
+    }
+    let declare = revision
+        .filter(|r| *r >= 3)
+        .map(|_| crate::sessionmeta::PROTOCOL_VERSION);
+    Ok((token, declare))
+}
+
 /// How the program ended, from the client's point of view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Finish {
@@ -40,26 +128,28 @@ pub fn exit_code(f: &Finish) -> i32 {
 
 /// Build the request line's JSON (pure; unit-tested).
 pub fn build_request(args: &ExecArgs) -> Result<Value> {
+    build_request_with(args, None, None)
+}
+
+/// As [`build_request`], with the seat credential and protocol revision a
+/// revision-3 session may receive.
+pub fn build_request_with(
+    args: &ExecArgs,
+    token: Option<&str>,
+    revision: Option<u32>,
+) -> Result<Value> {
     let mut env = BTreeMap::new();
     for spec in &args.env {
         let (k, v) = parse_env_spec(spec).map_err(|e| anyhow!(e))?;
         env.insert(k, v);
     }
-    let client = if args.client.is_some() {
-        Some(json!({
-            "label": args.client,
-            "label_source": "flag",
-        }))
-    } else {
-        None
-    };
     Ok(json!({
         "op": "exec",
         "argv": args.command,
         "cwd": args.cwd,
         "env": env,
         "tty": args.tty,
-        "client": client,
+        "client": client_field(args.client.as_deref(), token, revision),
     }))
 }
 
@@ -216,7 +306,8 @@ pub fn refuse_real_terminal(
 
 /// Run `hisn exec`; returns the process exit code.
 pub fn run(args: ExecArgs) -> Result<i32> {
-    let req = build_request(&args)?;
+    let (token, revision) = seat_material(&args.session, args.seat_token_file.as_deref())?;
+    let req = build_request_with(&args, token.as_deref(), revision)?;
     refuse_real_terminal(args.tty, args.no_tty, sys::isatty)?;
     let sock = supervisor::socket_for(&args.session)?;
     let conn = UnixStream::connect(&sock)
@@ -517,6 +608,41 @@ mod tests {
             Command::Exec(e) => e,
             _ => panic!("not exec"),
         }
+    }
+
+    /// 0.5.1: the seat credential and the revision ride in `client`, and a
+    /// client without a credential is byte-identical to 0.5.0.
+    #[test]
+    fn seat_credential_and_revision_ride_in_client() {
+        let a = exec_args(&["hisn", "exec", "--session", "s", "--", "ls"]);
+        // No credential, no revision: the request is exactly the 0.5.0 shape.
+        assert_eq!(
+            build_request(&a).unwrap(),
+            json!({"op":"exec","argv":["ls"],"cwd":null,"env":{},"tty":false,"client":null})
+        );
+        // With a credential and revision 3: only `client` gains fields.
+        let req = build_request_with(&a, Some("TOK"), Some(3)).unwrap();
+        assert_eq!(
+            req["client"],
+            json!({"protocol_version":3,"seat_token":"TOK"})
+        );
+        // With a label too: both ride, and the credential is never in env.
+        let c = exec_args(&[
+            "hisn",
+            "exec",
+            "--session",
+            "s",
+            "--client",
+            "rubin-wakil",
+            "--",
+            "ls",
+        ]);
+        let req = build_request_with(&c, Some("TOK"), Some(3)).unwrap();
+        assert_eq!(
+            req["client"],
+            json!({"label":"rubin-wakil","label_source":"flag","protocol_version":3,"seat_token":"TOK"})
+        );
+        assert!(!req["env"].to_string().contains("TOK"));
     }
 
     #[test]

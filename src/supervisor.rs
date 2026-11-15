@@ -46,6 +46,25 @@ use crate::sessionmeta;
 use crate::workspace::{self, WorkspaceRef, workspace_id_for, workspace_name_for};
 use crate::{seccomp, sig, sys};
 
+/// The journal identity for `client`: when a credential authenticated a
+/// seat, the server-set seat/role (ADR 0021); otherwise the 0.5.0 shape.
+fn journal_client(client: &authz::ClientRecord) -> JournalClient {
+    match (&client.seat, &client.seat_role) {
+        (Some(seat), Some(role)) => JournalClient::seat(
+            client.uid,
+            seat.clone(),
+            role.as_str().to_owned(),
+            client.req_id.clone(),
+        ),
+        _ => JournalClient::plain(
+            client.uid,
+            client.label.clone(),
+            client.label_source.clone(),
+            client.req_id.clone(),
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn log_client_record(
     audit: &Audit,
@@ -60,12 +79,18 @@ fn log_client_record(
 ) {
     let mut entry = Audit::entry(op, stage, path, mode, result, client.pid);
     if let Some(o) = entry.as_object_mut() {
+        // ADR 0021: for a credentialed client the label is the seat name;
+        // grants.jsonl gets no new field (rule 4).
+        let (label, label_source) = match &client.seat {
+            Some(seat) => (seat.clone(), "seat".to_string()),
+            None => (client.label.clone(), client.label_source.clone()),
+        };
         o.insert(
             "client".into(),
             json!({
                 "uid": client.uid,
-                "label": client.label,
-                "label_source": client.label_source,
+                "label": label,
+                "label_source": label_source,
                 "req_id": client.req_id,
             }),
         );
@@ -78,12 +103,7 @@ fn log_client_record(
     // stops the audit (rule 5); `append` counts it.
     let _ = journal.append(
         &format!("{op}/{stage}"),
-        Some(JournalClient {
-            uid: client.uid,
-            label: client.label.clone(),
-            label_source: client.label_source.clone(),
-            req_id: client.req_id.clone(),
-        }),
+        Some(journal_client(client)),
         entry,
     );
 }
@@ -97,16 +117,7 @@ fn journal_exec_exit_record(
     duration_ms: u128,
 ) {
     let data = exit_record_data(client, exit, cancelled, lost, duration_ms);
-    let _ = journal.append(
-        "exec/exit",
-        Some(JournalClient {
-            uid: client.uid,
-            label: client.label.clone(),
-            label_source: client.label_source.clone(),
-            req_id: client.req_id.clone(),
-        }),
-        data,
-    );
+    let _ = journal.append("exec/exit", Some(journal_client(client)), data);
 }
 
 fn journal_exec_request_record(
@@ -129,16 +140,7 @@ fn journal_exec_request_record(
     }
     data["seq"] = json!(client.seq);
     data["authz"] = json!({ "allow": true });
-    let _ = journal.append(
-        &format!("{op}/request"),
-        Some(JournalClient {
-            uid: client.uid,
-            label: client.label.clone(),
-            label_source: client.label_source.clone(),
-            req_id: client.req_id.clone(),
-        }),
-        data,
-    );
+    let _ = journal.append(&format!("{op}/request"), Some(journal_client(client)), data);
 }
 
 // ---------------------------------------------------------------- R5 decision
@@ -1551,16 +1553,10 @@ impl Shared {
             );
         }
         let data = json!({ "kind": kind, "text": text });
-        match self.journal.append(
-            kind,
-            Some(JournalClient {
-                uid: client.uid,
-                label: client.label.clone(),
-                label_source: client.label_source.clone(),
-                req_id: client.req_id.clone(),
-            }),
-            data,
-        ) {
+        match self
+            .journal
+            .append(kind, Some(journal_client(client)), data)
+        {
             Ok(()) => {
                 // The record's `wseq` is assigned under the flock in `append`;
                 // the response echoes only what the caller sent, so the caller
@@ -1807,6 +1803,8 @@ impl Handler for Ctl {
             req_id: None,
             seq: 0,
             principal: None,
+            seat: None,
+            seat_role: None,
         };
         let session = self.sh.session_auth();
         let credential = match req.client_field().and_then(|c| c.seat_token.clone()) {
@@ -1850,6 +1848,8 @@ impl Handler for Ctl {
             req_id,
             seq,
             principal: None,
+            seat: None,
+            seat_role: None,
         };
         let session = self.sh.session_auth();
         let credential = match req.client_field().and_then(|c| c.seat_token.clone()) {
@@ -2697,6 +2697,7 @@ fn run_supervisor_inner(
         uid,
         label: crate::session::local_label(),
         client_id: String::new(),
+        extra: std::collections::BTreeMap::new(),
     };
     // 0.4.0 step 4: parse --env K=V as the session env snapshot. Computed
     // names (HOME, USER, LOGNAME, cache vars) are refused at run with the
@@ -2781,6 +2782,7 @@ fn run_supervisor_inner(
             meta.lease = Some(sessionmeta::Lease {
                 idle_timeout_s: Some(timeout),
                 last_activity: Some(session::rfc3339_now()),
+                extra: std::collections::BTreeMap::new(),
             });
         }
         meta.write_to(&tmp.path)?;
@@ -4098,6 +4100,8 @@ mod tests {
             label_source: "flag".into(),
             req_id: Some("r1".into()),
             seq: 7,
+            seat: None,
+            seat_role: None,
         };
         log_client_record(
             &audit,
@@ -4786,6 +4790,8 @@ mod tests {
                 req_id: Some("r1".into()),
                 principal: None,
                 seq: 5,
+                seat: None,
+                seat_role: None,
             },
             Some(&exec::Exit::Code(3)),
             false,
@@ -4809,6 +4815,8 @@ mod tests {
                 req_id: None,
                 principal: None,
                 seq: 6,
+                seat: None,
+                seat_role: None,
             },
             Some(&exec::Exit::Signal(15)),
             false,
@@ -4829,6 +4837,8 @@ mod tests {
                 req_id: Some("r9".into()),
                 principal: None,
                 seq: 9,
+                seat: None,
+                seat_role: None,
             },
             None,
             true,

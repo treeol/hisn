@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use hisn::cli::{Cli, Command, PolicyCommand, ProfileCommand, RootfsCommand};
 use hisn::policy::{self, Overrides, Policy};
 use hisn::profile;
-use hisn::{attach, execcli, journal, mounts, rootfs_store, session, supervisor, workspace};
+use hisn::{attach, execcli, journal, mounts, rootfs_store, seats, session, supervisor, workspace};
 
 /// Exit code for hisn-internal errors (policy, host); distinct from a
 /// command's own exit status.
@@ -118,16 +118,18 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Attach(a) => Ok(exit_u8(attach::run(a)?)),
         Command::Grant(a) => {
             let mode = if a.rw { "rw" } else { "ro" };
-            let r = supervisor::client_request(
+            let r = client_request_with_seat(
                 &a.session,
-                &json!({"op":"grant","path":a.path,"mode":mode,"recursive":a.recursive}),
+                json!({"op":"grant","path":a.path,"mode":mode,"recursive":a.recursive}),
+                a.seat_token_file.as_deref(),
             )?;
             print_response(&r)
         }
         Command::Revoke(a) => {
-            let r = supervisor::client_request(
+            let r = client_request_with_seat(
                 &a.session,
-                &json!({"op":"revoke","path":a.path,"hard":a.hard,"kill_holders":a.kill_holders}),
+                json!({"op":"revoke","path":a.path,"hard":a.hard,"kill_holders":a.kill_holders}),
+                a.seat_token_file.as_deref(),
             )?;
             print_response(&r)
         }
@@ -145,8 +147,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 eprintln!("session {} was stale; removed", a.session);
                 return Ok(ExitCode::SUCCESS);
             }
-            let r =
-                supervisor::client_request(&a.session, &json!({"op":"kill","signal":a.signal}))?;
+            let r = client_request_with_seat(
+                &a.session,
+                json!({"op":"kill","signal":a.signal}),
+                a.seat_token_file.as_deref(),
+            )?;
             print_response(&r)
         }
         Command::Stop(a) => {
@@ -267,7 +272,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
         }
         Command::Inspect(a) => {
-            let r = supervisor::client_request(&a.session, &json!({"op":"inspect"}))?;
+            let r = client_request_with_seat(
+                &a.session,
+                json!({"op":"inspect"}),
+                a.seat_token_file.as_deref(),
+            )?;
             if a.json || r["ok"] != true {
                 return print_response(&r);
             }
@@ -285,6 +294,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             a.purge,
             a.name_prefix.as_deref(),
             a.dry_run,
+            a.seat_token_file.as_deref(),
         ),
         Command::Rootfs { command } => match command {
             RootfsCommand::Import(args) => rootfs_import(args),
@@ -332,14 +342,15 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             // A note is a client mutation (its connection registers, its seat
             // is a member, the lease is touched) *and* writes the journal.
             // Documented in CONTROL-PROTOCOL.md and sessions.md.
-            let r = supervisor::client_request(
+            let r = client_request_with_seat(
                 &a.session,
-                &json!({"op":"note","kind":kind,"text":text,
-                        "client":{"protocol_version":hisn::sessionmeta::PROTOCOL_VERSION}}),
+                json!({"op":"note","kind":kind,"text":text}),
+                a.seat_token_file.as_deref(),
             )?;
             print_response(&r)
         }
         Command::Journal(a) => journal_cmd(a),
+        Command::Seat(a) => seat_cmd(a),
     }
 }
 
@@ -368,6 +379,134 @@ fn load_resolved(file: Option<PathBuf>) -> Result<(PathBuf, policy::ResolvedPoli
     Ok((file, resolved))
 }
 
+/// The seat credential material for a command that talks to `session`
+/// (0.5.1, decision H/I): the token and the revision it may declare, or
+/// an exit-2 refusal. The token is never printed, never put in a session's
+/// environment, and never sent to a session below revision 3.
+fn seat_client(session: &str, token_file: Option<&Path>) -> Result<Option<Value>> {
+    let (token, revision) = execcli::seat_material(session, token_file)?;
+    Ok(execcli::client_field(None, token.as_deref(), revision))
+}
+
+/// One control request for a command that talks to `session`, with the
+/// client object decision H/I require. A client without a credential is
+/// byte-identical to 0.5.0: `client` is absent entirely.
+fn client_request_with_seat(
+    session: &str,
+    mut req: Value,
+    token_file: Option<&Path>,
+) -> Result<Value> {
+    if let Some(client) = seat_client(session, token_file)?
+        && let Some(obj) = req.as_object_mut()
+    {
+        obj.insert("client".into(), client);
+    }
+    supervisor::client_request(session, &req)
+}
+
+/// The workspace id for `hisn seat`.
+fn seat_workspace(a: &hisn::cli::SeatArgs) -> Result<String> {
+    if let Some(w) = &a.workspace {
+        return Ok(
+            match (
+                workspace::is_valid_workspace_id(w),
+                workspace::workspace_dir(w).is_dir(),
+            ) {
+                (true, true) => w.clone(),
+                _ => workspace::workspace_id_for_name(w),
+            },
+        );
+    }
+    if let Some(s) = &a.session {
+        return journal_session_lookup(s, None)
+            .map(|m| m.workspace)
+            .ok_or_else(|| anyhow::anyhow!("no workspace for session {s}"));
+    }
+    let cwd = std::env::current_dir().context("current dir")?;
+    let canon = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    Ok(workspace::workspace_id_for_path(&canon))
+}
+
+/// `hisn seat` (ADR 0021). The store is written directly (one code path;
+/// running supervisors notice through the stat before each decision).
+/// Seat management is journaled, never with the credential.
+fn seat_cmd(a: hisn::cli::SeatArgs) -> Result<ExitCode> {
+    let id = seat_workspace(&a)?;
+    let dir = workspace::workspace_dir(&id);
+    let j = journal::Journal::new(dir.clone(), a.session.clone().unwrap_or_default());
+    let client = journal::JournalClient::plain(
+        rustix::process::getuid().as_raw(),
+        workspace::workspace_name_for(std::env::current_dir().unwrap_or_default(), None),
+        "seat".into(),
+        None,
+    );
+    match a.op {
+        hisn::cli::SeatOp::Add {
+            name,
+            role,
+            expires,
+        } => {
+            let role = match role.as_deref() {
+                Some(r) => seats::Role::parse(r).ok_or_else(|| {
+                    anyhow::anyhow!("unknown role {r:?} (owner, member or observer)")
+                })?,
+                None => seats::Role::Member,
+            };
+            if let Some(e) = expires.as_deref()
+                && !(e.ends_with('Z') && hisn::session::parse_rfc3339_secs(e).is_some())
+            {
+                return Err(anyhow::anyhow!(
+                    "--expires {e:?} is not an RFC 3339 UTC (Z) timestamp"
+                ));
+            }
+            let token =
+                seats::add(&dir, &name, role, expires.clone()).map_err(|e| anyhow::anyhow!(e))?;
+            let _ = j.append(
+                "seat-add/request",
+                Some(client),
+                json!({"seat": name, "role": role.as_str()}),
+            );
+            println!("{token}");
+            eprintln!(
+                "hisn: seat {name} created (role {}); this credential cannot be shown again",
+                role.as_str()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        hisn::cli::SeatOp::Ls => {
+            for v in seats::views(&dir) {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    v.name,
+                    v.role,
+                    v.created,
+                    v.expires.as_deref().unwrap_or("-"),
+                    if v.revoked { "revoked" } else { "live" }
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        hisn::cli::SeatOp::SetRole { name, role } => {
+            let role = seats::Role::parse(&role)
+                .ok_or_else(|| anyhow::anyhow!("unknown role {role:?}"))?;
+            seats::set_role(&dir, &name, role).map_err(|e| anyhow::anyhow!(e))?;
+            let _ = j.append(
+                "seat-set-role/request",
+                Some(client),
+                json!({"seat": name, "role": role.as_str()}),
+            );
+            println!("seat {name} is now {}", role.as_str());
+            Ok(ExitCode::SUCCESS)
+        }
+        hisn::cli::SeatOp::Revoke { name } => {
+            seats::revoke(&dir, &name).map_err(|e| anyhow::anyhow!(e))?;
+            let _ = j.append("seat-revoke/request", Some(client), json!({"seat": name}));
+            println!("seat {name} revoked");
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
 fn print_response(r: &Value) -> Result<ExitCode> {
     println!("{r}");
     Ok(if r["ok"] == true {
@@ -384,12 +523,13 @@ fn ls(
     purge: bool,
     name_prefix: Option<&str>,
     dry_run: bool,
+    seat_token_file: Option<&Path>,
 ) -> Result<ExitCode> {
     let uid = rustix::process::getuid().as_raw();
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
     match session_id {
         Some(id) => {
-            let r = supervisor::client_request(id, &json!({"op":"list"}))?;
+            let r = client_request_with_seat(id, json!({"op":"list"}), seat_token_file)?;
             if json_out || r["ok"] != true {
                 return print_response(&r);
             }
@@ -662,6 +802,15 @@ fn session_v2_json(
         "pid": Value::Null,
         "started": meta.map(|m| Value::String(m.created.ts.clone())).unwrap_or(Value::Null),
         "journal_failures": journal_failures.map_or(Value::Null, Value::from),
+        "seats": meta.and_then(|m| m.workspace.as_ref().map(|w| {
+            let dir = hisn::workspace::workspace_dir(&w.id);
+            let views: Vec<Value> = hisn::seats::views(&dir)
+                .iter()
+                .map(|v| json!({ "name": v.name, "role": v.role, "created": v.created,
+                                 "expires": v.expires, "revoked": v.revoked }))
+                .collect();
+            Value::Array(views)
+        })).unwrap_or(Value::Null),
         "execs": execs,
         "services": services,
         "clients": clients,
@@ -1079,6 +1228,8 @@ mod ls_tests {
             uid: 1000,
             label: "local".into(),
             client_id: "c".into(),
+
+            extra: std::collections::BTreeMap::new(),
         };
         let mut meta = SessionMeta::new("abc", Some("seat"), owner, "/w", "none");
         meta.rootfs = Some("wakil-dev".into());
@@ -1087,6 +1238,7 @@ mod ls_tests {
             label: "rubin-wakil".into(),
             first_seen: "2026-11-07T12:00:00Z".into(),
             last_seen: "2026-11-07T12:01:00Z".into(),
+            extra: std::collections::BTreeMap::new(),
         }];
         let clients = vec![json!({
             "uid": 1000, "pid": 42, "label": "rubin-wakil",
@@ -1148,6 +1300,8 @@ mod ls_tests {
             uid: 1000,
             label: "local".into(),
             client_id: "c".into(),
+
+            extra: std::collections::BTreeMap::new(),
         };
         let m = SessionMeta::new("abc", Some("nm"), owner, "/w", "none");
         m.write_to(&d).unwrap();
@@ -1252,6 +1406,8 @@ mod ls_tests {
                 uid: rustix::process::getuid().as_raw(),
                 label: "local".into(),
                 client_id: "c".into(),
+
+                extra: std::collections::BTreeMap::new(),
             },
             "/w",
             "none",
@@ -1307,6 +1463,8 @@ mod ls_tests {
             uid: 1000,
             label: "local".into(),
             client_id: "c".into(),
+
+            extra: std::collections::BTreeMap::new(),
         };
         let mut m = SessionMeta::new("abc", Some("nm"), owner, "/w", "none");
         m.workspace = Some(hisn::workspace::WorkspaceRef {
@@ -1329,6 +1487,8 @@ mod ls_tests {
                 uid: 1000,
                 label: "local".into(),
                 client_id: "c".into(),
+
+                extra: std::collections::BTreeMap::new(),
             },
             "/w",
             "none",

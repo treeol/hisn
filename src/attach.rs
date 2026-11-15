@@ -23,14 +23,15 @@ use crate::sys;
 
 /// Build the control-protocol request for an attach.
 pub fn build_request(args: &AttachArgs) -> Result<Value> {
-    let client = if args.client.is_some() {
-        Some(json!({
-            "label": args.client,
-            "label_source": "flag",
-        }))
-    } else {
-        None
-    };
+    build_request_with(args, None, None)
+}
+
+/// As [`build_request`], with the seat credential and revision.
+pub fn build_request_with(
+    args: &AttachArgs,
+    token: Option<&str>,
+    revision: Option<u32>,
+) -> Result<Value> {
     Ok(json!({
         "op": "exec",
         "argv": [],
@@ -38,14 +39,16 @@ pub fn build_request(args: &AttachArgs) -> Result<Value> {
         "env": {},
         "tty": true,
         "attach": true,
-        "client": client,
+        "client": crate::execcli::client_field(args.client.as_deref(), token, revision),
     }))
 }
 
 /// Run `hisn attach`. Allocates a pty, sends the request, relays I/O, and
 /// intercepts the detach key (Ctrl-] d).
 pub fn run(args: AttachArgs) -> Result<i32> {
-    let req = build_request(&args)?;
+    let (token, revision) =
+        crate::execcli::seat_material(&args.session, args.seat_token_file.as_deref())?;
+    let req = build_request_with(&args, token.as_deref(), revision)?;
     let sock = supervisor::socket_for(&args.session)?;
     let conn = UnixStream::connect(&sock)
         .with_context(|| format!("connecting to session {}", args.session))?;

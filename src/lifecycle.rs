@@ -481,6 +481,8 @@ mod tests {
                 uid: 1000,
                 label: "local".into(),
                 client_id: String::new(),
+
+                extra: std::collections::BTreeMap::new(),
             },
             "/tmp",
             "none",
@@ -489,6 +491,7 @@ mod tests {
         m.lease = Some(sessionmeta::Lease {
             idle_timeout_s: Some(timeout_s),
             last_activity: Some(crate::session::rfc3339(start)),
+            extra: std::collections::BTreeMap::new(),
         });
         m.write_to(d.path()).expect("write session.json");
         d

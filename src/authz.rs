@@ -46,6 +46,11 @@ pub struct ClientRecord {
     pub seq: u64,
     /// Reserved for a later role model. Always `None` in 0.4.
     pub principal: Option<String>,
+    /// 0.5.1 (ADR 0021): the seat the presented credential authenticated,
+    /// and its role — server-set from the credential, never from the
+    /// client's label. `None` for a client without a credential.
+    pub seat: Option<String>,
+    pub seat_role: Option<crate::seats::Role>,
 }
 
 impl ClientRecord {
@@ -60,6 +65,8 @@ impl ClientRecord {
             req_id: None,
             seq,
             principal: None,
+            seat: None,
+            seat_role: None,
         }
     }
 }
@@ -297,6 +304,8 @@ mod tests {
             req_id: None,
             seq: 1,
             principal: None,
+            seat: None,
+            seat_role: None,
         }
     }
 

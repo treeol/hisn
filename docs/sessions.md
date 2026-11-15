@@ -108,12 +108,28 @@ exclusive `flock`, because several supervisors write to one workspace),
 `session`, `kind`, `client` (when one exists — `uid`, `label`,
 `label_source`, `req_id`) and `data`.
 
+**Seats (0.5.1).** A seat is a named client identity for one workspace
+(`seats.json` beside the journal, one credential per seat, shown once at
+creation and stored only as a hash), with a role — `owner`, `member` or
+`observer` — in the one role table of `src/authz.rs`. When a request
+presents a credential, the journal `client` also carries the **server-set**
+`seat` and `role` and `label_source` `"seat"`: the seat name comes from the
+credential, never from the client's `--client` label, so a credentialed
+client cannot impersonate another seat in the journal. `hisn journal
+--seat NAME` filters on that server-set seat (the old label match stays
+for records without one). Seat management itself is journaled (who created,
+changed or revoked which seat, never the credential). The credential is
+taken from `HISN_SEAT_TOKEN` or `--seat-token-file`, never from a
+command-line argument and never into a session's environment. Under one
+Unix user a seat is attribution and a guard against mistakes, not a
+security boundary (ADR 0021).
+
 Every event written to `grants.jsonl` today is also journaled (same
 information, journal shape) — the audit log itself is unchanged (the journal
 is in addition to it). Plus session start/stop, notes and markers, and the
 git-change records. It is a **record, not a replay mechanism**: nothing
 re-executes it. Queries read the host-side files directly
-(`hisn journal [--workspace W | --session S] [--seat LABEL] [--kind K]
+(`hisn journal [--workspace W | --session S] [--seat NAME] [--kind K]
 [--since TS] [--last N] [--json]`), so they also work for stopped and pruned
 sessions. Default output is one readable line per event; `--json` prints
 the records unchanged.

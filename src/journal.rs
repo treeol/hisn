@@ -1027,12 +1027,37 @@ fn summary_for(rec: &JournalRecord) -> String {
             escape_terminal(d.get("result").and_then(|v| v.as_str()).unwrap_or("?"))
         ),
         "note" | "marker" => {
-            let text = d
-                .get("text")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-                .unwrap_or_else(|| d.to_string());
-            escape_terminal(&text)
+            let text = d.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            escape_terminal(text)
+        }
+        "kill/request" | "signal/request" => {
+            escape_terminal(d.get("result").and_then(|v| v.as_str()).unwrap_or("?"))
+        }
+        "forward/start" | "forward/result" => {
+            let subject = d.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            escape_terminal(&format!(
+                "forward {}{}",
+                subject,
+                match (rec.kind.as_str(), d.get("result").and_then(|v| v.as_str())) {
+                    ("forward/result", Some(result)) => format!(" {}", escape_terminal(result)),
+                    _ => String::new(),
+                }
+            ))
+        }
+        "lease/expired" => format!(
+            "lease expired ({})",
+            escape_terminal(d.get("result").and_then(|v| v.as_str()).unwrap_or("?"))
+        ),
+        _ if rec.kind.ends_with("/refused") => {
+            let op = d.get("op").and_then(|v| v.as_str()).unwrap_or("operation");
+            let reason = d.get("result").and_then(|v| v.as_str()).unwrap_or("denied");
+            let mut summary = escape_terminal(op);
+            if let Some(path) = d.get("path").and_then(|v| v.as_str()) {
+                summary.push(' ');
+                summary.push_str(&escape_terminal(path));
+            }
+            summary.push_str(&format!(" refused ({})", escape_terminal(reason)));
+            summary
         }
         "grant/request" | "revoke/request" => {
             let path = d.get("path").and_then(|v| v.as_str()).unwrap_or("?");
@@ -1055,7 +1080,11 @@ fn summary_for(rec: &JournalRecord) -> String {
         "session/start" => "session started".to_owned(),
         "session/stop" => "session stopped".to_owned(),
         "git-change" => git_change_summary(d),
-        _ => escape_terminal(&d.to_string()),
+        _ => format!(
+            "unrecognized {} ({} bytes; use --json)",
+            rec.kind,
+            d.to_string().len()
+        ),
     }
 }
 
@@ -2226,6 +2255,186 @@ mod tests {
             .filter(|r| r.kind.starts_with("exec/"))
             .collect();
         assert_eq!(render_collapsed(&no_starts).len(), 2);
+    }
+
+    #[test]
+    fn release050_every_writable_kind_is_compact_and_unknown_uses_fallback() {
+        let escaped_label = "local";
+        let kinds = [
+            (
+                "grant/request",
+                json!({"op":"grant","stage":"request","path":"/srv/data","mode":"rw","result":null,"seq":11,"authz":{"allow":true}}),
+                "grant/request",
+                "/srv/data rw",
+            ),
+            (
+                "grant/result",
+                json!({"op":"grant","stage":"result","path":"/srv/data","mode":"rw","result":"ok","seq":11,"authz":{"allow":true}}),
+                "grant/result",
+                "/srv/data ok",
+            ),
+            (
+                "revoke/request",
+                json!({"op":"revoke","stage":"request","path":"/srv/data","mode":null,"result":null,"seq":12,"authz":{"allow":true}}),
+                "revoke/request",
+                "/srv/data",
+            ),
+            (
+                "revoke/result",
+                json!({"op":"revoke","stage":"result","path":"/srv/data","mode":null,"result":"ok","seq":12,"authz":{"allow":true}}),
+                "revoke/result",
+                "/srv/data ok",
+            ),
+            (
+                "signal/request",
+                json!({"op":"signal","stage":"request","path":null,"mode":null,"result":"KILL","uid":1000,"seq":13,"authz":{"allow":true}}),
+                "signal/request",
+                "KILL",
+            ),
+            (
+                "kill/request",
+                json!({"op":"kill","stage":"request","path":null,"mode":null,"result":"TERM","uid":1000,"seq":14,"authz":{"allow":true}}),
+                "kill/request",
+                "TERM",
+            ),
+            (
+                "exec/result",
+                json!({"op":"exec","stage":"result","path":"sh","mode":null,"result":"ok","seq":15,"authz":{"allow":true}}),
+                "exec/result",
+                "result:ok",
+            ),
+            (
+                "attach/result",
+                json!({"op":"attach","stage":"result","path":"sh","mode":null,"result":"ok","seq":16,"authz":{"allow":true}}),
+                "attach/result",
+                "result:ok",
+            ),
+            (
+                "exec/exit",
+                json!({"op":"exec","stage":"exit","duration_ms":120,"cancelled":false,"lost":false,"seq":17,"authz":{"allow":true},"exit_code":3}),
+                "exec/exit",
+                "exit:3 120ms",
+            ),
+            (
+                "auth/refused",
+                json!({"op":"auth","stage":"refused","result":"not owner","uid":1000,"seq":18,"authz":{"allow":false}}),
+                "auth/refused",
+                "auth refused (not owner)",
+            ),
+            (
+                "forward/start",
+                json!({"op":"forward","stage":"start","path":"/tmp/service.sock","mode":null,"result":null}),
+                "forward/start",
+                "forward /tmp/service.sock",
+            ),
+            (
+                "forward/result",
+                json!({"op":"forward","stage":"result","path":"/tmp/service.sock","mode":null,"result":"ok"}),
+                "forward/result",
+                "forward /tmp/service.sock ok",
+            ),
+            (
+                "lease/expired",
+                json!({"op":"lease","stage":"expired","path":null,"mode":null,"result":"idle"}),
+                "lease/expired",
+                "lease expired (idle)",
+            ),
+            (
+                "grant/refused",
+                json!({"op":"grant","stage":"refused","path":"/srv/data","mode":"rw","result":"not owner","seq":19,"authz":{"allow":false}}),
+                "grant/refused",
+                "grant /srv/data refused (not owner)",
+            ),
+            (
+                "session/start",
+                json!({"workspace":"0123456789abcdef"}),
+                "session/start",
+                "session started",
+            ),
+            (
+                "session/stop",
+                json!({"workspace":"0123456789abcdef"}),
+                "session/stop",
+                "session stopped",
+            ),
+            (
+                "note",
+                json!({"kind":"note","text":"hello"}),
+                "note",
+                "hello",
+            ),
+            (
+                "marker",
+                json!({"kind":"marker","text":"checkpoint"}),
+                "marker",
+                "checkpoint",
+            ),
+            (
+                "git-change",
+                json!({"cwd":"/work/proj","unchanged":true,"hooks_count":1,"config_keys_count":2}),
+                "git-change",
+                "git unchanged (hooks 1, config keys 2)",
+            ),
+        ];
+        let records: Vec<_> = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, data, _, _))| {
+                rec(
+                    (i + 1) as u64,
+                    kind,
+                    "abcdef0123456789",
+                    Some(escaped_label),
+                    data.clone(),
+                )
+            })
+            .collect();
+        let lines = render_collapsed(&records);
+        assert_eq!(lines.len(), kinds.len(), "{lines:?}");
+        for (line, (_, _, kind, expected)) in lines.iter().zip(kinds.iter()) {
+            assert!(line.contains(kind), "line names its kind: {line}");
+            assert!(
+                line.contains(expected),
+                "line summarizes {kind} as {expected:?}: {line}"
+            );
+            assert!(
+                !line.contains('{') && !line.contains('}'),
+                "no raw JSON object printed: {line}"
+            );
+        }
+        // Multi-line wire-op/records and unknown kinds never reach the raw dump.
+        for kind in ["inspect/request", "future/kind"] {
+            let line = summary_for(&rec(
+                (kinds.len() + 1) as u64,
+                kind,
+                "abcdef0123456789",
+                None,
+                json!({"op":"future","stage":"request","seq":20,"future":{"raw":"value"}}),
+            ));
+            assert!(
+                line.contains(kind),
+                "unknown fallback names its kind: {line}"
+            );
+            assert!(
+                !line.contains('{') && !line.contains('}'),
+                "unknown fallback never prints JSON: {line}"
+            );
+            assert!(
+                line.contains("--json"),
+                "unknown fallback points to --json: {line}"
+            );
+            assert!(
+                line.contains(
+                    &serde_json::to_string(
+                        &json!({"op":"future","stage":"request","seq":20,"future":{"raw":"value"}})
+                    )
+                    .unwrap()
+                    .len()
+                    .to_string()
+                ),
+                "fallback reports record size: {line}"
+            );
+        }
     }
 
     #[test]

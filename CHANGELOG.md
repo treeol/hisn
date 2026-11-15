@@ -28,9 +28,10 @@ sandbox.
 - **Workspace journal.** One `journal.jsonl` per workspace (mode 0600,
   workspace-wide `wseq`, 64 MiB rotation) records the audit-shaped events,
   exec requests and exits, notes/markers, session start/stop, and git-change
-  records. Exec request records carry argv capped at 512 bytes in total,
-  plus the request cwd; exec exits carry the exit code or signal, cancelled/
-  lost, and duration.
+  records. Exec request records carry argv capped at 512 bytes in total (the
+  fitting whole-element prefix; an over-long first element records an empty
+  argv with the original counts), plus the request cwd; exec exits carry the
+  exit code or signal, cancelled/lost, and duration.
 - **`hisn journal`.** Compact readable lines (merged `exec` events) with
   `--workspace`, `--session`, `--seat`, `--kind`, `--since` and `--last`
   filters, and exact `--json` output. `--session ID-or-NAME` resolves the

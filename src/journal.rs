@@ -1082,7 +1082,7 @@ fn summary_for(rec: &JournalRecord) -> String {
         "git-change" => git_change_summary(d),
         _ => format!(
             "unrecognized {} ({} bytes; use --json)",
-            rec.kind,
+            escape_terminal(&rec.kind),
             d.to_string().len()
         ),
     }
@@ -2435,6 +2435,23 @@ mod tests {
                 "fallback reports record size: {line}"
             );
         }
+    }
+
+    #[test]
+    fn release050_unknown_kind_is_terminal_escaped() {
+        let escaped = summary_for(&rec(
+            1,
+            "future/\u{1b}[31mkind",
+            "abcdef0123456789",
+            None,
+            json!({"op":"future","stage":"request","seq":21,"future":{"raw":"value"}}),
+        ));
+        assert!(
+            !escaped.contains('\u{1b}'),
+            "fallback must not pass ESC through: {escaped:?}"
+        );
+        assert!(!escaped.contains('{') && !escaped.contains('}'));
+        assert!(escaped.contains("--json"), "{escaped}");
     }
 
     #[test]

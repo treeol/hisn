@@ -5,7 +5,8 @@ describe the sandbox core (0.2 exec
 included); §15–§19 describe the 0.3 orchestration layer; §20 and §20.1
 describe named sessions, attach, leases and the 0.4.1 changes; §21 and
 §20.2 describe the 0.4.3 session-startup refactor, behaviour changes and
-the 0.4.2 follow-up fixes. The
+the 0.4.2 follow-up fixes. §22 describes the 0.5.0 workspaces, journal,
+control-protocol version gate and git-change report. The
 session lifecycle in
 one place is [sessions.md](sessions.md). The decisions behind
 each part are in [`docs/adr/`](adr/README.md). Binding input: `docs/BRIEF.md`

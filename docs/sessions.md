@@ -119,7 +119,8 @@ sessions. Default output is one readable line per event; `--json` prints
 the records unchanged.
 
 **What an exec records.** The journal's exec request record carries the
-argv (capped at 512 bytes in total across all elements, with a `truncated`
+argv (capped at 512 bytes in total across all elements, whole elements only —
+the fitting prefix, empty when even argv[0] does not fit — with a `truncated`
 flag and the original element count/byte length when capped) and the
 working directory when the request has one — so the journal answers *what
 ran*. **The journal can contain whatever a command line contains**: argv is

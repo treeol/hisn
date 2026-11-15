@@ -4,46 +4,53 @@
 
 # hisn
 
-hisn is a Linux sandbox for running agents and their tools in isolated, named, lease-managed sessions: a single binary, no daemon, no root.
+hisn is a Linux sandbox for running agents and their tools. It runs each
+workload in an isolated, named session and keeps a record of what the session
+did. It is a single binary and needs no daemon and no root.
 
 [![CI](https://github.com/treeol/hisn/actions/workflows/ci.yml/badge.svg)](https://github.com/treeol/hisn/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/treeol/hisn)](https://github.com/treeol/hisn/releases)
 [![Rust edition 2024](https://img.shields.io/badge/rust%20edition-2024-orange.svg)](Cargo.toml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-hisn runs a command in a private view of the machine. The command sees its
-working directory at the same path as on the host, a read-only toolchain, and
-private `$HOME`, `/tmp` and `/run`. Paths outside the view are absent
-(`ENOENT`), not denied. Access beyond that exists only when granted, and every
-grant ends with the session.
+A command started by hisn sees a private view of the machine: its working
+directory at the same path as on the host, a read-only toolchain, and private
+`$HOME`, `/tmp` and `/run`. Paths outside this view do not exist for the
+command (`ENOENT`); they are not merely denied. Access beyond the view exists
+only when it is granted, and every grant ends with the session.
 
-## What it does
+## Features
 
-- **Namespace isolation with a pinned rootfs.** Unprivileged user, mount, pid,
-  ipc and uts namespaces, `pivot_root` into an empty tmpfs, seccomp, Landlock,
-  and an optional read-only rootfs imported once with `hisn rootfs import`.
-- **Named sessions with lifecycle state and leases.** `--name`, a recorded
-  state (`creating`, `running`, `stopping`, `stopped`, `crashed`), and an
-  optional `idle_timeout` after which an unused session stops.
-- **Attach and exec with client identity.** Every request carries a client
-  record (uid and pid from `SO_PEERCRED`, a label); one `authorize()` function
-  gates every operation.
-- **Event-driven start and stop.** `run --detach` returns when the control
-  socket accepts; `stop` waits on a pidfd. No fixed polling interval.
-- **Audit log and archival.** An append-only `grants.jsonl` per session
-  recording client identity, authorization result, and sequence number,
-  archived to `$XDG_STATE_HOME/hisn/audit/` when the session is pruned.
-- **Machine-readable state.** `hisn ls --json` (schema `hisn-ls/v2`) for
-  drivers such as Wakil.
-- **Workspace journal.** Every session belongs to a workspace
-  (`--workspace NAME` or derived from the cwd); exec argv (capped at
-  512 bytes in total across all elements) and exits (exit code or
-  signal, cancelled/lost, duration), session start and stop, grants
-  and revokes, notes and markers, and a git-change report of
-  `.git/hooks` and `.git/config` are recorded in the workspace journal
-  (`$XDG_STATE_HOME/hisn/workspaces/<id>/journal.jsonl`). `hisn journal`
-  reads it back host-side, including after a session ends. Nothing is
-  blocked or reverted by the git report.
+- **Isolation.** Unprivileged user, mount, pid, ipc and uts namespaces,
+  `pivot_root` into an empty tmpfs, seccomp and Landlock. A read-only rootfs
+  can be imported once with `hisn rootfs import` and reused by every session.
+- **Named sessions.** A session has a name, a recorded state (`creating`,
+  `running`, `stopping`, `stopped`, `crashed`) and an optional `idle_timeout`
+  after which an unused session stops.
+- **Exec and attach.** Commands and interactive shells run inside a running
+  session. Every request carries a client record (uid and pid from
+  `SO_PEERCRED`, and a label), and one `authorize()` function decides every
+  operation.
+- **Grants.** `hisn grant --session S PATH` attaches a host path inside the
+  running session's mount namespace, read-only unless `--rw` is set (grants
+  given at `run` time use `--grant PATH[:ro|rw]`, default `ro`). `hisn
+  revoke` detaches it; without `--hard` the answer only guarantees it is no
+  longer visible (`lookup`), with `--hard` it also kills every sandbox
+  process except init. Grants never outlive the session: they live in the
+  sandbox mount namespace, not in any stored table.
+- **Workspace journal.** hisn records what happens in a workspace: session
+  start and stop, each command with its command line, exit code and duration,
+  grants and revokes, and notes. `hisn journal` reads the record back, and
+  `hisn note` adds a note to it.
+- **Git change report.** When a session stops, hisn records whether
+  `.git/hooks` or `.git/config` changed during the session and flags
+  configuration keys that can run programs. This is a report; nothing is
+  blocked.
+- **Audit log.** Each session has an append-only `grants.jsonl`, archived to
+  `$XDG_STATE_HOME/hisn/audit/` when the session is pruned.
+- **Documented interface.** `hisn ls --json` (schema `hisn-ls/v2`) reports
+  session state, and the control socket protocol is specified in
+  [docs/CONTROL-PROTOCOL.md](docs/CONTROL-PROTOCOL.md).
 
 ## Architecture
 
@@ -57,8 +64,8 @@ flowchart LR
     INIT --> NS["namespaces, rootfs,<br/>seccomp, Landlock"]
     NS --> CMD["session command<br/>and execs"]
     SUP --> DIR["session dir<br/>session.json<br/>supervisor.pid<br/>grants.jsonl"]
-    SUP --> WS["workspace dir<br/>journal.jsonl"]
-    JRN["hisn journal"] -.->|reads directly, host-side| WS
+    SUP --> JRN["workspace state<br/>journal.jsonl"]
+    JCLI["hisn journal"] -.->|reads directly, host-side| JRN
     CLI -.->|clients| AUTHZ
 ```
 
@@ -66,10 +73,11 @@ flowchart LR
 - Control socket and protocol: `src/control.rs`; authorization: `src/authz.rs`.
 - Supervisor: `src/supervisor.rs`; stop and idle expiry: `src/lifecycle.rs`.
 - Session directory and metadata: `src/session.rs`, `src/sessionmeta.rs`, `src/registry.rs` (names).
+- `stop` command and idle expiry: `src/lifecycle.rs` (with the supervisor).
+- Workspace and journal: `src/workspace.rs`, `src/journal.rs`; git change report: `src/gitreport.rs`.
 - Sandbox: `src/init.rs`, `src/rootfs.rs`, `src/mounts.rs`, `src/seccomp.rs`, `src/landlock.rs`, `src/env.rs`, `src/exec.rs`.
 - Policy and profiles: `src/policy.rs`, `src/profile.rs`; rootfs store: `src/rootfs_store.rs`, `src/rootfs_import.rs`.
-- Secrets plumbing: `src/ssh_agent.rs`, `src/services.rs`.
-- Workspace journal: `src/workspace.rs`, `src/journal.rs`, `src/gitreport.rs`.
+- Secrets plumbing (SSH agent proxy, services): `src/services.rs`, `src/ssh_agent.rs`.
 - The remaining modules are not the Architecture story: `src/alias.rs`,
   `src/grant.rs`, `src/sys.rs`, `src/sig.rs`, `src/check.rs` — see
   `src/lib.rs` for the full list.
@@ -88,12 +96,14 @@ install -m 0755 hisn-x86_64-linux-gnu ~/.local/bin/hisn
 Or build from source with `cargo install --path . --locked`. Then:
 
 ```sh
-hisn check                                              # does this host qualify?
-hisn rootfs import dev --from-image debian:12           # one image; needs docker (or use --from-tar FILE)
+hisn check                                              # check that this host can run hisn
+hisn rootfs import dev --from-image debian:12           # import one image; needs docker (or use --from-tar FILE)
 hisn run --name demo --detach --rootfs-path "$(hisn rootfs path dev)"
                                                         # prints "<id> demo ready"
-hisn exec --session demo -- uname -a                    # a command in the session
+hisn exec --session demo -- uname -a                    # run a command in the session
 hisn attach --session demo                              # interactive shell; Ctrl-] d detaches
+hisn note --session demo "first test run"               # add a note to the journal
+hisn journal --session demo --last 10                   # show the last 10 events
 hisn ls                                                 # NAME ID STATE CWD ROOTFS NET AGE CLIENTS LEASE
 hisn stop --session demo                                # state stopped, directory kept
 hisn ls --prune --name-prefix demo                      # archive and remove stopped demo* sessions
@@ -109,12 +119,13 @@ seccomp. `hisn check` reports what is missing (exit 2; `--json` for a report).
 
 ## Workspace journal
 
-Each session belongs to a workspace: by default the one derived from its
-canonical cwd (so all sessions in one directory share one journal), or the one
-named by `--workspace NAME`. State lives in
+A workspace is the unit that sessions share. By default it is derived from the
+session's canonical working directory, so all sessions started in one
+directory write to one journal. `hisn run --workspace NAME` selects a
+workspace by name instead. State lives in
 `$XDG_STATE_HOME/hisn/workspaces/<id>/` (dir `0700`); the journal is
-`journal.jsonl` (0600, one JSON object per line, 64 MiB rotation). It is a
-record, not a replay mechanism, and it is never mounted into a session.
+`journal.jsonl` (0600, one JSON object per line, 64 MiB rotation; rotated
+files are kept and still read).
 
 ```sh
 hisn note --session demo "halfway through the migration"   # verbatim, at most 8 KiB
@@ -123,19 +134,18 @@ hisn journal --kind exec --since 2026-11-07T12:00:00Z       # exec events since 
 hisn journal --json                                          # exact records, one per line
 ```
 
-`--session` accepts an id or the name; the workspace is resolved from the
-live session's `session.json` first, then from persistent session markers
-across all workspaces, so the lookup works from any directory and after the
-session has ended. In readable mode `--last N` counts displayed events after
-merging (exec request/result/exit collapse into one line); `--json` counts
-raw records. `--since` must be an RFC 3339 UTC timestamp ending in `Z`;
-an offset such as `+02:00` is rejected rather than silently parsed as UTC.
-The journal can contain whatever a command line contains, including secrets:
-argv is recorded verbatim, capped at 512 bytes in total across all elements
-(whole elements only), without pattern-based redaction. This is journal-only —
-`grants.jsonl` never carries argv. The write format is
-[docs/CONTROL-PROTOCOL.md](docs/CONTROL-PROTOCOL.md) (protocol revision 2,
-recorded in `session.json` as `protocol_revision`).
+The default output is one line per event. A command, its result and its exit
+are merged into a single line with the command line, exit code and duration.
+`--last N` counts displayed events; with `--json` it counts raw records.
+`--since` must be an RFC 3339 UTC timestamp ending in `Z`: an offset such as
+`+02:00` is rejected, not silently parsed as UTC. `--session` accepts an id
+or the name and resolves the workspace from the live session's `session.json`
+first, then the persistent session markers, so the lookup works from any
+directory and after the session has ended. The journal stores command lines
+as given — see the security model.
+
+The journal is a record, not a replay mechanism: nothing re-executes it and
+it is not used to undo anything.
 
 ## Security model
 
@@ -153,33 +163,45 @@ sandbox's pid namespace. `authorize()` allows a request only when the client
 uid equals the session owner's uid. Observers (`ls`, `inspect`, `sessioninfo`)
 are never registered as clients and never keep a session alive.
 
-**Logged.** Operations are recorded in the session's `grants.jsonl` with the
+**Recorded.** Operations are recorded in the session's `grants.jsonl` with the
 client label, a sequence number and the authorization result. The workspace
-journal records the same events (in journal shape) plus exec argv and exits,
-session start and stop, notes, and the git-change report. Pruning archives
-the audit log and the final `session.json` before removing the directory;
-the workspace journal survives pruning, and `hisn journal` reads it
-host-side for stopped and pruned sessions.
+journal mirrors the same events (in journal shape) and adds exec argv
+(capped at 512 bytes in total across all elements, verbatim, no pattern
+redaction), exec exits (code or signal, cancelled/lost, duration), session
+start and stop, notes and markers, lease expiry, and the git-change report.
+Pruning archives the log and the final `session.json` before removing the
+directory; the workspace journal survives pruning (it lives in the workspace
+dir, not the session dir), and `hisn journal` reads it host-side for stopped
+and pruned sessions. The journal is private to the user (directory mode 0700,
+file mode 0600) and is not mounted into sessions. It stores command lines as
+given, so it can contain secrets that were passed on a command line.
 
 **Not provided.** hisn is not a VM: the sandbox shares the host kernel, and a
 kernel vulnerability is outside the model. It does not filter network traffic;
 under `network = "host"` the session has the host's network. It does not limit
-memory or cpu beyond `setrlimit` limits. An egress proxy and cgroup v2 limits are planned,
-not yet scheduled ([roadmap](docs/ROADMAP.md)).
+memory or cpu beyond `setrlimit` limits. The journal and the git change report record
+events; they do not prevent them. An egress proxy and cgroup v2 limits are
+planned, not yet scheduled ([roadmap](docs/ROADMAP.md)).
 
-Depth: [DESIGN](docs/DESIGN.md), the [ADR index](docs/adr/README.md),
+Details: [DESIGN](docs/DESIGN.md), the [ADR index](docs/adr/README.md),
 [SECURITY](SECURITY.md).
 
 ## Using hisn from a program
 
-The contract is described in one place:
-[Driving hisn from a program](docs/sessions.md#driving-hisn-from-a-program).
+hisn is driven through its CLI and its control socket. Two documents describe
+the contract:
+
+- [Driving hisn from a program](docs/sessions.md#driving-hisn-from-a-program)
+  describes the CLI contract.
+- [docs/CONTROL-PROTOCOL.md](docs/CONTROL-PROTOCOL.md) specifies the control
+  socket: framing, operations, error codes and versioning.
+
 In short:
 
 - `hisn run --name N --detach` prints `<id> <name|-> ready` and exits 0 when
-  the session is ready; a failed start exits 125. The protocol revision is
-  recorded in `session.json` as `protocol_revision` (this release: 2, absent
-  on a pre-0.5.0 session).
+  the session is ready; a failed start exits 125. The control protocol
+  revision (this release: 2, absent on a pre-0.5.0 session) is recorded in
+  `session.json` as `protocol_revision`.
 - Exit codes: the command's status, `128+N` for signal `N`, `125` for a hisn
   error, `126` not executable, `127` not found.
 - `hisn ls --json` returns `{"schema":"hisn-ls/v2","sessions":[...]}` with live
@@ -187,17 +209,24 @@ In short:
   `protocol_revision`, `workspace`, `journal` and `journal_failures`).
 - The `sessioninfo` control op supplies that live view; observers do not count
   as clients.
+- `hisn journal --json` prints journal records unchanged, one per line.
+- The control socket has 8 operations; a 0.4.3 client works unchanged against
+  this release (six ops are byte-identical answers; `sessioninfo` and
+  `inspect` gained additive fields).
 
 [Wakil](docs/WAKIL-INTEGRATION.md) is the reference driver.
 
 ## Status
 
-hisn 0.5.0. Release notes: [docs/releases/v0.5.0.md](docs/releases/v0.5.0.md);
-history in [CHANGELOG](CHANGELOG.md). CI runs the leak suite on Ubuntu 22.04
-and 24.04 (x86_64); aarch64 and musl are cross-checked with clippy and build
-only. Planned, not yet
-scheduled: an egress proxy, cgroup v2 limits, and a pty allocated inside the
-session for attach ([ROADMAP](docs/ROADMAP.md)).
+The current release is hisn 0.5.0. Release notes, including compatibility and
+known limitations, are in [docs/releases/v0.5.0.md](docs/releases/v0.5.0.md);
+earlier releases are in the [CHANGELOG](CHANGELOG.md).
+
+CI runs the leak suite on Ubuntu 22.04 and 24.04 (x86_64). aarch64 and musl
+targets are checked with clippy and a build only.
+
+Planned, not yet scheduled: an egress proxy, cgroup v2 limits, and a pty
+allocated inside the session for attach ([ROADMAP](docs/ROADMAP.md)).
 
 ## Development
 

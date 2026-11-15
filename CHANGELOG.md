@@ -7,6 +7,62 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-15
+
+0.5.0 adds the workspace journal: each workspace keeps an append-only
+`journal.jsonl` of what its sessions did, and `hisn journal` reads it back in
+one compact line per event.
+
+**Host evidence (rubin):** `make release-gate` green — leak suite `350 passed,
+0 failed, 9 skipped, 1 weak`; with `HISN_TEST_ROOTFS` and
+`HISN_BIG_TESTS` the leak suite reports `363 passed, 0 failed, 5 skipped,
+1 weak`. A Wakil pinned to hisn 0.4.3 drove a session started by this build:
+commands, exit codes, durations, notes, session stop and the git report all
+appeared in the journal, `hisn journal --session <id>` worked from another
+directory for a running and for a stopped session, and `hisn note` against a
+0.4.3 session was refused with exit 2. `target/debug/hisn --version` prints
+`hisn 0.5.0`. No sessions, leak or integration tests were run in the build
+sandbox.
+
+### Added
+- **Workspace journal.** One `journal.jsonl` per workspace (mode 0600,
+  workspace-wide `wseq`, 64 MiB rotation) records the audit-shaped events,
+  exec requests and exits, notes/markers, session start/stop, and git-change
+  records. Exec request records carry argv capped at 512 bytes in total,
+  plus the request cwd; exec exits carry the exit code or signal, cancelled/
+  lost, and duration.
+- **`hisn journal`.** Compact readable lines (merged `exec` events) with
+  `--workspace`, `--session`, `--seat`, `--kind`, `--since` and `--last`
+  filters, and exact `--json` output. `--session ID-or-NAME` resolves the
+  workspace from any directory — live `session.json` first, then persistent
+  session markers — including after the session has ended.
+- **`hisn note`.** A verbatim note/marker (at most 8 KiB) journaled through
+  the new `note` control op; never parsed, interpreted or executed.
+- **Workspaces.** Every session belongs to a workspace (default from the
+  canonical cwd, or `--workspace NAME`); one journal is shared by all sessions
+  in a directory.
+- **Git-change report.** Start/stop snapshots of `.git/hooks` and
+  `.git/config` journaled as one short diff, flagged program-executing keys.
+  Report only: nothing is blocked or reverted.
+- **Protocol revision 2.** `client.protocol_version` / `protocol_revision`
+  gates the new op; absent means revision 1. `ls --json` gains additive
+  `hisn_version`, `protocol_revision`, `workspace`, `journal` and
+  `journal_failures`.
+
+### Compatibility
+- A 0.4.3 client works unchanged against a 0.5.0 supervisor; the 0.5.0 CLI
+  sends nothing new to a 0.4.3 session; `grants.jsonl` is unchanged; running
+  0.4.3 sessions are not affected by installing 0.5.0.
+
+### Known limitations
+- A 0.4.3 binary that rewrites `session.json` (for example `hisn stop`) drops
+  the fields it does not know, after which that session is treated as revision
+  1. The journal can contain whatever a command line contains, including
+  secrets. Records are synced at session stop and rotation, not per record;
+  rotated files are never deleted automatically; a dying supervisor leaves no
+  git-change stop snapshot; and a client that wraps its commands in a
+  launcher is journaled as the launcher.
+
 ## [0.4.3] - 2026-11-11
 
 0.4.3 adds no features. It locks in the 0.4.2 fixes with regression tests,
@@ -561,7 +617,8 @@ First release.
 - `hisn exec` verifies fail-closed, before running anything, that the root it
   entered is the sandbox root (DESIGN D25).
 
-[Unreleased]: https://github.com/treeol/hisn/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/treeol/hisn/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/treeol/hisn/releases/tag/v0.5.0
 [0.4.3]: https://github.com/treeol/hisn/releases/tag/v0.4.3
 [0.4.2]: https://github.com/treeol/hisn/releases/tag/v0.4.2
 [0.4.1]: https://github.com/treeol/hisn/releases/tag/v0.4.1

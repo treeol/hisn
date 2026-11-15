@@ -262,14 +262,13 @@ where
     let bytes = serde_json::to_vec_pretty(&store).map_err(|e| e.to_string())?;
     let tmp = dir.join(format!(".seats.json.tmp-{}", std::process::id()));
     {
+        let _ = fs::remove_file(&tmp);
+        use std::os::unix::fs::OpenOptionsExt;
         let mut file = fs::OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
-            .truncate(true)
+            .mode(0o600)
             .open(&tmp)
-            .map_err(|e| format!("{}: {e}", tmp.display()))?;
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("{}: {e}", tmp.display()))?;
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
@@ -526,10 +525,13 @@ mod tests {
     #[test]
     fn corrupt_store_fails_closed() {
         let (_t, d) = ws();
+        // A token that was valid before corruption must fail closed after it.
+        let token = add(&d, "bob", Role::Member, None).unwrap();
+        assert!(matches!(verify(&d, &token), SeatVerdict::Found(_)));
         // Truncated / corrupt / empty stores verify nothing.
         for bytes in [&b"{"[..], b"not json", b"", b"[]"] {
             fs::write(store_path(&d), bytes).unwrap();
-            assert_eq!(verify(&d, &"0".repeat(64)), SeatVerdict::Unknown);
+            assert_eq!(verify(&d, &token), SeatVerdict::Unknown);
             assert!(views(&d).is_empty());
         }
         // A store written by a newer schema version also fails closed.
@@ -578,9 +580,15 @@ mod tests {
         let mut cache = SeatCache::new();
         cache.refresh(&d);
         assert!(cache.as_slice().is_empty());
+        // An unchanged stamp (no write in between) is not a reload.
+        assert!(!cache.refresh(&d), "unchanged stamp must not reload");
         let token = add(&d, "bob", Role::Member, None).unwrap();
-        cache.refresh(&d);
+        assert!(cache.refresh(&d), "a changed stamp must reload");
         assert_eq!(cache.as_slice().len(), 1);
+        assert!(
+            !cache.refresh(&d),
+            "a second read at the same stamp must not reload"
+        );
         let _ = token;
     }
 }

@@ -272,9 +272,9 @@ pub fn authorize(
                 Err(Refusal {
                     op,
                     reason: format!(
-                        "seat {name} (role {}) may not {:?}: requires {}",
+                        "seat {name} (role {}) may not {}: requires {}",
                         role.as_str(),
-                        op,
+                        op.name(),
                         op.required_role().as_str()
                     ),
                 })
@@ -480,6 +480,31 @@ mod tests {
 
     fn every_op() -> Vec<(Op, Request)> {
         vec![
+            (
+                Op::SeatAdd,
+                Request::SeatAdd {
+                    name: "bob".into(),
+                    role: None,
+                    expires: None,
+                    client: None,
+                },
+            ),
+            (Op::SeatLs, Request::SeatLs { client: None }),
+            (
+                Op::SeatSetRole,
+                Request::SeatSetRole {
+                    name: "bob".into(),
+                    role: "member".into(),
+                    client: None,
+                },
+            ),
+            (
+                Op::SeatRevoke,
+                Request::SeatRevoke {
+                    name: "bob".into(),
+                    client: None,
+                },
+            ),
             (
                 Op::Grant,
                 Request::Grant {

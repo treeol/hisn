@@ -180,6 +180,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             struct Client<'a> {
                 session: &'a str,
                 dir: &'a Path,
+                /// The client object for the kill request (seat credential
+                /// when one is configured; absent otherwise, 0.5.0 shape).
+                client: Option<Value>,
                 /// 0.4.1 step 2: a pidfd on the session's supervisor, when it
                 /// can be opened and still matches supervisor.pid's starttime.
                 /// The stop wait blocks on it instead of polling every 100 ms.
@@ -187,11 +190,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             impl hisn::lifecycle::StopTarget for Client<'_> {
                 fn signal(&self, _sig: i32) -> Result<(), String> {
-                    let r = supervisor::client_request(
-                        self.session,
-                        &json!({"op":"kill","signal":"TERM"}),
-                    )
-                    .map_err(|e| format!("{e:#}"))?;
+                    let mut req = json!({"op":"kill","signal":"TERM"});
+                    if let Some(c) = &self.client
+                        && let Some(obj) = req.as_object_mut()
+                    {
+                        obj.insert("client".into(), c.clone());
+                    }
+                    let r = supervisor::client_request(self.session, &req)
+                        .map_err(|e| format!("{e:#}"))?;
                     if r["ok"] == true {
                         Ok(())
                     } else {
@@ -221,6 +227,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let target = Client {
                 session: &a.session,
                 dir: &dir,
+                client: seat_client(&a.session, a.seat_token_file.as_deref())?,
                 pidfd: supervisor_pidfd,
             };
             let write_state = |st: hisn::sessionmeta::State| {
@@ -433,11 +440,22 @@ fn seat_workspace(a: &hisn::cli::SeatArgs) -> Result<String> {
 fn seat_cmd(a: hisn::cli::SeatArgs) -> Result<ExitCode> {
     let id = seat_workspace(&a)?;
     let dir = workspace::workspace_dir(&id);
-    let j = journal::Journal::new(dir.clone(), a.session.clone().unwrap_or_default());
+    // The journaling session is the resolved session id when one was named,
+    // else empty (a workspace-only management event).
+    let session_id = a
+        .session
+        .as_deref()
+        .and_then(|arg| journal_session_lookup(arg, None))
+        .map(|m| m.session)
+        .unwrap_or_default();
+    let j = journal::Journal::new(dir.clone(), session_id);
+    // Host-side management acts as the local owner: label_source "none" is
+    // 0.5.0's marker for "no client-supplied label", and no seat field is
+    // stamped — this did not authenticate by credential.
     let client = journal::JournalClient::plain(
         rustix::process::getuid().as_raw(),
         workspace::workspace_name_for(std::env::current_dir().unwrap_or_default(), None),
-        "seat".into(),
+        "none".into(),
         None,
     );
     match a.op {

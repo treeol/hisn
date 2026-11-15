@@ -363,6 +363,9 @@ pub struct StopArgs {
     /// Session name or id.
     #[arg(long)]
     pub session: String,
+    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    #[arg(long, value_name = "PATH")]
+    pub seat_token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -429,7 +432,8 @@ pub struct JournalArgs {
     /// Session id or name (live metadata, then persistent workspace markers).
     #[arg(long)]
     pub session: Option<String>,
-    /// Only records carrying this client label (the "seat").
+    /// Only records of this server-set seat (0.5.1); for records without a
+    /// seat field, of this client label (the 0.5.0 behaviour).
     #[arg(long)]
     pub seat: Option<String>,
     /// Select a raw kind; readable --kind exec selects the exec family.

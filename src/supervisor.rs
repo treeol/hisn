@@ -1589,6 +1589,14 @@ impl Shared {
             },
             None => crate::seats::Role::Member,
         };
+        if let Some(e) = expires
+            && !(e.ends_with('Z') && crate::session::parse_rfc3339_secs(e).is_some())
+        {
+            return err(
+                control::E_BAD_REQUEST,
+                format!("expires {e:?} is not an RFC 3339 UTC (Z) timestamp"),
+            );
+        }
         match crate::seats::add(&self.workspace_dir, name, role, expires.map(str::to_string)) {
             Ok(token) => {
                 self.log_client(
@@ -1809,7 +1817,8 @@ impl Handler for Ctl {
         let session = self.sh.session_auth();
         let credential = match req.client_field().and_then(|c| c.seat_token.clone()) {
             Some(token) if !token.is_empty() => self.sh.verify_credential(&token),
-            _ => authz::Credential::Absent,
+            Some(_) => authz::Credential::Rejected(authz::CredentialFailure::Unknown),
+            None => authz::Credential::Absent,
         };
         authz::authorize(&client, &session, &credential, req).is_ok()
     }
@@ -1840,6 +1849,18 @@ impl Handler for Ctl {
                 )
             })
             .unwrap_or_else(|| (self.sh.client_label(peer_uid), "none".to_string(), None));
+        // The credential is verified before the record is built, so an
+        // authenticated seat is stamped on it (server-set, ADR 0021) and
+        // every journal/audit line for this request carries the seat.
+        let credential = match req.client_field().and_then(|c| c.seat_token.clone()) {
+            Some(token) if !token.is_empty() => self.sh.verify_credential(&token),
+            Some(_) => authz::Credential::Rejected(authz::CredentialFailure::Unknown),
+            None => authz::Credential::Absent,
+        };
+        let (seat, seat_role) = match &credential {
+            authz::Credential::Authenticated { name, role } => (Some(name.clone()), Some(*role)),
+            _ => (None, None),
+        };
         let client = authz::ClientRecord {
             uid: peer_uid,
             pid: peer_pid,
@@ -1848,14 +1869,10 @@ impl Handler for Ctl {
             req_id,
             seq,
             principal: None,
-            seat: None,
-            seat_role: None,
+            seat,
+            seat_role,
         };
         let session = self.sh.session_auth();
-        let credential = match req.client_field().and_then(|c| c.seat_token.clone()) {
-            Some(token) if !token.is_empty() => self.sh.verify_credential(&token),
-            _ => authz::Credential::Absent,
-        };
         let auth = match authz::authorize(&client, &session, &credential, &req) {
             Ok(a) => a,
             Err(refusal) => {

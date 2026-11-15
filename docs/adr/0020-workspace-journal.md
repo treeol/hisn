@@ -35,6 +35,8 @@ decision (the session belongs to a workspace; state under
   kinds. Readable `--kind exec` selects the exec family; JSON matches exact
   raw kinds. Matching exec groups are retrieved
   from all retained files, including requests before the filter window.
+  Groups are scoped by session incarnation (session/start boundaries or a
+  repeated request), so reusing an id cannot borrow an old exec's exit.
   Missing requests are explicitly marked orphan; unfinished requests open.
   Queries scan each retained file once, bounded by its size at open and a
   16 MiB per-record cap (no fixed total-history limit).
@@ -48,8 +50,11 @@ decision (the session belongs to a workspace; state under
   even after normal cleanup). Each start atomically writes a 0600
   `sessions/<session-id>` name line in a 0700 workspace subdirectory,
   owner-checked and no-symlink. Writes are best-effort/count failures.
-  Reused names choose newest mtime and report the chosen ID; markers are
-  lookup hints only, never control authority. Finally fall back to cwd,
+  State components are validated before creating children; only ancestors
+  above the state root may be symlinked. Explicit --workspace confines
+  resolution to that workspace. Reused names choose newest mtime and report
+  the chosen ID; markers are lookup hints only, never control authority.
+  Finally fall back to cwd,
   naming the workspace searched and pointing to `--workspace`.
 - When the state home falls back to `/tmp/hisn-state-unset-<uid>`, the
   supervisor warns once at session start that the journal will not

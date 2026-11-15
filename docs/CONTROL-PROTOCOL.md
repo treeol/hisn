@@ -191,7 +191,8 @@ contains — argv is recorded verbatim, without pattern-based redaction.
 This is journal-only: the audit log (`grants.jsonl`) never carries argv
 and its format is unchanged, so a 0.4.3 client sees exactly what it saw
 before. The wire above is unchanged. Readable journal output merges these
-raw kinds into an `exec` line; `--json` keeps each original record. See
+raw kinds into an `exec` line within a session incarnation (reused session
+ids are separated); `--json` keeps each original record. See
 [session journal queries](sessions.md) for filtering and `--last` semantics.
 
 ### `signal`

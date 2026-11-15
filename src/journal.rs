@@ -830,12 +830,9 @@ fn collapse_key(rec: &JournalRecord) -> Option<(String, u64)> {
     }
 }
 
-/// Render the selected records for readable output (item 3): one compact
-/// line per event. A request, its result and its exit with the same
-/// session and `seq` collapse into one line; a request with no result or
-/// exit in the selected window is shown alone and marked open. Filters
-/// (`--last` etc.) have already been applied by the caller, to the raw
-/// records, before collapsing.
+/// Render a record set as compact events, scoped by session incarnation.
+/// Prefer query_readable for CLI filtering: it completes matching groups
+/// from retained history before applying the displayed-line limit.
 pub fn render_collapsed(recs: &[JournalRecord]) -> Vec<String> {
     record_groups(recs)
         .iter()

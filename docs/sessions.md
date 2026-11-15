@@ -133,7 +133,9 @@ collapse into one line. `--last N` counts displayed lines after merging;
 `--json --last N` still counts raw records. Readable queries select events
 with the other filters, then retrieve their complete exec groups from all
 retained files, even if a request predates `--since`. Events are ordered by
-their newest record; the line header identifies the request. A request with
+their newest record; the line header identifies the request. Session/start
+boundaries (or repeated requests when a start is missing) separate reused
+session ids, rather than merging a new request with an old exit. A request with
 no exit or terminal error is marked `[open]`; a result/exit with no retained
 request is marked `[orphan: request unavailable]`. Legacy requests show the
 quoted executable path when argv was not recorded.

@@ -313,6 +313,9 @@ pub struct Shared {
     /// request, not rate-limited). The idle timer reads this instead of
     /// the persisted lease value, which is throttled to 10 s writes.
     last_activity_secs: std::sync::atomic::AtomicI64,
+    /// 0.5.1 (ADR 0021): the workspace seat set, reloaded from `seats.json`
+    /// before each authorization decision when the store's stamp changed.
+    seat_cache: Mutex<crate::seats::SeatCache>,
 }
 
 /// 0.4.1 R2: the live control connections. The client count and the per-
@@ -489,6 +492,50 @@ impl Shared {
     /// The in-sandbox service states (used by `services`).
     pub fn services(&self) -> &Mutex<std::collections::BTreeMap<String, ServiceState>> {
         &self.services
+    }
+
+    /// 0.5.1 (ADR 0021, decision J): the workspace seat set, reloaded from
+    /// `seats.json` (one `stat(2)` per decision; a reload only when the
+    /// stamp changed) so a `seat set-role` or `seat revoke` takes effect in
+    /// a running session without a restart.
+    fn seat_set(&self) -> Vec<crate::seats::SeatIdentity> {
+        let mut cache = self.seat_cache.lock().expect("seat cache");
+        cache.refresh(&self.workspace_dir);
+        cache
+            .as_slice()
+            .into_iter()
+            .filter(|s| !s.revoked)
+            .map(|s| crate::seats::SeatIdentity {
+                name: s.name,
+                role: s.role,
+            })
+            .collect()
+    }
+
+    /// Check a presented credential against the store (decision F).
+    fn verify_credential(&self, token: &str) -> authz::Credential {
+        match crate::seats::verify(&self.workspace_dir, token) {
+            crate::seats::SeatVerdict::Found(id) => authz::Credential::Authenticated {
+                name: id.name,
+                role: id.role,
+            },
+            crate::seats::SeatVerdict::Revoked => {
+                authz::Credential::Rejected(authz::CredentialFailure::Revoked)
+            }
+            crate::seats::SeatVerdict::Expired => {
+                authz::Credential::Rejected(authz::CredentialFailure::Expired)
+            }
+            crate::seats::SeatVerdict::Unknown => {
+                authz::Credential::Rejected(authz::CredentialFailure::Unknown)
+            }
+        }
+    }
+
+    fn session_auth(&self) -> authz::SessionAuth {
+        authz::SessionAuth {
+            owner_uid: self.uid,
+            seats: self.seat_set(),
+        }
     }
 
     /// Next request sequence number (supervisor-assigned, never reused).
@@ -1524,6 +1571,102 @@ impl Shared {
         }
     }
 
+    /// 0.5.1 (ADR 0021): the seat-management ops (owner-only in the role
+    /// table). Journaled with the acting client; the credential is never
+    /// journaled, audited or returned more than once.
+    fn do_seat_add(
+        &self,
+        client: &authz::ClientRecord,
+        name: &str,
+        role: Option<&str>,
+        expires: Option<&str>,
+    ) -> Value {
+        let role = match role {
+            Some(r) => match crate::seats::Role::parse(r) {
+                Some(r) => r,
+                None => {
+                    return err(
+                        control::E_BAD_REQUEST,
+                        format!("unknown role {r:?} (owner, member or observer)"),
+                    );
+                }
+            },
+            None => crate::seats::Role::Member,
+        };
+        match crate::seats::add(&self.workspace_dir, name, role, expires.map(str::to_string)) {
+            Ok(token) => {
+                self.log_client(
+                    "seat-add",
+                    "request",
+                    Some(name),
+                    Some(role.as_str()),
+                    None,
+                    client,
+                    true,
+                );
+                // The one-time credential travels in the response only.
+                ok(json!({ "name": name, "role": role.as_str(), "credential": token }))
+            }
+            Err(e) => err(control::E_BAD_REQUEST, e),
+        }
+    }
+
+    fn do_seat_ls(&self) -> Value {
+        let seats: Vec<Value> = crate::seats::views(&self.workspace_dir)
+            .iter()
+            .map(|v| {
+                json!({ "name": v.name, "role": v.role, "created": v.created,
+                        "expires": v.expires, "revoked": v.revoked })
+            })
+            .collect();
+        ok(json!({ "seats": seats }))
+    }
+
+    fn do_seat_set_role(&self, client: &authz::ClientRecord, name: &str, role: &str) -> Value {
+        let role = match crate::seats::Role::parse(role) {
+            Some(r) => r,
+            None => {
+                return err(
+                    control::E_BAD_REQUEST,
+                    format!("unknown role {role:?} (owner, member or observer)"),
+                );
+            }
+        };
+        match crate::seats::set_role(&self.workspace_dir, name, role) {
+            Ok(()) => {
+                self.log_client(
+                    "seat-set-role",
+                    "request",
+                    Some(name),
+                    Some(role.as_str()),
+                    None,
+                    client,
+                    true,
+                );
+                ok(json!({ "name": name, "role": role.as_str() }))
+            }
+            Err(e) => err(control::E_BAD_REQUEST, e),
+        }
+    }
+
+    fn do_seat_revoke(&self, client: &authz::ClientRecord, name: &str) -> Value {
+        match crate::seats::revoke(&self.workspace_dir, name) {
+            Ok(()) => {
+                self.log_client(
+                    "seat-revoke",
+                    "request",
+                    Some(name),
+                    None,
+                    None,
+                    client,
+                    true,
+                );
+                ok(json!({ "name": name, "revoked": true }))
+            }
+            Err(e) => err(control::E_BAD_REQUEST, e),
+        }
+    }
+
     fn inspect(&self, _auth: &authz::Authorized) -> Value {
         // 0.5.0 (B4): the failed-journal-write count for `ls --json` (additive).
         let journal_failures = self.journal.failures();
@@ -1665,10 +1808,12 @@ impl Handler for Ctl {
             seq: 0,
             principal: None,
         };
-        let session = authz::SessionAuth {
-            owner_uid: self.sh.uid,
+        let session = self.sh.session_auth();
+        let credential = match req.client_field().and_then(|c| c.seat_token.clone()) {
+            Some(token) if !token.is_empty() => self.sh.verify_credential(&token),
+            _ => authz::Credential::Absent,
         };
-        authz::authorize(&client, &session, req).is_ok()
+        authz::authorize(&client, &session, &credential, req).is_ok()
     }
 
     fn disconnect(&self, conn: ConnId) {
@@ -1706,10 +1851,12 @@ impl Handler for Ctl {
             seq,
             principal: None,
         };
-        let session = authz::SessionAuth {
-            owner_uid: self.sh.uid,
+        let session = self.sh.session_auth();
+        let credential = match req.client_field().and_then(|c| c.seat_token.clone()) {
+            Some(token) if !token.is_empty() => self.sh.verify_credential(&token),
+            _ => authz::Credential::Absent,
         };
-        let auth = match authz::authorize(&client, &session, &req) {
+        let auth = match authz::authorize(&client, &session, &credential, &req) {
             Ok(a) => a,
             Err(refusal) => {
                 self.sh.log_client(
@@ -1835,6 +1982,24 @@ impl Handler for Ctl {
                     },
                 }
             }
+            // 0.5.1 (ADR 0021, decision E): seat management, owner-only in
+            // the role table. The wire ops are one path to the store; the
+            // CLI also writes the store directly (one code path, two doors).
+            Request::SeatAdd {
+                name,
+                role,
+                expires,
+                client: _,
+            } => self
+                .sh
+                .do_seat_add(&client, &name, role.as_deref(), expires.as_deref()),
+            Request::SeatLs { client: _ } => self.sh.do_seat_ls(),
+            Request::SeatSetRole {
+                name,
+                role,
+                client: _,
+            } => self.sh.do_seat_set_role(&client, &name, &role),
+            Request::SeatRevoke { name, client: _ } => self.sh.do_seat_revoke(&client, &name),
         }
     }
 }
@@ -3405,6 +3570,7 @@ fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
         last_activity_secs: std::sync::atomic::AtomicI64::new(crate::lifecycle::Clock::now_secs(
             &crate::lifecycle::SystemClock,
         )),
+        seat_cache: Mutex::new(crate::seats::SeatCache::new()),
     });
     // The only way to start `network = "host"` without abstract-socket
     // scoping is the explicit flag; it is audited (DESIGN §7, B1).
@@ -3430,7 +3596,9 @@ fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
             &internal,
             &authz::SessionAuth {
                 owner_uid: shared.uid,
+                seats: Vec::new(),
             },
+            &authz::Credential::Absent,
             &Request::Grant {
                 path: path.to_string(),
                 mode: *mode,

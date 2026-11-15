@@ -22,6 +22,7 @@ pub mod registry;
 pub mod rootfs;
 pub mod rootfs_import;
 pub mod rootfs_store;
+pub mod seats;
 pub mod seccomp;
 pub mod services;
 pub mod session;

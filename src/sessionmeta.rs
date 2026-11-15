@@ -33,13 +33,14 @@ pub const FILE: &str = "session.json";
 pub const HISN_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 0.5.0: the control-protocol revision this build speaks (Part A, revised in
-/// the step-1 follow-up). This integer is the *only* version the CLI and the
-/// supervisor compare: `client.protocol_version` on the wire carries it, and
-/// `session.json` records `protocol_revision` beside `hisn_version`. A
-/// request that declares a higher revision is answered `E_VERSION`; absent
-/// means revision 1 (0.4.3 behaviour). The release version string must
-/// never be compared, so a `-dev` build can use its own feature.
-pub const PROTOCOL_REVISION: u32 = 2;
+/// the step-1 follow-up; revision 3 by 0.5.1, ADR 0021). This integer is the
+/// *only* version the CLI and the supervisor compare:
+/// `client.protocol_version` on the wire carries it, and `session.json`
+/// records `protocol_revision` beside `hisn_version`. A request that
+/// declares a higher revision is answered `E_VERSION`; absent means
+/// revision 1 (0.4.3 behaviour). The release version string must never be
+/// compared, so a `-dev` build can use its own feature.
+pub const PROTOCOL_REVISION: u32 = 3;
 
 /// The wire field name for the revision (`client.protocol_version`).
 /// Kept as the historical field name; there is one concept — the protocol
@@ -366,12 +367,12 @@ mod tests {
     #[test]
     fn protocol_revision_is_two_and_the_version_string_is_never_the_gate() {
         // Item 1: the gate is the integer revision, not the release version.
-        // This build is `0.5.0-dev` (Cargo.toml) and must still declare
-        // revision 2 so its own CLI can use its own feature.
-        assert_eq!(PROTOCOL_REVISION, 2);
-        assert_eq!(crate::control::PROTOCOL_VERSION, 2);
+        // This build is `0.5.1-dev` (Cargo.toml) and must still declare
+        // revision 3 so its own CLI can use its own feature.
+        assert_eq!(PROTOCOL_REVISION, 3);
+        assert_eq!(crate::control::PROTOCOL_VERSION, 3);
         // A dev version string does not lower the revision.
-        assert!(HISN_VERSION.contains("0.5.0"));
+        assert!(HISN_VERSION.contains("0.5.1"));
     }
 
     #[test]

@@ -151,6 +151,41 @@ pub enum Request {
         #[serde(default)]
         client: Option<ClientField>,
     },
+    /// 0.5.1 (ADR 0021): create a seat in the workspace store. Revision 3.
+    /// `expires` is an optional RFC 3339 UTC timestamp (`Z` suffix).
+    /// The supervisor returns the credential once; it is never logged.
+    #[serde(rename = "seat-add")]
+    SeatAdd {
+        name: String,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        expires: Option<String>,
+        #[serde(default)]
+        client: Option<ClientField>,
+    },
+    /// 0.5.1: list the workspace seats (names and roles, never credentials).
+    /// Revision 3. Owner-only.
+    #[serde(rename = "seat-ls")]
+    SeatLs {
+        #[serde(default)]
+        client: Option<ClientField>,
+    },
+    /// 0.5.1: change a seat's role. Revision 3. Owner-only.
+    #[serde(rename = "seat-set-role")]
+    SeatSetRole {
+        name: String,
+        role: String,
+        #[serde(default)]
+        client: Option<ClientField>,
+    },
+    /// 0.5.1: revoke a seat. Revision 3. Owner-only.
+    #[serde(rename = "seat-revoke")]
+    SeatRevoke {
+        name: String,
+        #[serde(default)]
+        client: Option<ClientField>,
+    },
 }
 
 /// The highest protocol revision this build speaks (Part A). One concept,
@@ -207,6 +242,12 @@ pub struct ClientField {
     /// `None` = revision 1 (a 0.4.3 client). Additive, both directions.
     #[serde(default)]
     pub protocol_version: Option<u32>,
+    /// 0.5.1 (ADR 0021): the seat credential. `None` = owner (decision B).
+    /// The token is never copied into the client record, the journal or
+    /// the audit log: the supervisor hashes it against the store and keeps
+    /// only the seat name and role.
+    #[serde(default)]
+    pub seat_token: Option<String>,
 }
 
 impl Request {
@@ -221,6 +262,10 @@ impl Request {
             Request::Signal { .. } => "signal",
             Request::SessionInfo { .. } => "sessioninfo",
             Request::Note { .. } => "note",
+            Request::SeatAdd { .. } => "seat-add",
+            Request::SeatLs { .. } => "seat-ls",
+            Request::SeatSetRole { .. } => "seat-set-role",
+            Request::SeatRevoke { .. } => "seat-revoke",
         }
     }
 
@@ -260,7 +305,11 @@ impl Request {
             | Request::Exec { client, .. }
             | Request::Signal { client, .. }
             | Request::SessionInfo { client, .. }
-            | Request::Note { client, .. } => client.as_ref(),
+            | Request::Note { client, .. }
+            | Request::SeatAdd { client, .. }
+            | Request::SeatLs { client, .. }
+            | Request::SeatSetRole { client, .. }
+            | Request::SeatRevoke { client, .. } => client.as_ref(),
         }
     }
 }
@@ -1566,7 +1615,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.declared_version(), Some(2));
-        assert_eq!(PROTOCOL_VERSION, 2, "this build declares revision 2");
+        assert_eq!(PROTOCOL_VERSION, 3, "this build declares revision 3");
         // `protocol_version` is the one new field; anything else in `client`
         // is still refused (deny_unknown_fields kept).
         assert!(
@@ -1720,9 +1769,9 @@ mod tests {
                 assert_eq!(field.req_id.as_deref(), Some("7f3a"));
             }
         }
-        // The doc documents exactly the 9 ops (8 of 0.4.3 + note) and one
-        // client field example. Adding an op to either side without the
-        // other fails here.
+        // The doc documents exactly the 13 ops (8 of 0.4.3 + note + the
+        // four 0.5.1 seat ops) and one client field example. Adding an op
+        // to either side without the other fails here.
         assert_eq!(
             ops_seen,
             [
@@ -1734,7 +1783,11 @@ mod tests {
                 "kill",
                 "exec",
                 "signal",
-                "note"
+                "note",
+                "seat-add",
+                "seat-ls",
+                "seat-set-role",
+                "seat-revoke"
             ],
             "documented ops must be exactly the code's ops"
         );

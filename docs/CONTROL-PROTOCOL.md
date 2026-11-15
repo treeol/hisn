@@ -2,13 +2,13 @@
 
 The control socket is the wire between a `hisn` client and a session's
 supervisor. It is a **documented contract**: WAKIL (and any other client) is
-pinned to hisn 0.4.3 and must keep working against a 0.5.0 supervisor, and a
-0.5.0 CLI must keep working against a still-running 0.4.3 supervisor. This
+pinned to hisn 0.4.3 and must keep working against a 0.5.1 supervisor, and a
+0.5.1 CLI must keep working against a still-running 0.4.3 supervisor. This
 document is the single source for the wire shape; the shapes below were
 generated from the code (`src/control.rs`, `src/supervisor.rs`,
 `src/sessionmeta.rs`) and cross-checked against `docs/POLICY-SPEC.md` §7.
 
-<p><strong>Regenerated from code on 2026-11-14.</strong> If this file and the
+<p><strong>Regenerated from code on 2026-11-15.</strong> If this file and the
 code disagree, the code wins and this file is wrong.</p>
 
 ## Framing
@@ -37,18 +37,32 @@ code disagree, the code wins and this file is wrong.</p>
 
 ## `client` field rules
 
-Every request may carry a `client` object with three optional fields:
+Every request may carry a `client` object with four optional fields:
 
 ```json
-{"label": "wakil@rubin", "label_source": "ssh", "req_id": "7f3a"}
+{"label": "wakil@rubin", "label_source": "ssh", "req_id": "7f3a", "protocol_version": 3}
 ```
 
 - `label` — a human label from `--client LABEL` (or derived from the SSH
   environment by the client). The supervisor falls back to `local` (the
   owner's uid) or `uid:<n>` (another uid) when absent.
 - `label_source` — where `label` came from: `flag`, `ssh`, `local`, `none`,
-  or `internal`.
+  `internal`, or `seat` (0.5.1: the label is the seat name).
 - `req_id` — an opaque request id chosen by the client.
+- `protocol_version` — the protocol revision the client speaks (one
+  concept, one number: `PROTOCOL_REVISION` in `src/sessionmeta.rs`).
+- `seat_token` (0.5.1) — a seat credential: an opaque string the supervisor
+  hashes (SHA-256) and compares against the workspace seat store
+  (`seats.json`). It is never recorded: it does not appear in the journal,
+  `grants.jsonl`, `session.json`, `ls` output, logs or error messages, and
+  it is never copied into the client record. The CLI takes it from
+  `HISN_SEAT_TOKEN` or `--seat-token-file`, never from a command-line
+  argument, and never into a session's environment.
+
+Under one Unix user a seat is **attribution and a guard against mistakes,
+not a security boundary**: any process of that user can omit the credential
+(and be the owner) or read the user's files. Real separation comes with
+separate Unix users (ADR 0021).
 
 `client` is **strict**: an unknown field in the object (including `uid`, which
 is never a request field — uid comes only from `SO_PEERCRED`) makes the whole
@@ -76,7 +90,7 @@ Error response: `{"ok":false,"error":"<CODE>","message":"…"}`.
 | `E_NOT_GRANTED` | `revoke` of a path that is not granted. |
 | `E_HELD` | reserved: a revoke holder was found that cannot be killed under a soft revoke (not currently emitted; kept for the v0 contract). |
 | `E_INTERNAL` | the sandbox failed (setup, a hard revoke that could not complete — the session is then killed, a supervisor error). |
-| `E_UNAUTHORIZED` | the authorization seam refused the request (the peer was not the session owner in 0.4; see DESIGN §9). |
+| `E_UNAUTHORIZED` | the authorization seam refused the request (the peer was not the session owner; or a presented seat credential is unknown, revoked or expired; or the seat's role does not allow the op). The message names the seat, the op and the required role. |
 | `E_EXEC` | the program could not be started (confinement failed, not found, not executable). |
 | `E_VERSION` | **0.5.0**: the request declares a protocol revision newer than the supervisor supports. The message names the supported revision. See "Version rule". An unknown op string is never `E_VERSION`: it fails parsing first and is answered `E_BAD_REQUEST` + close, exactly as in 0.4.3. |
 
@@ -209,7 +223,7 @@ program's process group. `E_NOT_FOUND` for a stale `exec_id`, a recycled
 ### `note` (0.5.0)
 
 ```json
-{"op":"note","kind":"note","text":"…","client":{"protocol_version":2}}
+{"op":"note","kind":"note","text":"…","client":{"protocol_version":3}}
 ```
 
 `kind` is `"note"` or `"marker"`; `text` is at most 8 KiB (8192 bytes).
@@ -220,7 +234,62 @@ verbatim; it is never parsed, interpreted or executed anywhere. Success:
 response, because the journal write *is* the operation). A `kind` other than
 `note`/`marker` or text over 8 KiB is `E_BAD_REQUEST`.
 
-## Version rule (0.5.0)
+### `seat-add` (0.5.1, revision 3)
+
+```json
+{"op":"seat-add","name":"bob","role":"member","client":{"protocol_version":3}}
+```
+
+`name` (the session-name charset, never `local` or `hisn-internal`), `role`
+(`owner`|`member`|`observer`, default `member`), `expires` (optional RFC
+3339 UTC timestamp). Success:
+`{"ok":true,"name":N,"role":R,"credential":C}` — the credential is shown
+**exactly once**, here; the store keeps only its SHA-256 hash. A name that
+is already live is `E_BAD_REQUEST`. Owner-only.
+
+### `seat-ls` (0.5.1, revision 3)
+
+```json
+{"op":"seat-ls","client":{"protocol_version":3}}
+```
+
+Success: `{"ok":true,"seats":[{"name","role","created","expires","revoked"}]}`.
+Never carries a hash or a credential. Owner-only.
+
+### `seat-set-role` (0.5.1, revision 3)
+
+```json
+{"op":"seat-set-role","name":"bob","role":"observer","client":{"protocol_version":3}}
+```
+
+`name`, `role`. Success: `{"ok":true,"name":N,"role":R}`. Owner-only.
+
+### `seat-revoke` (0.5.1, revision 3)
+
+```json
+{"op":"seat-revoke","name":"bob","client":{"protocol_version":3}}
+```
+
+`name`. Success: `{"ok":true,"name":N,"revoked":true}`. From the next request
+onward the seat's credential is refused; a running exec or attached shell
+is not killed by the revocation (authorization is per request). Owner-only.
+
+## Role table (0.5.1, ADR 0021)
+
+Every op is assigned in one table in `src/authz.rs`; no op is unassigned.
+
+| op | owner | member | observer |
+|---|---|---|---|
+| grant, revoke, kill | yes | no | no |
+| seat-add, seat-ls, seat-set-role, seat-revoke | yes | no | no |
+| exec (incl. attach), signal, note | yes | yes | no |
+| list, inspect, sessioninfo | yes | yes | yes |
+
+A same-uid client that presents **no** credential is the owner, exactly as
+in 0.5.0. A presented credential that is unknown, revoked or expired is
+refused and never falls back to owner.
+
+## Version rule (0.5.0; revision 3 in 0.5.1)
 
 `client.protocol_version` is an optional integer: the **protocol revision**.
 One concept, one number (declared once, as `PROTOCOL_REVISION` in
@@ -230,7 +299,7 @@ directions**:
 
 - The supervisor records its own version in `session.json` as the optional
   `hisn_version` field (e.g. `"0.5.0-dev"`) and its protocol revision as
-  `protocol_revision` (this build: `2`), both written at session creation.
+  `protocol_revision` (this build: `3`), both written at session creation.
   A pre-0.5.0 `session.json` has neither field (or a `null`).
 - `hisn_version` is **information only and is never compared** — not by the
   CLI, not by the supervisor. The gate is the integer revision: that is what
@@ -243,7 +312,7 @@ directions**:
   still-running 0.4.3 supervisor behaves exactly as 0.4.3 for the old ops,
   and for a new op (`note`) it refuses locally rather than sending an op the
   old supervisor would close.
-- The supervisor speaks protocol revision `2`. A request that declares a
+- The supervisor speaks protocol revision `3`. A request that declares a
   revision **newer** than the supervisor's is answered
   `{"ok":false,"error":"E_VERSION", …}` naming the supported revision,
   before any effect and before the connection counts as a client. Requests
@@ -273,8 +342,8 @@ No field is renamed, retyped or removed, so a 0.4.3 client reading a 0.5.0
 
 | direction | behaviour |
 | --- | --- |
-| 0.4.3 client → 0.5.0 supervisor | Same request and response bytes for the 8 existing ops. `E_VERSION` is only ever answered to a request that declares a version, which a 0.4.3 client never sends. |
-| 0.5.0 CLI → 0.4.3 supervisor | The CLI reads `protocol_revision` (absent = 1) and so does not send `protocol_version` nor the `note` op. The 8 old ops are byte-identical. |
+| 0.4.3 client → 0.5.1 supervisor | Same request and response bytes for the 8 existing ops. `E_VERSION` is only ever answered to a request that declares a version, which a 0.4.3 client never sends. |
+| 0.5.1 CLI → 0.4.3 supervisor | The CLI reads `protocol_revision` (absent = 1) and so does not send `protocol_version` nor the `note` op. The 8 old ops are byte-identical. |
 | `grants.jsonl` | Unchanged in format and path. The journal is written *in addition*, never instead. |
 | `session.json` | Additive optional fields only; old files load unchanged. |
 | `ls --json` | Additive keys only; no field changed or removed. |
@@ -293,6 +362,6 @@ probe) is never a client at all.
 
 The 0.5.0 workspace journal (`hisn journal`, the `note` op, `wseq`, rotation)
 is specified in the journal ADR (`docs/adr/0020-workspace-journal.md`) and in
-`docs/sessions.md`; this document covers the wire. Network modes, seat
-credentials, roles, approvals, tasks, messages, invites and secrets are later
-0.5.x steps and are not on this wire yet.
+`docs/sessions.md`; seat credentials and roles (protocol revision 3) are
+specified in ADR 0021. Approvals, tasks, messages, invites and secrets are
+later steps and are not on this wire yet.

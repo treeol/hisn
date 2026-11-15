@@ -13,12 +13,13 @@ All notable changes to hisn are recorded here. The format follows
 credential and a role, per workspace. Under one Unix user a seat is
 attribution and a guard against mistakes, not a security boundary.
 
-**Verification in this session:** `cargo fmt --check` and `cargo clippy
---all-targets -- -D warnings` clean; `cargo test --lib` 522 passed with
-only the two known environmental failures. The leak suite (including the
-new L89), the integration tests and `make release-gate` were not run here
-(this session runs inside a live hisn session); the release is tagged after
-the release gate passes on the release host.
+**Host evidence (at `89daf77`):** `make release-gate` green — leak suite
+`371 passed, 0 failed, 9 skipped, 1 weak`; with `HISN_TEST_ROOTFS` and
+`HISN_BIG_TESTS` `384 passed, 0 failed, 5 skipped, 1 weak`; L89 has
+21 checks. In the build sandbox, `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings` were clean and
+`cargo test --lib` reported 522 passed with only the two known
+environmental failures.
 
 ### Added
 - **`hisn seat add|ls|set-role|revoke`** with `--workspace` or `--session`.

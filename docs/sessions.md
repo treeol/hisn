@@ -159,8 +159,10 @@ Markers are owned by the current user, regular files, never symlinks; the
 reader ignores unsafe owners/modes and overlong/invalid names. A reused
 name selects the newest marker by modification time (deterministic ID and
 workspace tie-break), and reports which ID it chose when ambiguous. The
-resolved ID filters records. Explicit `--workspace` still chooses the
-workspace. If neither live metadata nor markers resolve the session, the
+resolved ID filters records. Explicit `--workspace` chooses the workspace
+and confines both live-session and marker lookup to that workspace; a
+reused name in another workspace cannot redirect the session filter. If
+neither live metadata nor markers resolve the session, the
 reader falls back to the current-directory workspace and names the searched
 workspace with a pointer to `--workspace`.
 

@@ -772,18 +772,31 @@ fn session_revision(session_arg: &str) -> Option<u32> {
 }
 
 /// Resolve a journal session through live metadata, then persistent markers.
+#[cfg(test)]
 fn journal_session_lookup_under(
     roots: &[PathBuf],
     registry: &Path,
     state: &Path,
     arg: &str,
 ) -> Option<workspace::SessionMarker> {
+    journal_session_lookup_in_workspace_under(roots, registry, state, arg, None)
+}
+
+fn journal_session_lookup_in_workspace_under(
+    roots: &[PathBuf],
+    registry: &Path,
+    state: &Path,
+    arg: &str,
+    workspace_filter: Option<&str>,
+) -> Option<workspace::SessionMarker> {
     let live = (|| {
         let id = session::resolve_session_arg(roots, registry, arg).ok()?;
         let dir = session::find_session(roots, &id).ok()?;
         let meta = hisn::sessionmeta::read(&dir)?;
         let workspace = meta.workspace?.id;
-        if !workspace::is_valid_workspace_id(&workspace) {
+        if !workspace::is_valid_workspace_id(&workspace)
+            || workspace_filter.is_some_and(|w| w != workspace)
+        {
             return None;
         }
         Some(workspace::SessionMarker {
@@ -793,23 +806,27 @@ fn journal_session_lookup_under(
             ambiguous: false,
         })
     })();
-    live.or_else(|| workspace::find_session_marker(state, arg))
+    live.or_else(|| workspace::find_session_marker_in_workspace(state, arg, workspace_filter))
 }
 
-fn journal_session_lookup(arg: &str) -> Option<workspace::SessionMarker> {
+fn journal_session_lookup(
+    arg: &str,
+    workspace_filter: Option<&str>,
+) -> Option<workspace::SessionMarker> {
     let uid = rustix::process::getuid().as_raw();
     let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
-    journal_session_lookup_under(
+    journal_session_lookup_in_workspace_under(
         &roots,
         &hisn::registry::registry_root(uid),
         &workspace::state_home(),
         arg,
+        workspace_filter,
     )
 }
 
 #[cfg(test)]
 fn workspace_for_session(arg: &str) -> Option<String> {
-    journal_session_lookup(arg).map(|m| m.workspace)
+    journal_session_lookup(arg, None).map(|m| m.workspace)
 }
 
 /// `hisn journal` (B7): read the workspace journal host-side and print it.
@@ -822,8 +839,17 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
     // to `--workspace` / the cwd-derived workspace. `--workspace` given
     // explicitly alongside `--session` wins (as before).
     let session_arg = a.session.clone();
-    // Resolve once: no race from re-querying after the session stops.
-    let resolved = session_arg.as_deref().and_then(journal_session_lookup);
+    let explicit_workspace = a.workspace.as_deref().map(|w| {
+        if workspace::is_valid_workspace_id(w) && workspace::workspace_dir(w).is_dir() {
+            w.to_owned()
+        } else {
+            workspace::workspace_id_for_name(w)
+        }
+    });
+    // Resolve once, scoped to --workspace if present.
+    let resolved = session_arg
+        .as_deref()
+        .and_then(|s| journal_session_lookup(s, explicit_workspace.as_deref()));
     if let Some(m) = &resolved
         && m.ambiguous
     {
@@ -836,23 +862,8 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
         .as_ref()
         .map(|m| m.session.clone())
         .or_else(|| a.session.clone());
-    let id = match a.workspace.as_deref() {
-        Some(w) => {
-            if workspace::workspace_id_for_name(w) == w
-                || w.len() == 16 && w.chars().all(|c| c.is_ascii_hexdigit())
-            {
-                // A bare 16-hex id (or a name that coincides) — prefer the id
-                // when it names an existing dir, else the name's id.
-                let by_id = workspace::workspace_dir(w);
-                if by_id.is_dir() {
-                    w.to_owned()
-                } else {
-                    workspace::workspace_id_for_name(w)
-                }
-            } else {
-                workspace::workspace_id_for_name(w)
-            }
-        }
+    let id = match explicit_workspace {
+        Some(w) => w,
         None => {
             if let Some(m) = &resolved {
                 m.workspace.clone()
@@ -1196,6 +1207,37 @@ mod ls_tests {
     }
 
     #[test]
+    fn polish2_explicit_workspace_scopes_reused_session_name() {
+        let d = tempfile::tempdir_in("target").unwrap();
+        let state = d.path().join("state");
+        let a = state.join("workspaces/0123456789abcdef");
+        let b = state.join("workspaces/fedcba9876543210");
+        for (dir, id, secs) in [(&a, "old", 1), (&b, "new", 2)] {
+            hisn::workspace::write_session_marker(dir, id, Some("chat")).unwrap();
+            std::fs::File::open(dir.join("sessions").join(id))
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+                )
+                .unwrap();
+        }
+        let found = super::journal_session_lookup_in_workspace_under(
+            &[],
+            &d.path().join("registry"),
+            &state,
+            "chat",
+            Some("0123456789abcdef"),
+        )
+        .unwrap();
+        assert_eq!(
+            found.session, "old",
+            "explicit workspace must not select newest marker elsewhere"
+        );
+        assert_eq!(found.workspace, "0123456789abcdef");
+    }
+
+    #[test]
     fn polish2_live_metadata_precedes_markers() {
         let d = tempfile::tempdir_in("target").unwrap();
         let state = d.path().join("state");
@@ -1225,6 +1267,18 @@ mod ls_tests {
             None,
         )
         .unwrap();
+        let scoped = super::journal_session_lookup_in_workspace_under(
+            std::slice::from_ref(&runtime),
+            &d.path().join("registry"),
+            &state,
+            "live-1",
+            Some("fedcba9876543210"),
+        )
+        .unwrap();
+        assert_eq!(
+            scoped.workspace, "fedcba9876543210",
+            "live session elsewhere must not override explicit workspace"
+        );
         let found = super::journal_session_lookup_under(
             &[runtime],
             &d.path().join("registry"),

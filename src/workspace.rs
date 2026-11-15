@@ -407,10 +407,28 @@ fn marker_names(fd: &std::os::fd::OwnedFd) -> std::io::Result<Vec<String>> {
 }
 
 pub fn find_session_marker(root: &Path, arg: &str) -> Option<SessionMarker> {
-    find_session_marker_for_uid(root, arg, rustix::process::getuid().as_raw())
+    find_session_marker_in_workspace(root, arg, None)
 }
 
+pub fn find_session_marker_in_workspace(
+    root: &Path,
+    arg: &str,
+    workspace: Option<&str>,
+) -> Option<SessionMarker> {
+    find_session_marker_scoped(root, arg, rustix::process::getuid().as_raw(), workspace)
+}
+
+#[cfg(test)]
 fn find_session_marker_for_uid(root: &Path, arg: &str, uid: u32) -> Option<SessionMarker> {
+    find_session_marker_scoped(root, arg, uid, None)
+}
+
+fn find_session_marker_scoped(
+    root: &Path,
+    arg: &str,
+    uid: u32,
+    workspace: Option<&str>,
+) -> Option<SessionMarker> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     if !crate::policy::is_valid_session_id(arg) {
@@ -420,7 +438,7 @@ fn find_session_marker_for_uid(root: &Path, arg: &str, uid: u32) -> Option<Sessi
     let workspaces = open_marker_dir(root.as_raw_fd(), Path::new("workspaces"), uid, false).ok()?;
     let mut candidates = Vec::new();
     for wid in marker_names(&workspaces).ok()? {
-        if !is_valid_workspace_id(&wid) {
+        if !is_valid_workspace_id(&wid) || workspace.is_some_and(|w| w != wid) {
             continue;
         }
         let Ok(ws) = open_marker_dir(workspaces.as_raw_fd(), Path::new(&wid), uid, true) else {

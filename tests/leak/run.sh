@@ -3955,10 +3955,14 @@ if needs_host; then
     else
       fail "L89 credentialless client still has full access" "exec without a credential failed"
     fi
-    if "$HISN" grant --session "l89-$$" -- "$WORK/l89-grant" >/dev/null 2>&1; then
+    # A fresh path: "l89-grant" was already granted at the revoke-refusal
+    # step above, so granting it again would fail with E_EXISTS for any
+    # client. The credentialless grant needs its own ungranted path.
+    mkdir -p "$WORK/l89-owner-grant"
+    if "$HISN" grant --session "l89-$$" -- "$WORK/l89-owner-grant" >"$WORK/l89-owner-grant.out" 2>"$WORK/l89-owner-grant.err"; then
       pass "L89 credentialless grant works"
     else
-      fail "L89 credentialless grant works" "grant without a credential failed"
+      fail "L89 credentialless grant works" "hisn said: [$(head -c 400 "$WORK/l89-owner-grant.out")]; stderr: [$(head -c 400 "$WORK/l89-owner-grant.err")]"
     fi
     # --- the credential appears in none of the recorded surfaces --------
     L89_AUDIT="$L89_DIR/grants.jsonl"

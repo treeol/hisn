@@ -303,9 +303,8 @@ pub fn write_session_marker(dir: &Path, id: &str, name: Option<&str>) -> std::io
     {
         return Err(std::io::Error::other("invalid session marker id/name"));
     }
-    ensure_workspace(dir)?;
     let uid = rustix::process::getuid().as_raw();
-    let ws = open_marker_dir(libc::AT_FDCWD, dir, uid, true)?;
+    let ws = create_marker_workspace(dir, uid)?;
     let sessions = crate::sys::cstr(Path::new("sessions"))?;
     rustix::fs::mkdirat(
         &ws,
@@ -364,6 +363,82 @@ pub fn write_session_marker(dir: &Path, id: &str, name: Option<&str>) -> std::io
         let _ = rustix::fs::unlinkat(&fd, tmp.as_c_str(), rustix::fs::AtFlags::empty());
     }
     result
+}
+
+/// Create only below a pinned, checked state root. Ancestors above that root
+/// belong to the user; workspace/sessions children never follow symlinks.
+fn create_marker_workspace(dir: &Path, uid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+    let home = state_home();
+    let root = if dir.starts_with(&home) {
+        home
+    } else if dir.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("workspaces")) {
+        dir.parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| std::io::Error::other("workspace has no state root"))?
+            .to_path_buf()
+    } else {
+        dir.parent()
+            .ok_or_else(|| std::io::Error::other("workspace has no parent"))?
+            .to_path_buf()
+    };
+    let parts: Vec<_> = dir
+        .strip_prefix(&root)
+        .map_err(std::io::Error::other)?
+        .components()
+        .collect();
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|p| !matches!(p, std::path::Component::Normal(_)))
+    {
+        return Err(std::io::Error::other("invalid marker workspace path"));
+    }
+    let parent = root
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // Only ancestors ABOVE hisn's state root may be symlinked.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)?;
+    let parent = open_marker_dir(libc::AT_FDCWD, parent, uid, false)?;
+    let leaf = root
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("state root has no name"))?;
+    let mut fd = create_marker_child(&parent, Path::new(leaf), uid, false)?;
+    for (index, part) in parts.iter().enumerate() {
+        fd = create_marker_child(
+            &fd,
+            Path::new(part.as_os_str()),
+            uid,
+            index + 1 == parts.len(),
+        )?;
+    }
+    Ok(fd)
+}
+
+fn create_marker_child(
+    parent: &std::os::fd::OwnedFd,
+    name: &Path,
+    uid: u32,
+    private: bool,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::AsRawFd;
+    let name_c = crate::sys::cstr(name)?;
+    rustix::fs::mkdirat(
+        parent,
+        name_c.as_c_str(),
+        rustix::fs::Mode::from_raw_mode(0o700),
+    )
+    .or_else(|e| {
+        if e == rustix::io::Errno::EXIST {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    })?;
+    open_marker_dir(parent.as_raw_fd(), name, uid, private)
 }
 
 fn open_marker_dir(
@@ -523,6 +598,30 @@ mod tests {
         let d = tempfile::tempdir_in("target").unwrap();
         let root = d.path().join("hisn");
         (d, root)
+    }
+
+    #[test]
+    fn polish2_marker_refusal_does_not_create_through_state_symlinks() {
+        use std::os::unix::fs::symlink;
+        for root_link in [true, false] {
+            let (d, root) = marker_tree();
+            let outside = fs::canonicalize(d.path()).unwrap().join("outside");
+            fs::create_dir(&outside).unwrap();
+            if root_link {
+                symlink(&outside, &root).unwrap();
+            } else {
+                fs::create_dir(&root).unwrap();
+                symlink(&outside, root.join("workspaces")).unwrap();
+            }
+            let result =
+                write_session_marker(&root.join("workspaces/0123456789abcdef"), "id", None);
+            assert!(result.is_err(), "unsafe state tree must be refused");
+            assert_eq!(
+                fs::read_dir(&outside).unwrap().count(),
+                0,
+                "refusal must happen before creating children through a symlink"
+            );
+        }
     }
 
     #[test]

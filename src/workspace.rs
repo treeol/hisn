@@ -402,7 +402,7 @@ fn create_marker_workspace(dir: &Path, uid: u32) -> std::io::Result<std::os::fd:
         .recursive(true)
         .mode(0o700)
         .create(parent)?;
-    let parent = open_marker_dir(libc::AT_FDCWD, parent, uid, false)?;
+    let parent = open_marker_ancestor(parent)?;
     let leaf = root
         .file_name()
         .ok_or_else(|| std::io::Error::other("state root has no name"))?;
@@ -416,6 +416,34 @@ fn create_marker_workspace(dir: &Path, uid: u32) -> std::io::Result<std::os::fd:
         )?;
     }
     Ok(fd)
+}
+
+/// Pin the user's ancestors, which may be symlinked. The state root itself
+/// is then opened relative to this fd with the normal no-symlink checks.
+fn open_marker_ancestor(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    let canonical = fs::canonicalize(path)?;
+    let c = crate::sys::cstr(&canonical)?;
+    crate::sys::openat2(
+        libc::AT_FDCWD,
+        &c,
+        (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            as u64,
+        0,
+        crate::sys::RESOLVE_NO_SYMLINKS | crate::sys::RESOLVE_NO_MAGICLINKS,
+    )
+}
+
+fn open_marker_root(path: &Path, uid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::AsRawFd;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let fd = open_marker_ancestor(parent)?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("state root has no name"))?;
+    open_marker_dir(fd.as_raw_fd(), Path::new(leaf), uid, false)
 }
 
 fn create_marker_child(
@@ -509,7 +537,7 @@ fn find_session_marker_scoped(
     if !crate::policy::is_valid_session_id(arg) {
         return None;
     }
-    let root = open_marker_dir(libc::AT_FDCWD, root, uid, false).ok()?;
+    let root = open_marker_root(root, uid).ok()?;
     let workspaces = open_marker_dir(root.as_raw_fd(), Path::new("workspaces"), uid, false).ok()?;
     let mut candidates = Vec::new();
     for wid in marker_names(&workspaces).ok()? {
@@ -598,6 +626,36 @@ mod tests {
         let d = tempfile::tempdir_in("target").unwrap();
         let root = d.path().join("hisn");
         (d, root)
+    }
+
+    #[test]
+    fn polish2_markers_allow_symlinked_ancestors_above_state_root() {
+        let d = tempfile::tempdir_in("target").unwrap();
+        let base = fs::canonicalize(d.path()).unwrap();
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        let root = real.join("hisn");
+        write_session_marker(
+            &root.join("workspaces/0123456789abcdef"),
+            "old",
+            Some("chat"),
+        )
+        .unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let through_alias = alias.join("hisn");
+        assert_eq!(
+            find_session_marker(&through_alias, "old").map(|m| m.session),
+            Some("old".into()),
+            "ancestors above state_home are user paths, not protected state components"
+        );
+        write_session_marker(
+            &through_alias.join("workspaces/0123456789abcdef"),
+            "new",
+            None,
+        )
+        .unwrap();
+        assert!(find_session_marker(&root, "new").is_some());
     }
 
     #[test]

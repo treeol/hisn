@@ -156,7 +156,10 @@ across all workspaces, so it works from any directory after the session
 ends. At start, `workspaces/<workspace-id>/sessions/<session-id>` (0600 in a
 0700 directory) records the session name on one line (empty for unnamed).
 Markers are owned by the current user, regular files, never symlinks; the
-reader ignores unsafe owners/modes and overlong/invalid names. A reused
+reader ignores unsafe owners/modes and overlong/invalid names. State-root
+and workspace components are checked before children are created and opened
+relative to pinned descriptors; symlinks are refused inside the state tree,
+while user-selected ancestors above the state root may be symlinked. A reused
 name selects the newest marker by modification time (deterministic ID and
 workspace tie-break), and reports which ID it chose when ambiguous. The
 resolved ID filters records. Explicit `--workspace` chooses the workspace

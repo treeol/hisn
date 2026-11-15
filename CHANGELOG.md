@@ -51,9 +51,13 @@ sandbox.
   `journal_failures`.
 
 ### Compatibility
-- A 0.4.3 client works unchanged against a 0.5.0 supervisor; the 0.5.0 CLI
-  sends nothing new to a 0.4.3 session; `grants.jsonl` is unchanged; running
-  0.4.3 sessions are not affected by installing 0.5.0.
+- A 0.4.3 client works against a 0.5.0 supervisor: grant, revoke, list, kill,
+  exec and signal answer with the same bytes as before, while `sessioninfo`
+  also returns `workspace` (the id text), `journal_failures` and
+  `journal_bytes`, and `inspect` also returns `journal_failures` and
+  `journal_bytes` (all purely additive). The 0.5.0 CLI sends nothing new to a
+  0.4.3 session; `grants.jsonl` is unchanged; running 0.4.3 sessions are not
+  affected by installing 0.5.0.
 
 ### Known limitations
 - A 0.4.3 binary that rewrites `session.json` (for example `hisn stop`) drops

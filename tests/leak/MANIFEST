@@ -121,6 +121,7 @@ L86
 L87
 L88
 L89
+L90
 L94
 L96
 L97
@@ -136,3 +137,13 @@ L107
 L109
 L110
 L111
+L112
+L113
+L114
+L115
+L116
+L103: connect from a second thread
+L110: non-dumpable program
+L113: no failed lookup recorded as ok
+L114: single records
+L115: host's own nsswitch.conf

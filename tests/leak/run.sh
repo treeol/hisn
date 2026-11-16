@@ -4038,195 +4038,66 @@ else
   skip "L89 seats with credentials and roles" "hisn check failed (no userns)"
 fi
 
-# === 0.6.0 network cases (ADR 0022 rollout subset; L90-L93/L95/L101/L108
-# are 0.7.0 allowlist). Each needs a session with network="open" plus a
-# host-side TCP listener the case starts itself (hermetic: 192.0.2.1/24
-# on a throwaway interface in the outer netns; no traffic leaves the host).
-# Socket work inside the session goes through `hisn exec` python3 with
-# exact errno assertions (the probe binary has no socket op).
-if needs_host; then
-  net_start_listener() { # PORT -> writes listener pid to $WORK/net-listener.pid
-    python3 - "$1" <<'PY' &
-import socket, sys
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("192.0.2.1", int(sys.argv[1])))
-s.listen(8)
-while True:
-    try:
-        c, _ = s.accept()
-    except OSError:
-        break
-    c.sendall(b"L-NET-OK")
-    c.close()
-PY
-    echo $! >"$WORK/net-listener.pid"
-    sleep 0.3
-  }
-  net_stop_listener() { [ -f "$WORK/net-listener.pid" ] && kill "$(cat "$WORK/net-listener.pid")" 2>/dev/null; }
-  # Start the hermetic listener on 192.0.2.1:18081 for L96/L99/L103.
-  net_start_listener 18081
-
-  # L96: sandbox loopback listener reached (CONTINUE).
-  L96_CWD=$(new_cwd l96); L96_POL="$WORK/l96.toml"; write_policy "$L96_POL" "$L96_CWD" open
-  if start_session l96-$$ "$L96_CWD" "$L96_POL"; then
-    L96_OUT=$(timeout 20 "$HISN" exec --session "l96-$$" -- python3 -c "
-import socket
-s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-s.bind(('127.0.0.1',19001)); s.listen(1)
-c=socket.socket(); c.connect(('127.0.0.1',19001)); c.sendall(b'hi'); a,_=s.accept(); a.sendall(b'LOOPBACK-OK'); a.close(); c.close()" 2>&1)
-    case "$L96_OUT" in *"LOOPBACK-OK"*) pass "L96 sandbox loopback listener reached" ;; *) fail "L96 sandbox loopback listener reached" "[$L96_OUT]" ;; esac
-    end_session "$L96_CWD" "$S_PID"
-  else
-    fail "L96 open session starts" "start_session failed"
-  fi
-
-  # L99: non-blocking connect + poll through the mechanism, and the
-  # blocking flag is the child's original (not forced O_NONBLOCK).
-  L99_CWD=$(new_cwd l99); L99_POL="$WORK/l99.toml"; write_policy "$L99_POL" "$L99_CWD" open
-  if start_session l99-$$ "$L99_CWD" "$L99_POL"; then
-    L99_OUT=$(timeout 20 "$HISN" exec --session "l99-$$" -- python3 -c "
-import socket, select, fcntl, os
-s=socket.socket(); s.setblocking(False)
-s.connect_ex(('192.0.2.1',18081))
-r,_,_=select.select([s],[],[],10)
-if not r: print('POLL-TIMEOUT')
-else:
-    try: s.connect(('192.0.2.1',18081))
-    except OSError: pass
-    fl=fcntl.fcntl(s, fcntl.F_GETFL)
-    print('NB-OK' if fl & os.O_NONBLOCK else 'NB-MISSING')" 2>&1)
-    case "$L99_OUT" in *"NB-OK"*) pass "L99 non-blocking connect + poll keeps client flags" ;; *) fail "L99 non-blocking connect" "[$L99_OUT]" ;; esac
-    end_session "$L99_CWD" "$S_PID"
-  else
-    fail "L99 open session starts" "start_session failed"
-  fi
-
-  # L107: private/host-loopback refused in open (EACCES, not ENETUNREACH).
-  L107_CWD=$(new_cwd l107); L107_POL="$WORK/l107.toml"; write_policy "$L107_POL" "$L107_CWD" open
-  if start_session l107-$$ "$L107_CWD" "$L107_POL"; then
-    L107_OUT=$(timeout 20 "$HISN" exec --session "l107-$$" -- python3 -c "
-import socket
-s=socket.socket()
-try:
-    s.connect(('192.168.1.1',80))
-    print('CONNECTED')
-except PermissionError:
-    print('Permission denied')
-except OSError as e:
-    print(e.strerror)" 2>&1)
-    case "$L107_OUT" in *"Permission denied"*) pass "L107 private target refused EACCES" ;; *) fail "L107 private target refused EACCES" "[$L107_OUT]" ;; esac
-    end_session "$L107_CWD" "$S_PID"
-  else
-    fail "L107 private target refused EACCES" "start_session failed"
-  fi
-
-  # L106: a stalled upstream connect does not wedge unrelated connects.
-  # The leak harness starts its own blackhole (a listener that never
-  # accepts still completes the TCP handshake, so the stall is created
-  # by a connect to an unassigned dummy-subnet address that drops the
-  # SYN — the connect stays pending until the supervisor deadline).
-  L106_CWD=$(new_cwd l106); L106_POL="$WORK/l106.toml"; write_policy "$L106_POL" "$L106_CWD" open
-  if start_session l106-$$ "$L106_CWD" "$L106_POL"; then
-    L106_OUT=$(timeout 30 "$HISN" exec --session "l106-$$" -- python3 -c "
-import socket, threading, time
-done = {}
-def slow():
-    s=socket.socket(); s.settimeout(20)
-    try: s.connect(('192.0.2.98',18199))
-    except OSError: done['slow']='refused'
-def fast():
-    time.sleep(0.2)
-    t0=time.time()
-    s=socket.socket(); s.settimeout(10); s.connect(('192.0.2.1',18081))
-    done['fast_dt']=time.time()-t0
-t1=threading.Thread(target=slow); t2=threading.Thread(target=fast)
-t1.start(); t2.start(); t2.join(12); t1.join(2)
-print('L106-OK' if done.get('fast_dt',99) < 2.0 else 'L106-SLOW')" 2>&1)
-    case "$L106_OUT" in *"L106-OK"*) pass "L106 stalled connect does not wedge others" ;; *) fail "L106 stalled connect does not wedge others" "[$L106_OUT]" ;; esac
-    end_session "$L106_CWD" "$S_PID"
-  else
-    fail "L106 stalled connect does not wedge others" "start_session failed"
-  fi
-
-  # L110: dumpable-0 program (sets PR_SET_DUMPABLE=0 after exec) gets
-  # EACCES at read time, journaled refuse/read-failed.
-  L110_CWD=$(new_cwd l110); L110_POL="$WORK/l110.toml"; write_policy "$L110_POL" "$L110_CWD" open
-  if start_session l110-$$ "$L110_CWD" "$L110_POL"; then
-    L110_OUT=$(timeout 20 "$HISN" exec --session "l110-$$" -- python3 -c "
-import ctypes, socket
-libc=ctypes.CDLL('libc.so.6')
-libc.prctl(4, 0, 0, 0, 0)
-s=socket.socket()
-try:
-    s.connect(('192.0.2.1',18081))
-    print('CONNECTED')
-except PermissionError:
-    print('Permission denied')
-except OSError as e:
-    print(e.strerror)" 2>&1)
-    case "$L110_OUT" in *"Permission denied"*) pass "L110 dumpable-0 connect refused EACCES" ;; *) fail "L110 dumpable-0 connect refused EACCES" "[$L110_OUT]" ;; esac
-    J110=$(timeout 20 "$HISN" journal --workspace "$L110_CWD" --json 2>/dev/null || echo '{}')
-    case "$J110" in *"read-failed"*) pass "L110 journal refuse/read-failed" ;; *) fail "L110 journal refuse/read-failed" "journal [$J110]" ;; esac
-    end_session "$L110_CWD" "$S_PID"
-  else
-    fail "L110 dumpable-0 connect refused EACCES" "start_session failed"
-    fail "L110 journal refuse/read-failed" "start_session failed"
-  fi
-
-  # L109: AF_VSOCK refused EACCES.
-  L109_CWD=$(new_cwd l109); L109_POL="$WORK/l109.toml"; write_policy "$L109_POL" "$L109_CWD" open
-  if start_session l109-$$ "$L109_CWD" "$L109_POL"; then
-    L109_OUT=$(timeout 20 "$HISN" exec --session "l109-$$" -- python3 -c "
-import socket
-s=socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM)
-try:
-    s.connect((2,1234))
-    print('CONNECTED')
-except PermissionError:
-    print('Permission denied')
-except OSError as e:
-    print(e.strerror)" 2>&1)
-    case "$L109_OUT" in *"Permission denied"*) pass "L109 vsock refused EACCES" ;; *) fail "L109 vsock refused EACCES" "[$L109_OUT]" ;; esac
-    end_session "$L109_CWD" "$S_PID"
-  else
-    fail "L109 vsock refused EACCES" "start_session failed"
-  fi
-
-  # L111: netns differs from the supervisor's (inner inode != outer).
-  # Both sides must be real inodes (`net:[<digits>]`); a missing session
-  # or an error message is a FAIL, never a PASS.
-  L111_CWD=$(new_cwd l111); L111_POL="$WORK/l111.toml"; write_policy "$L111_POL" "$L111_CWD" open
-  if start_session l111-$$ "$L111_CWD" "$L111_POL"; then
-    L111_IN=$(timeout 20 "$HISN" exec --session "l111-$$" -- readlink /proc/self/ns/net 2>&1)
-    L111_OUT=$(readlink /proc/self/ns/net 2>/dev/null || echo none)
-    case "$L111_IN" in
-      net:\[*\])
-        [ "$L111_IN" != "$L111_OUT" ] && pass "L111 sandbox netns differs from supervisor" || fail "L111 sandbox netns differs from supervisor" "inner [$L111_IN] outer [$L111_OUT]" ;;
-      *) fail "L111 sandbox netns differs from supervisor" "inner is not an inode: [$L111_IN]" ;;
-    esac
-    end_session "$L111_CWD" "$S_PID"
-  else
-    fail "L111 sandbox netns differs from supervisor" "start_session failed"
-  fi
-
-  # L94 (DNS responder via hostname), L97 (host unix socket), L98
-  # (sendto ENETUNREACH), L100 (supervisor kill -> ENOSYS), L102 (journal
-  # record), L103 (exec-tree interception — exercised above via hisn
-  # exec), L104 (SOCK_DGRAM EACCES), L105 (bind loss): asserted with
-  # exact errno + verdict by scripts/host-verify-network.sh (the
-  # hermetic host gate). SKIP here so every MANIFEST id has exactly one
-  # line.
-  for LID in L94 L97 L98 L100 L102 L103 L104 L105; do
-    skip "$LID hermetic socket case" "asserted by scripts/host-verify-network.sh (host gate), not by the leak harness"
+# === 0.6.0 network cases (ADR 0022, open mode): L90, L94, L96-L100,
+# L102-L107, L109-L116. They live in net_cases.sh, which
+# scripts/host-verify-network.sh runs too. It runs inside a throwaway
+# user + network namespace (`unshare -Urn`) that has only loopback and a
+# dummy interface, so no traffic can leave the machine, and with hisn's
+# runtime and state directories inside its own work dir.
+NET_IDS="L90 L94 L96 L97 L98 L99 L100 L102 L103 L104 L105 L106 L107 L109 L110 L111 L112 L113 L114 L115 L116"
+NET_MISSING=""
+command -v ip >/dev/null 2>&1 || NET_MISSING="the ip command (iproute2) is not installed"
+[ -n "$NET_MISSING" ] || timeout 10 unshare -Urn true 2>/dev/null ||
+  NET_MISSING="unshare -Urn (an unprivileged user + network namespace) is not available"
+if [ -n "$NET_MISSING" ]; then
+  for id in $NET_IDS; do
+    skip "$id open-mode network case" "$NET_MISSING"
   done
-  net_stop_listener
+else
+  NET_WORK=$(mktemp -d /tmp/hisn-net.XXXXXX)
+  NET_TOKEN="net$$"
+  timeout 900 unshare -Urn bash "$HERE/net_cases.sh" "$HISN" "$NET_WORK" "$NET_TOKEN" \
+    </dev/null >"$WORK/net-cases.out" 2>&1
+  NET_RC=$?
+  # Backstop: a supervisor the script could not stop (e.g. it timed
+  # out). Only pids it recorded, only while they still name this run.
+  if [ -f "$NET_WORK/supervisor.pids" ]; then
+    while read -r p; do
+      [ -n "$p" ] && [ -r "/proc/$p/cmdline" ] &&
+        tr '\0' ' ' <"/proc/$p/cmdline" | grep -qF -- "$NET_TOKEN" && kill -9 "$p" 2>/dev/null
+    done <"$NET_WORK/supervisor.pids"
+  fi
+  rm -rf "$NET_WORK"
+  NET_P=0 NET_F=0
+  while IFS= read -r line; do
+    case "$line" in
+      "PASS  "*) NET_P=$((NET_P + 1)); pass "${line#PASS  }" ;;
+      "FAIL: "*)
+        NET_F=$((NET_F + 1))
+        rest=${line#FAIL: }
+        fail "${rest%% -- *}" "${rest#* -- }"
+        ;;
+      "INFO  "*) printf '%s\n' "$line" ;;
+    esac
+  done <"$WORK/net-cases.out"
+  # The script's own count must agree with the lines read here, and it
+  # must have exited 0: a run that died half-way is a failure.
+  NET_TRAILER=$(grep '^NET-CASES: ' "$WORK/net-cases.out" | tail -n 1)
+  printf '%s\n' "${NET_TRAILER:-NET-CASES: (no summary line)}"
+  if [ "$NET_RC" -eq 124 ]; then
+    fail "net cases complete" "net_cases.sh timed out after 900 s"
+  elif [ "$NET_TRAILER" != "NET-CASES: pass=$NET_P fail=$NET_F" ]; then
+    fail "net cases complete" "summary [$NET_TRAILER] does not match the $NET_P PASS and $NET_F FAIL lines read (exit $NET_RC); last output: $(tail -n 3 "$WORK/net-cases.out" | tr '\n' ' ')"
+  elif [ "$NET_RC" -ne 0 ] && [ "$NET_F" -eq 0 ]; then
+    fail "net cases complete" "net_cases.sh exited $NET_RC without a FAIL line"
+  else
+    pass "net cases complete: $NET_P passed, $NET_F failed, summary line agrees"
+  fi
 fi
 
-# Every id in MANIFEST must produce at least one line. This runs AFTER
-# the 0.6.0 block (which emits L94/L96-L111) — the previous position,
-# before that block, made L106/L107/L109/L110/L111 permanently
-# "missing" even when they ran.
+# Every id in MANIFEST must produce at least one line. A missing id means
+# the test was silently dropped from the suite — FAIL. (This check stays
+# the last block: it must come after every test.)
 MANIFEST="$HERE/MANIFEST"
 if [ -f "$MANIFEST" ]; then
   EMITTED=$(printf '%s\n' "$OUTPUT_LOG" | sed -n 's/^\(L[0-9][0-9]*[a-z]*\)\([^0-9a-z].*\)\{0,1\}$/\1/p' | sort -u)

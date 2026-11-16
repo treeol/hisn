@@ -469,13 +469,16 @@ impl Policy {
                     format!("{s:?} is not a syscall name"),
                 ));
             }
-            if s == "connect" || s == "socket" {
+            // ADR 0022 decision 11: only meaningful under interception.
+            // In `none`/`host` there is no USER_NOTIF filter, so deny is
+            // legal and byte-identical to 0.5.1.
+            if (s == "connect" || s == "socket") && self.session.network == Network::Open {
                 return Err(invalid(
                     "seccomp.extra_deny",
                     format!(
-                        "{s:?} cannot be denied via extra_deny; \
-                         network interception is governed by ADR 0022 `network` modes \
-                         (ERRNO outranks USER_NOTIF, so a deny would break connect interception)"
+                        "{s:?} cannot be denied via extra_deny under network = \"open\"; \
+                         connect interception is governed by ADR 0022 modes \
+                         (ERRNO outranks USER_NOTIF, so a deny would break interception)"
                     ),
                 ));
             }

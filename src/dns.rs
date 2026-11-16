@@ -137,6 +137,17 @@ pub fn run(
     ups: Vec<SocketAddr>,
     shutdown: &std::sync::atomic::AtomicBool,
 ) {
+    run_with_journal(udp, tcp, ups, shutdown, None)
+}
+
+/// Same as [`run`] with journal records (`network/dns`, best-effort).
+pub fn run_with_journal(
+    udp: OwnedFd,
+    tcp: OwnedFd,
+    ups: Vec<SocketAddr>,
+    shutdown: &std::sync::atomic::AtomicBool,
+    journal: Option<std::sync::Arc<crate::journal::Journal>>,
+) {
     let ups = std::sync::Arc::new(ups);
     let mut conns: Vec<TcpConn> = Vec::new();
     let mut pollfds: Vec<libc::pollfd> = Vec::new();
@@ -157,9 +168,16 @@ pub fn run(
             revents: 0,
         });
         for c in &mut conns {
+            // POLLOUT only when there is output pending; otherwise poll
+            // spins at 100% CPU on every open connection.
+            let events = if c.out_pos < c.out.len() {
+                libc::POLLIN | libc::POLLOUT
+            } else {
+                libc::POLLIN
+            };
             pollfds.push(libc::pollfd {
                 fd: c.fd.as_raw_fd(),
-                events: libc::POLLIN | libc::POLLOUT,
+                events,
                 revents: 0,
             });
         }
@@ -196,6 +214,12 @@ pub fn run(
                 let q = &buf[..n as usize];
                 let resp = exchange(q, &ups);
                 let resp = resp.unwrap_or_else(|| servfail(q).unwrap_or_default());
+                if let Some(j) = &journal {
+                    j.dns_record(
+                        if resp.is_empty() { "drop" } else { "ok" },
+                        &format!("udp query {} bytes", n),
+                    );
+                }
                 if !resp.is_empty() {
                     // Reply to the sender.
                     let _ = unsafe {
@@ -284,6 +308,12 @@ pub fn run(
                             conns[i].need = None;
                             let resp = exchange(&msg, &ups)
                                 .unwrap_or_else(|| servfail(&msg).unwrap_or_default());
+                            if let Some(j) = &journal {
+                                j.dns_record(
+                                    if resp.is_empty() { "drop" } else { "ok" },
+                                    &format!("tcp query {} bytes", msg.len()),
+                                );
+                            }
                             if !resp.is_empty() {
                                 let l = resp.len() as u16;
                                 conns[i].out.extend_from_slice(&l.to_be_bytes());
@@ -317,7 +347,10 @@ fn exchange(q: &[u8], ups: &[SocketAddr]) -> Option<Vec<u8>> {
 }
 
 fn exchange_one(q: &[u8], up: SocketAddr, deadline: Instant) -> Option<Vec<u8>> {
-    let sock = UdpSocket::bind("127.0.0.1:0").ok()?;
+    // Bind the wildcard address so the socket can route to a
+    // non-loopback (or IPv6) upstream; 127.0.0.1 would not route.
+    let bind_addr = if up.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let sock = UdpSocket::bind(bind_addr).ok()?;
     sock.set_read_timeout(Some(Duration::from_millis(500)))
         .ok()?;
     sock.connect(up).ok()?;
@@ -361,7 +394,7 @@ pub fn bind_dns() -> io::Result<(OwnedFd, OwnedFd)> {
     }
     let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     addr.sin_family = libc::AF_INET as libc::sa_family_t;
-    addr.sin_addr.s_addr = libc::INADDR_LOOPBACK;
+    addr.sin_addr.s_addr = libc::INADDR_LOOPBACK.to_be();
     addr.sin_port = 53u16.to_be();
     let r = unsafe {
         libc::bind(

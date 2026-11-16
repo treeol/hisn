@@ -124,7 +124,7 @@ checkfail() { # name forbidden-substring cmd...
   local out
   out=$(timeout 30 "$@" 2>&1); local rc=$?
   if [ "$rc" -eq 124 ]; then echo "FAIL: $name -- timeout"; return; fi
-  case "$out" in *"$no"*) echo "FAIL: $name -- unexpected [$no] in [$(echo "$out" | head -c 200)]";; case *) echo "PASS  $name";; esac
+  case "$out" in *"$no"*) echo "FAIL: $name -- unexpected [$no] in [$(echo "$out" | head -c 200)]";; *) echo "PASS  $name";; esac
 }
 
 # open session: main command is a sleep; exec python3 through hisn exec.
@@ -203,18 +203,17 @@ print(s.recv(100).decode())"
   check "L103 exec tree interception" "HERMETIC-OK" "$HISN" exec --session hv-herm -- python3 -c "
 import socket
 s=socket.socket(); s.settimeout(10); s.connect(('192.0.2.1',18080)); print(s.recv(100).decode())"
-  # L94 DNS via the supervisor responder (hermetic.test -> 192.0.2.1).
-  # The responder forwards to the host resolver discovery; in this
-  # throwaway netns the discovery file is the host's, so L94 is asserted
-  # by the host-side check that getaddrinfo works — here we assert SERVFAIL
-  # on an unresolvable name when the responder is up (it must answer).
-  check "L94 resolver answers (SERVFAIL or NOERROR, never hang)" "GAI-OK" "$HISN" exec --session hv-herm -- python3 -c "
+  # L94 DNS via the supervisor responder: resolve a REAL hostname
+  # (hermetic.test -> 192.0.2.1) through the shipped nsswitch/resolv.conf.
+  # The hermetic DNS server on 192.0.2.2:53 is the only thing that can
+  # answer this name, so a pass proves the sandbox-local files + responder.
+  check "L94 hermetic.test resolves via shipped files" "DNS-OK" "$HISN" exec --session hv-herm -- python3 -c "
 import socket
-try:
-    r=socket.getaddrinfo('192.0.2.1',18080,socket.AF_INET,socket.SOCK_STREAM)
-    print('GAI-OK')
-except Exception as e:
-    print('GAI-ERR')"
+r=socket.getaddrinfo('hermetic.test',18080,socket.AF_INET,socket.SOCK_STREAM)
+s=socket.socket(); s.settimeout(10); s.connect(r[0][4])
+print(s.recv(100).decode())
+# success prints HERMETIC-OK; map it to the expected token
+" 2>&1 | sed 's/HERMETIC-OK/DNS-OK/'
   # L111 netns differs (asserted structurally: session runs, so the
   # supervisor-side assertion passed; journal carries the verdicts)
   J=$(timeout 20 "$HISN" journal --workspace "$W" --json 2>/dev/null || echo '{}')
@@ -251,14 +250,16 @@ fi
 note "step 4: real network"
 if [ "${1:-}" = "--real" ]; then
   TARGET=${HISN_REAL_TARGET:-1.1.1.1}
-  check_real() {
-    local out
-    out=$(timeout 30 ./target/release/hisn exec --session hv-real -- python3 -c "
+  W=$(mktemp -d)
+  printf 'version = "hisn-policy/v1"\n[session]\ncwd = "%s"\nnetwork = "open"\n' "$W" >"$W/open.toml"
+  timeout 60 ./target/release/hisn run --policy "$W/open.toml" --session-id hv-real -- sleep 120 >"$W/real.out" 2>&1 &
+  sleep 3
+  out=$(timeout 30 ./target/release/hisn exec --session hv-real -- python3 -c "
 import socket
 s=socket.socket(); s.settimeout(10); s.connect(('$TARGET',53)); print('REAL-OK')" 2>&1)
-    case "$out" in *"REAL-OK"*) pass "real connect to $TARGET";; *) fail "real connect to $TARGET" "[$out]";; esac
-  }
-  check_real
+  case "$out" in *"REAL-OK"*) pass "real connect to $TARGET";; *) fail "real connect to $TARGET" "[$out]";; esac
+  timeout 20 ./target/release/hisn stop --session hv-real >/dev/null 2>&1 || true
+  rm -rf "$W"
 else
   skip "real" "pass --real (and HISN_REAL_TARGET if not 1.1.1.1)"
 fi

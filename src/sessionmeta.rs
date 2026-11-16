@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(PROTOCOL_REVISION, 3);
         assert_eq!(crate::control::PROTOCOL_VERSION, 3);
         // A dev version string does not lower the revision.
-        assert!(HISN_VERSION.contains("0.5.1"));
+        assert!(HISN_VERSION.contains("0.6.0"));
     }
 
     #[test]

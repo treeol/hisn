@@ -3202,23 +3202,26 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     // ADR 0022 open mode: start the NOTIF engine on init's listener and
     // the DNS responder on init's bound fds. Both are owned here for the
     // session lifetime; dropping them (session end) shuts them down.
+    // The exec-tree engine is stored alongside so its Drop joins the
+    // receiver + workers (no leaked engine); the DNS shutdown flag is
+    // set on session exit via `_dns_shutdown`.
     let _net_engine = net_listener.map(|l| {
         crate::notif::NotifEngine::start(l, Some(Arc::new(net_journal.clone_for_engine())), 30)
     });
-    // ADR 0022 open mode: the exec-tree listener (E's own filter chain).
-    if let Some(l) = exec_net_listener {
-        let _exec_engine =
-            crate::notif::NotifEngine::start(l, Some(Arc::new(net_journal.clone_for_engine())), 30);
-        std::mem::forget(_exec_engine);
-    }
-    let _dns_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if let Some((udp, tcp)) = dns_fds {
+    let _exec_engine = exec_net_listener.map(|l| {
+        crate::notif::NotifEngine::start(l, Some(Arc::new(net_journal.clone_for_engine())), 30)
+    });
+    let dns_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _dns_handle = if let Some((udp, tcp)) = dns_fds {
         let ups = crate::dns::upstreams(policy.nameservers.as_deref());
-        let sd = _dns_shutdown.clone();
-        std::thread::spawn(move || {
-            crate::dns::run(udp, tcp, ups, &sd);
-        });
-    }
+        let sd = dns_shutdown.clone();
+        let j = Some(Arc::new(net_journal.clone_for_engine()));
+        Some(std::thread::spawn(move || {
+            crate::dns::run_with_journal(udp, tcp, ups, &sd, j);
+        }))
+    } else {
+        None
+    };
     let listener = control.listener;
     let handler = control.handler;
     let ssh_agent_expose = control.ssh_agent_expose;
@@ -3250,6 +3253,9 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     // Phase: wait (idle timer + relay).
     let idle_timer = start_idle_timer(&policy, &shared, pid);
     let code = relay_and_wait(pid, master, tty);
+    // ADR 0022: stop the DNS responder thread (the engines drop with
+    // `_net_engine` / `_exec_engine` below when this function returns).
+    dns_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
     // The session is live and ending on the normal path: the guard must not
     // kill and reap init again (relay_and_wait already reaped it). The stop
     // paths below own the remaining cleanup.
@@ -3524,19 +3530,24 @@ fn start_namespaces(
     }
     let n = ready.len;
     // READY fd order (ADR 0022): root, pty_master?, listener?, dns_udp?, dns_tcp?
-    // The ?s are present only in open mode. The count is validated exactly;
-    // a missing or extra fd is a startup failure (the startup-ownership
-    // contract from the pre-implementation review).
+    // The pty slot is present iff cfg.use_pty; the open slots iff open mode.
+    // The count is validated exactly per configuration; a missing or extra
+    // fd is a startup failure (the startup-ownership contract from the
+    // pre-implementation review).
     let is_open = cfg.policy.network == Network::Open;
+    let has_pty = cfg.use_pty;
     let mut ready_fds = ready.fds.into_iter();
     let ready_root = ready_fds.next();
-    let master = ready_fds.next();
+    let master = if has_pty { ready_fds.next() } else { None };
+    if has_pty && master.is_none() {
+        bail!("sandbox init did not send its pty master with READY");
+    }
     let (net_listener, dns_udp, dns_tcp) = if is_open {
         let l = ready_fds.next();
         let u = ready_fds.next();
         let t = ready_fds.next();
         if ready_fds.next().is_some() {
-            bail!("sandbox init sent READY with extra fds (expected root+pty?+3)");
+            bail!("sandbox init sent READY with extra fds");
         }
         (l, u, t)
     } else {
@@ -4044,6 +4055,18 @@ fn spawn_exec_helper(ctx: ExecContext) -> Result<ExecClient> {
     // the caller via the ExecClient's optional slot.
     let mut client = ExecClient::new(parent_end);
     if is_open {
+        // Bounded wait: if E fails to install its filter (old kernel,
+        // EBUSY), helper_serve exits without sending and the supervisor
+        // must fail closed, not hang forever (review BLOCKING B6).
+        let mut pfd = libc::pollfd {
+            fd: client.raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let pr = unsafe { libc::poll(&mut pfd, 1, 10_000) };
+        if pr <= 0 {
+            bail!("exec helper did not send its connect-filter listener within 10s");
+        }
         let mut buf = vec![0u8; 4096];
         let r = sys::recv_with_fds(client.raw_fd(), &mut buf)
             .context("waiting for exec-tree listener")?;

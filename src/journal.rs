@@ -272,11 +272,14 @@ impl Journal {
     /// `verdict` is allow/refuse/continue/dns; `reason` is a short
     /// machine-readable cause. Seat attribution is None in 0.6.0 (the
     /// exec-table mapping is 0.7.0; L102 records session + target +
-    /// verdict + reason).
+    /// verdict + reason). `target` is the `ip:port` (or family) read
+    /// from the notification, when known.
     pub fn net_record(&self, verdict: &str, reason: &str, n: &crate::notif::Notif) {
+        let target = crate::notif::notif_target(n);
         let data = serde_json::json!({
-            "target": format!("pid:{}", n.pid),
+            "target": target,
             "notif_id": n.id,
+            "pid": n.pid,
             "verdict": verdict,
             "reason": reason,
             "seat": Value::Null,
@@ -292,6 +295,17 @@ impl Journal {
             "seat": Value::Null,
         });
         let _ = self.append("network/dns", None, data);
+    }
+
+    /// Coalesced connect summary (network/summary): aggregate verdict
+    /// counts since the last summary, emitted at most 50/s by the caller.
+    pub fn net_summary(&self, allow: u64, refuse: u64, cont: u64) {
+        let data = serde_json::json!({
+            "allow": allow,
+            "refuse": refuse,
+            "continue": cont,
+        });
+        let _ = self.append("network/summary", None, data);
     }
 
     /// Append one record. `kind` is the record kind (an audit `op` plus
@@ -706,15 +720,21 @@ fn prune_journal_files(dir: &Path, _rotate_after: u64) {
     if total <= budget {
         return;
     }
-    // Over budget: delete oldest rotated files until under it.
+    // Over budget: delete oldest rotated files (never the current
+    // journal.jsonl, which is last in `files`) until under it.
+    let mut remaining = files.len();
     let mut total = total;
     for f in &files {
-        if files.len() <= MAX_JOURNAL_FILES && total <= budget {
+        if remaining <= MAX_JOURNAL_FILES && total <= budget {
             break;
+        }
+        if f.file_name().and_then(|n| n.to_str()) == Some(JOURNAL_FILE) {
+            continue; // never delete the active journal
         }
         let len = fs::metadata(f).map(|m| m.len()).unwrap_or(0);
         if fs::remove_file(f).is_ok() {
             total = total.saturating_sub(len);
+            remaining -= 1;
         }
     }
 }

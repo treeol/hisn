@@ -4070,7 +4070,8 @@ fi
 # are 0.7.0 allowlist). Each needs a session with network="open" plus a
 # host-side TCP listener the case starts itself (hermetic: 192.0.2.1/24
 # on a throwaway interface in the outer netns; no traffic leaves the host).
-# These read the python3 at $HERE/l8.py for socket work inside sessions.
+# Socket work inside the session goes through `hisn exec` python3 with
+# exact errno assertions (the probe binary has no socket op).
 if needs_host; then
   net_start_listener() { # PORT -> writes listener pid to $WORK/net-listener.pid
     python3 - "$1" <<'PY' &
@@ -4091,24 +4092,39 @@ PY
     sleep 0.3
   }
   net_stop_listener() { [ -f "$WORK/net-listener.pid" ] && kill "$(cat "$WORK/net-listener.pid")" 2>/dev/null; }
+  # Start the hermetic listener on 192.0.2.1:18081 for L96/L99/L103.
+  net_start_listener 18081
 
   # L96: sandbox loopback listener reached (CONTINUE).
   L96_CWD=$(new_cwd l96); L96_POL="$WORK/l96.toml"; write_policy "$L96_POL" "$L96_CWD" open
   if start_session l96-$$ "$L96_CWD" "$L96_POL"; then
-    # start a loopback listener inside the session via the probe is not
-    # available; use python3 from the toolchain mount instead.
-    L96_GOT=$(q "$L96_CWD" stat /proc/self/ns/net 2>/dev/null)
-    case "$L96_GOT" in *net*) pass "L96 sandbox has its own netns" ;; *) fail "L96 sandbox has its own netns" "got [$L96_GOT]" ;; esac
+    L96_OUT=$(timeout 20 "$HISN" exec --session "l96-$$" -- python3 -c "
+import socket
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('127.0.0.1',19001)); s.listen(1)
+c=socket.socket(); c.connect(('127.0.0.1',19001)); c.sendall(b'hi'); a,_=s.accept(); a.sendall(b'LOOPBACK-OK'); a.close(); c.close()" 2>&1)
+    case "$L96_OUT" in *"LOOPBACK-OK"*) pass "L96 sandbox loopback listener reached" ;; *) fail "L96 sandbox loopback listener reached" "[$L96_OUT]" ;; esac
     end_session "$L96_CWD" "$S_PID"
   else
     fail "L96 open session starts" "start_session failed"
   fi
 
-  # L99: non-blocking connect + poll through the mechanism.
+  # L99: non-blocking connect + poll through the mechanism, and the
+  # blocking flag is the child's original (not forced O_NONBLOCK).
   L99_CWD=$(new_cwd l99); L99_POL="$WORK/l99.toml"; write_policy "$L99_POL" "$L99_CWD" open
   if start_session l99-$$ "$L99_CWD" "$L99_POL"; then
-    L99_OUT=$(q "$L99_CWD" stat /etc/resolv.conf 2>/dev/null)
-    case "$L99_OUT" in *"nameserver 127.0.0.1"*) pass "L99 open mode ships sandbox resolv.conf" ;; *) fail "L99 open mode ships sandbox resolv.conf" "[$L99_OUT]" ;; esac
+    L99_OUT=$(timeout 20 "$HISN" exec --session "l99-$$" -- python3 -c "
+import socket, select, fcntl
+s=socket.socket(); s.setblocking(False)
+s.connect_ex(('192.0.2.1',18081))
+r,_,_=select.select([s],[],[],10)
+if not r: print('POLL-TIMEOUT')
+else:
+    try: s.connect(('192.0.2.1',18081))
+    except OSError: pass
+    fl=fcntl.fcntl(s, fcntl.F_GETFL)
+    print('NB-OK' if fl & 1 else 'NB-MISSING')" 2>&1)
+    case "$L99_OUT" in *"NB-OK"*) pass "L99 non-blocking connect + poll keeps client flags" ;; *) fail "L99 non-blocking connect" "[$L99_OUT]" ;; esac
     end_session "$L99_CWD" "$S_PID"
   else
     fail "L99 open session starts" "start_session failed"
@@ -4117,14 +4133,17 @@ PY
   # L107: private/host-loopback refused in open (EACCES, not ENETUNREACH).
   L107_CWD=$(new_cwd l107); L107_POL="$WORK/l107.toml"; write_policy "$L107_POL" "$L107_CWD" open
   if start_session l107-$$ "$L107_CWD" "$L107_POL"; then
-    # Connect to a host-loopback-only port must be refused by the private
-    # block even though the supervisor could route it. The probe asserts
-    # EACCES for a 127.0.0.1 connect to a closed port (blocked before any
-    # outbound); here we assert the journal carries a refuse verdict.
-    sleep 0.5
-    L107_WS=$(ls_workspace_id "l107-$$" 2>/dev/null || true)
-    L107_J=$("$HISN" journal --workspace "${L107_WS:-x}" --json 2>/dev/null || echo '{}')
-    case "$L107_J" in *network*) pass "L107 network decisions are journaled" ;; *) skip "L107 network decisions are journaled" "no network journal records yet (no connects made); covered by host script" ;; esac
+    L107_OUT=$(timeout 20 "$HISN" exec --session "l107-$$" -- python3 -c "
+import socket
+s=socket.socket()
+try:
+    s.connect(('192.168.1.1',80))
+    print('CONNECTED')
+except PermissionError:
+    print('Permission denied')
+except OSError as e:
+    print(e.strerror)" 2>&1)
+    case "$L107_OUT" in *"Permission denied"*) pass "L107 private target refused EACCES" ;; *) fail "L107 private target refused EACCES" "[$L107_OUT]" ;; esac
     end_session "$L107_CWD" "$S_PID"
   else
     fail "L107 open session starts" "start_session failed"
@@ -4133,36 +4152,45 @@ PY
   # L109: AF_VSOCK refused EACCES.
   L109_CWD=$(new_cwd l109); L109_POL="$WORK/l109.toml"; write_policy "$L109_POL" "$L109_CWD" open
   if start_session l109-$$ "$L109_CWD" "$L109_POL"; then
-    # vsock connect must fail; exact errno asserted by the probe command.
-    L109_GOT=$(q "$L109_CWD" stat /proc/self/ns/net 2>/dev/null)
-    case "$L109_GOT" in *net*) pass "L109 open session has sandboxed netns (vsock path governed)" ;; *) fail "L109 open session has sandboxed netns" "[$L109_GOT]" ;; esac
+    L109_OUT=$(timeout 20 "$HISN" exec --session "l109-$$" -- python3 -c "
+import socket
+s=socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM)
+try:
+    s.connect((2,1234))
+    print('CONNECTED')
+except PermissionError:
+    print('Permission denied')
+except OSError as e:
+    print(e.strerror)" 2>&1)
+    case "$L109_OUT" in *"Permission denied"*) pass "L109 vsock refused EACCES" ;; *) fail "L109 vsock refused EACCES" "[$L109_OUT]" ;; esac
     end_session "$L109_CWD" "$S_PID"
   else
     fail "L109 open session starts" "start_session failed"
   fi
 
-  # L111: netns differs from supervisor's.
+  # L111: netns differs from the supervisor's (inner inode != outer).
   L111_CWD=$(new_cwd l111); L111_POL="$WORK/l111.toml"; write_policy "$L111_POL" "$L111_CWD" open
   if start_session l111-$$ "$L111_CWD" "$L111_POL"; then
-    L111_IN=$(q "$L111_CWD" stat /proc/self/ns/net 2>/dev/null)
+    L111_IN=$(timeout 20 "$HISN" exec --session "l111-$$" -- readlink /proc/self/ns/net 2>&1)
     L111_OUT=$(readlink /proc/self/ns/net 2>/dev/null || echo none)
-    case "$L111_IN" in *"net: ["*) pass "L111 sandbox netns inode readable" ;; *) fail "L111 sandbox netns inode readable" "[$L111_IN]" ;; esac
+    [ "$L111_IN" != "$L111_OUT" ] && [ -n "$L111_IN" ] && pass "L111 sandbox netns differs from supervisor" || fail "L111 sandbox netns differs" "inner [$L111_IN] outer [$L111_OUT]"
     end_session "$L111_CWD" "$S_PID"
   else
     fail "L111 open session starts" "start_session failed"
   fi
 
-  # L94 (DNS responder), L97 (host unix socket), L98 (sendto ENETUNREACH),
-  # L100 (supervisor kill -> ENOSYS), L102 (journal record), L103 (exec
-  # tree interception), L104 (SOCK_DGRAM EACCES), L105 (bind loss),
-  # L106 (worker concurrency), L110 (dumpable-0 EACCES): these need socket
-  # work inside the session and are asserted with exact errno + journal
-  # verdict by scripts/host-verify-network.sh (the hermetic host gate).
-  # They are declared SKIP here so the manifest is satisfied on hosts
-  # where only the leak suite runs; the host script is the gate.
+  # L94 (DNS responder via hostname), L97 (host unix socket), L98
+  # (sendto ENETUNREACH), L100 (supervisor kill -> ENOSYS), L102 (journal
+  # record), L103 (exec-tree interception, already exercised above — the
+  # checks ran through `hisn exec`), L104 (SOCK_DGRAM EACCES), L105 (bind
+  # loss), L106 (worker concurrency), L110 (dumpable-0 EACCES): asserted
+  # with exact errno + verdict by scripts/host-verify-network.sh (the
+  # hermetic host gate). They are SKIP here so the MANIFEST is satisfied
+  # on hosts where only the leak suite runs.
   for LID in L94 L97 L98 L100 L102 L103 L104 L105 L106 L110; do
     skip "$LID hermetic socket case" "asserted by scripts/host-verify-network.sh (host gate), not by the leak harness"
   done
+  net_stop_listener
 fi
 
 # ----------------------------------------------------------------- summary

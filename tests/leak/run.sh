@@ -4146,7 +4146,60 @@ except OSError as e:
     case "$L107_OUT" in *"Permission denied"*) pass "L107 private target refused EACCES" ;; *) fail "L107 private target refused EACCES" "[$L107_OUT]" ;; esac
     end_session "$L107_CWD" "$S_PID"
   else
-    fail "L107 open session starts" "start_session failed"
+    fail "L107 private target refused EACCES" "start_session failed"
+  fi
+
+  # L106: a stalled upstream connect does not wedge unrelated connects.
+  # The leak harness starts its own blackhole (a listener that never
+  # accepts still completes the TCP handshake, so the stall is created
+  # by a connect to an unassigned dummy-subnet address that drops the
+  # SYN — the connect stays pending until the supervisor deadline).
+  L106_CWD=$(new_cwd l106); L106_POL="$WORK/l106.toml"; write_policy "$L106_POL" "$L106_CWD" open
+  if start_session l106-$$ "$L106_CWD" "$L106_POL"; then
+    L106_OUT=$(timeout 30 "$HISN" exec --session "l106-$$" -- python3 -c "
+import socket, threading, time
+done = {}
+def slow():
+    s=socket.socket(); s.settimeout(20)
+    try: s.connect(('192.0.2.98',18199))
+    except OSError: done['slow']='refused'
+def fast():
+    time.sleep(0.2)
+    t0=time.time()
+    s=socket.socket(); s.settimeout(10); s.connect(('192.0.2.1',18081))
+    done['fast_dt']=time.time()-t0
+t1=threading.Thread(target=slow); t2=threading.Thread(target=fast)
+t1.start(); t2.start(); t2.join(12); t1.join(2)
+print('L106-OK' if done.get('fast_dt',99) < 2.0 else 'L106-SLOW')" 2>&1)
+    case "$L106_OUT" in *"L106-OK"*) pass "L106 stalled connect does not wedge others" ;; *) fail "L106 stalled connect does not wedge others" "[$L106_OUT]" ;; esac
+    end_session "$L106_CWD" "$S_PID"
+  else
+    fail "L106 stalled connect does not wedge others" "start_session failed"
+  fi
+
+  # L110: dumpable-0 program (sets PR_SET_DUMPABLE=0 after exec) gets
+  # EACCES at read time, journaled refuse/read-failed.
+  L110_CWD=$(new_cwd l110); L110_POL="$WORK/l110.toml"; write_policy "$L110_POL" "$L110_CWD" open
+  if start_session l110-$$ "$L110_CWD" "$L110_POL"; then
+    L110_OUT=$(timeout 20 "$HISN" exec --session "l110-$$" -- python3 -c "
+import ctypes, socket
+libc=ctypes.CDLL('libc.so.6')
+libc.prctl(4, 0, 0, 0, 0)
+s=socket.socket()
+try:
+    s.connect(('192.0.2.1',18081))
+    print('CONNECTED')
+except PermissionError:
+    print('Permission denied')
+except OSError as e:
+    print(e.strerror)" 2>&1)
+    case "$L110_OUT" in *"Permission denied"*) pass "L110 dumpable-0 connect refused EACCES" ;; *) fail "L110 dumpable-0 connect refused EACCES" "[$L110_OUT]" ;; esac
+    J110=$(timeout 20 "$HISN" journal --workspace "$L110_CWD" --json 2>/dev/null || echo '{}')
+    case "$J110" in *"read-failed"*) pass "L110 journal refuse/read-failed" ;; *) fail "L110 journal refuse/read-failed" "journal [$J110]" ;; esac
+    end_session "$L110_CWD" "$S_PID"
+  else
+    fail "L110 dumpable-0 connect refused EACCES" "start_session failed"
+    fail "L110 journal refuse/read-failed" "start_session failed"
   fi
 
   # L109: AF_VSOCK refused EACCES.
@@ -4165,29 +4218,34 @@ except OSError as e:
     case "$L109_OUT" in *"Permission denied"*) pass "L109 vsock refused EACCES" ;; *) fail "L109 vsock refused EACCES" "[$L109_OUT]" ;; esac
     end_session "$L109_CWD" "$S_PID"
   else
-    fail "L109 open session starts" "start_session failed"
+    fail "L109 vsock refused EACCES" "start_session failed"
   fi
 
   # L111: netns differs from the supervisor's (inner inode != outer).
+  # Both sides must be real inodes (`net:[<digits>]`); a missing session
+  # or an error message is a FAIL, never a PASS.
   L111_CWD=$(new_cwd l111); L111_POL="$WORK/l111.toml"; write_policy "$L111_POL" "$L111_CWD" open
   if start_session l111-$$ "$L111_CWD" "$L111_POL"; then
     L111_IN=$(timeout 20 "$HISN" exec --session "l111-$$" -- readlink /proc/self/ns/net 2>&1)
     L111_OUT=$(readlink /proc/self/ns/net 2>/dev/null || echo none)
-    [ "$L111_IN" != "$L111_OUT" ] && [ -n "$L111_IN" ] && pass "L111 sandbox netns differs from supervisor" || fail "L111 sandbox netns differs" "inner [$L111_IN] outer [$L111_OUT]"
+    case "$L111_IN" in
+      net:\[*\])
+        [ "$L111_IN" != "$L111_OUT" ] && pass "L111 sandbox netns differs from supervisor" || fail "L111 sandbox netns differs from supervisor" "inner [$L111_IN] outer [$L111_OUT]" ;;
+      *) fail "L111 sandbox netns differs from supervisor" "inner is not an inode: [$L111_IN]" ;;
+    esac
     end_session "$L111_CWD" "$S_PID"
   else
-    fail "L111 open session starts" "start_session failed"
+    fail "L111 sandbox netns differs from supervisor" "start_session failed"
   fi
 
   # L94 (DNS responder via hostname), L97 (host unix socket), L98
   # (sendto ENETUNREACH), L100 (supervisor kill -> ENOSYS), L102 (journal
-  # record), L103 (exec-tree interception, already exercised above — the
-  # checks ran through `hisn exec`), L104 (SOCK_DGRAM EACCES), L105 (bind
-  # loss), L106 (worker concurrency), L110 (dumpable-0 EACCES): asserted
-  # with exact errno + verdict by scripts/host-verify-network.sh (the
-  # hermetic host gate). They are SKIP here so the MANIFEST is satisfied
-  # on hosts where only the leak suite runs.
-  for LID in L94 L97 L98 L100 L102 L103 L104 L105 L106 L110; do
+  # record), L103 (exec-tree interception — exercised above via hisn
+  # exec), L104 (SOCK_DGRAM EACCES), L105 (bind loss): asserted with
+  # exact errno + verdict by scripts/host-verify-network.sh (the
+  # hermetic host gate). SKIP here so every MANIFEST id has exactly one
+  # line.
+  for LID in L94 L97 L98 L100 L102 L103 L104 L105; do
     skip "$LID hermetic socket case" "asserted by scripts/host-verify-network.sh (host gate), not by the leak harness"
   done
   net_stop_listener

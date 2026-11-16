@@ -3136,16 +3136,14 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     // The supervisor must NOT be in the sandbox netns; if it is (e.g. a
     // missing CLONE_NEWNET), outbound connects would silently hit the
     // sandbox namespace and interception is meaningless.
+    //
+    // The sandbox netns fd is `exec_ns.net` (opened before GO, while init
+    // is still dumpable) — never a `/proc/<init>/ns/net` read after init
+    // sets PR_SET_DUMPABLE=0, which the kernel refuses with EACCES and
+    // made every open session fail closed (host-verified). Both sides
+    // are fstat of open fds: the sandbox netns fd vs our own netns fd.
     if policy.network == Network::Open {
-        let self_inode =
-            sys::ns_inode(std::process::id() as i32, "net").context("supervisor netns inode")?;
-        let init_inode = sys::ns_inode(pid, "net").context("sandbox netns inode")?;
-        if self_inode == init_inode {
-            bail!(
-                "refusing to start: supervisor shares the sandbox netns (inode {self_inode}); \
-                 CLONE_NEWNET is missing"
-            );
-        }
+        check_netns_differs(&exec_ns.net)?;
         crate::notif::probe_features().map_err(|e| anyhow!(e))?;
     }
 
@@ -4007,6 +4005,46 @@ fn open_ns(pid: i32, name: &str) -> Result<OwnedFd> {
     Ok(f.into())
 }
 
+/// Netns-differs assertion (ADR 0022 decision 2): the supervisor's own
+/// netns must differ from the sandbox netns. `sandbox_net` is the fd the
+/// supervisor opened before GO (while init was still dumpable); both
+/// sides are fstat of open fds, so no `/proc/<pid>/ns/net` read — which
+/// the kernel refuses with EACCES after init sets PR_SET_DUMPABLE=0 —
+/// is ever involved. Any error (or a missing fd in open mode) refuses
+/// to start. Pure comparison is factored for unit tests.
+fn check_netns_differs(sandbox_net: &Option<OwnedFd>) -> Result<()> {
+    let sandbox = sandbox_net
+        .as_ref()
+        .context("sandbox has no netns fd in open mode")?;
+    let self_net = fs::File::open("/proc/self/ns/net").context("supervisor netns fd")?;
+    netns_differs(&self_net, sandbox)
+}
+
+/// fstat-based netns comparison: Ok iff the two netns fds are different
+/// namespaces (st_dev + st_ino differ). Fails closed on any error.
+fn netns_differs(a: &fs::File, b: &OwnedFd) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let md_a = a.metadata().context("supervisor netns fstat")?;
+    // SAFETY: fstat of another open fd — `libc::fstat` by raw fd; no
+    // second File is created, so no double-close.
+    let md_b = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        let rc = libc::fstat(b.as_raw_fd(), &mut st);
+        if rc != 0 {
+            return Err(io::Error::last_os_error()).context("sandbox netns fstat");
+        }
+        st
+    };
+    if md_a.dev() == md_b.st_dev && md_a.ino() == md_b.st_ino {
+        bail!(
+            "refusing to start: supervisor shares the sandbox netns (ino {}); \
+             CLONE_NEWNET is missing",
+            md_a.ino()
+        );
+    }
+    Ok(())
+}
+
 fn bind_socket(path: &Path) -> Result<UnixListener> {
     // Bind under a restrictive umask so the socket is never briefly wider than 0600.
     // SAFETY: umask is process-global but we are single-threaded here.
@@ -4246,6 +4284,31 @@ pub fn client_request(session_arg: &str, req: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::{ClientInfo, ConnRegistry};
+
+    #[test]
+    fn netns_differs_same_inode_fails() {
+        // Same netns twice -> equal, so the check must refuse (fail
+        // closed). Two opens of /proc/self/ns/net share one inode.
+        let a = std::fs::File::open("/proc/self/ns/net").unwrap();
+        let b: std::os::fd::OwnedFd = a.try_clone().unwrap().into();
+        assert!(super::netns_differs(&a, &b).is_err());
+    }
+
+    #[test]
+    fn netns_differs_own_and_sandbox_like_differ_or_self() {
+        // The supervisor's own netns vs itself must be equal (single
+        // namespace in this test process). A different namespace is
+        // exercised only on the host run; here we assert the equality
+        // branch and that check_netns_differs fails closed for None.
+        assert!(
+            super::netns_differs(
+                &std::fs::File::open("/proc/self/ns/net").unwrap(),
+                &std::fs::File::open("/proc/self/ns/net").unwrap().into()
+            )
+            .is_err()
+        );
+        assert!(super::check_netns_differs(&None).is_err());
+    }
 
     #[test]
     fn yama_refuse_parse() {

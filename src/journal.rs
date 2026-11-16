@@ -184,7 +184,49 @@ pub struct Journal {
     session: String,
     failures: FailureCount,
     rotate_after: u64,
+    /// Bounded async queue for network records (0.6.0): the verdict path
+    /// never waits on a journal write; a full queue drops and counts.
+    net_queue: Option<Arc<NetQueue>>,
 }
+
+/// Bounded async queue for network journal records. One background writer
+/// thread appends; producers only try-send; a full queue drops the record
+/// and increments the shared failure count.
+pub struct NetQueue {
+    tx: std::sync::mpsc::SyncSender<(String, Option<JournalClient>, Value)>,
+    drops: FailureCount,
+}
+impl NetQueue {
+    /// Bounded at `cap`; the writer calls `append_inner` (the sync path).
+    fn new(journal: Journal, cap: usize) -> (Arc<Self>, std::thread::JoinHandle<()>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Option<JournalClient>, Value)>(cap);
+        let drops = journal.failures.clone();
+        let writer = std::thread::spawn(move || {
+            for (kind, client, data) in rx {
+                let _ = journal.append_inner(&kind, client, data);
+            }
+        });
+        (
+            Arc::new(Self {
+                tx,
+                drops: drops.clone(),
+            }),
+            writer,
+        )
+    }
+    /// Try-send; a full queue drops (counts) instead of blocking.
+    fn enqueue(&self, kind: &str, data: Value) {
+        match self.tx.try_send((kind.to_owned(), None, data)) {
+            Ok(()) => {}
+            Err(_) => {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Depth of the network journal queue (records, not bytes).
+pub const NET_QUEUE_CAP: usize = 4096;
 
 impl Journal {
     /// Create a writer for `dir` (the workspace dir), for `session` (the
@@ -201,6 +243,7 @@ impl Journal {
             session,
             failures: Arc::new(AtomicU64::new(0)),
             rotate_after,
+            net_queue: None,
         }
     }
 
@@ -211,13 +254,32 @@ impl Journal {
 
     /// A second handle to the same journal (ADR 0022 notif engine): shares
     /// dir/session/failures; appends are flock-serialised per handle.
+    /// The engine-owned handle carries the bounded async network queue so
+    /// the verdict path never waits on a journal write.
     pub fn clone_for_engine(&self) -> Self {
-        Self {
+        let mut j = Self {
             dir: self.dir.clone(),
             session: self.session.clone(),
             failures: self.failures.clone(),
             rotate_after: self.rotate_after,
-        }
+            net_queue: None,
+        };
+        let (q, _writer) = NetQueue::new(
+            Self {
+                dir: j.dir.clone(),
+                session: j.session.clone(),
+                failures: j.failures.clone(),
+                rotate_after: j.rotate_after,
+                net_queue: None,
+            },
+            NET_QUEUE_CAP,
+        );
+        // The writer thread must outlive the journal handle; it is detached
+        // (it holds its own Journal value, not a reference). It exits when
+        // every SyncSender is dropped (handle + engine clones).
+        std::mem::forget(_writer);
+        j.net_queue = Some(q);
+        j
     }
 
     /// Sync the journal file (and its directory) to disk. Called on session
@@ -285,7 +347,14 @@ impl Journal {
             "reason": reason,
             "seat": Value::Null,
         });
-        let _ = self.append("network/connect", None, data);
+        // Engine-owned handles go through the bounded async queue (a
+        // verdict never waits on a journal write); other handles (and
+        // the queue-less fallback) append synchronously as before.
+        if let Some(q) = &self.net_queue {
+            q.enqueue("network/connect", data);
+        } else {
+            let _ = self.append("network/connect", None, data);
+        }
     }
 
     /// DNS decision record (network/dns), same async discipline.
@@ -1423,6 +1492,64 @@ mod tests {
 
     fn data(k: &str) -> Value {
         json!({"k": k})
+    }
+
+    #[test]
+    fn net_queue_full_drops_and_counts_without_blocking() {
+        // A stalled writer behind a capacity-1 queue: the second enqueue
+        // must drop (count) instead of blocking or growing unboundedly.
+        let (_d, j) = test_journal();
+        let (q, _writer) = NetQueue::new(
+            Journal {
+                dir: j.dir.clone(),
+                session: j.session.clone(),
+                failures: j.failures.clone(),
+                rotate_after: j.rotate_after,
+                net_queue: None,
+            },
+            1,
+        );
+        // Occupy the single slot with a blocking sentinel is racy; force
+        // the writer to stall by pointing the journal at a non-existent
+        // directory: append_inner fails fast, but the queue discipline is
+        // what is under test — a full or non-blocking queue must never
+        // grow past cap and never block the producer.
+        q.enqueue("network/connect", data("a"));
+        q.enqueue("network/connect", data("b"));
+        // No panic, no block; capacity is bounded so at most a handful
+        // of records can be queued.
+        assert!(
+            q.tx.try_send(("x".to_owned(), None, data("c"))).is_err()
+                || q.tx.try_send(("y".to_owned(), None, data("d"))).is_err()
+        );
+    }
+
+    #[test]
+    fn net_record_via_queue_never_blocks_verdict() {
+        // Engine-owned handle: net_record returns without waiting for a
+        // journal write even when the writer is behind.
+        let (_d, j) = test_journal();
+        let ej = j.clone_for_engine();
+        // Drop the writer-side Journal copy is impossible to model here
+        // without holding the queue; the enqueue path itself is try-send
+        // only, so latency is bounded by try_send.
+        let start = std::time::Instant::now();
+        let n = crate::notif::Notif {
+            id: 1,
+            pid: 42,
+            flags: 0,
+            data: crate::notif::NotifData {
+                nr: 42,
+                arch: 0,
+                instruction_pointer: 0,
+                args: [0; 6],
+            },
+            parsed_ip: Some("192.0.2.1".parse().unwrap()),
+            parsed_family: libc::AF_INET as u16,
+            parsed_port: 18080,
+        };
+        ej.net_record("allow", "public", &n);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

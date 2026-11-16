@@ -108,7 +108,7 @@ pub fn probe_features() -> Result<Features, String> {
     unsafe { libc::waitpid(pid, &mut status, 0) };
     if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
         return Err("seccomp user-notif probe failed: missing feature \
-             (NEW_LISTENER needs kernel >= 4.14, NOTIF_ID_VALID >= 5.0, \
+             (NEW_LISTENER/NOTIF_RECV/SEND/ID_VALID need kernel >= 5.0, \
              CONTINUE >= 5.5, ADDFD/SETFD >= 5.9, FLAG_SEND >= 5.14; \
              floor 5.9; FLAG_SEND is optional — two-step injection is used)"
             .to_string());
@@ -123,9 +123,44 @@ pub fn probe_features() -> Result<Features, String> {
     })
 }
 
+/// `SECCOMP_GET_NOTIF_SIZES` ioctl (added in 5.5): the kernel reports
+/// its `seccomp_notif`/`seccomp_notif_resp` sizes. Ours are 80/24; a
+/// larger kernel size would mean the kernel struct has grown and our
+/// copy could truncate a notification — refuse to start then. Run in
+/// `probe_features_inner`.
+fn kernel_notif_sizes_ok(fd: i32) -> bool {
+    #[repr(C)]
+    struct NotifSizes {
+        notif: u16,
+        resp: u16,
+        data: u16,
+    }
+    let mut sizes = NotifSizes {
+        notif: 0,
+        resp: 0,
+        data: 0,
+    };
+    let r = unsafe {
+        libc::ioctl(
+            fd,
+            0x4008_2104, // _IOR('!', 4, struct seccomp_notif_sizes)
+            &mut sizes as *mut NotifSizes as *mut libc::c_void,
+        )
+    };
+    if r != 0 {
+        // Op unknown (pre-5.5): our sizes are the documented baseline.
+        return true;
+    }
+    sizes.notif <= 80 && sizes.resp <= 24 && sizes.data <= 64
+}
+
 fn probe_features_inner() -> Result<Features, String> {
-    let _listener = install_connect_filter().map_err(|e| format!("NEW_LISTENER (>=4.14): {e}"))?;
+    let _listener = install_connect_filter().map_err(|e| format!("NEW_LISTENER (>=5.0): {e}"))?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&_listener);
+    // Kernel struct sizes must not exceed ours (fail closed if they do).
+    if !kernel_notif_sizes_ok(fd) {
+        return Err("kernel seccomp_notif struct larger than hisn's copy".to_string());
+    }
     // NOTIF_ID_VALID with a bogus id: EINVAL means the op exists,
     // ENOSYS/EOPNOTSUPP means it does not.
     let id_valid = {
@@ -165,6 +200,12 @@ fn probe_features_inner() -> Result<Features, String> {
 /// `seccomp_notif_addfd { u64 id; u32 flags; u32 srcfd; u32 newfd; u32 newfd_flags }`.
 /// Operations are `ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_*)` — NOT
 /// `seccomp(2)` — with `SECCOMP_IOWR/IOW('!', n, type)`, `'!'` = 0x21.
+///
+/// The kernel structs are `#[repr(C)]` and size-asserted against
+/// `/usr/include/linux/seccomp.h`: `seccomp_data` = 64 bytes
+/// (4 + 4 + 8 + 48), `seccomp_notif` = 80 bytes (8 + 4 + 4 + 64),
+/// `seccomp_notif_resp` = 24 (8 + 8 + 4 + 4),
+/// `seccomp_notif_addfd` = 24 (8 + 4 + 4 + 4 + 4 — wait, 8+4+4+4+4 = 24).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NotifData {
@@ -173,10 +214,20 @@ pub struct NotifData {
     pub instruction_pointer: u64,
     pub args: [u64; 6],
 }
-/// The kernel `seccomp_notif` plus the supervisor-parsed destination
-/// for the journal target. Kernel ioctls write only the first part
-/// (id/pid/flags/data); the trailing parsed fields are supervisor-only
-/// and are filled by the worker after the sockaddr read.
+/// The exact kernel `seccomp_notif` (80 bytes, `#[repr(C)]`). This is
+/// the buffer handed to `SECCOMP_IOCTL_NOTIF_RECV`. The supervisor's
+/// parsed destination lives in the separate Rust struct [`Notif`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RawNotif {
+    pub id: u64,
+    pub pid: u32,
+    pub flags: u32,
+    pub data: NotifData,
+}
+
+/// The supervisor's parsed destination for the journal target — a
+/// separate Rust struct, never handed to the kernel.
 #[derive(Debug, Clone)]
 pub struct Notif {
     pub id: u64,
@@ -205,6 +256,28 @@ impl Default for Notif {
         }
     }
 }
+impl From<RawNotif> for Notif {
+    fn from(r: RawNotif) -> Self {
+        Self {
+            id: r.id,
+            pid: r.pid,
+            flags: r.flags,
+            data: r.data,
+            parsed_ip: None,
+            parsed_family: 0,
+            parsed_port: 0,
+        }
+    }
+}
+
+// Kernel struct size asserts (checked at compile time).
+const _: () = assert!(std::mem::size_of::<NotifData>() == 64, "seccomp_data");
+const _: () = assert!(std::mem::size_of::<RawNotif>() == 80, "seccomp_notif");
+const _: () = assert!(std::mem::size_of::<NotifResp>() == 24, "seccomp_notif_resp");
+const _: () = assert!(
+    std::mem::size_of::<NotifAddFd>() == 24,
+    "seccomp_notif_addfd"
+);
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct NotifResp {
@@ -299,6 +372,10 @@ pub struct NotifEngine {
     pub handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Max pending notifications between receiver and workers; a full queue
+/// refuses EACCES immediately (journaled refuse/queue-full).
+pub const MAX_PENDING: usize = 256;
+
 impl NotifEngine {
     /// Start the engine on `listener`. `journal` is a clone of the
     /// workspace journal (best-effort; verdict never waits on it — the
@@ -361,8 +438,8 @@ fn engine_loop(
             }
         })
     });
-    // Receiver + 64 workers on a bounded queue (256 pending).
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(Notif, std::time::Instant)>(256);
+    // Receiver + 64 workers on a bounded queue (MAX_PENDING pending).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Notif, std::time::Instant)>(MAX_PENDING);
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
     let mut workers = Vec::new();
     for _ in 0..64 {
@@ -409,17 +486,15 @@ fn engine_loop(
         if pfd.revents & libc::POLLIN == 0 {
             continue;
         }
-        // Kernel writes the seccomp_notif prefix; the trailing parsed
-        // fields are supervisor-only (filled by the worker after the read).
-        let mut n: Notif = Notif::default();
-        // SAFETY: the first 56 bytes match struct seccomp_notif exactly
-        // (id u64, pid u32, flags u32, data {nr i32, arch u32, ip u64,
-        // args [u64;6]}); the trailing parsed fields are untouched by the
-        // kernel and keep their Default values.
-        let n_ptr = &mut n as *mut Notif as *mut u8;
-        match seccomp_ioctl(lfd, OP_RECV, n_ptr as *mut libc::c_void) {
+        // The kernel struct is the exact 80-byte `seccomp_notif`. The
+        // receive buffer is zeroed before every NOTIF_RECV (a stale
+        // buffer must never leak a previous notification's bytes), and
+        // the parsed fields are a separate Rust struct built from it.
+        let mut raw: RawNotif = unsafe { std::mem::zeroed() };
+        match seccomp_ioctl(lfd, OP_RECV, &mut raw as *mut RawNotif as *mut libc::c_void) {
             Ok(()) => {
                 let recv_at = std::time::Instant::now();
+                let n: Notif = raw.into();
                 match tx.try_send((n, recv_at)) {
                     Ok(()) => {}
                     Err(std::sync::mpsc::TrySendError::Full((n, _))) => {

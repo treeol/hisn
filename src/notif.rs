@@ -123,12 +123,13 @@ pub fn probe_features() -> Result<Features, String> {
     })
 }
 
-/// `SECCOMP_GET_NOTIF_SIZES` ioctl (added in 5.5): the kernel reports
-/// its `seccomp_notif`/`seccomp_notif_resp` sizes. Ours are 80/24; a
-/// larger kernel size would mean the kernel struct has grown and our
-/// copy could truncate a notification — refuse to start then. Run in
-/// `probe_features_inner`.
-fn kernel_notif_sizes_ok(fd: i32) -> bool {
+/// `SECCOMP_GET_NOTIF_SIZES` (5.5): a `seccomp(2)` operation
+/// (`seccomp(SECCOMP_GET_NOTIF_SIZES, 0, &sizes)`), not a listener
+/// ioctl. The kernel reports its `seccomp_notif`/`seccomp_notif_resp`
+/// sizes; ours are 80/24, and a larger kernel size would mean the
+/// kernel struct has grown and our copy could truncate a notification.
+/// Run in `probe_features_inner`.
+fn kernel_notif_sizes_ok() -> bool {
     #[repr(C)]
     struct NotifSizes {
         notif: u16,
@@ -140,15 +141,18 @@ fn kernel_notif_sizes_ok(fd: i32) -> bool {
         resp: 0,
         data: 0,
     };
+    // SAFETY: seccomp() syscall; sizes is a valid output buffer.
     let r = unsafe {
-        libc::ioctl(
-            fd,
-            0x4008_2104, // _IOR('!', 4, struct seccomp_notif_sizes)
+        libc::syscall(
+            libc::SYS_seccomp,
+            3i32, // SECCOMP_GET_NOTIF_SIZES
+            0u32,
             &mut sizes as *mut NotifSizes as *mut libc::c_void,
         )
     };
     if r != 0 {
-        // Op unknown (pre-5.5): our sizes are the documented baseline.
+        // Op unknown (pre-5.5, or the op is not permitted here): our
+        // sizes are the documented baseline from the header.
         return true;
     }
     sizes.notif <= 80 && sizes.resp <= 24 && sizes.data <= 64
@@ -158,19 +162,21 @@ fn probe_features_inner() -> Result<Features, String> {
     let _listener = install_connect_filter().map_err(|e| format!("NEW_LISTENER (>=5.0): {e}"))?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&_listener);
     // Kernel struct sizes must not exceed ours (fail closed if they do).
-    if !kernel_notif_sizes_ok(fd) {
+    if !kernel_notif_sizes_ok() {
         return Err("kernel seccomp_notif struct larger than hisn's copy".to_string());
     }
-    // NOTIF_ID_VALID with a bogus id: EINVAL means the op exists,
-    // ENOSYS/EOPNOTSUPP means it does not.
+    // NOTIF_ID_VALID / ADDFD probes with a bogus id/struct: they must
+    // fail with EINVAL/EACCES (the op exists), never with ENOSYS,
+    // EOPNOTSUPP or ENOTTY (the op does not exist). ENOTTY previously
+    // passed both probes silently and only failed at runtime OP_RECV.
     let id_valid = {
         let bogus: u64 = 0xdead_beef;
         let r = unsafe { libc::ioctl(fd, OP_ID_VALID, &bogus as *const u64 as *mut libc::c_void) };
         let e = unsafe { *libc::__errno_location() };
-        r == -1 && e != libc::ENOSYS && e != libc::EOPNOTSUPP
+        r == -1 && e != libc::ENOSYS && e != libc::EOPNOTSUPP && e != libc::ENOTTY
     };
     // ADDFD with a zeroed struct: must fail (bad fd/id) with EINVAL/EACCES,
-    // not ENOSYS/EOPNOTSUPP.
+    // not ENOSYS/EOPNOTSUPP/ENOTTY.
     let addfd = {
         let zero: NotifAddFd = unsafe { std::mem::zeroed() };
         let r = unsafe {
@@ -181,7 +187,7 @@ fn probe_features_inner() -> Result<Features, String> {
             )
         };
         let e = unsafe { *libc::__errno_location() };
-        r == -1 && e != libc::ENOSYS && e != libc::EOPNOTSUPP
+        r == -1 && e != libc::ENOSYS && e != libc::EOPNOTSUPP && e != libc::ENOTTY
     };
     Ok(Features {
         new_listener: true,
@@ -295,12 +301,38 @@ pub struct NotifAddFd {
     pub newfd: u32,
     pub newfd_flags: u32,
 }
-// SECCOMP_IOWR(0, seccomp_notif) / (1, seccomp_notif_resp), SECCOMP_IOW(2, u64) / (3, addfd).
-// _IOWR(dir,type,nr) = (dir<<30)|(size<<16)|('!'<<8)|nr ; _IOW = (0<<30)|(size<<16)|('!'<<8)|nr.
-pub const OP_RECV: libc::c_ulong = 0xC080_2121; // _IOWR('!',0,sizeof(seccomp_notif)=128)
-pub const OP_SEND: libc::c_ulong = 0xC018_2121; // _IOWR('!',1,sizeof(seccomp_notif_resp)=24)
-pub const OP_ID_VALID: libc::c_ulong = 0x4008_2122; // _IOW('!',2,sizeof(u64)=8)
-pub const OP_ADDFD: libc::c_ulong = 0x4014_2123; // _IOW('!',3,sizeof(seccomp_notif_addfd)=20)
+// SECCOMP_IOWR(0, seccomp_notif) / (1, seccomp_notif_resp), SECCOMP_IOW(2, u64) / (3, addfd),
+// from /usr/include/linux/seccomp.h: _IOWR(dir=3,type='!',nr,size) =
+// (3<<30)|(size<<16)|(0x21<<8)|nr; _IOW(dir=2).
+//   RECV    = _IOWR('!', 0, 80) = 0xC050_2100
+//   SEND    = _IOWR('!', 1, 24) = 0xC018_2101
+//   ID_VALID= _IOW ('!', 2, 8)  = 0x4008_2102
+//   ADDFD   = _IOW ('!', 3, 24) = 0x4018_2103
+pub const OP_RECV: libc::c_ulong = 0xC050_2100;
+pub const OP_SEND: libc::c_ulong = 0xC018_2101;
+pub const OP_ID_VALID: libc::c_ulong = 0x4008_2102;
+pub const OP_ADDFD: libc::c_ulong = 0x4018_2103;
+const _: () = assert!(
+    ((OP_RECV >> 16) & 0x1fff) == std::mem::size_of::<RawNotif>() as u64,
+    "OP_RECV size"
+);
+const _: () = assert!(
+    ((OP_SEND >> 16) & 0x1fff) == std::mem::size_of::<NotifResp>() as u64,
+    "OP_SEND size"
+);
+const _: () = assert!(((OP_ID_VALID >> 16) & 0x1fff) == 8, "OP_ID_VALID size");
+const _: () = assert!(
+    ((OP_ADDFD >> 16) & 0x1fff) == std::mem::size_of::<NotifAddFd>() as u64,
+    "OP_ADDFD size"
+);
+const _: () = assert!(
+    (OP_RECV & 0xff) == 0
+        && (OP_SEND & 0xff) == 1
+        && (OP_ID_VALID & 0xff) == 2
+        && (OP_ADDFD & 0xff) == 3,
+    "OP nr"
+);
+const _: () = assert!(((OP_RECV >> 8) & 0xff) == 0x21, "OP magic");
 pub const FLAG_CONTINUE: u32 = 1; // SECCOMP_USER_NOTIF_FLAG_CONTINUE
 pub const FLAG_SETFD: u32 = 1; // SECCOMP_ADDFD_FLAG_SETFD
 pub const FLAG_SEND: u32 = 2; // SECCOMP_ADDFD_FLAG_SEND

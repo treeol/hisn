@@ -4086,7 +4086,7 @@ c=socket.socket(); c.connect(('127.0.0.1',19001)); c.sendall(b'hi'); a,_=s.accep
   L99_CWD=$(new_cwd l99); L99_POL="$WORK/l99.toml"; write_policy "$L99_POL" "$L99_CWD" open
   if start_session l99-$$ "$L99_CWD" "$L99_POL"; then
     L99_OUT=$(timeout 20 "$HISN" exec --session "l99-$$" -- python3 -c "
-import socket, select, fcntl
+import socket, select, fcntl, os
 s=socket.socket(); s.setblocking(False)
 s.connect_ex(('192.0.2.1',18081))
 r,_,_=select.select([s],[],[],10)
@@ -4095,7 +4095,7 @@ else:
     try: s.connect(('192.0.2.1',18081))
     except OSError: pass
     fl=fcntl.fcntl(s, fcntl.F_GETFL)
-    print('NB-OK' if fl & 1 else 'NB-MISSING')" 2>&1)
+    print('NB-OK' if fl & os.O_NONBLOCK else 'NB-MISSING')" 2>&1)
     case "$L99_OUT" in *"NB-OK"*) pass "L99 non-blocking connect + poll keeps client flags" ;; *) fail "L99 non-blocking connect" "[$L99_OUT]" ;; esac
     end_session "$L99_CWD" "$S_PID"
   else

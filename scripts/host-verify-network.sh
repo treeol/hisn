@@ -18,11 +18,12 @@
 #      its own TCP listener (192.0.2.1:18080) and DNS server (192.0.2.2:53)
 #      and verifies a preflight connect to an unassigned dummy-subnet
 #      address (192.0.2.98) times out before using it as the blackhole.
-#      No traffic leaves the host. Cases: L90/L94/L96/L97/L98/L99/L100/
-#      L102/L103/L104/L105/L106/L107/L109/L110/L111/L112, SERVFAIL (own
-#      session, nameserver 192.0.2.3), flood cap, extra_deny rejection
-#      (open) + acceptance (none), none byte-identical. No case may PASS
-#      without its session existing and its expected line present.
+#      No traffic leaves the host. Cases: L90/L94/L96/L97/L98/L99(run in
+#      the leak suite)/L100/L102/L103/L104/L105/L106/L107/L109/L110/
+#      L111/L112, SERVFAIL (own session, nameserver 192.0.2.3), flood cap
+#      (network/summary), extra_deny rejection (open) + acceptance
+#      (none), none byte-identical. No case may PASS without its session
+#      existing and its expected line present.
 #   4. with --real: real-network step (TCP to 1.1.1.1:53, curl -sI
 #      https://github.com, git ls-remote, LAN gateway refused EACCES,
 #      session journal records printed).
@@ -197,7 +198,7 @@ check() { # name expected-substring cmd...
 
 SIDE="hv-herm"
 POL="$W/open.toml"
-printf 'version = "hisn-policy/v1"\n[session]\ncwd = "%s"\nnetwork = "open"\n' "$W" >"$POL"
+printf 'version = "hisn-policy/v1"\n[session]\ncwd = "%s"\nnetwork = "open"\n[net]\nnameservers = ["192.0.2.2"]\n' "$W" >"$POL"
 timeout 600 "$HISN" run --no-tty --policy "$POL" --session-id "$SIDE" -- sleep 600 >"$W/sess.out" 2>&1 &
 SESS_RC=$!
 sleep 3
@@ -319,6 +320,18 @@ s.bind(('0.0.0.0',19055)); s.settimeout(10)
 s.connect(('192.0.2.1',18080))
 port = s.getsockname()[1]
 print('L105-OK' if port != 19055 else 'L105-SAME')"
+# Flood cap: >50 connects/s are coalesced into network/summary, not
+# one record per connect.
+timeout 60 "$HISN" exec --no-tty --session "$SIDE" -- python3 -c "
+import socket
+for _ in range(60):
+    s=socket.socket(); s.settimeout(10); s.connect(('192.0.2.1',18080)); s.recv(100); s.close()" >/dev/null 2>&1 || true
+sleep 0.3
+JF=$(timeout 20 "$HISN" journal --workspace "$W" --json 2>/dev/null || echo '{}')
+case "$JF" in
+  *"network/summary"*) echo "PASS  flood coalesced into network/summary" ;;
+  *) echo "FAIL: flood coalesced into network/summary -- journal [$(echo "$JF" | head -c 400)]" ;;
+esac
 # L106: one connect to the blackhole (stays pending: no listener, SYN
 # dropped) and one to the listener, concurrently; the second must
 # complete in under 2s while the first is still pending.
@@ -549,21 +562,36 @@ ip link set lo up 2>/dev/null || true
 printf 'version = "hisn-policy/v1"\n[session]\ncwd = "%s"\nnetwork = "none"\n' "$W" >"$W/none.toml"
 timeout 300 "$HISN" run --no-tty --policy "$W/none.toml" --session-id hv-none -- sleep 300 >"$W/none.out" 2>&1 &
 sleep 3
+# No case may PASS without its session: gate on ls --json listing hv-none.
+if ! timeout 20 "$HISN" ls --json 2>/dev/null | grep -q "hv-none"; then
+  echo "FAIL: none byte-identical -- session hv-none not listed"
+  cat "$W/none.out" | tail -20
+  exit 1
+fi
 # Inside the session: /etc/resolv.conf must not be the hisn-generated
 # 127.0.0.1 one, and /etc/nsswitch.conf must not be the generated one.
-RES=$(timeout 20 "$HISN" exec --no-tty --session hv-none -- cat /etc/resolv.conf 2>&1
-)
+# The execs must exit 0 before content is judged.
+RES=$(timeout 20 "$HISN" exec --no-tty --session hv-none -- cat /etc/resolv.conf 2>&1)
+RC_RES=$?
 NSS=$(timeout 20 "$HISN" exec --no-tty --session hv-none -- cat /etc/nsswitch.conf 2>&1)
-printf 'resolv.conf: %s\n' "$RES"
-printf 'nsswitch.conf: %s\n' "$NSS"
-case "$RES" in
-  *127.0.0.1*|*"nameserver"*"127."*) echo "FAIL: none byte-identical -- generated resolv.conf present" ;;
-  *) echo "PASS  none: no hisn-generated resolv.conf" ;;
-esac
-case "$NSS" in
-  *"files dns"*"127.0.0.1"*) echo "FAIL: none byte-identical -- generated nsswitch.conf present" ;;
-  *) echo "PASS  none: no hisn-generated nsswitch.conf" ;;
-esac
+RC_NSS=$?
+if [ "$RC_RES" -ne 0 ]; then
+  echo "FAIL: none byte-identical -- cat /etc/resolv.conf exit $RC_RES: [$RES]"
+else
+  case "$RES" in
+    *127.0.0.1*) echo "FAIL: none byte-identical -- generated resolv.conf present" ;;
+    *) echo "PASS  none: no hisn-generated resolv.conf" ;;
+  esac
+fi
+if [ "$RC_NSS" -ne 0 ]; then
+  echo "FAIL: none byte-identical -- cat /etc/nsswitch.conf exit $RC_NSS: [$NSS]"
+else
+  # The generated nsswitch is exactly "hosts: files dns" — judge that.
+  case "$NSS" in
+    *"hosts: files dns"*) echo "FAIL: none byte-identical -- generated nsswitch.conf present" ;;
+    *) echo "PASS  none: no hisn-generated nsswitch.conf" ;;
+  esac
+fi
 timeout 20 "$HISN" stop --session hv-none >/dev/null 2>&1 || true
 INNER
   chmod +x "$WORK/none_inner.sh"

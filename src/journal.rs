@@ -189,44 +189,161 @@ pub struct Journal {
     net_queue: Option<Arc<NetQueue>>,
 }
 
-/// Bounded async queue for network journal records. One background writer
-/// thread appends; producers only try-send; a full queue drops the record
-/// and increments the shared failure count.
+/// Bounded queue for network journal records (`network/connect`,
+/// `network/dns`). Producers (the connect workers and the DNS responder)
+/// only `try_send`: a verdict never waits on a journal write. One writer
+/// thread appends. Two bounds protect the journal from a program that
+/// connects in a loop:
+///
+/// - at most [`NET_RECORDS_PER_SEC`] records per second are written one by
+///   one; the rest of that second is only counted, and the counts are
+///   written as one `network/summary` record;
+/// - at most `cap` records wait in the queue; one more is dropped and
+///   counted (`dropped` in the next summary, and the failure count).
 pub struct NetQueue {
-    tx: std::sync::mpsc::SyncSender<(String, Option<JournalClient>, Value)>,
-    drops: FailureCount,
+    tx: std::sync::mpsc::SyncSender<NetMsg>,
+    dropped: Arc<AtomicU64>,
+    failures: FailureCount,
 }
-impl NetQueue {
-    /// Bounded at `cap`; the writer calls `append_inner` (the sync path).
-    fn new(journal: Journal, cap: usize) -> (Arc<Self>, std::thread::JoinHandle<()>) {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Option<JournalClient>, Value)>(cap);
-        let drops = journal.failures.clone();
-        let writer = std::thread::spawn(move || {
-            for (kind, client, data) in rx {
-                let _ = journal.append_inner(&kind, client, data);
-            }
-        });
-        (
-            Arc::new(Self {
-                tx,
-                drops: drops.clone(),
-            }),
-            writer,
-        )
-    }
-    /// Try-send; a full queue drops (counts) instead of blocking.
-    fn enqueue(&self, kind: &str, data: Value) {
-        match self.tx.try_send((kind.to_owned(), None, data)) {
-            Ok(()) => {}
-            Err(_) => {
-                self.drops.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
+
+enum NetMsg {
+    Record(&'static str, Value),
+    /// Write any pending summary, then acknowledge.
+    Flush(std::sync::mpsc::Sender<()>),
 }
 
 /// Depth of the network journal queue (records, not bytes).
 pub const NET_QUEUE_CAP: usize = 4096;
+/// Network records written individually per second; see [`NetQueue`].
+pub const NET_RECORDS_PER_SEC: u32 = 50;
+
+/// Counts of the records that were not written individually.
+#[derive(Default)]
+struct NetCounts {
+    allow: u64,
+    refuse: u64,
+    cont: u64,
+    dns: u64,
+}
+
+impl NetCounts {
+    fn add(&mut self, kind: &str, data: &Value) {
+        if kind == "network/dns" {
+            self.dns += 1;
+            return;
+        }
+        match data.get("verdict").and_then(Value::as_str) {
+            Some("allow") => self.allow += 1,
+            Some("continue") => self.cont += 1,
+            _ => self.refuse += 1,
+        }
+    }
+    fn total(&self) -> u64 {
+        self.allow + self.refuse + self.cont + self.dns
+    }
+}
+
+impl NetQueue {
+    fn new(journal: Journal, cap: usize) -> Arc<Self> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<NetMsg>(cap.max(1));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let failures = journal.failures.clone();
+        let writer_dropped = dropped.clone();
+        // Detached: the thread owns its own Journal value and ends when
+        // the last sender is gone. `Journal::net_flush` is how a caller
+        // waits for it.
+        std::thread::spawn(move || net_writer(&journal, &rx, &writer_dropped));
+        Arc::new(Self {
+            tx,
+            dropped,
+            failures,
+        })
+    }
+
+    /// Try-send; a full queue drops the record and counts it.
+    fn enqueue(&self, kind: &'static str, data: Value) {
+        if self.tx.try_send(NetMsg::Record(kind, data)).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Wait until everything queued so far is written (bounded).
+    fn flush(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let mut msg = NetMsg::Flush(ack_tx);
+        loop {
+            match self.tx.try_send(msg) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(m)) => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    msg = m;
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        ack_rx.recv_timeout(left).is_ok()
+    }
+}
+
+fn net_writer(journal: &Journal, rx: &std::sync::mpsc::Receiver<NetMsg>, dropped: &AtomicU64) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let second = std::time::Duration::from_secs(1);
+    let mut window = std::time::Instant::now();
+    let mut written = 0u32;
+    let mut over = NetCounts::default();
+    let summary = |over: &mut NetCounts| {
+        let lost = dropped.swap(0, Ordering::Relaxed);
+        if over.total() == 0 && lost == 0 {
+            return;
+        }
+        let data = json!({
+            "allow": over.allow,
+            "refuse": over.refuse,
+            "continue": over.cont,
+            "dns": over.dns,
+            "dropped": lost,
+        });
+        *over = NetCounts::default();
+        if journal.append_inner("network/summary", None, data).is_err() {
+            journal.failures.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    loop {
+        let msg = rx.recv_timeout(std::time::Duration::from_millis(250));
+        if window.elapsed() >= second {
+            summary(&mut over);
+            window = std::time::Instant::now();
+            written = 0;
+        }
+        match msg {
+            Ok(NetMsg::Record(kind, data)) => {
+                if written < NET_RECORDS_PER_SEC {
+                    written += 1;
+                    if journal.append_inner(kind, None, data).is_err() {
+                        journal.failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    over.add(kind, &data);
+                }
+            }
+            Ok(NetMsg::Flush(ack)) => {
+                summary(&mut over);
+                let _ = ack.send(());
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                summary(&mut over);
+                return;
+            }
+        }
+    }
+}
 
 impl Journal {
     /// Create a writer for `dir` (the workspace dir), for `session` (the
@@ -252,34 +369,41 @@ impl Journal {
         self.failures.load(Ordering::Relaxed)
     }
 
-    /// A second handle to the same journal (ADR 0022 notif engine): shares
-    /// dir/session/failures; appends are flock-serialised per handle.
-    /// The engine-owned handle carries the bounded async network queue so
-    /// the verdict path never waits on a journal write.
+    /// A handle for the network path (ADR 0022: connect workers and DNS
+    /// responder). It shares dir/session/failures with `self`, and its
+    /// network records go through one bounded [`NetQueue`], so a verdict
+    /// never waits on a journal write. Calling this on a handle that
+    /// already has a queue shares that queue (one writer per session).
     pub fn clone_for_engine(&self) -> Self {
-        let mut j = Self {
+        self.clone_for_engine_with_cap(NET_QUEUE_CAP)
+    }
+
+    fn plain_clone(&self) -> Self {
+        Self {
             dir: self.dir.clone(),
             session: self.session.clone(),
             failures: self.failures.clone(),
             rotate_after: self.rotate_after,
             net_queue: None,
-        };
-        let (q, _writer) = NetQueue::new(
-            Self {
-                dir: j.dir.clone(),
-                session: j.session.clone(),
-                failures: j.failures.clone(),
-                rotate_after: j.rotate_after,
-                net_queue: None,
-            },
-            NET_QUEUE_CAP,
-        );
-        // The writer thread must outlive the journal handle; it is detached
-        // (it holds its own Journal value, not a reference). It exits when
-        // every SyncSender is dropped (handle + engine clones).
-        std::mem::forget(_writer);
-        j.net_queue = Some(q);
+        }
+    }
+
+    fn clone_for_engine_with_cap(&self, cap: usize) -> Self {
+        let mut j = self.plain_clone();
+        j.net_queue = Some(match &self.net_queue {
+            Some(q) => q.clone(),
+            None => NetQueue::new(self.plain_clone(), cap),
+        });
         j
+    }
+
+    /// Wait (bounded) until the network records queued so far are in the
+    /// journal file. True when they are, or when this handle has no queue.
+    pub fn net_flush(&self, timeout: std::time::Duration) -> bool {
+        match &self.net_queue {
+            Some(q) => q.flush(timeout),
+            None => true,
+        }
     }
 
     /// Sync the journal file (and its directory) to disk. Called on session
@@ -327,19 +451,19 @@ impl Journal {
         }
     }
 
-    /// 0.6.0 (ADR 0022): record one network decision. The verdict path
-    /// never waits on the journal: this goes through a bounded async
-    /// queue (see [`net_queue`]); a full queue drops the record and
-    /// increments the failure count instead of blocking the verdict.
-    /// `verdict` is allow/refuse/continue/dns; `reason` is a short
-    /// machine-readable cause. Seat attribution is None in 0.6.0 (the
-    /// exec-table mapping is 0.7.0; L102 records session + target +
-    /// verdict + reason). `target` is the `ip:port` (or family) parsed
-    /// from the notification's sockaddr by the supervisor.
+    /// 0.6.0 (ADR 0022): record one connect decision (`network/connect`).
+    /// `verdict` is allow/refuse/continue; `reason` is a short
+    /// machine-readable cause; `target` is the `ip:port` (or family) the
+    /// supervisor parsed from its own copy of the sockaddr. `seat` is
+    /// always null in 0.6.0.
+    ///
+    /// On an engine handle ([`Journal::clone_for_engine`]) this only
+    /// queues the record (see [`NetQueue`]); the caller never waits on a
+    /// journal write. A handle without a queue appends synchronously.
     pub fn net_record(&self, verdict: &str, reason: &str, n: &crate::notif::Notif) {
         let target =
             crate::notif::notif_target(n.parsed_ip.as_ref(), n.parsed_family, n.parsed_port);
-        let data = serde_json::json!({
+        let data = json!({
             "target": target,
             "notif_id": n.id,
             "pid": n.pid,
@@ -347,35 +471,23 @@ impl Journal {
             "reason": reason,
             "seat": Value::Null,
         });
-        // Engine-owned handles go through the bounded async queue (a
-        // verdict never waits on a journal write); other handles (and
-        // the queue-less fallback) append synchronously as before.
-        if let Some(q) = &self.net_queue {
-            q.enqueue("network/connect", data);
-        } else {
-            let _ = self.append("network/connect", None, data);
+        self.net_enqueue("network/connect", data);
+    }
+
+    /// One DNS query the responder answered (`network/dns`); `data` is
+    /// built by [`crate::dns::record`]. Same queue discipline as
+    /// [`Journal::net_record`].
+    pub fn dns_record(&self, data: Value) {
+        self.net_enqueue("network/dns", data);
+    }
+
+    fn net_enqueue(&self, kind: &'static str, data: Value) {
+        match &self.net_queue {
+            Some(q) => q.enqueue(kind, data),
+            None => {
+                let _ = self.append(kind, None, data);
+            }
         }
-    }
-
-    /// DNS decision record (network/dns), same async discipline.
-    pub fn dns_record(&self, verdict: &str, detail: &str) {
-        let data = serde_json::json!({
-            "verdict": verdict,
-            "detail": detail,
-            "seat": Value::Null,
-        });
-        let _ = self.append("network/dns", None, data);
-    }
-
-    /// Coalesced connect summary (network/summary): aggregate verdict
-    /// counts since the last summary, emitted at most 50/s by the caller.
-    pub fn net_summary(&self, allow: u64, refuse: u64, cont: u64) {
-        let data = serde_json::json!({
-            "allow": allow,
-            "refuse": refuse,
-            "continue": cont,
-        });
-        let _ = self.append("network/summary", None, data);
     }
 
     /// Append one record. `kind` is the record kind (an audit `op` plus
@@ -1295,16 +1407,31 @@ fn summary_for(rec: &JournalRecord) -> String {
         "session/start" => "session started".to_owned(),
         "session/stop" => "session stopped".to_owned(),
         "git-change" => git_change_summary(d),
-        "network/connect" | "network/dns" => {
+        "network/connect" => {
             let target = d.get("target").and_then(|v| v.as_str()).unwrap_or("?");
             let verdict = d.get("verdict").and_then(|v| v.as_str()).unwrap_or("?");
             format!("{} {}", escape_terminal(verdict), escape_terminal(target))
         }
+        "network/dns" => {
+            let field = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+            format!(
+                "{} {} {} {}",
+                escape_terminal(field("verdict")),
+                escape_terminal(field("rcode")),
+                escape_terminal(field("name")),
+                escape_terminal(field("qtype")),
+            )
+        }
         "network/summary" => {
-            let allow = d.get("allow").and_then(|v| v.as_u64()).unwrap_or(0);
-            let refuse = d.get("refuse").and_then(|v| v.as_u64()).unwrap_or(0);
-            let cont = d.get("continue").and_then(|v| v.as_u64()).unwrap_or(0);
-            format!("allow={allow} refuse={refuse} continue={cont}")
+            let n = |k: &str| d.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            format!(
+                "not recorded one by one: allow={} refuse={} continue={} dns={} dropped={}",
+                n("allow"),
+                n("refuse"),
+                n("continue"),
+                n("dns"),
+                n("dropped"),
+            )
         }
         _ => format!(
             "unrecognized {} ({} bytes; use --json)",
@@ -1494,62 +1621,133 @@ mod tests {
         json!({"k": k})
     }
 
-    #[test]
-    fn net_queue_full_drops_and_counts_without_blocking() {
-        // A stalled writer behind a capacity-1 queue: the second enqueue
-        // must drop (count) instead of blocking or growing unboundedly.
-        let (_d, j) = test_journal();
-        let (q, _writer) = NetQueue::new(
-            Journal {
-                dir: j.dir.clone(),
-                session: j.session.clone(),
-                failures: j.failures.clone(),
-                rotate_after: j.rotate_after,
-                net_queue: None,
-            },
-            1,
-        );
-        // Occupy the single slot with a blocking sentinel is racy; force
-        // the writer to stall by pointing the journal at a non-existent
-        // directory: append_inner fails fast, but the queue discipline is
-        // what is under test — a full or non-blocking queue must never
-        // grow past cap and never block the producer.
-        q.enqueue("network/connect", data("a"));
-        q.enqueue("network/connect", data("b"));
-        // No panic, no block; capacity is bounded so at most a handful
-        // of records can be queued.
-        assert!(
-            q.tx.try_send(("x".to_owned(), None, data("c"))).is_err()
-                || q.tx.try_send(("y".to_owned(), None, data("d"))).is_err()
-        );
+    fn test_notif(port: u16) -> crate::notif::Notif {
+        crate::notif::Notif {
+            id: 1,
+            pid: 42,
+            parsed_ip: Some("192.0.2.1".parse().unwrap()),
+            parsed_family: libc::AF_INET as u16,
+            parsed_port: port,
+            ..Default::default()
+        }
+    }
+
+    fn records_of(j: &Journal, kind: &str) -> Vec<JournalRecord> {
+        read_records(&j.dir)
+            .0
+            .into_iter()
+            .filter(|r| r.kind == kind)
+            .collect()
+    }
+
+    /// Hold the journal's exclusive lock on a separate open file
+    /// description, as a hung lock holder would.
+    fn hold_journal_lock(j: &Journal) -> File {
+        create_test_ws_dir(&j.dir);
+        let f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(j.dir.join(LOCK_FILE))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(_fd_of(&f), libc::LOCK_EX) }, 0);
+        f
     }
 
     #[test]
-    fn net_record_via_queue_never_blocks_verdict() {
-        // Engine-owned handle: net_record returns without waiting for a
-        // journal write even when the writer is behind.
+    fn net_record_does_not_wait_for_a_blocked_journal() {
+        // The journal lock is held elsewhere, so every append blocks for
+        // its 1 s lock budget. An engine handle must return at once.
+        let (_d, j) = test_journal();
+        let lock = hold_journal_lock(&j);
+        let ej = j.clone_for_engine();
+        let start = std::time::Instant::now();
+        for port in 0..20 {
+            ej.net_record("allow", "injected", &test_notif(port));
+        }
+        let took = start.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(200),
+            "20 net_record calls took {took:?} while the journal was locked"
+        );
+        // Control: the same journal through a handle without a queue does
+        // block, so the test above measures the queue and not a fast disk.
+        let start = std::time::Instant::now();
+        j.net_record("allow", "injected", &test_notif(99));
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(900),
+            "a queue-less handle should have waited for the lock"
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn net_queue_full_drops_and_counts() {
+        // Capacity 2 and a writer stuck on the journal lock: of 10 records
+        // at most 3 are taken (2 queued + 1 in the writer's hands); the
+        // rest are dropped and counted, and the producer never blocks.
+        let (_d, j) = test_journal();
+        let lock = hold_journal_lock(&j);
+        let ej = j.clone_for_engine_with_cap(2);
+        let start = std::time::Instant::now();
+        for port in 0..10 {
+            ej.net_record("allow", "injected", &test_notif(port));
+        }
+        assert!(start.elapsed() < std::time::Duration::from_millis(200));
+        let dropped = ej
+            .net_queue
+            .as_ref()
+            .unwrap()
+            .dropped
+            .load(Ordering::Relaxed);
+        assert!((7..=8).contains(&dropped), "dropped {dropped} of 10");
+        assert!(j.failures() >= dropped);
+        // Once the lock is free the drop count reaches the journal.
+        drop(lock);
+        assert!(ej.net_flush(std::time::Duration::from_secs(10)));
+        let lost: u64 = records_of(&j, "network/summary")
+            .iter()
+            .map(|r| r.data["dropped"].as_u64().unwrap())
+            .sum();
+        assert_eq!(lost, dropped);
+    }
+
+    #[test]
+    fn net_flood_is_capped_and_summarized() {
+        // 500 records in one burst: at most NET_RECORDS_PER_SEC per
+        // second are written one by one, the rest are counted in
+        // network/summary, and nothing is lost from the total.
         let (_d, j) = test_journal();
         let ej = j.clone_for_engine();
-        // Drop the writer-side Journal copy is impossible to model here
-        // without holding the queue; the enqueue path itself is try-send
-        // only, so latency is bounded by try_send.
         let start = std::time::Instant::now();
-        let n = crate::notif::Notif {
-            id: 1,
-            pid: 42,
-            flags: 0,
-            data: crate::notif::NotifData {
-                nr: 42,
-                arch: 0,
-                instruction_pointer: 0,
-                args: [0; 6],
-            },
-            parsed_ip: Some("192.0.2.1".parse().unwrap()),
-            parsed_family: libc::AF_INET as u16,
-            parsed_port: 18080,
-        };
-        ej.net_record("allow", "public", &n);
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        for port in 0..500 {
+            ej.net_record("allow", "injected", &test_notif(port));
+        }
+        assert!(ej.net_flush(std::time::Duration::from_secs(10)));
+        let windows = start.elapsed().as_secs() + 1;
+        let single = records_of(&j, "network/connect").len() as u64;
+        let summarized: u64 = records_of(&j, "network/summary")
+            .iter()
+            .map(|r| r.data["allow"].as_u64().unwrap())
+            .sum();
+        assert!(single >= u64::from(NET_RECORDS_PER_SEC), "{single}");
+        assert!(
+            single <= u64::from(NET_RECORDS_PER_SEC) * windows,
+            "{single} single records in {windows} s"
+        );
+        assert_eq!(single + summarized, 500);
+    }
+
+    #[test]
+    fn engine_handles_share_one_queue() {
+        let (_d, j) = test_journal();
+        let a = j.clone_for_engine();
+        let b = a.clone_for_engine();
+        assert!(Arc::ptr_eq(
+            a.net_queue.as_ref().unwrap(),
+            b.net_queue.as_ref().unwrap()
+        ));
     }
 
     #[test]

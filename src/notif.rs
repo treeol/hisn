@@ -68,67 +68,63 @@ pub fn install_connect_filter() -> io::Result<OwnedFd> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Features {
-    pub new_listener: bool,
-    pub id_valid: bool,
-    pub addfd: bool,
-    pub continue_flag: bool,
-    pub send_flag: bool,
-}
-
-/// Probe user-notif features in a forked child (fail closed). The child
-/// installs a throwaway listener and probes it with real ioctls
-/// (`SECCOMP_IOCTL_NOTIF_ID_VALID` with a bogus id must fail with EINVAL,
-/// not ENOSYS; `SECCOMP_IOCTL_NOTIF_ADDFD` with a zeroed struct must
-/// fail with EINVAL/EACCES, not ENOSYS/EOPNOTSUPP). The parent only
-/// sees the child's exit code, so a failure reports the floor rather
-/// than a guessed feature.
-pub fn probe_features() -> Result<Features, String> {
-    // SAFETY: fork; child only syscalls + _exit.
+/// Probe the seccomp user-notification features open mode needs, by
+/// using them (never by parsing the kernel version). A forked child
+/// installs a throwaway filter with a listener and calls the ioctls on
+/// it; the filter dies with the child. `Err` names the first missing
+/// feature and its minimum kernel; the caller refuses to start.
+///
+/// What is proven: `NEW_LISTENER` (5.0), `NOTIF_ID_VALID` (5.0) and
+/// `NOTIF_ADDFD` with `SETFD` (5.9). `NOTIF_RECV`/`NOTIF_SEND` come with
+/// the listener (5.0). `USER_NOTIF_FLAG_CONTINUE` (5.5) cannot be probed
+/// without a pending notification; every kernel that has `ADDFD` has it.
+pub fn probe_features() -> Result<(), String> {
+    // SAFETY: fork; the child only makes syscalls and _exits.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(format!(
-            "probe: fork failed: {}",
+            "seccomp user-notification probe: fork failed: {}",
             io::Error::last_os_error()
         ));
     }
     if pid == 0 {
-        let r = probe_features_inner();
-        let code = match r {
-            Ok(f) => {
-                let bad = !(f.new_listener && f.id_valid && f.addfd && f.continue_flag);
-                if bad { 42 } else { 0 }
-            }
-            Err(_) => 43,
-        };
+        let code = probe_child();
         unsafe { libc::_exit(code) }
     }
     let mut status = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
-    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
-        return Err("seccomp user-notif probe failed: missing feature \
-             (NEW_LISTENER/NOTIF_RECV/SEND/ID_VALID need kernel >= 5.0, \
-             CONTINUE >= 5.5, ADDFD/SETFD >= 5.9, FLAG_SEND >= 5.14; \
-             floor 5.9; FLAG_SEND is optional — two-step injection is used)"
-            .to_string());
-    }
-    // Child only reported success; reconstruct features as all-true (probe verified).
-    Ok(Features {
-        new_listener: true,
-        id_valid: true,
-        addfd: true,
-        continue_flag: true,
-        send_flag: true,
-    })
+    // SAFETY: waiting for our own child.
+    let waited = loop {
+        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if r == pid || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break r;
+        }
+    };
+    let code = if waited == pid && libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        -1
+    };
+    let missing = match code {
+        0 => return Ok(()),
+        PROBE_NO_LISTENER => "SECCOMP_FILTER_FLAG_NEW_LISTENER (kernel >= 5.0)",
+        PROBE_STRUCT_SIZE => "a seccomp_notif layout hisn knows (the kernel's is larger)",
+        PROBE_NO_ID_VALID => "SECCOMP_IOCTL_NOTIF_ID_VALID (kernel >= 5.0)",
+        PROBE_NO_ADDFD => "SECCOMP_IOCTL_NOTIF_ADDFD with SECCOMP_ADDFD_FLAG_SETFD (kernel >= 5.9)",
+        _ => "a working probe (the probe process did not finish)",
+    };
+    Err(format!(
+        "network = \"open\" needs seccomp user notification, and this kernel lacks {missing}"
+    ))
 }
 
-/// `SECCOMP_GET_NOTIF_SIZES` (5.5): a `seccomp(2)` operation
-/// (`seccomp(SECCOMP_GET_NOTIF_SIZES, 0, &sizes)`), not a listener
-/// ioctl. The kernel reports its `seccomp_notif`/`seccomp_notif_resp`
-/// sizes; ours are 80/24, and a larger kernel size would mean the
-/// kernel struct has grown and our copy could truncate a notification.
-/// Run in `probe_features_inner`.
+const PROBE_NO_LISTENER: i32 = 10;
+const PROBE_STRUCT_SIZE: i32 = 11;
+const PROBE_NO_ID_VALID: i32 = 12;
+const PROBE_NO_ADDFD: i32 = 13;
+
+/// `SECCOMP_GET_NOTIF_SIZES` (5.5): a `seccomp(2)` operation, not a
+/// listener ioctl. The kernel reports its struct sizes; ours are
+/// 80/24/64, and a larger kernel struct would truncate a notification.
 fn kernel_notif_sizes_ok() -> bool {
     #[repr(C)]
     struct NotifSizes {
@@ -151,51 +147,53 @@ fn kernel_notif_sizes_ok() -> bool {
         )
     };
     if r != 0 {
-        // Op unknown (pre-5.5, or the op is not permitted here): our
-        // sizes are the documented baseline from the header.
+        // Operation unknown (before 5.5): the sizes are the original
+        // ones, which are ours.
         return true;
     }
     sizes.notif <= 80 && sizes.resp <= 24 && sizes.data <= 64
 }
 
-fn probe_features_inner() -> Result<Features, String> {
-    let _listener = install_connect_filter().map_err(|e| format!("NEW_LISTENER (>=5.0): {e}"))?;
-    let fd = std::os::fd::AsRawFd::as_raw_fd(&_listener);
-    // Kernel struct sizes must not exceed ours (fail closed if they do).
+/// Runs in the forked probe child; returns its exit code.
+fn probe_child() -> i32 {
+    // The filter install needs no_new_privs or CAP_SYS_ADMIN; the
+    // supervisor has the capability in its user namespace, a plain
+    // caller does not. Setting it here affects only this child.
+    // SAFETY: prctl with constant arguments.
+    unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    let Ok(listener) = install_connect_filter() else {
+        return PROBE_NO_LISTENER;
+    };
+    let fd = listener.as_raw_fd();
     if !kernel_notif_sizes_ok() {
-        return Err("kernel seccomp_notif struct larger than hisn's copy".to_string());
+        return PROBE_STRUCT_SIZE;
     }
-    // NOTIF_ID_VALID / ADDFD probes with a bogus id/struct: they must
-    // fail with EINVAL/EACCES (the op exists), never with ENOSYS,
-    // EOPNOTSUPP or ENOTTY (the op does not exist). ENOTTY previously
-    // passed both probes silently and only failed at runtime OP_RECV.
-    let id_valid = {
-        let bogus: u64 = 0xdead_beef;
-        let r = unsafe { libc::ioctl(fd, OP_ID_VALID, &bogus as *const u64 as *mut libc::c_void) };
-        let e = unsafe { *libc::__errno_location() };
-        r == -1 && e != libc::ENOSYS && e != libc::EOPNOTSUPP && e != libc::ENOTTY
+    // Both probes use an id no notification has. The kernel answers an
+    // ioctl number it does not know on a listener with EINVAL, and a
+    // known operation on an unknown id with ENOENT. So only ENOENT
+    // proves the operation exists.
+    let bogus: u64 = 0xdead_beef;
+    // SAFETY: ioctl on our listener with a valid pointer to a u64.
+    let r = unsafe { libc::ioctl(fd, OP_ID_VALID, &bogus as *const u64) };
+    if !(r == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)) {
+        return PROBE_NO_ID_VALID;
+    }
+    // ADDFD with SETFD and a valid source fd (the listener itself): a
+    // kernel with ADDFD+SETFD (5.9) accepts the flags and the source fd,
+    // then fails the id lookup with ENOENT.
+    let probe = NotifAddFd {
+        id: bogus,
+        flags: FLAG_SETFD,
+        srcfd: fd as u32,
+        newfd: 0,
+        newfd_flags: 0,
     };
-    // ADDFD with a zeroed struct: must fail (bad fd/id) with EINVAL/EACCES,
-    // not ENOSYS/EOPNOTSUPP/ENOTTY.
-    let addfd = {
-        let zero: NotifAddFd = unsafe { std::mem::zeroed() };
-        let r = unsafe {
-            libc::ioctl(
-                fd,
-                OP_ADDFD,
-                &zero as *const NotifAddFd as *mut libc::c_void,
-            )
-        };
-        let e = unsafe { *libc::__errno_location() };
-        r == -1 && e != libc::ENOSYS && e != libc::EOPNOTSUPP && e != libc::ENOTTY
-    };
-    Ok(Features {
-        new_listener: true,
-        id_valid,
-        addfd,
-        continue_flag: true,
-        send_flag: true,
-    })
+    // SAFETY: ioctl on our listener with a valid pointer to the struct.
+    let r = unsafe { libc::ioctl(fd, OP_ADDFD, &probe as *const NotifAddFd) };
+    if !(r == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)) {
+        return PROBE_NO_ADDFD;
+    }
+    0
 }
 
 /// Wire structs for seccomp user-notif ioctls — from
@@ -301,16 +299,23 @@ pub struct NotifAddFd {
     pub newfd: u32,
     pub newfd_flags: u32,
 }
-// SECCOMP_IOWR(0, seccomp_notif) / (1, seccomp_notif_resp), SECCOMP_IOW(2, u64) / (3, addfd),
-// from /usr/include/linux/seccomp.h: _IOWR(dir=3,type='!',nr,size) =
-// (3<<30)|(size<<16)|(0x21<<8)|nr; _IOW(dir=2).
-//   RECV    = _IOWR('!', 0, 80) = 0xC050_2100
-//   SEND    = _IOWR('!', 1, 24) = 0xC018_2101
-//   ID_VALID= _IOW ('!', 2, 8)  = 0x4008_2102
-//   ADDFD   = _IOW ('!', 3, 24) = 0x4018_2103
+// ioctl numbers from /usr/include/linux/seccomp.h, with
+// _IOC(dir,type,nr,size) = (dir<<30)|(size<<16)|(type<<8)|nr, type '!' =
+// 0x21, _IOC_WRITE = 1, _IOC_READ = 2:
+//   RECV     = _IOWR('!', 0, 80) = 0xC050_2100
+//   SEND     = _IOWR('!', 1, 24) = 0xC018_2101
+//   ID_VALID = _IOR ('!', 2, 8)  = 0x8008_2102  (see below)
+//   ADDFD    = _IOW ('!', 3, 24) = 0x4018_2103
+//
+// ID_VALID: Linux 5.0 defined it with the wrong direction (_IOR,
+// 0x8008_2102). 5.17 corrected the header to _IOW (0x4008_2102) and kept
+// the original number as SECCOMP_IOCTL_NOTIF_ID_VALID_WRONG_DIR, which the
+// kernel still accepts. Kernels 5.0-5.16 answer the corrected number with
+// EINVAL, so hisn uses the original one: it is the only encoding every
+// kernel since 5.0 accepts (the floor for open mode is 5.9).
 pub const OP_RECV: libc::c_ulong = 0xC050_2100;
 pub const OP_SEND: libc::c_ulong = 0xC018_2101;
-pub const OP_ID_VALID: libc::c_ulong = 0x4008_2102;
+pub const OP_ID_VALID: libc::c_ulong = 0x8008_2102;
 pub const OP_ADDFD: libc::c_ulong = 0x4018_2103;
 const _: () = assert!(
     ((OP_RECV >> 16) & 0x1fff) == std::mem::size_of::<RawNotif>() as u64,
@@ -407,22 +412,95 @@ pub struct NotifEngine {
 /// Max pending notifications between receiver and workers; a full queue
 /// refuses EACCES immediately (journaled refuse/queue-full).
 pub const MAX_PENDING: usize = 256;
+/// Worker threads per listener.
+pub const WORKERS: usize = 64;
+
+/// Reads the `sockaddr` a notified task passed to `connect()`:
+/// `(pid, remote address, length) -> bytes`. Production uses
+/// [`read_sockaddr`]; tests substitute a failing or slow reader.
+pub type SockaddrReader = fn(u32, u64, usize) -> io::Result<[u8; 128]>;
+
+/// Engine sizing and the sockaddr reader.
+#[derive(Clone, Copy)]
+pub struct EngineConfig {
+    /// Outbound connect deadline in seconds, counted from `NOTIF_RECV`.
+    pub deadline_s: u64,
+    pub workers: usize,
+    /// Notifications that may wait for a worker; one more is refused.
+    pub queue: usize,
+    pub reader: SockaddrReader,
+}
+
+impl EngineConfig {
+    pub fn new(deadline_s: u64) -> Self {
+        Self {
+            deadline_s,
+            workers: WORKERS,
+            queue: MAX_PENDING,
+            reader: read_sockaddr,
+        }
+    }
+}
+
+/// Read `len` bytes (2..=128) at `addr` in task `pid` with one
+/// `process_vm_readv`. A short or failed read is an error; the caller
+/// refuses the connect (fail closed).
+pub fn read_sockaddr(pid: u32, addr: u64, len: usize) -> io::Result<[u8; 128]> {
+    let mut buf = [0u8; 128];
+    let len = len.min(buf.len());
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: len,
+    };
+    let mut remote = libc::iovec {
+        iov_base: addr as *mut libc::c_void,
+        iov_len: len,
+    };
+    // SAFETY: both iovecs describe `len` bytes; `buf` outlives the call.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_process_vm_readv,
+            pid as i64,
+            &mut iov as *mut libc::iovec,
+            1usize,
+            &mut remote as *mut libc::iovec,
+            1usize,
+            0u64,
+        )
+    };
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if r as usize != len {
+        return Err(io::Error::other("short sockaddr read"));
+    }
+    Ok(buf)
+}
 
 impl NotifEngine {
-    /// Start the engine on `listener`. `journal` is a clone of the
-    /// workspace journal (best-effort; verdict never waits on it — the
-    /// journal write happens on a bounded async queue inside `journal_net`).
-    /// `seat` attribution: None for now (exec-table mapping is 0.7.0;
-    /// L102 in the 0.6 subset records session + target + verdict).
+    /// Start the engine on `listener` with the production configuration.
+    /// `journal` is an engine handle of the workspace journal
+    /// ([`crate::journal::Journal::clone_for_engine`]): its network records
+    /// go through a bounded queue, so a verdict never waits on a journal
+    /// write. Seat attribution is not recorded in 0.6.0.
     pub fn start(
         listener: OwnedFd,
         journal: Option<std::sync::Arc<crate::journal::Journal>>,
         deadline_s: u64,
     ) -> Self {
+        Self::start_with(listener, journal, EngineConfig::new(deadline_s))
+    }
+
+    /// Start the engine with an explicit configuration.
+    pub fn start_with(
+        listener: OwnedFd,
+        journal: Option<std::sync::Arc<crate::journal::Journal>>,
+        cfg: EngineConfig,
+    ) -> Self {
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sd = shutdown.clone();
         let handle = std::thread::spawn(move || {
-            engine_loop(listener, journal, deadline_s, &sd);
+            engine_loop(listener, journal, cfg, &sd);
         });
         Self {
             shutdown,
@@ -444,40 +522,21 @@ impl Drop for NotifEngine {
 fn engine_loop(
     listener: OwnedFd,
     journal: Option<std::sync::Arc<crate::journal::Journal>>,
-    deadline_s: u64,
+    cfg: EngineConfig,
     shutdown: &std::sync::atomic::AtomicBool,
 ) {
     // Keep the listener alive until every worker has joined: workers hold
     // only the raw fd number, so dropping it first would be use-after-close.
     let listener = std::sync::Arc::new(listener);
     let lfd = listener.as_raw_fd();
-    // Coalesced summary counters (network/summary at most 50/s).
-    let (sum_tx, sum_rx) = std::sync::mpsc::channel::<(&'static str, u64)>();
-    let summary_handle = journal.clone().map(|j| {
-        std::thread::spawn(move || {
-            let mut counts = std::collections::HashMap::new();
-            let mut last = std::time::Instant::now();
-            for (verdict, n) in sum_rx {
-                *counts.entry(verdict).or_insert(0u64) += n;
-                if last.elapsed() >= std::time::Duration::from_millis(20) {
-                    let a = counts.get("allow").copied().unwrap_or(0);
-                    let r = counts.get("refuse").copied().unwrap_or(0);
-                    let c = counts.get("continue").copied().unwrap_or(0);
-                    j.net_summary(a, r, c);
-                    counts.clear();
-                    last = std::time::Instant::now();
-                }
-            }
-        })
-    });
-    // Receiver + 64 workers on a bounded queue (MAX_PENDING pending).
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(Notif, std::time::Instant)>(MAX_PENDING);
+    // Receiver + workers on a bounded queue. The receiver only
+    // dispatches; a full queue is answered by the receiver itself.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Notif, std::time::Instant)>(cfg.queue.max(1));
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
     let mut workers = Vec::new();
-    for _ in 0..64 {
+    for _ in 0..cfg.workers.max(1) {
         let rx = rx.clone();
         let j = journal.clone();
-        let sum = sum_tx.clone();
         workers.push(std::thread::spawn(move || {
             loop {
                 let msg = {
@@ -485,9 +544,7 @@ fn engine_loop(
                     lock.recv()
                 };
                 match msg {
-                    Ok((mut n, recv_at)) => {
-                        handle_notif(lfd, &mut n, recv_at, deadline_s, &j, &sum)
-                    }
+                    Ok((mut n, recv_at)) => handle_notif(lfd, &mut n, recv_at, &cfg, &j),
                     Err(_) => return,
                 }
             }
@@ -537,7 +594,6 @@ fn engine_loop(
                         }
                         if let Some(j) = &journal {
                             j.net_record("refuse", "queue-full", &n);
-                            let _ = sum_tx.send(("refuse", 1));
                         }
                     }
                     Err(std::sync::mpsc::TrySendError::Disconnected((n, _))) => {
@@ -557,12 +613,8 @@ fn engine_loop(
     // Drop the queue sender so workers drain and exit; join them before
     // the listener Arc is released.
     drop(tx);
-    drop(sum_tx);
     for w in workers {
         let _ = w.join();
-    }
-    if let Some(h) = summary_handle {
-        let _ = h.join();
     }
     drop(listener);
 }
@@ -571,28 +623,29 @@ fn handle_notif(
     lfd: i32,
     n: &mut Notif,
     recv_at: std::time::Instant,
-    deadline_s: u64,
+    cfg: &EngineConfig,
     journal: &Option<std::sync::Arc<crate::journal::Journal>>,
-    sum: &std::sync::mpsc::Sender<(&'static str, u64)>,
 ) {
-    let deadline = recv_at + std::time::Duration::from_secs(deadline_s.max(1));
-    // ID_VALID before the read.
+    let deadline = recv_at + std::time::Duration::from_secs(cfg.deadline_s.max(1));
+    // A pidfd for the notified task (`n.pid` is a thread id), then
+    // ID_VALID: once the id is confirmed, the pidfd refers to the task
+    // that is suspended in this connect() and not to a recycled id.
+    let pidfd = match open_task_pidfd(n.pid as libc::pid_t, true) {
+        Ok(fd) => fd,
+        Err(_) => {
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -(libc::EACCES), 0, 0);
+                if let Some(j) = journal {
+                    j.net_record("refuse", "pidfd-open-failed", n);
+                }
+            }
+            return;
+        }
+    };
     if !id_valid(lfd, n.id) {
         return;
     }
-    // pidfd for the notified task.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, n.pid as i64, 0u32) };
-    if pidfd < 0 {
-        if id_valid(lfd, n.id) {
-            reply(lfd, n.id, -(libc::EACCES), 0, 0);
-        }
-        if let Some(j) = journal {
-            j.net_record("refuse", "pidfd-open-failed", n);
-            let _ = sum.send(("refuse", 1));
-        }
-        return;
-    }
-    let _pidfd_guard = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
+    let pidfd = pidfd.as_raw_fd();
     // connect(sockfd, sockaddr*, addrlen): sockfd is args[0].
     let sockfd = n.data.args[0] as i32;
     let addrlen = n.data.args[2] as usize;
@@ -602,41 +655,24 @@ fn handle_notif(
         }
         if let Some(j) = journal {
             j.net_record("refuse", "bad-addrlen", n);
-            let _ = sum.send(("refuse", 1));
         }
         return;
     }
-    let mut buf = [0u8; 128];
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-        iov_len: addrlen,
-    };
-    let mut remote = libc::iovec {
-        iov_base: n.data.args[1] as *mut libc::c_void,
-        iov_len: addrlen,
-    };
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_process_vm_readv,
-            n.pid as i64,
-            &mut iov as *mut libc::iovec,
-            1usize,
-            &mut remote as *mut libc::iovec,
-            1usize,
-            0u64,
-        )
-    };
-    if r <= 0 {
-        // Read failed (EPERM: dumpable-0 or ptrace_scope>=2): fail closed.
-        if id_valid(lfd, n.id) {
-            reply(lfd, n.id, -(libc::EACCES), 0, 0);
+    // One read of the sockaddr into a private buffer. If it fails (the
+    // task is gone, or the kernel denies the read) the destination is
+    // unknown, so the connect is refused: fail closed, never CONTINUE.
+    let buf = match (cfg.reader)(n.pid, n.data.args[1], addrlen) {
+        Ok(b) => b,
+        Err(_) => {
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -(libc::EACCES), 0, 0);
+            }
+            if let Some(j) = journal {
+                j.net_record("refuse", "read-failed", n);
+            }
+            return;
         }
-        if let Some(j) = journal {
-            j.net_record("refuse", "read-failed", n);
-            let _ = sum.send(("refuse", 1));
-        }
-        return;
-    }
+    };
     let family = u16::from_ne_bytes([buf[0], buf[1]]);
     // Parse IP when INET/INET6.
     let mut ip: Option<IpAddr> = None;
@@ -686,7 +722,6 @@ fn handle_notif(
             }
             if let Some(j) = journal {
                 j.net_record("continue", "loopback-or-unix", n);
-                let _ = sum.send(("continue", 1));
             }
         }
         Verdict::Refuse => {
@@ -705,7 +740,6 @@ fn handle_notif(
             }
             if let Some(j) = journal {
                 j.net_record("refuse", reason, n);
-                let _ = sum.send(("refuse", 1));
             }
         }
         Verdict::Allow => {
@@ -751,7 +785,6 @@ fn handle_notif(
                     }
                     if let Some(j) = journal {
                         j.net_record("refuse", "connect-failed", n);
-                        let _ = sum.send(("refuse", 1));
                     }
                     return;
                 }
@@ -765,6 +798,13 @@ fn handle_notif(
                     };
                     let pr = unsafe { libc::poll(&mut pfd, 1, 1000) };
                     if pr <= 0 {
+                        // Still connecting. If the task has gone away
+                        // meanwhile (killed, or the session is ending),
+                        // nobody waits for this socket: stop now instead
+                        // of holding the worker until the deadline.
+                        if !id_valid(lfd, n.id) {
+                            return;
+                        }
                         continue;
                     }
                     let mut err = 0i32;
@@ -786,7 +826,6 @@ fn handle_notif(
                         }
                         if let Some(j) = journal {
                             j.net_record("refuse", "connect-error", n);
-                            let _ = sum.send(("refuse", 1));
                         }
                         return;
                     }
@@ -798,7 +837,6 @@ fn handle_notif(
                     }
                     if let Some(j) = journal {
                         j.net_record("refuse", "deadline", n);
-                        let _ = sum.send(("refuse", 1));
                     }
                     return;
                 }
@@ -827,14 +865,21 @@ fn handle_notif(
             addfd.flags = FLAG_SETFD;
             addfd.srcfd = newfd as u32;
             addfd.newfd = n.data.args[0] as u32;
-            addfd.newfd_flags = 0;
+            // SETFD replaces the task's descriptor, including its
+            // close-on-exec flag: carry the original flag over, so a
+            // socket opened with SOCK_CLOEXEC does not start leaking into
+            // programs the task executes.
+            addfd.newfd_flags = if task_fd_cloexec(n.pid, sockfd) {
+                libc::O_CLOEXEC as u32
+            } else {
+                0
+            };
             let r = seccomp_ioctl(lfd, OP_ADDFD, &mut addfd as *mut NotifAddFd as *mut _);
             match r {
                 Ok(()) => {
                     reply(lfd, n.id, 0, 0, 0);
                     if let Some(j) = journal {
                         j.net_record("allow", "injected", n);
-                        let _ = sum.send(("allow", 1));
                     }
                 }
                 Err(e) => {
@@ -847,6 +892,79 @@ fn handle_notif(
             // (the injected copy is owned by the child now).
         }
     }
+}
+
+/// Open a pidfd through which `tid`'s file descriptors can be taken.
+///
+/// `tid` may be any thread of a program: connects from threads other
+/// than the main one are the normal case (thread pools, Go, Java).
+/// With `thread_flag`, `PIDFD_THREAD` (Linux 6.9) opens the thread
+/// itself. A kernel without the flag answers EINVAL; then the pidfd of
+/// the thread's process is used instead, which is only correct when the
+/// thread shares the process's descriptor table, so that is verified
+/// with `kcmp(KCMP_FILES)` and anything else is an error (the caller
+/// refuses the connect).
+fn open_task_pidfd(tid: libc::pid_t, thread_flag: bool) -> io::Result<OwnedFd> {
+    const PIDFD_THREAD: libc::c_uint = libc::O_EXCL as libc::c_uint;
+    const KCMP_FILES: libc::c_int = 2;
+    let open = |pid: libc::pid_t, flags: libc::c_uint| -> io::Result<OwnedFd> {
+        // SAFETY: pidfd_open takes two integers; the result is checked.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, flags) };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: fresh fd owned by us.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+        }
+    };
+    if thread_flag {
+        match open(tid, PIDFD_THREAD) {
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+            other => return other,
+        }
+    }
+    let status = std::fs::read_to_string(format!("/proc/{tid}/status"))?;
+    let tgid = parse_tgid(&status).ok_or_else(|| io::Error::other("no Tgid in status"))?;
+    let fd = open(tgid, 0)?;
+    if tgid != tid {
+        // SAFETY: kcmp takes integers only.
+        let same = unsafe { libc::syscall(libc::SYS_kcmp, tid, tgid, KCMP_FILES, 0, 0) };
+        if same != 0 {
+            return Err(io::Error::other(
+                "thread does not share its process's descriptor table",
+            ));
+        }
+    }
+    Ok(fd)
+}
+
+/// Is descriptor `fd` of task `tid` close-on-exec? Read from
+/// `/proc/<tid>/fdinfo/<fd>`. When that cannot be read the answer is
+/// "yes": losing a socket across exec is the safe side, leaking one is
+/// not.
+fn task_fd_cloexec(tid: u32, fd: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{tid}/fdinfo/{fd}")) {
+        Ok(text) => fdinfo_cloexec(&text).unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// The close-on-exec bit of an fdinfo text (`flags:` is octal and
+/// includes `O_CLOEXEC`).
+fn fdinfo_cloexec(fdinfo: &str) -> Option<bool> {
+    let flags = fdinfo.lines().find_map(|l| l.strip_prefix("flags:"))?;
+    let flags = u32::from_str_radix(flags.trim(), 8).ok()?;
+    Some(flags & libc::O_CLOEXEC as u32 != 0)
+}
+
+/// The `Tgid:` value of a `/proc/<tid>/status` text.
+fn parse_tgid(status: &str) -> Option<libc::pid_t> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Tgid:"))?
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn copy_sock_opts(addr_fd: i32, pidfd: i32, newfd: i32) -> Option<bool> {
@@ -973,8 +1091,12 @@ pub fn sockaddr_port(family: u16, buf: &[u8]) -> u16 {
 
 /// True iff `ip` is a public (routable, non-private) address per ADR 0022 block list:
 /// loopback, unspecified, multicast, link-local (incl 169.254.169.254), CGNAT
-/// 100.64/10, RFC1918, ULA, plus 0/8 and 240/4 reserved, and v4-mapped forms
-/// are classified by their embedded v4 address.
+/// 100.64/10, RFC1918, ULA, site-local fec0::/10, plus 0/8 and 240/4
+/// reserved. IPv6 forms that embed an IPv4 address are classified by that
+/// address, so a private target cannot be reached through a transition
+/// prefix: v4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`, NAT64
+/// `64:ff9b::/96` and `64:ff9b:1::/48`, 6to4 `2002::/16`, and Teredo
+/// `2001::/32` (server address, and the client address stored inverted).
 /// NOTE: documentation ranges 192.0.2/24, 198.51.100/24, 203.0.113/24 are NOT
 /// blocked — not in the ADR list, and hermetic tests use 192.0.2.1/24 listeners.
 pub fn is_public_ip(ip: &IpAddr) -> bool {
@@ -999,6 +1121,25 @@ pub fn is_public_ip(ip: &IpAddr) -> bool {
             }
             if o[0] == 0xfe && (o[1] & 0xc0) == 0x80 {
                 return false; // link-local fe80::/10
+            }
+            if o[0] == 0xfe && (o[1] & 0xc0) == 0xc0 {
+                return false; // site-local fec0::/10 (deprecated, never public)
+            }
+            // IPv4-compatible ::/96 (deprecated): `::a.b.c.d`. `::` and
+            // `::1` were handled above.
+            if o[..12].iter().all(|&b| b == 0) {
+                return is_public_v4(&Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+            }
+            // 6to4 2002:AABB:CCDD::/48 embeds the IPv4 address A.B.C.D.
+            if o[0] == 0x20 && o[1] == 0x02 {
+                return is_public_v4(&Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+            }
+            // Teredo 2001:0000::/32: bytes 4..8 are the server's IPv4
+            // address, bytes 12..16 the client's, bitwise inverted.
+            if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0 && o[3] == 0 {
+                let server = Ipv4Addr::new(o[4], o[5], o[6], o[7]);
+                let client = Ipv4Addr::new(!o[12], !o[13], !o[14], !o[15]);
+                return is_public_v4(&server) && is_public_v4(&client);
             }
             true
         }
@@ -1041,7 +1182,6 @@ fn is_public_v4(v4: &Ipv4Addr) -> bool {
     if o[0] == 198 && (o[1] & 0xfe) == 0x12 {
         return false; // 198.18.0.0/15 (benchmarking, not routable public)
     }
-    let _ = Ipv6Addr::UNSPECIFIED;
     true
 }
 
@@ -1086,6 +1226,25 @@ mod tests {
             "64:ff9b::0a00:0001",
             "64:ff9b::c0a8:0101",
             "64:ff9b:1::0a00:0001",
+            // Site-local (deprecated).
+            "fec0::1",
+            "feff::1",
+            // IPv4-compatible ::/96 embedding private / loopback v4.
+            "::10.0.0.1",
+            "::192.168.1.1",
+            "::127.0.0.1",
+            "::169.254.169.254",
+            // 6to4 2002:V4::/48 embedding private v4.
+            "2002:0a00:0001::1",
+            "2002:c0a8:0101::1",
+            "2002:7f00:0001::1",
+            "2002:a9fe:a9fe::1",
+            // Teredo 2001:0::/32: client 192.168.1.1 (stored inverted)
+            // behind a public server; then a private server.
+            "2001:0:4136:e378:8000:63bf:3f57:fefe",
+            "2001:0:0a00:0001::f7f7:f7f7",
+            // Teredo with client 127.0.0.1 (inverted 80ff:fffe).
+            "2001:0:4136:e378:8000:63bf:80ff:fffe",
         ] {
             assert!(!is_public_ip(&ip(s)), "{s} must be blocked");
         }
@@ -1109,201 +1268,329 @@ mod tests {
             "::ffff:8.8.8.8",
             // NAT64 embedding a public v4 stays public.
             "64:ff9b::0808:0808",
+            // Transition forms embedding a public v4 stay public.
+            "::8.8.8.8",
+            "2002:0808:0808::1",
+            // Teredo: public server 65.54.227.120, client 192.0.2.45.
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            // Not Teredo (2001:1::/32) and not site-local (fe00::/10 is
+            // unassigned, fec0::/10 is the site-local range).
+            "2001:1::1",
+            "2001:db8::1",
         ] {
             assert!(is_public_ip(&ip(s)), "{s} must be public");
         }
     }
 
-    #[test]
-    fn e2e_connect_goes_through_engine() {
-        // End-to-end: a child installs the real filter (NEW_LISTENER),
-        // then makes a real connect(); the parent receives, decides and
-        // answers it through the real engine code path (NotifEngine::start
-        // on the child's listener fd). Without seccomp user-notif this
-        // prints a named SKIP and returns Ok.
-        //
-        // The child sends its listener fd over a pipe via SCM_RIGHTS,
-        // then connects to a loopback listener the parent owns; the
-        // engine must read the sockaddr (process_vm_readv), decide
-        // loopback -> CONTINUE, and the connect must succeed.
-        let mut pipefd = [0i32; 2];
-        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
-            println!(
-                "SKIP e2e_connect_goes_through_engine: pipe failed ({})",
-                io::Error::last_os_error()
-            );
-            return;
-        }
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            println!(
-                "SKIP e2e_connect_goes_through_engine: fork failed ({})",
-                io::Error::last_os_error()
-            );
-            return;
-        }
-        if pid == 0 {
-            // Child: install the filter in its OWN chain, pass the
-            // listener fd to the parent, then connect.
-            unsafe {
-                libc::close(pipefd[0]);
-                match install_connect_filter() {
-                    Ok(listener) => {
-                        let mut msg: libc::msghdr = std::mem::zeroed();
-                        let mut iov = libc::iovec {
-                            iov_base: b"L".as_ptr() as *mut libc::c_void,
-                            iov_len: 1,
-                        };
-                        msg.msg_iov = &mut iov;
-                        msg.msg_iovlen = 1;
-                        let space = libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) as usize;
-                        let mut cmsg_buf = vec![0u8; space];
-                        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-                        msg.msg_controllen = space as _;
-                        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-                        if !cmsg.is_null() {
-                            (*cmsg).cmsg_level = libc::SOL_SOCKET;
-                            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-                            (*cmsg).cmsg_len =
-                                libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
-                            let data = libc::CMSG_DATA(cmsg) as *mut i32;
-                            *data = listener.as_raw_fd();
-                            libc::sendmsg(pipefd[1], &msg, 0);
-                        }
-                        drop(listener);
-                        let port = std::env::var("E2E_PORT")
-                            .ok()
-                            .and_then(|s| s.parse::<u16>().ok())
-                            .unwrap_or(18997);
-                        let s =
-                            libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
-                        if s < 0 {
-                            libc::_exit(2);
-                        }
-                        let mut addr: libc::sockaddr_in = std::mem::zeroed();
-                        addr.sin_family = libc::AF_INET as libc::sa_family_t;
-                        addr.sin_addr.s_addr = libc::INADDR_LOOPBACK.to_be();
-                        addr.sin_port = port.to_be();
-                        let rc = libc::connect(
-                            s,
-                            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
-                            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                        );
-                        libc::_exit(if rc == 0 { 0 } else { 3 });
-                    }
-                    Err(_) => libc::_exit(4),
-                }
-            }
-        }
-        // Parent: receive the listener fd (bounded wait).
-        unsafe { libc::close(pipefd[1]) };
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        let mut byte = [0u8; 1];
-        let mut iov = libc::iovec {
-            iov_base: byte.as_mut_ptr() as *mut libc::c_void,
-            iov_len: 1,
-        };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
-        let mut cmsg_buf = vec![0u8; space];
-        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = space as _;
-        let mut got_fd: Option<OwnedFd> = None;
-        for _ in 0..25 {
-            let mut pfd = libc::pollfd {
-                fd: pipefd[0],
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let r = unsafe { libc::poll(&mut pfd, 1, 200) };
-            if r > 0 && pfd.revents & libc::POLLIN != 0 {
-                let r2 = unsafe { libc::recvmsg(pipefd[0], &mut msg, 0) };
-                if r2 >= 1 {
-                    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-                    if !cmsg.is_null() {
-                        let data = unsafe { libc::CMSG_DATA(cmsg) } as *const i32;
-                        got_fd = Some(unsafe { OwnedFd::from_raw_fd(*data) });
-                    }
-                    break;
-                }
-            }
-            let mut st = 0;
-            if unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) } == pid {
-                println!(
-                    "SKIP e2e_connect_goes_through_engine: child exited before sending fd (status {st})"
-                );
-                unsafe { libc::close(pipefd[0]) };
-                return;
-            }
-        }
-        unsafe { libc::close(pipefd[0]) };
-        let listener = match got_fd {
-            Some(f) => f,
-            None => {
-                println!("SKIP e2e_connect_goes_through_engine: no listener fd received");
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-                unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
-                return;
-            }
-        };
-        // Parent loopback listener for the child's CONTINUE target.
-        let port = std::env::var("E2E_PORT")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(18997);
-        let lsock =
-            unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-        assert!(lsock >= 0, "loopback listener socket");
+    // ---- engine tests: a real filter, real connect() calls ----------------
+
+    fn connect_once(port: u16) -> i32 {
+        // SAFETY: plain socket + connect on a fresh fd; only libc calls,
+        // so this is safe to run in a forked child.
         unsafe {
-            let mut la: libc::sockaddr_in = std::mem::zeroed();
-            la.sin_family = libc::AF_INET as libc::sa_family_t;
-            la.sin_addr.s_addr = libc::INADDR_LOOPBACK.to_be();
-            la.sin_port = port.to_be();
-            let bind_rc = libc::bind(
-                lsock,
-                &la as *const libc::sockaddr_in as *const libc::sockaddr,
+            let s = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            if s < 0 {
+                return 250;
+            }
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr.sin_addr.s_addr = libc::INADDR_LOOPBACK.to_be();
+            addr.sin_port = port.to_be();
+            let rc = libc::connect(
+                s,
+                &addr as *const libc::sockaddr_in as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
             );
-            if bind_rc != 0 {
-                println!(
-                    "SKIP e2e_connect_goes_through_engine: bind {port} failed ({})",
-                    io::Error::last_os_error()
+            if rc == 0 {
+                0
+            } else {
+                *libc::__errno_location()
+            }
+        }
+    }
+
+    /// Child side of [`connecting_child`]. Exit code: `16 * refused +
+    /// connected`, or 2xx when the setup failed.
+    fn child_body(sock: i32, n: usize, port: u16) -> i32 {
+        // The filter install needs no_new_privs (or CAP_SYS_ADMIN).
+        if crate::sys::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0).is_err() {
+            return 203;
+        }
+        let Ok(listener) = install_connect_filter() else {
+            return 204;
+        };
+        if crate::sys::send_with_fds(sock, b"L", &[listener.as_raw_fd()]).is_err() {
+            return 205;
+        }
+        drop(listener);
+        let mut pids = Vec::with_capacity(n);
+        for _ in 0..n {
+            // SAFETY: the grandchild only calls connect_once and _exit.
+            let p = unsafe { libc::fork() };
+            if p == 0 {
+                unsafe { libc::_exit(connect_once(port)) }
+            }
+            pids.push(p);
+        }
+        let (mut connected, mut refused) = (0, 0);
+        for p in pids {
+            let mut st = 0;
+            unsafe { libc::waitpid(p, &mut st, 0) };
+            match libc::WEXITSTATUS(st) {
+                0 => connected += 1,
+                libc::EACCES => refused += 1,
+                _ => return 206,
+            }
+        }
+        16 * refused + connected
+    }
+
+    /// Fork a child that installs the real connect filter, hands its
+    /// listener to this process, and then lets `n` grandchildren each
+    /// `connect()` once to `127.0.0.1:port`. Their connects stay
+    /// suspended until an engine serves the returned listener.
+    fn connecting_child(n: usize, port: u16) -> (libc::pid_t, OwnedFd) {
+        let (ours, theirs) = crate::sys::socketpair_seqpacket().unwrap();
+        // SAFETY: the child runs child_body and _exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            drop(ours);
+            let code = child_body(theirs.as_raw_fd(), n, port);
+            unsafe { libc::_exit(code) }
+        }
+        drop(theirs);
+        let mut pfd = libc::pollfd {
+            fd: ours.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pfd, 1, 10_000) };
+        let mut buf = [0u8; 8];
+        let fd = (ready > 0)
+            .then(|| crate::sys::recv_with_fds(ours.as_raw_fd(), &mut buf).ok())
+            .flatten()
+            .and_then(|r| r.fds.into_iter().next());
+        match fd {
+            Some(fd) => (pid, fd),
+            None => {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                let mut st = 0;
+                unsafe { libc::waitpid(pid, &mut st, 0) };
+                panic!(
+                    "the test child could not install a seccomp user-notification \
+                     filter (exit status {st:#x}); these tests need kernel >= 5.0 \
+                     with seccomp user notification"
                 );
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, std::ptr::null_mut(), 0);
-                return;
             }
-            libc::listen(lsock, 4);
         }
-        let engine = NotifEngine::start(listener, None, 5);
-        let was_some = engine.handle.is_some();
-        assert!(was_some, "engine must start with a receiver handle");
-        let mut status = 0;
-        let mut done = false;
-        for _ in 0..60 {
-            if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
-                done = true;
-                break;
+    }
+
+    /// Wait for the child of [`connecting_child`]; its exit code.
+    fn child_exit(pid: libc::pid_t) -> i32 {
+        let mut st = 0;
+        for _ in 0..200 {
+            if unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) } == pid {
+                assert!(libc::WIFEXITED(st), "child status {st:#x}");
+                return libc::WEXITSTATUS(st);
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        if !done {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            unsafe { libc::waitpid(pid, &mut status, 0) };
-        }
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        unsafe { libc::waitpid(pid, &mut st, 0) };
+        panic!("child did not finish within 10 s: a connect() was left unanswered");
+    }
+
+    fn loopback_listener() -> (std::net::TcpListener, u16) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        (l, port)
+    }
+
+    fn engine_journal() -> (tempfile::TempDir, std::sync::Arc<crate::journal::Journal>) {
+        let d = tempfile::tempdir().unwrap();
+        let j = crate::journal::Journal::new(d.path().join("ws"), "s1".into());
+        (d, std::sync::Arc::new(j.clone_for_engine()))
+    }
+
+    /// `(verdict, reason, target)` of every network/connect record.
+    fn connect_records(
+        d: &tempfile::TempDir,
+        j: &crate::journal::Journal,
+    ) -> Vec<(String, String, String)> {
+        assert!(j.net_flush(std::time::Duration::from_secs(10)));
+        let (records, _) = crate::journal::read_records(&d.path().join("ws"));
+        let field = |r: &crate::journal::JournalRecord, k: &str| {
+            r.data[k].as_str().unwrap_or("").to_owned()
+        };
+        records
+            .iter()
+            .filter(|r| r.kind == "network/connect")
+            .map(|r| (field(r, "verdict"), field(r, "reason"), field(r, "target")))
+            .collect()
+    }
+
+    #[test]
+    fn engine_continues_a_loopback_connect_and_journals_the_target() {
+        let (_l, port) = loopback_listener();
+        let (d, j) = engine_journal();
+        let (pid, listener) = connecting_child(1, port);
+        let engine = NotifEngine::start(listener, Some(j.clone()), 5);
+        assert_eq!(child_exit(pid), 1, "one connect, connected");
         drop(engine);
-        assert!(libc::WIFEXITED(status));
-        let code = libc::WEXITSTATUS(status);
-        assert!(
-            code == 0 || code == 4,
-            "child must exit 0 (connect succeeded via engine) or 4 (filter unavailable), got {code}"
+        assert_eq!(
+            connect_records(&d, &j),
+            [(
+                "continue".to_owned(),
+                "loopback-or-unix".to_owned(),
+                format!("127.0.0.1:{port}")
+            )]
         );
-        if code == 4 {
-            println!(
-                "SKIP e2e_connect_goes_through_engine: child could not install user-notif filter"
-            );
+    }
+
+    fn failing_reader(_pid: u32, _addr: u64, _len: usize) -> io::Result<[u8; 128]> {
+        Err(io::Error::from_raw_os_error(libc::EPERM))
+    }
+
+    #[test]
+    fn failed_sockaddr_read_refuses_eacces_and_journals() {
+        // The destination cannot be read, so it is unknown: the connect
+        // must be refused (EACCES), never continued, even though the
+        // real target is a loopback listener that would be allowed.
+        let (_l, port) = loopback_listener();
+        let (d, j) = engine_journal();
+        let (pid, listener) = connecting_child(1, port);
+        let cfg = EngineConfig {
+            reader: failing_reader,
+            ..EngineConfig::new(5)
+        };
+        let engine = NotifEngine::start_with(listener, Some(j.clone()), cfg);
+        assert_eq!(child_exit(pid), 16, "one connect, refused with EACCES");
+        drop(engine);
+        let records = connect_records(&d, &j);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, "refuse");
+        assert_eq!(records[0].1, "read-failed");
+    }
+
+    fn slow_reader(pid: u32, addr: u64, len: usize) -> io::Result<[u8; 128]> {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        read_sockaddr(pid, addr, len)
+    }
+
+    #[test]
+    fn full_queue_refuses_eacces_at_once_and_journals() {
+        // One worker that needs 1.5 s per connect and room for one
+        // waiting notification. Six connects are pending when the engine
+        // starts: the worker takes one, at most two more find room in
+        // the queue over time, and every other one is refused by the
+        // receiver without waiting for the worker.
+        let (_l, port) = loopback_listener();
+        let (d, j) = engine_journal();
+        let (pid, listener) = connecting_child(6, port);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let cfg = EngineConfig {
+            workers: 1,
+            queue: 1,
+            reader: slow_reader,
+            ..EngineConfig::new(5)
+        };
+        let engine = NotifEngine::start_with(listener, Some(j.clone()), cfg);
+        // Well before the worker finishes its first connect, the refused
+        // ones are already journaled.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let early = connect_records(&d, &j);
+        let early_full = early.iter().filter(|r| r.1 == "queue-full").count();
+        assert!(early_full >= 3, "refused after 0.7 s: {early:?}");
+        assert!(early.iter().all(|r| r.1 == "queue-full"), "{early:?}");
+
+        let code = child_exit(pid);
+        let (refused, connected) = (code / 16, code % 16);
+        drop(engine);
+        assert_eq!(refused + connected, 6, "exit code {code}");
+        assert!((1..=3).contains(&connected), "connected {connected}");
+        let records = connect_records(&d, &j);
+        let full = records.iter().filter(|r| r.1 == "queue-full").count();
+        let cont = records.iter().filter(|r| r.0 == "continue").count();
+        assert_eq!(
+            (full as i32, cont as i32),
+            (refused, connected),
+            "{records:?}"
+        );
+    }
+
+    #[test]
+    fn pidfd_for_a_non_leader_thread() {
+        // A connect() from a thread other than the main one arrives with
+        // that thread's id. Both ways of opening it must work: the
+        // thread flag (6.9+), and the fallback through the process.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            // SAFETY: gettid has no arguments.
+            tx.send(unsafe { libc::gettid() }).unwrap();
+            let _ = stop_rx.recv();
+        });
+        let tid = rx.recv().unwrap();
+        assert_ne!(tid, std::process::id() as libc::pid_t);
+        // Without the flag, pidfd_open refuses a thread id; that was the
+        // bug: every connect from a non-main thread was refused EACCES.
+        let plain = unsafe { libc::syscall(libc::SYS_pidfd_open, tid, 0u32) };
+        assert_eq!(plain, -1, "pidfd_open(tid, 0) must fail for a thread");
+        for thread_flag in [true, false] {
+            let fd = open_task_pidfd(tid, thread_flag)
+                .unwrap_or_else(|e| panic!("thread_flag={thread_flag}: {e}"));
+            // The pidfd gives access to the thread's descriptors: take
+            // a copy of the pidfd itself through it.
+            let copy =
+                unsafe { libc::syscall(libc::SYS_pidfd_getfd, fd.as_raw_fd(), fd.as_raw_fd(), 0) };
+            assert!(copy >= 0, "pidfd_getfd (thread_flag={thread_flag})");
+            unsafe { libc::close(copy as i32) };
         }
+        drop(stop_tx);
+        t.join().unwrap();
+        assert_eq!(
+            parse_tgid("Name:\tx\nTgid:\t4242\nPid:\t4250\n"),
+            Some(4242)
+        );
+        assert_eq!(parse_tgid("Name:\tx\n"), None);
+    }
+
+    #[test]
+    fn close_on_exec_is_read_from_fdinfo() {
+        assert_eq!(
+            fdinfo_cloexec("pos:\t0\nflags:\t02000002\nmnt_id:\t10\n"),
+            Some(true)
+        );
+        assert_eq!(
+            fdinfo_cloexec("pos:\t0\nflags:\t02\nmnt_id:\t10\n"),
+            Some(false)
+        );
+        assert_eq!(fdinfo_cloexec("pos:\t0\n"), None);
+        // A real descriptor of this process, both ways.
+        let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(s >= 0);
+        let me = std::process::id();
+        assert!(task_fd_cloexec(me, s));
+        unsafe { libc::fcntl(s, libc::F_SETFD, 0) };
+        assert!(!task_fd_cloexec(me, s));
+        unsafe { libc::close(s) };
+        // Unreadable: the safe answer.
+        assert!(task_fd_cloexec(me, 1_000_000));
+    }
+
+    #[test]
+    fn id_valid_number_is_the_one_every_kernel_accepts() {
+        // _IOR('!', 2, __u64): direction 2 (read) in bits 30..31.
+        assert_eq!(OP_ID_VALID, 0x8008_2102);
+        assert_eq!(OP_ID_VALID >> 30, 2);
+    }
+
+    #[test]
+    fn probe_finds_the_features_on_this_kernel() {
+        // Runs the real startup probe: an unknown id must be answered
+        // with ENOENT by ID_VALID and by ADDFD+SETFD.
+        assert_eq!(probe_features(), Ok(()));
     }
 
     #[test]

@@ -3119,6 +3119,15 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
         gid,
     };
 
+    // ADR 0022 open mode: find the DNS upstreams before anything is
+    // created. A session whose responder could only answer SERVFAIL does
+    // not start; the error names the files that were checked.
+    let dns_upstreams = if policy.network == Network::Open {
+        crate::dns::discover_upstreams(policy.nameservers.as_deref()).map_err(|e| anyhow!(e))?
+    } else {
+        Vec::new()
+    };
+
     // Phase: namespaces (userns S + init clone + GO/READY handshake).
     let Namespaces {
         pid,
@@ -3161,10 +3170,13 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     )?;
     drop(mntns_fd);
 
-    // ADR 0022: clone the journal handle for the notif engine before the
-    // original is moved into start_control (Journal is not Clone; the
-    // Arc shares one writer — appends are flock-serialised anyway).
-    let net_journal = journal.clone_for_engine();
+    // ADR 0022: one journal handle for the network path (both connect
+    // engines and the DNS responder), taken before the original moves
+    // into start_control. Its records go through one bounded queue, so a
+    // verdict never waits on a journal write. Only open mode has a
+    // network path (and only then is the queue's writer thread started).
+    let net_journal =
+        (policy.network == Network::Open).then(|| Arc::new(journal.clone_for_engine()));
     let exec_net_listener = exec_client.net_listener.take();
 
     // Phase: control (shared state, listener, initial grants, forwards, SSH).
@@ -3197,29 +3209,20 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     // start-time git-change snapshot; calling both recorded a duplicate
     // session/start, which the review flagged.
     shared.journal_session_start();
-    // ADR 0022 open mode: start the NOTIF engine on init's listener and
-    // the DNS responder on init's bound fds. Both are owned here for the
-    // session lifetime; dropping them (session end) shuts them down.
-    // The exec-tree engine is stored alongside so its Drop joins the
-    // receiver + workers (no leaked engine); the DNS shutdown flag is
-    // set on session exit via `_dns_shutdown`.
-    let _net_engine = net_listener.map(|l| {
-        crate::notif::NotifEngine::start(l, Some(Arc::new(net_journal.clone_for_engine())), 30)
-    });
-    let _exec_engine = exec_net_listener.map(|l| {
-        crate::notif::NotifEngine::start(l, Some(Arc::new(net_journal.clone_for_engine())), 30)
-    });
-    let dns_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _dns_handle = if let Some((udp, tcp)) = dns_fds {
-        let ups = crate::dns::upstreams(policy.nameservers.as_deref());
+    // ADR 0022 open mode: start one connect engine per listener (init's
+    // tree and the exec tree) and the DNS responder on the sockets init
+    // bound. All three live until this function returns: the engines are
+    // joined by their Drop, the responder by `dns_shutdown` below.
+    let _net_engine = net_listener
+        .map(|l| crate::notif::NotifEngine::start(l, net_journal.clone(), CONNECT_DEADLINE_S));
+    let _exec_engine = exec_net_listener
+        .map(|l| crate::notif::NotifEngine::start(l, net_journal.clone(), CONNECT_DEADLINE_S));
+    let dns_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dns_handle = dns_fds.map(|(udp, tcp)| {
         let sd = dns_shutdown.clone();
-        let j = Some(Arc::new(net_journal.clone_for_engine()));
-        Some(std::thread::spawn(move || {
-            crate::dns::run_with_journal(udp, tcp, ups, &sd, j);
-        }))
-    } else {
-        None
-    };
+        let j = net_journal.clone();
+        std::thread::spawn(move || crate::dns::run(udp, tcp, dns_upstreams, &sd, j))
+    });
     let listener = control.listener;
     let handler = control.handler;
     let ssh_agent_expose = control.ssh_agent_expose;
@@ -3251,9 +3254,17 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     // Phase: wait (idle timer + relay).
     let idle_timer = start_idle_timer(&policy, &shared, pid);
     let code = relay_and_wait(pid, master, tty);
-    // ADR 0022: stop the DNS responder thread (the engines drop with
-    // `_net_engine` / `_exec_engine` below when this function returns).
+    // ADR 0022: the sandbox is gone. Stop the DNS responder and write
+    // out the network records still queued (bounded), so `hisn journal`
+    // right after the session shows them. The engines stop when
+    // `_net_engine` / `_exec_engine` drop at the end of this function.
     dns_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(h) = dns_handle {
+        let _ = h.join();
+    }
+    if let Some(j) = &net_journal {
+        j.net_flush(std::time::Duration::from_secs(2));
+    }
     // The session is live and ending on the normal path: the guard must not
     // kill and reap init again (relay_and_wait already reaped it). The stop
     // paths below own the remaining cleanup.
@@ -3426,6 +3437,10 @@ fn prepare_session_env(a: &mut PrepareEnvArgs<'_>, rules: &mut Rules) -> Result<
         ssh_proxy_listener,
     })
 }
+
+/// Outbound connect deadline of open mode, in seconds from `NOTIF_RECV`
+/// (ADR 0022 decision 6).
+const CONNECT_DEADLINE_S: u64 = 30;
 
 /// Yama ptrace_scope parse: true = must refuse (fail closed if >= 2).
 pub fn yama_refuse(content: &str) -> bool {

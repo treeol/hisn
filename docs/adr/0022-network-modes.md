@@ -100,13 +100,13 @@ host output pasted after each pass; pass-6 host results are pending.
 | Supervisor (ancestor in the owning userns) reads the `sockaddr` of the exec'd program via `process_vm_readv` **and** `/proc/<pid>/mem`; execve resets dumpable to 1 even with NNP so the program is readable; `NOTIF_ID_VALID=0` after the read | B2 | PASS |
 | A non-dumpable process that never exec'd cannot be read (EPERM) | B1 | INFO (as expected) |
 | Loopback, unix-path and abstract-unix connects continue via `CONTINUE` | C1–C3 | PASS |
-| `CONTINUE` is subject to a TOCTOU race (child rewrites the buffer): 22 of 2000 rewrites won (`continued=1975, refused=25`); harmless only because the netns is empty | C4 | INFO (race measured) |
+| `CONTINUE` is subject to a TOCTOU race (child rewrites the buffer): 22 of 2000 rewrites won (`continued=1975, refused=25`); harmless only because the netns is empty. Pass 6 measured `enetunreach=47, refused=25, continued=1975, attempts=2000, toctou_wins=22`. | C4 pass 6 | INFO (race measured) |
 | `sendto`/`sendmsg`/`sendmmsg`/`MSG_FASTOPEN` to outside addresses fail `ENETUNREACH` in the empty netns; control from host namespace reaches | E1–E4, E-control | PASS |
 | Socket options survive the swap when copied via `pidfd_getfd`; `SO_RCVBUF`/`SO_SNDBUF` read back 2× the requested value, so the supervisor requests half | F | PASS |
 | A program's own nested filter with ALLOW for `connect` does not break interception; its own ERRNO filter wins over the outer `USER_NOTIF` (only for that program) | H1, H3 | PASS |
-| A second listener in one filter chain fails `EBUSY` | H2 (pass-5 code ran in the wrong task; pass-6 re-test pending) + kernel ABI | not cleanly measured yet — pending |
+| A second listener in one filter chain fails `EBUSY` (errno=16) | H2 pass 6 (preconditions checked) | PASS |
 | A stalled supervisor blocks the sandboxed process indefinitely (`seccomp_do_user_notification`) | pass-4 host finding 3 | observed (old `probe_d` still blocked) |
-| DNS through the supervisor | D1a–D3 | **not proven, probe plumbing bug** (see below) |
+| DNS through the supervisor | D1a–D3 (not proven by the probe: the probe's DNS socket was not served inside the sandbox netns, so `dns_queries=0`; D1b already had `hosts: files dns` and still failed) | not proven by the probe — covered by L94 on the host |
 
 **DNS was not proven.** Pass 6's draft claim — "host `/etc/nsswitch.conf`
 is `hosts: files dns`, nss-resolve hypothesis refuted" — was read from
@@ -132,8 +132,8 @@ unchanged from the task; the rest are stated with their refinement.
 1. **Three modes.** `none` (unchanged, stays default), `allowlist`,
    `open`. `open` uses the same interception with an allow-all policy
    and full journaling. hisn never shares the host netns; `network =
-   "host"` becomes a deprecated alias for `open` for one release
-   (profile validate warns), then is rejected. `Network` gains two
+   "host"` is **unchanged with a deprecation warning, not aliased** to
+   `open` (Valon's decision, 2026-11-16). `Network` gains two
    variants (`src/policy.rs:41-44`). **`open` is not "host":** the
    supervisor connects from the host netns, so `open` can reach
    host-loopback services — see the Threat model and the connect-time
@@ -283,15 +283,19 @@ unchanged from the task; the rest are stated with their refinement.
    does not affect in-flight connects. There is no op to widen a
    *running* session's netns; nothing can create a route.
 10. **Fail closed on missing kernel features.** `allowlist`/`open` check
-    at startup: `SECCOMP_FILTER_FLAG_NEW_LISTENER` (4.14),
-    `SECCOMP_IOCTL_NOTIF_ADDFD` (5.0), `SECCOMP_ADDFD_FLAG_SEND`
-    (5.14), `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (5.5),
-    `SECCOMP_IOCTL_NOTIF_ID_VALID` (5.0). If any is missing, startup
-    fails with a clear error naming the feature and the minimum
+    at startup: `SECCOMP_RET_USER_NOTIF` (5.0),
+    `SECCOMP_FILTER_FLAG_NEW_LISTENER` (5.0),
+    `SECCOMP_IOCTL_NOTIF_RECV`/`SEND`/`ID_VALID` (5.0),
+    `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (5.5),
+    `SECCOMP_IOCTL_NOTIF_ADDFD` incl. `SETFD` (5.9),
+    `SECCOMP_ADDFD_FLAG_SEND` (5.14). If a hard-floor feature is missing,
+    startup fails with a clear error naming the feature and the minimum
     kernel. `none` never touches these and keeps working.
-    Minimum kernels: **5.14** for the full design; **4.14** without
-    `FLAG_SEND` (two-step inject, same result, one extra syscall per
-    connect) — below 4.14, allowlist/open refuse to start.
+    Minimum kernels: **floor 5.9** (`SETFD` injection; 5.9–5.13 installs
+    use `SETFD` + a separate `NOTIF_SEND`, 5.14+ may use `FLAG_SEND`
+    one-step — same result, one extra syscall per connect on 5.9–5.13).
+    Sources: `seccomp_unotify(2)`, `seccomp(2)`, `pidfd_open(2)`,
+    `pidfd_getfd(2)` (Linux man pages).
 11. **Separate hand-written BPF filter.** The interception filter
     (`connect` → `USER_NOTIF`, everything else → `ALLOW`) is
     hand-assembled, following the x32-guard precedent
@@ -365,13 +369,13 @@ connect_deadline_s = 30      # default; decision 6
 
 ## Connect flow and DNS flow
 
-Connect (allowlist/open), per notification:
+Connect (allowlist/open), per notification, in this exact order:
 
 1. Supervisor polls the listener (`poll` 2 s, child-exit aware via
    `waitid(WNOWAIT)`), receives the notification, dispatches it to a
-   worker (decision 6).
-2. `NOTIF_ID_VALID` **before** the read; opens a pidfd for
-   `notif.pid`; validates `addrlen` (`>= sizeof(sa_family_t)`,
+   worker (decision 6). The 30 s deadline starts at `NOTIF_RECV`.
+2. `NOTIF_ID_VALID` **read once, before the sockaddr read**; opens a
+   pidfd for `notif.pid`; validates `addrlen` (`>= sizeof(sa_family_t)`,
    `<= sizeof(sockaddr_storage)`, and the family-specific minimum for
    `AF_INET`/`AF_INET6`) — out of range → `-EINVAL`. Reads the
    `sockaddr` of the notified task with `process_vm_readv`, at most
@@ -382,37 +386,60 @@ Connect (allowlist/open), per notification:
    or host `ptrace_scope >= 2`) → reply `-EACCES`, journal
    `refuse/read-failed`. Stated in the agent-facing docs: a
    dumpable-0 program cannot be intercepted and gets refused.
-3. Reads `SO_TYPE` via `pidfd_getfd`+`getsockopt`; refuses any
-   non-`SOCK_STREAM` IP connect with `EACCES` (decision 4).
-4. Decides by family: `AF_INET`/`AF_INET6` (step 6), `AF_UNIX`
-   path/abstract (decision 5, **always** `CONTINUE`), everything else
-   → `EACCES`.
-5. Serves DNS: on `127.0.0.1:53` (UDP+TCP, bound pre-filter), answers
-   allowed names (forwarded to the host resolver; address list pinned
-   with TTL+60 s) and NXDOMAINs everything else. The pin store is the
-   allow check's name evidence.
-6. **Private-address block (Mashūra BLOCKING 4 — applies to `open`
+3. **Loopback and `AF_UNIX` `CONTINUE` — before the `SOCK_STREAM` check.**
+   `AF_UNIX` (path/abstract, decision 5) always `CONTINUE`s. Loopback
+   (`127.0.0.0/8`, `::1`) always `CONTINUE`s *regardless of socket type*,
+   so DNS over UDP to `127.0.0.1:53` (leak case L112) works in `open`
+   (loopback always stays inside the sandbox netns; never forwarded;
+   host services only via `[[host_services]]`/`[[forward]]).
+4. `SOCK_STREAM` check: refuses any non-`SOCK_STREAM` non-loopback IP
+   connect with `EACCES` (decision 4). Other families (vsock, …) → `EACCES`.
+5. **Private-address block (Mashūra BLOCKING 4 — applies to `open`
    too).** At connect time, in **both** modes, the supervisor refuses
-   loopback (`127.0.0.0/8`, `::1`), unspecified, multicast,
-   link-local (`169.254.0.0/16`, `fe80::/10`, incl. the metadata
-   address `169.254.169.254`), CGNAT (`100.64.0.0/10`), RFC1918, ULA
-   (`fc00::/7`), and IPv4-mapped forms of any of those, **unless** an
-   explicit IP/CIDR rule matches that exact target. A DNS pin alone
-   never authorises a non-public address. This is what stops `open`
-   from silently reaching host-loopback daemons: `open` is allow-all
-   *public*, not allow-all at all.
-7. On allow: copies socket options from the child's original socket
-   (`pidfd_getfd`; buffers halved) onto the new socket, connects
-   non-blocking from the host netns, injects with
-   `ADDFD|SETFD|SEND` (decision 7), replies 0 with the injected fd.
-   If the outbound connect fails, replies `-errno` from that connect
-   (`ECONNREFUSED`, `EHOSTUNREACH`, …), never a generic `EACCES`.
-   Non-blocking semantics are preserved: a non-blocking `connect()`
-   suspended in user-notif returns through the injected fd; the
-   client's `poll(POLLOUT)`/`SO_ERROR` behaves as with a normal
+   unspecified, multicast, link-local (`169.254.0.0/16`, `fe80::/10`,
+   incl. the metadata address `169.254.169.254`), CGNAT
+   (`100.64.0.0/10`), RFC1918, ULA (`fc00::/7`), `198.18.0.0/15`
+   (benchmarking), IPv4-mapped forms of any of those, and NAT64
+   prefixes `64:ff9b::/96` / `64:ff9b:1::/48` classified by their
+   embedded IPv4 address — **unless** an explicit IP/CIDR rule matches
+   that exact target. Loopback is *not* in this list: loopback always
+   stays inside the sandbox netns (step 3, never forwarded; host
+   services only via `[[host_services]]`/`[[forward]]`). A DNS pin
+   alone never authorises a non-public address. This is what stops
+   `open` from silently reaching host-loopback daemons: `open` is
+   allow-all *public*, not allow-all at all.
+6. On allow: copies socket options from the child's original socket
+   (`pidfd_getfd`; buffers halved) onto the new socket, restores the
+   child's original `O_NONBLOCK` state, connects non-blocking from the
+   host netns, injects with `ADDFD|SETFD` (+ `SEND` on 5.14+; two-step
+   `SETFD` + separate `NOTIF_SEND` on 5.9–5.13), replies 0 with the
+   injected fd. If the outbound connect fails, replies `-errno` from
+   that connect (`ECONNREFUSED`, `EHOSTUNREACH`, …), never a generic
+   `EACCES`. Non-blocking semantics are preserved: a non-blocking
+   `connect()` suspended in user-notif returns through the injected fd;
+   the client's `poll(POLLOUT)`/`SO_ERROR` behaves as with a normal
    connected socket (Q3). Journal failure never blocks a verdict.
-8. IPv4 and IPv6 are handled identically; the sockaddr family comes
-   from the supervisor's copy. Deadline runs from dispatch (decision 6).
+7. IPv4 and IPv6 are handled identically; the sockaddr family comes
+   from the supervisor's copy. Deadline runs from `NOTIF_RECV`
+   (decision 6).
+
+**DNS flow (decision 3, as shipped).** The responder socket is bound by
+init on `127.0.0.1:53` (UDP+TCP, before caps drop) and handed to the
+supervisor over `SCM_RIGHTS`. The supervisor forwards queries to the
+host resolver discovery (host `/etc/resolv.conf` → upstream list →
+`[net] nameservers` override) and answers `SERVFAIL` on failure. The
+sandbox ships its *own* `/etc/resolv.conf` (`nameserver 127.0.0.1`) and
+`/etc/nsswitch.conf` (`hosts: files dns`) so the host's nss chain is
+not in the path. The earlier DNS probe failed (`dns_queries=0`)
+because its DNS socket was not served inside the sandbox netns — the
+probe's own socket was never populated; D1b already had
+`hosts: files dns` and still failed for that reason. The probe result
+is therefore *not* evidence for or against the shipped responder; L94
+on the host is the gate (the script's `192.0.2.2:53` server can only
+be reached through the shipped files + responder).
+`network = "none"` gets neither file (byte-identical to 0.5.1);
+`network = "host"` is unchanged (with its deprecation warning) and is
+*not* aliased to `open`.
 
 Errors returned to the program: allow → 0 (connected); path unix not
 in view is **not** hisn's verdict — `CONTINUE` lets the kernel return
@@ -492,21 +519,25 @@ stated here instead of claimed.
 
 | Feature | Minimum kernel | Effect if missing |
 |---|---|---|
-| `SECCOMP_FILTER_FLAG_NEW_LISTENER` | 4.14 | allowlist/open refuse to start |
-| `SECCOMP_RET_USER_NOTIF` | 4.14 | refuse |
-| `SECCOMP_IOCTL_NOTIF_ID_VALID` | 5.0 | refuse |
-| `SECCOMP_IOCTL_NOTIF_ADDFD` | 5.0 | refuse |
-| `SECCOMP_USER_NOTIF_FLAG_CONTINUE` | 5.5 | refuse |
+| `SECCOMP_RET_USER_NOTIF` | 5.0 | refuse to start |
+| `SECCOMP_FILTER_FLAG_NEW_LISTENER` | 5.0 | refuse to start |
+| `SECCOMP_IOCTL_NOTIF_RECV` | 5.0 | refuse to start |
+| `SECCOMP_IOCTL_NOTIF_SEND` | 5.0 | refuse to start |
+| `SECCOMP_IOCTL_NOTIF_ID_VALID` | 5.0 | refuse to start |
+| `SECCOMP_USER_NOTIF_FLAG_CONTINUE` | 5.5 | refuse to start |
+| `SECCOMP_IOCTL_NOTIF_ADDFD` (incl. `SETFD`) | 5.9 | refuse to start (no correct injection below 5.9) |
 | `SECCOMP_ADDFD_FLAG_SEND` | 5.14 | two-step inject (`SETFD` + separate `NOTIF_SEND`), slower, same result |
 | `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` | 5.19 | not required (deadline + workers cover the hang) |
+| `pidfd_open` | 5.3 | refuse to start |
+| `pidfd_getfd` | 5.6 | refuse to start |
 
 Feature detection is by **attempting the ioctl/filter install** at
 startup and logging what was found — not by parsing `uname -r` (distro
-backports make the version string lie). Recommended minimum for a
-useful deployment: **5.14** (full design), floor **4.14** (`SETFD`,
-5.0, is the hard floor — below it there is no correct injection at
+backports make the version string lie). Floor is **5.9** (`SETFD`
+injection is the hard floor — below it there is no correct injection at
 all). The startup error names the first missing feature and its
-minimum kernel.
+minimum kernel. Sources: `seccomp_unotify(2)`, `seccomp(2)`,
+`pidfd_open(2)`, `pidfd_getfd(2)` (Linux man pages).
 
 ## Test plan
 
@@ -561,22 +592,25 @@ from the probe.
   probing. Smallest useful step: an agent gets outbound TCP; `none`
   unchanged; default unchanged.
 - **0.7.0 — `allowlist`** (DNS pinning, policy format, `net-policy-set`,
-  `net explain`, leak cases L90–L111). `network = "host"` deprecated
-  alias for `open` with a validate warning.
+  `net explain`, leak cases L90–L111). `network = "host"` stays
+  unchanged with its deprecation warning (not aliased to `open`).
 
-## Open questions for Valon
+## Valon's decisions (2026-11-16)
 
-1. **Does `open` (allow-all public, fully journaled) satisfy the
-   remote-node multi-agent case, or is allowlist required from day one?**
-   Recommendation: ship `open` first (0.6.0) — it is the mechanism proof;
-   allowlist is a policy table on top of it.
-2. **Should `network = "host"` keep working after 0.7.0 (alias), or break?**
-   Recommendation: alias for one release with a deprecation warning,
-   then reject — it is the only mode that shares the host netns, and
-   this ADR's whole point is never to.
-3. **Per-seat netns for `ask`-style per-agent approval later** (PLAN-0.5
-   O3)? Recommendation: out of scope for this ADR; session-level policy
-   + per-decision seat attribution (decision 8) is enough for v1.
+- **Ship `open` first** (0.6.0) — allow-all public, fully journaled,
+  with the private-address block from day one; allowlist is 0.7.0.
+- **`network = "host"` is not aliased** to `open`; it stays unchanged
+  with its deprecation warning.
+- **Per-seat netns is out of scope** for this ADR's v1; session-level
+  policy + per-decision journaling is the v1 boundary.
+- **Yama `ptrace_scope >= 2` refuses to start** (`open`/`allowlist`
+  fail closed at startup; absent or `< 2` is fine — `process_vm_readv`
+  would otherwise fail every connect at read time).
+- **E (the exec helper) sets `PR_SET_NO_NEW_PRIVS` itself** before
+  installing its connect filter; the filter install never relies on
+  `CAP_SYS_ADMIN`.
+- **Private-address block ships with `open`** (allow-all *public*, not
+  allow-all at all); no `[net] allow` exceptions in 0.6.0.
 
 ## Review record
 
@@ -585,7 +619,11 @@ from the probe.
 Implemented on `work/0.6.0` (open mode only; allowlist is 0.7.0).
 Commits: phase 1 plumbing + filter/probe/classifier; phase 2 NOTIF
 engine + DNS responder + journal + init/exec/supervisor integration;
-phase 3 leak cases + host script + release docs. The pre-implementation
+phase 3 leak cases + host script + release docs; review-fix commits
+(real `ioctl` ABI, `args[0]` sockfd, two-step `SETFD` injection,
+`O_NONBLOCK` restore, READY fd count gated on PTY, DNS bind before
+caps drop, bounded worker pool, NAT64/`198.18/15` block, `ip:port`
+journal targets, e2e integration test). The pre-implementation
 review's BLOCKING points were folded in: exact connect order
 (af_unix/loopback `CONTINUE` before the non-stream refusal, so UDP
 DNS to 127.0.0.1:53 works), READY fd count validation, init closes its

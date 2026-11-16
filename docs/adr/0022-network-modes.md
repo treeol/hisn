@@ -1,0 +1,609 @@
+# ADR 0022 — Network modes: none / allowlist / open via connect interception
+
+Title: Controlled outbound network for sandboxed sessions — `none` (unchanged
+default), `allowlist`, and `open`, implemented by intercepting `connect()`
+with seccomp user notification and letting the supervisor decide.
+
+Status: Proposed. Date: 2026-11-16. Origin: the connect-interception
+probe series (`.wakil/probes/connect-notify/`, passes 1–6; report
+`.wakil/reports/probe-connect-notify.md`). This ADR replaces the transport
+design of ADR 0018 (a host-side HTTP/SOCKS proxy) with a `connect()`
+interception transport that works for any TCP client without the client
+knowing, and that keeps the empty netns as the security boundary. ADR
+0018's policy language (`[net] allow`, default deny, rebinding guard)
+carries over; its proxy transport does not.
+
+## Phase 0 — what hisn does today (read in src/, before designing)
+
+- **Namespaces.** `network = "none"` adds only `CLONE_NEWNET` to the init
+  clone: `NEWUSER|NEWNS|NEWPID|NEWIPC|NEWUTS` (+ `NEWNET` iff
+  `Network::None`) (`src/supervisor.rs:3401-3408`). The supervisor first
+  unshares `NEWUSER|NEWNS` + uid/gid maps, then clones init;
+  init brings up loopback only (`src/init.rs:393`, SIOCSIFFLAGS, no route,
+  no DNS setup). The netns fd is opened pre-GO while init is still
+  dumpable (`src/supervisor.rs:3431`) and passed to the exec helper, which
+  `setns()`es net before the program runs (`src/exec.rs:894-898`).
+- **Ancestor chain.** supervisor (host, in userns S) → init (PID 1, direct
+  clone child, `PDEATHSIG=SIGKILL`, `src/init.rs:89`) → D (exec helper:
+  sets `PR_SET_DUMPABLE=0` at `src/exec.rs:962`, again at `:983`) → W →
+  P (the program, after `execve`). The supervisor stays an ancestor of
+  every sandboxed program for the program's whole life. **execve resets
+  dumpable to 1 even with `no_new_privs`** (probe pass 4, measured), so
+  the running program P is dumpable and readable by its ancestor under
+  Yama `ptrace_scope=1`.
+- **Seccomp denylist.** `BASE_DENY` (`src/seccomp.rs:127-177`) contains
+  `mount`, `unshare`, `ptrace`, `io_uring_*`, etc. — **not** `connect`,
+  `socket`, `socketpair`, `sendto`, `sendmsg`, `sendmmsg`. `socket` and
+  `connect` appear only in the `COMMON` lookup table
+  (`src/seccomp.rs:107-108`) so profiles *could* name them in
+  `extra_deny`; a test asserts they stay ALLOW by default
+  (`src/seccomp.rs:472-497`). Kernel precedence is
+  KILL > TRAP > ERRNO > USER_NOTIF > TRACE > LOG > ALLOW, so an ERRNO
+  verdict for `connect` from any stacked filter would outrank the
+  USER_NOTIF verdict; hisn must never put `connect` in `extra_deny`.
+  `seccompiler 0.5.0` (`Cargo.toml:26`) builds `SeccompAction::{Allow,
+  Errno, KillThread, KillProcess, Log, Trace, Trap}` only
+  (`src/seccomp.rs:273-281`) — no `UserNotif`; the interception filter
+  must be hand-written BPF, following the x32-guard precedent
+  (`src/seccomp.rs:301-312`).
+- **Filesystem view of host sockets.** `/run` is a **fresh private
+  tmpfs**, not the host `/run` (`src/mounts.rs:664-672`); `/tmp` likewise
+  (`:655-663`); `/var`, `/sys`, `/home`, `/root` are never mounted
+  (`:1432-1435`). So by default the sandbox sees **no** host
+  `/run/user/<uid>`, no dbus (`/run/dbus`), no docker/podman socket, no
+  `/run/systemd/resolve/io.systemd.Resolve`, no `/var/run`. The only
+  host trees visible are toolchain dirs read-only (`/usr /bin /sbin
+  /lib /lib64 /opt /nix`), `cwd` rw, and explicitly granted
+  `[[forward]]` / `[[host_services]]` / `[docker]` mounts, each behind
+  `risk_ack` (`src/profile.rs:907-955`). ssh-agent is a filtering proxy
+  bound in the session dir, forwarded to `/run/ssh-agent.sock`
+  (`src/ssh_agent.rs:14-17`). The host `/etc/resolv.conf` is read
+  out-of-band; only `network = "host"` sessions get a generated
+  resolv.conf (`src/mounts.rs:63-69,124-169`). Landlock has **no**
+  network scope: only `AccessFs` PathBeneath rules
+  (`src/landlock.rs:88-118`) — it cannot restrict `connect()` to unix
+  sockets; the mount view above is what hides host sockets.
+- **Policy storage.** Profile: `[policy] session.network` (enum
+  `Network::{None, Host}`, `src/policy.rs:41-44`) + optional `[net]
+  nameservers` (`src/profile.rs:382-386`, validated non-loopback).
+  `session.json` records `network: "none"|"host"` and
+  `protocol_revision` (`src/sessionmeta.rs:113-142`); the wire revision
+  is `PROTOCOL_REVISION = 3` (`src/sessionmeta.rs:43`), the only version
+  compared (`client.protocol_version`; absent = rev 1; higher declared
+  → `E_VERSION`). Authz: `allows(role, op)` with roles
+  `Owner > Member > Observer` (`src/authz.rs:115-122`); `required_role`
+  (`:184-190`) gates every op by table. Nothing runtime reads
+  `ptrace_scope`; no Yama handling exists in `src/`.
+
+## Context and the probe verdict
+
+hisn today offers only `network = "none"` (empty netns, loopback, no
+route) and `network = "host"` (shares the host netns, unfiltered).
+ADR 0018 (draft, not in the tree) proposed an allowlist proxy for the
+`host` mode; it was never built. The question this ADR answers: can the
+supervisor decide each outbound `connect()` from inside the empty netns,
+transparently, for any agent, with no manual work — and is that safer
+than sharing the host netns? The probe series ran on rubin (Fedora 45,
+kernel 7.3.3-300.fc45.x86_64); every probe compiles with
+`gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2`.
+
+One table: fact → probe case → host result. Host results are only from
+host output pasted after each pass; pass-6 host results are pending.
+
+| Fact | Probe case | Host result |
+|---|---|---|
+| `USER_NOTIF` on `connect()` + supervisor connects in host netns + `NOTIF_ADDFD` hands the socket in | Q1 | PASS |
+| Same, across a user+net namespace boundary | Q2 | PASS |
+| Blocking, non-blocking, IPv6 connects; real curl/python3/git unmodified | Q3/Q3b | PASS |
+| ~20–25 µs extra per intercepted connect (5.2 ms/100 vs 3.3 ms/100) | Q5 | PASS |
+| Supervisor death → pending `connect()` returns `ENOSYS` (38) | Q5/G | PASS |
+| Supervisor (ancestor in the owning userns) reads the `sockaddr` of the exec'd program via `process_vm_readv` **and** `/proc/<pid>/mem`; execve resets dumpable to 1 even with NNP so the program is readable; `NOTIF_ID_VALID=0` after the read | B2 | PASS |
+| A non-dumpable process that never exec'd cannot be read (EPERM) | B1 | INFO (as expected) |
+| Loopback, unix-path and abstract-unix connects continue via `CONTINUE` | C1–C3 | PASS |
+| `CONTINUE` is subject to a TOCTOU race (child rewrites the buffer): 22 of 2000 rewrites won (`continued=1975, refused=25`); harmless only because the netns is empty | C4 | INFO (race measured) |
+| `sendto`/`sendmsg`/`sendmmsg`/`MSG_FASTOPEN` to outside addresses fail `ENETUNREACH` in the empty netns; control from host namespace reaches | E1–E4, E-control | PASS |
+| Socket options survive the swap when copied via `pidfd_getfd`; `SO_RCVBUF`/`SO_SNDBUF` read back 2× the requested value, so the supervisor requests half | F | PASS |
+| A program's own nested filter with ALLOW for `connect` does not break interception; its own ERRNO filter wins over the outer `USER_NOTIF` (only for that program) | H1, H3 | PASS |
+| A second listener in one filter chain fails `EBUSY` | H2 (pass-5 code ran in the wrong task; pass-6 re-test pending) + kernel ABI | not cleanly measured yet — pending |
+| A stalled supervisor blocks the sandboxed process indefinitely (`seccomp_do_user_notification`) | pass-4 host finding 3 | observed (old `probe_d` still blocked) |
+| DNS through the supervisor | D1a–D3 | **not proven, probe plumbing bug** (see below) |
+
+**DNS was not proven.** Pass 6's draft claim — "host `/etc/nsswitch.conf`
+is `hosts: files dns`, nss-resolve hypothesis refuted" — was read from
+inside a hisn session, which sees the session's own `/etc/nsswitch.conf`.
+Rubin's real host file (from pasted host output) is
+`hosts: files myhostname mdns4_minimal [NOTFOUND=return] resolve
+[!UNAVAIL=return] dns`. `nss-resolve` therefore runs before `dns` and
+answers or stops the chain, and the probe reached `Temporary failure in
+name resolution` with `dns_queries=0`. The correction is recorded in
+`.wakil/reports/probe-connect-notify.md` (Pass 6 + final summary). The
+failure is probe plumbing (no sandbox-local `hosts: files dns` nsswitch,
+DNS socket placement), not a kernel result. The design below makes
+hisn ship its own sandbox nsswitch + resolv.conf, which removes the
+host's nss-resolve from the path entirely — but **DNS must be re-tested
+on the host with that in place before the design can claim it works**,
+and the test plan includes exactly that.
+
+## Decision
+
+The eleven decided points, refined by Phase 0. Points 1, 2, 3, 6, 10 are
+unchanged from the task; the rest are stated with their refinement.
+
+1. **Three modes.** `none` (unchanged, stays default), `allowlist`,
+   `open`. `open` uses the same interception with an allow-all policy
+   and full journaling. hisn never shares the host netns; `network =
+   "host"` becomes a deprecated alias for `open` for one release
+   (profile validate warns), then is rejected. `Network` gains two
+   variants (`src/policy.rs:41-44`). **`open` is not "host":** the
+   supervisor connects from the host netns, so `open` can reach
+   host-loopback services — see the Threat model and the connect-time
+   private-address block below, which applies to `open` too. A
+   `NETNS` startup assertion is required: the supervisor verifies its
+   own `/proc/self/ns/net` inode differs from init's and fails closed
+   otherwise, so a new mode that accidentally omits `CLONE_NEWNET`
+   (the worst possible silent failure) cannot start.
+2. **The empty netns is the security boundary; interception is only the
+   controlled exit.** No design element relies on the supervisor seeing
+   every `connect()`. Everything outside `connect()` (all of case E:
+   `sendto`/`sendmsg`/`sendmmsg`/`MSG_FASTOPEN`) already fails with
+   `ENETUNREACH` in the empty netns, so there is no path out the
+   supervisor does not decide — the supervisor's job is to *allow*, not
+   to *see everything*. **Every new mode creates `CLONE_NEWNET` and
+   opens `open_ns(pid, "net")`** — the `Network::None`-only gating in
+   `src/supervisor.rs:3400-3435`, `src/init.rs` loopback-up, and the
+   exec-helper `setns(net)` must all treat `Allowlist`/`Open` like
+   `None` (Mashūra plumbing gap). Landlock: hisn does not use Landlock
+   network rules today (`src/landlock.rs:88-118` is `AccessFs` only);
+   the kernel ABI has had TCP connect/bind rights since ABI v4, but
+   they cannot express hostname pins or unix sockets, so v1 adds none —
+   stated explicitly, not assumed away.
+3. **Hostname allowlist is DNS-pinned.** hisn runs a DNS responder on
+   `127.0.0.1:53` (UDP and TCP) inside the sandbox netns, bound before
+   the filter is installed and before exec. It forwards only allowed
+   names to the host resolver (the existing resolver discovery in
+   `src/mounts.rs:63-169`, reused: upstreams from the host file or
+   `/run/systemd/resolve/resolv.conf`), answers NXDOMAIN for everything
+   else, and remembers `(name, ip, expires)` for every address it
+   handed out, expires = answer TTL + 60 s grace. **Authorisation test
+   (exact):** a `connect()` to `ip:port` is allowed iff there is an
+   explicit IP/CIDR rule matching `ip:port`, **or** there is an allow
+   rule matching `(queried_name, port)` and `ip` is a live pin for that
+   name. CNAME chains pin the terminal name's addresses but are checked
+   against the originally queried name; A/AAAA pins are kept per-family;
+   TTL=0 answers are never pinned; trailing-dot and IDNA/punycode
+   spellings of the same name are normalised to one comparison key.
+   hisn mounts its own `/etc/resolv.conf` (`nameserver 127.0.0.1`) and
+   `/etc/nsswitch.conf` (`hosts: files dns`, plus `passwd: files` /
+   `group: files`), ignoring the host's nss-resolve entirely — in
+   `allowlist` and `open` alike. This removes the exact failure the
+   probe hit. **In `none`, no resolv.conf/nsswitch is added** — `none`
+   stays byte-identical to today; adding files there would be a
+   behaviour change to the default mode (Mashūra finding).
+   **Who runs the responder (Mashūra BLOCKING 2).** init (or `E` for
+   exec trees) brings up loopback for all three modes **before
+   `drop_all_caps()`**, binds `127.0.0.1:53` (UDP+TCP) there, and
+   passes the bound fds to the supervisor via `SCM_RIGHTS` in the
+   `READY` handshake. The supervisor runs the responder thread on
+   those fds; the pin store lives in the supervisor. If port 53 is
+   already taken by an in-sandbox service, the session refuses to start
+   with a clear error. **Upstream transport.** The responder forwards
+   allowed queries with sockets created in the host netns — never via
+   an intercepted `connect()`, never via a general UDP path out of the
+   sandbox. Responder death fails DNS closed (`SERVFAIL`) and is
+   journaled; there is no fallback resolver in the sandbox.
+4. **Only `connect()` is intercepted in v1 — and only for stream sockets.**
+   `connect()` on a `SOCK_DGRAM` socket (QUIC/HTTP3, STUN, WireGuard,
+   glibc's RFC 6724 source-address probing) is **refused** with
+   `EACCES`, never injected: the supervisor reads `SO_TYPE` via
+   `pidfd_getfd`+`getsockopt` and refuses anything that is not
+   `SOCK_STREAM` for IP connects (Mashūra BLOCKING: `open` must not
+   become a silent UDP exit). Outbound UDP beyond DNS is therefore
+   unsupported in v1 by construction. Clients that support fallback
+   (most HTTP stacks) drop to TCP; clients that do not fail with a
+   clear `EACCES` (documented limitation L104). `sendto`/`sendmsg`/
+   `sendmmsg`/`MSG_FASTOPEN` to outside addresses fail `ENETUNREACH`
+   in the empty netns regardless (case E).
+5. **Loopback and abstract unix connects CONTINUE; path unix sockets are
+   the filesystem view's job.** Loopback (`127.0.0.0/8`, `::1`) and
+   abstract unix → `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (C1–C3). Path unix
+   connects are **always CONTINUEd**; the kernel's mount-namespace path
+   resolution then returns `ENOENT` for a hidden host socket (matching
+   test L97) or reaches the in-view socket (matching its mount
+   grant). The supervisor does **not** return `EACCES` for path unix —
+   it would have to resolve the path in the sandbox's mount namespace,
+   which it cannot do from the host mount ns (Mashūra finding 4).
+   Phase 0 shows the mount view already hides every host socket by
+   default: `/run` is a fresh tmpfs (`src/mounts.rs:664-672`), so
+   `/run/user/<uid>`, dbus, docker/podman, and
+   `/run/systemd/resolve/io.systemd.Resolve` are invisible unless a
+   profile grants one explicitly through `[[forward]]` /
+   `[[host_services]]` (risk-gated). Path unix connects are therefore
+   governed by mount visibility in all three modes. **Every other
+   `sa_family`** (`AF_VSOCK`, `AF_NETLINK`, `AF_BLUETOOTH`, `AF_ALG`,
+   `AF_PACKET`, …) is refused with `EACCES` unless it is
+   `AF_INET`/`AF_INET6`/`AF_UNIX`: vsock is not governed by the IP
+   netns at all, and an explicit refuse is the only safe default
+   (Mashūra BLOCKING 5). `AF_NETLINK` is refused too. Netlink to the
+   local kernel is not needed inside the sandbox.
+6. **Every notification has a deadline, answered by a concurrent
+   supervisor.** The supervisor is **not** single-threaded:
+   the `NOTIF_RECV` loop only dispatches; each notification is handled
+   by a worker (bounded pool, e.g. 64) that does the read, the decision,
+   and the outbound connect — so one blackholed IP cannot head-of-line
+   block every other `connect()` in the sandbox (Mashūra BLOCKING 3).
+   The deadline (default 30 s for the outbound connect, decision 6,
+   configurable per `[net]`) runs from dispatch; on expiry the worker
+   replies `-ETIMEDOUT` **from the worker**, never by waiting for the
+   wedged thread. When the queue is full, new notifications are
+   refused with `EACCES` immediately (fail closed). Outbound connects
+   in the supervisor are made **non-blocking** with an async completion
+   state machine; the deadline applies to the completion, not to a
+   blocking syscall. Supervisor death gives `ENOSYS` (kernel
+   behaviour, Q5/G). `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (5.19)
+   is optional hardening, not the deadline mechanism.
+7. **Atomic handover with option copy — `SETFD` is mandatory, always.**
+   The socket is injected with
+   `SECCOMP_IOCTL_NOTIF_ADDFD` + `SECCOMP_ADDFD_FLAG_SETFD` +
+   `SECCOMP_ADDFD_FLAG_SEND`, `newfd = notif.data.args[0]` (the
+   child's original fd number). **Without `SETFD`, `ADDFD` allocates a
+   new fd number and the child's `connect()` succeeds on an
+   unconnected socket while its original fd stays disconnected**
+   (Mashūra BLOCKING 3/7). `SETFD` requires kernel 5.0; `FLAG_SEND`
+   requires 5.14, and without it the fallback is `SETFD` + a separate
+   `NOTIF_SEND` (decision 10). Before injecting, the supervisor takes
+   the child's original socket via `pidfd_getfd` (supervisor is the
+   ancestor, B2), reads `O_NONBLOCK`, `SO_REUSEADDR`, `SO_RCVBUF`,
+   `SO_SNDBUF`, `SO_KEEPALIVE`, `TCP_NODELAY`, and sets them on its new
+   socket — requesting **half** the read value for the two buffer
+   sizes (case F). A prior `bind()` by the child (source address/port)
+   is lost on a fresh socket; the supervisor cannot reconstruct it —
+   documented limitation L105; programs that bind before connect lose
+   their local address choice. Epoll registrations are lost on fd
+   replacement (probe F); the client re-registers after `connect()`
+   returns, same as with any fd replacement. **Non-blocking connect:**
+   the supervisor completes the outbound connect synchronously (or
+   async, decision 6) and replies 0 with the injected fd; the client's
+   `poll(POLLOUT)`/`SO_ERROR` behaves as with a normal connected
+   socket (Q3). If the outbound connect fails, the supervisor replies
+   `-errno` from its own `connect()` (`ECONNREFUSED`, `EHOSTUNREACH`,
+   …), **never** a generic `EACCES` (Mashūra finding 6).
+8. **Every connect decision is a journal record.** One `network/connect`
+   record per notification, workspace journal (ADR 0020): `target`
+   (ip:port or unix path), `resolved_name` when the pin knows it,
+   `verdict` (`allow`/`refuse`/`continue`/`dns`), `latency_ms`,
+   `seat` (attribution: the exec's `client`, same field as exec
+   records), `session`, `wseq`. Workspace-wide, like every other record;
+   it is how a user answers "what did my agent reach" without asking
+   the agent.
+9. **Runtime policy change is owner-only, journal-only, future connects.**
+   A new op `net-policy-set` (below) requires role `owner`
+   (`src/authz.rs:115-122`); it updates the supervisor's live policy
+   table and a `net/policy.json` in the workspace state dir, journaled
+   as `network/policy-changed`. It does not recreate namespaces and
+   does not affect in-flight connects. There is no op to widen a
+   *running* session's netns; nothing can create a route.
+10. **Fail closed on missing kernel features.** `allowlist`/`open` check
+    at startup: `SECCOMP_FILTER_FLAG_NEW_LISTENER` (4.14),
+    `SECCOMP_IOCTL_NOTIF_ADDFD` (5.0), `SECCOMP_ADDFD_FLAG_SEND`
+    (5.14), `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (5.5),
+    `SECCOMP_IOCTL_NOTIF_ID_VALID` (5.0). If any is missing, startup
+    fails with a clear error naming the feature and the minimum
+    kernel. `none` never touches these and keeps working.
+    Minimum kernels: **5.14** for the full design; **4.14** without
+    `FLAG_SEND` (two-step inject, same result, one extra syscall per
+    connect) — below 4.14, allowlist/open refuse to start.
+11. **Separate hand-written BPF filter.** The interception filter
+    (`connect` → `USER_NOTIF`, everything else → `ALLOW`) is
+    hand-assembled, following the x32-guard precedent
+    (`src/seccomp.rs:301-312`). `seccompiler` cannot express it. The
+    existing denylist stays exactly as it is and **must not** return
+    ERRNO for `connect` (precedence, Phase 0): `extra_deny` entries
+    `connect`/`socket` are rejected at profile validate with a message
+    pointing at this ADR.
+
+**Where the single listener is created (refined).** The listener is
+created **once per exec helper chain, not once per session**, because
+seccomp filters are inherited only across `fork()`/`clone()` — the exec
+helper `E` is forked by the **supervisor** (`start_helpers`), not by
+sandbox init, so `hisn exec` / `hisn attach` / `[[services]]` programs
+would otherwise never see the `USER_NOTIF` filter (Mashūra round-1
+finding 1, confirmed in `src/supervisor.rs`/`src/exec.rs`). The design
+is therefore: the supervisor spawns `E`, which installs the
+`connect`→`USER_NOTIF` filter with `NEW_LISTENER` (one filter, one
+listener per *exec tree* — `EBUSY` forbids a second listener in the
+same chain, H2) and sends the listener fd to the supervisor over the
+existing helper socketpair via `SCM_RIGHTS` (the `send_with_fd` idiom,
+`src/sys.rs:468-494`), **before** `helper_loop` starts accepting work.
+`E` itself never calls `connect()` after installing, so the filter
+never intercepts the helper's own traffic. init's main command follows
+the same pattern: init installs its own listener at
+`src/init.rs:150` (after caps drop, before `PR_SET_DUMPABLE=0`) and
+hands it to the supervisor over the `sup_end`/`init_end` socketpair.
+Two listeners per session (init's + each exec tree's) are distinct
+chains — the kernel's one-listener rule is per chain, not per session.
+A leak test for an **exec'd** program (not only the main command) is
+required (L103).
+
+## Policy format
+
+Profile TOML, under the existing `[net]` table (`src/profile.rs:382`):
+
+```toml
+[policy.session]
+network = "allowlist"        # none (default) | allowlist | open
+
+[net]
+mode = "allowlist"           # same value; [policy.session.network] wins on conflict (validate error if both, different)
+allow = [
+  "github.com:443",          # name + port  (DNS-pinned)
+  "*.example.com:443",       # one-label wildcard; see below
+  "192.0.2.10:443",          # explicit IP + port (no DNS involved)
+  "10.0.0.0/8:8080",         # CIDR + port
+  "pypi.org:443",
+]
+nameservers = ["1.1.1.1"]    # existing key; host resolver used when absent
+connect_deadline_s = 30      # default; decision 6
+```
+
+- Host entries: `name` or `*.suffix` + mandatory `:port` (or `:port1-port2`).
+  `*.suffix` matches exactly one label (`a.example.com`, not `example.com`
+  itself, not `a.b.example.com`); the bare name must be listed separately.
+- IP entries never go through DNS; a name that resolves to an IP needs
+  either the name listed or the IP/CIDR listed (rebinding guard from
+  ADR 0018 — a name may not smuggle in an unlisted address).
+- `open` ignores `allow`; an empty `allow` under `allowlist` means
+  deny-all (loopback/unix only) — stated on stderr at startup so it is
+  never a silent hole.
+- Defaults: mode `none`, deadline 30 s, resolver = host's.
+- What a seat/agent sees: nothing to configure. The effective policy is
+  readable via `hisn net explain <host[:port]>` (prints the decision the
+  supervisor *would* make for that target, using the same rule above —
+  no connection is attempted) and `hisn net status` (mode + allow list),
+  and every decision lands in the journal (`hisn journal --kind
+  network`). An agent that wants a host added asks the user to update
+  the profile; there is no self-serve widening (decision 9).
+
+## Connect flow and DNS flow
+
+Connect (allowlist/open), per notification:
+
+1. Supervisor polls the listener (`poll` 2 s, child-exit aware via
+   `waitid(WNOWAIT)`), receives the notification, dispatches it to a
+   worker (decision 6).
+2. `NOTIF_ID_VALID` **before** the read; opens a pidfd for
+   `notif.pid`; validates `addrlen` (`>= sizeof(sa_family_t)`,
+   `<= sizeof(sockaddr_storage)`, and the family-specific minimum for
+   `AF_INET`/`AF_INET6`) — out of range → `-EINVAL`. Reads the
+   `sockaddr` of the notified task with `process_vm_readv`, at most
+   `sizeof(sockaddr_storage)` bytes, **once**, into a private buffer
+   (B2; a racing rewrite after the read is harmless — the supervisor
+   acts on its copy). `NOTIF_ID_VALID` again before replying. If the
+   read fails (`EPERM`: the program set `PR_SET_DUMPABLE=0` after exec,
+   or host `ptrace_scope >= 2`) → reply `-EACCES`, journal
+   `refuse/read-failed`. Stated in the agent-facing docs: a
+   dumpable-0 program cannot be intercepted and gets refused.
+3. Reads `SO_TYPE` via `pidfd_getfd`+`getsockopt`; refuses any
+   non-`SOCK_STREAM` IP connect with `EACCES` (decision 4).
+4. Decides by family: `AF_INET`/`AF_INET6` (step 6), `AF_UNIX`
+   path/abstract (decision 5, **always** `CONTINUE`), everything else
+   → `EACCES`.
+5. Serves DNS: on `127.0.0.1:53` (UDP+TCP, bound pre-filter), answers
+   allowed names (forwarded to the host resolver; address list pinned
+   with TTL+60 s) and NXDOMAINs everything else. The pin store is the
+   allow check's name evidence.
+6. **Private-address block (Mashūra BLOCKING 4 — applies to `open`
+   too).** At connect time, in **both** modes, the supervisor refuses
+   loopback (`127.0.0.0/8`, `::1`), unspecified, multicast,
+   link-local (`169.254.0.0/16`, `fe80::/10`, incl. the metadata
+   address `169.254.169.254`), CGNAT (`100.64.0.0/10`), RFC1918, ULA
+   (`fc00::/7`), and IPv4-mapped forms of any of those, **unless** an
+   explicit IP/CIDR rule matches that exact target. A DNS pin alone
+   never authorises a non-public address. This is what stops `open`
+   from silently reaching host-loopback daemons: `open` is allow-all
+   *public*, not allow-all at all.
+7. On allow: copies socket options from the child's original socket
+   (`pidfd_getfd`; buffers halved) onto the new socket, connects
+   non-blocking from the host netns, injects with
+   `ADDFD|SETFD|SEND` (decision 7), replies 0 with the injected fd.
+   If the outbound connect fails, replies `-errno` from that connect
+   (`ECONNREFUSED`, `EHOSTUNREACH`, …), never a generic `EACCES`.
+   Non-blocking semantics are preserved: a non-blocking `connect()`
+   suspended in user-notif returns through the injected fd; the
+   client's `poll(POLLOUT)`/`SO_ERROR` behaves as with a normal
+   connected socket (Q3). Journal failure never blocks a verdict.
+8. IPv4 and IPv6 are handled identically; the sockaddr family comes
+   from the supervisor's copy. Deadline runs from dispatch (decision 6).
+
+Errors returned to the program: allow → 0 (connected); path unix not
+in view is **not** hisn's verdict — `CONTINUE` lets the kernel return
+`ENOENT` for a hidden path; IP not allowed / private / wrong family /
+non-stream → `EACCES`; deadline → `ETIMEDOUT`; supervisor died →
+`ENOSYS` (kernel, not hisn's choice); `ENETUNREACH` can only come from
+the netns itself (e.g. a rewritten loopback CONTINUE, C4), never from
+hisn's refusal.
+
+## Threat model
+
+Protects against: an agent exfiltrating to, or being redirected to,
+an arbitrary host (default deny); DNS rebinding (pins bound to TTL +
+grace, ports checked at connect; private/loopback/link-local addresses
+refused unless explicitly listed, even in `open`); a `sendto`-only
+exfiltration channel (none exists in the empty netns, case E); a
+resolver outside hisn's control (sandbox nsswitch/resolv.conf are
+hisn's, decision 3).
+
+Does not protect against: exfiltration through an *allowed* host (an
+allowlisted git host can read what the agent pushes — that is what
+allowlisting means); tunneling through allowed domains (DNS pinning
+pins the *address*, not the content — a connection to an allowed IP is
+a connection to that IP for any protocol); the `CONTINUE` TOCTOU race
+(C4: 22/2000 rewrites won) — harmless here because every rewritten
+address still resolves inside the empty netns (loopback, or a TEST-NET
+range with no route, or a path with no listener); the shared-Unix-user
+caveat (ADR 0021 decision A: a same-uid process can omit the
+credential, read the user's files, and race the supervisor's
+`process_vm_readv` — seats are attribution, not a boundary, and the
+journal is the audit trail, not the control).
+
+**Stated limitation (Mashūra BLOCKING 6).** With `CONTINUE`, any
+sandbox process can reach **any loopback endpoint visible in the
+sandbox** — an in-sandbox service's listener, the DNS responder at
+`127.0.0.1:53`, a forwarded path-unix socket (e.g. the ssh-agent proxy
+at `/run/ssh-agent.sock`, which the view intentionally contains) —
+regardless of the network mode's policy. Mount visibility (Phase 0)
+is the *only* gate for path sockets, and loopback is by design open
+inside the sandbox. The supervisor is not consulted for these, and
+does not pretend to be: `CONTINUE` is accepted as "the empty netns
+confines the damage, the filesystem view is the policy". If stronger
+loopback policy is wanted later, loopback must go through
+supervisor-mediated proxying like IP does — out of scope for v1 and
+stated here instead of claimed.
+
+## Control protocol and journal changes
+
+- Protocol revision bumps 3 → 4 (`src/sessionmeta.rs:43`): adds op
+  `net-policy-set {mode, allow[]}` (role `owner`, `src/authz.rs:115`)
+  and op `net-explain {target}` (role `member`, read-only).
+  `client.protocol_version` gating already exists; absent = rev 1,
+  higher declared → `E_VERSION`; older clients are unaffected (they
+  never send the new ops, and the supervisor never requires them).
+- `session.json` records `network_mode` beside the existing `network`
+  field (the profile value, kept for `ls --json` compatibility —
+  same compat rule as the 0.5.x plan: `ls --json` keeps emitting the
+  profile's value). `net/policy.json` (workspace state dir, 0600)
+  persists a runtime policy change across supervisor restarts;
+  `net-policy-set` is session-live *and* persisted, and the widened
+  policy is printed by `hisn net status`. A policy change never tears
+  down established connections (revocation is prospective only), and
+  the change is owner-only in the ADR 0021 sense — under the
+  shared-uid caveat that means "any same-uid process", stated plainly
+  (decision 9).
+- Journal: `network/connect` per decision (decision 8),
+  `network/policy-changed` on `net-policy-set`. New `Request` variants
+  must be added to the authz table (`src/authz.rs:141-190`) — the
+  exhaustive `Op` match fails to compile until they are. Journal write
+  failure never blocks a verdict (step 7 of the connect flow); the
+  journal has a size cap from day one (open question 3 resolved: the
+  cap ships with `open` in 0.6.0, not "later" — an un-capped
+  per-connect record is a disk-flood vector the sandboxed program
+  controls).
+
+## Kernel requirements
+
+| Feature | Minimum kernel | Effect if missing |
+|---|---|---|
+| `SECCOMP_FILTER_FLAG_NEW_LISTENER` | 4.14 | allowlist/open refuse to start |
+| `SECCOMP_RET_USER_NOTIF` | 4.14 | refuse |
+| `SECCOMP_IOCTL_NOTIF_ID_VALID` | 5.0 | refuse |
+| `SECCOMP_IOCTL_NOTIF_ADDFD` | 5.0 | refuse |
+| `SECCOMP_USER_NOTIF_FLAG_CONTINUE` | 5.5 | refuse |
+| `SECCOMP_ADDFD_FLAG_SEND` | 5.14 | two-step inject (`SETFD` + separate `NOTIF_SEND`), slower, same result |
+| `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` | 5.19 | not required (deadline + workers cover the hang) |
+
+Feature detection is by **attempting the ioctl/filter install** at
+startup and logging what was found — not by parsing `uname -r` (distro
+backports make the version string lie). Recommended minimum for a
+useful deployment: **5.14** (full design), floor **4.14** (`SETFD`,
+5.0, is the hard floor — below it there is no correct injection at
+all). The startup error names the first missing feature and its
+minimum kernel.
+
+## Test plan
+
+Leak-suite cases (named; `tests/leak/MANIFEST`), each with expected
+result:
+
+- `L90` allowlisted TCP reachable (curl through the mechanism)
+- `L91` non-allowlisted host refused (`EACCES`)
+- `L92` raw IP of a non-listed host refused
+- `L93` allowed name resolving to an unlisted private IP refused (rebinding guard)
+- `L94` DNS: `probe.test` resolves to the pinned address via the supervisor's responder (the unproven probe case, now a hisn gate)
+- `L95` DNS: unlisted name → NXDOMAIN
+- `L96` loopback listener inside the sandbox reached (CONTINUE)
+- `L97` host unix socket invisible (connect to `/run/...` fails `ENOENT` — the path does not exist in the view, not a net decision)
+- `L98` `sendto` to an outside address fails `ENETUNREACH` (no connect, no leak)
+- `L99` non-blocking connect + poll works through the mechanism
+- `L100` supervisor killed mid-connect: program gets `ENOSYS`, no hang
+- `L101` policy change mid-session affects only new connects, journaled
+- `L102` journal has a `network/connect` record per decision with seat attribution (attribution = the exec's `client` for `hisn exec` programs, `null` for the main command and in-sandbox services, which have no seat — the pid→exec mapping is the exec table's, stated here so it is not discovered by accident)
+- `L103` an **exec'd** program (not only the main command) is intercepted (the listener is per exec tree, where the listener is created (refined)) — `hisn exec curl` through the mechanism
+- `L104` `connect()` on a `SOCK_DGRAM` socket is refused `EACCES` in `open` and `allowlist`
+- `L105` a program that `bind()`s before `connect()` loses its local address (documented limitation, asserted)
+- `L106` a stalled upstream connect does not wedge unrelated connects (worker concurrency, decision 6)
+- `L107` host-loopback, link-local (incl. `169.254.169.254`-style), RFC1918 and ULA targets refused in `open` unless explicitly listed (the private-address block, connect-flow step 6)
+- `L108` an allowed name resolving to a private IP is refused (pins never authorise non-public addresses)
+- `L109` `AF_VSOCK` connect refused `EACCES` in all modes
+- `L110` dumpable-0 program (sets `PR_SET_DUMPABLE=0` after exec, before `connect`) gets `EACCES` (read fails closed), journaled
+- `L111` sandbox netns differs from the supervisor's (`/proc/self/ns/net` inode) — startup assertion, fails closed
+
+Host verification, one script `scripts/host-verify-network.sh` (run on a
+host with unprivileged userns, no hisn session): builds one session per
+mode, asserts L90–L111 against loopback/`192.0.2.0/24` listeners the
+script starts itself. **No traffic leaves the host.** L94 (DNS) is a
+**pre-merge host gate**, not a post-merge leak test: the script runs
+the real nsswitch hisn ships inside the sandbox, on a host whose own
+nsswitch is the rubin `resolve`-first one — so a pass proves the
+sandbox-local files, not the host's, do the work. The same gate covers
+H2 (second listener `EBUSY` measured cleanly) and the "supervisor polls
+a listener created in another thread group" case, both still pending
+from the probe.
+
+## Rollout
+
+- **0.6.0 — `open` + interception, no allowlist.** Mode plumbing
+  (including `CLONE_NEWNET` for the new modes, the netns-difference
+  startup assertion, and the exec-tree listener placement), hand-written
+  BPF filter, worker-based supervisor, DNS responder (allow-all
+  forward), connect-time private-address block (decision: `open` is
+  allow-all *public* from day one — the blocklist ships with `open`,
+  not with allowlist, or `open` trains users to equate it with host
+  networking), journal records with the size cap, startup feature
+  probing. Smallest useful step: an agent gets outbound TCP; `none`
+  unchanged; default unchanged.
+- **0.7.0 — `allowlist`** (DNS pinning, policy format, `net-policy-set`,
+  `net explain`, leak cases L90–L111). `network = "host"` deprecated
+  alias for `open` with a validate warning.
+
+## Open questions for Valon
+
+1. **Does `open` (allow-all public, fully journaled) satisfy the
+   remote-node multi-agent case, or is allowlist required from day one?**
+   Recommendation: ship `open` first (0.6.0) — it is the mechanism proof;
+   allowlist is a policy table on top of it.
+2. **Should `network = "host"` keep working after 0.7.0 (alias), or break?**
+   Recommendation: alias for one release with a deprecation warning,
+   then reject — it is the only mode that shares the host netns, and
+   this ADR's whole point is never to.
+3. **Per-seat netns for `ask`-style per-agent approval later** (PLAN-0.5
+   O3)? Recommendation: out of scope for this ADR; session-level policy
+   + per-decision seat attribution (decision 8) is enough for v1.
+
+## Review record
+
+Mashūra round 1 (open questions: "What is missing or wrong in this
+design? Where can it fail open? What would an agent other than Wakil
+stumble over?") returned BLOCKING findings from all three panel
+members; the same three arrived independently: **exec-tree listener
+placement**, **DNS responder process/ownership**, **UDP `connect()`
+fail-open**, plus **host-loopback/private reachability in `open`**,
+**unspecified address families**, **CONTINUE TOCTOU scope**,
+**`SETFD` missing**, and **deadline ≠ wedged supervisor**. All were
+incorporated above (decisions 1–7, connect-flow steps 1–8, threat-model
+limitation, L103–L111). Round 2 was not needed — the panel converged
+and the fixes are additive and scoped. Non-blocking notes, listed as
+open points:
+
+- `hisn net explain` cannot know live pins without an RPC to the
+  running supervisor; specified as: `net-explain` is an op on the
+  running session (static approximation when no session is running).
+- `/etc/hosts` entries bypass DNS by design (`files` first); they are
+  not DNS-pinned and need explicit IP/CIDR rules in `allow` — stated,
+  not fixed, because `files` is how local names should work.
+- DoH/custom-resolver tools break under `allowlist` while
+  system-resolver tools work; documented (allowlist effectively
+  mandates the system resolver). QUIC/HTTP3 tools that hard-fail
+  instead of falling back are a documented L104 limitation, not
+  silently assumed to fall back.
+- `hisn net explain`/`net status` are host-side commands (in-sandbox
+  peers are refused by `authorize_peer`); in-sandbox agents see only
+  `EACCES`/`NXDOMAIN` and the journal is the explanation path.

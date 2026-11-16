@@ -106,7 +106,7 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     if let Err(e) = rustix::system::sethostname(cfg.policy.hostname.as_bytes()) {
         tracing::warn!("sethostname failed (non-fatal): {e}");
     }
-    if cfg.policy.network == Network::None {
+    if cfg.policy.network != Network::Host {
         loopback_up().context("bringing up lo")?;
     }
     rootfs::enter(&cfg.root_dir)?;

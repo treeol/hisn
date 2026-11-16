@@ -100,6 +100,7 @@ pub struct ImportArgs {
 pub enum NetworkArg {
     None,
     Host,
+    Open,
 }
 
 #[derive(Debug, Args)]

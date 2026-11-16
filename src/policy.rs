@@ -41,6 +41,7 @@ fn invalid(key: &str, reason: impl Into<String>) -> PolicyError {
 pub enum Network {
     None,
     Host,
+    Open,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -466,6 +467,16 @@ impl Policy {
                 return Err(invalid(
                     "seccomp.extra_deny",
                     format!("{s:?} is not a syscall name"),
+                ));
+            }
+            if s == "connect" || s == "socket" {
+                return Err(invalid(
+                    "seccomp.extra_deny",
+                    format!(
+                        "{s:?} cannot be denied via extra_deny; \
+                         network interception is governed by ADR 0022 `network` modes \
+                         (ERRNO outranks USER_NOTIF, so a deny would break connect interception)"
+                    ),
                 ));
             }
         }

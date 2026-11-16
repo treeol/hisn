@@ -16,6 +16,7 @@ pub mod journal;
 pub mod landlock;
 pub mod lifecycle;
 pub mod mounts;
+pub mod notif;
 pub mod policy;
 pub mod profile;
 pub mod registry;

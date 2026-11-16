@@ -291,6 +291,7 @@ impl HostFacts {
         // With a rootfs, the resolver is still the rootfs's own
         // `etc/resolv.conf` (copied verbatim, never through a symlink), as
         // before 0.3.3.
+        // NOTE: Open also gets none (phase 3 will generate hisn's resolv.conf).
         let resolv_conf: Option<Result<String, String>> =
             if policy.network != crate::policy::Network::Host {
                 None

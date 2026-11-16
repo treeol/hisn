@@ -2165,6 +2165,7 @@ pub fn prepare(args: &RunArgs, uid: u32) -> Result<Prepared> {
         network: args.network.map(|n| match n {
             crate::cli::NetworkArg::None => Network::None,
             crate::cli::NetworkArg::Host => Network::Host,
+            crate::cli::NetworkArg::Open => Network::Open,
         }),
         home_persist: args
             .home_persist
@@ -2764,6 +2765,7 @@ fn run_supervisor_inner(
             match policy.network {
                 Network::None => "none",
                 Network::Host => "host",
+                Network::Open => "open",
             },
         );
         meta.env_declared = declared_env_disk.clone();
@@ -3376,6 +3378,29 @@ fn prepare_session_env(a: &mut PrepareEnvArgs<'_>, rules: &mut Rules) -> Result<
     })
 }
 
+/// Yama ptrace_scope parse: true = must refuse (fail closed if >= 2).
+pub fn yama_refuse(content: &str) -> bool {
+    content
+        .trim()
+        .parse::<i32>()
+        .map(|v| v >= 2)
+        .unwrap_or(false)
+}
+
+fn check_yama_ptrace_scope() -> Result<()> {
+    const PATH: &str = "/proc/sys/kernel/yama/ptrace_scope";
+    match fs::read_to_string(PATH) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Ok(()), // absent/unreadable: fine per brief
+        Ok(c) if yama_refuse(&c) => bail!(
+            "refusing to start: Yama ptrace_scope >= 2 breaks process_vm_readv \
+             (kernel/yama/ptrace_scope={}); set it to 0 or 1",
+            c.trim()
+        ),
+        Ok(_) => Ok(()),
+    }
+}
+
 /// Phase `namespaces`: userns S, init clone, namespace fds, GO/READY.
 struct Namespaces {
     pid: i32,
@@ -3403,8 +3428,12 @@ fn start_namespaces(
         | libc::CLONE_NEWPID
         | libc::CLONE_NEWIPC
         | libc::CLONE_NEWUTS;
-    if cfg.policy.network == Network::None {
+    if cfg.policy.network != Network::Host {
         flags |= libc::CLONE_NEWNET;
+    }
+    // Abort early for open mode (Yama >= 2 breaks process_vm_readv -> fail closed).
+    if cfg.policy.network == Network::Open {
+        check_yama_ptrace_scope()?;
     }
     // SAFETY: single-threaded; the child immediately enters `init_main`,
     // which never returns into the supervisor's state.
@@ -3428,7 +3457,7 @@ fn start_namespaces(
     let ns_ipc = open_ns(pid, "ipc")?;
     let ns_uts = open_ns(pid, "uts")?;
     let ns_pid = open_ns(pid, "pid")?;
-    let ns_net = if cfg.policy.network == Network::None {
+    let ns_net = if cfg.policy.network != Network::Host {
         Some(open_ns(pid, "net")?)
     } else {
         None
@@ -4101,6 +4130,16 @@ pub fn client_request(session_arg: &str, req: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::{ClientInfo, ConnRegistry};
+
+    #[test]
+    fn yama_refuse_parse() {
+        assert!(super::yama_refuse("2\n"));
+        assert!(super::yama_refuse("3"));
+        assert!(!super::yama_refuse("0"));
+        assert!(!super::yama_refuse("1\n"));
+        assert!(!super::yama_refuse(""));
+        assert!(!super::yama_refuse("garbage"));
+    }
 
     #[test]
     fn polish2_real_exec_writers_render_one_compact_line() {

@@ -4038,34 +4038,6 @@ else
   skip "L89 seats with credentials and roles" "hisn check failed (no userns)"
 fi
 
-# Every id in MANIFEST must produce at least one line. A missing id means
-# the test was silently dropped from the suite — FAIL.
-MANIFEST="$HERE/MANIFEST"
-if [ -f "$MANIFEST" ]; then
-  EMITTED=$(printf '%s\n' "$OUTPUT_LOG" | sed -n 's/^\(L[0-9][0-9]*[a-z]*\)\([^0-9a-z].*\)\{0,1\}$/\1/p' | sort -u)
-  MISSING=""
-  while IFS= read -r id; do
-    [ -z "$id" ] && continue
-    case "$id" in \#*) continue ;; esac
-    case "$id" in
-      *": "*)
-        # "L17b: text" -- a line of test L17b whose name contains "text".
-        want_id=${id%%: *} want_txt=${id#*: }
-        printf '%s\n' "$OUTPUT_LOG" | grep -F -- "$want_id " | grep -qF -- "$want_txt" ||
-          { fail "manifest $id" "no $want_id line containing [$want_txt] (check silently dropped?)"; }
-        ;;
-      *)
-        printf '%s\n' "$EMITTED" | grep -qxF "$id" || MISSING="$MISSING $id"
-        ;;
-    esac
-  done <"$MANIFEST"
-  if [ -n "$MISSING" ]; then
-    for id in $MISSING; do
-      fail "manifest $id" "test id $id produced no line (silently dropped?)"
-    done
-  fi
-fi
-
 # === 0.6.0 network cases (ADR 0022 rollout subset; L90-L93/L95/L101/L108
 # are 0.7.0 allowlist). Each needs a session with network="open" plus a
 # host-side TCP listener the case starts itself (hermetic: 192.0.2.1/24
@@ -4249,6 +4221,35 @@ except OSError as e:
     skip "$LID hermetic socket case" "asserted by scripts/host-verify-network.sh (host gate), not by the leak harness"
   done
   net_stop_listener
+fi
+
+# Every id in MANIFEST must produce at least one line. This runs AFTER
+# the 0.6.0 block (which emits L94/L96-L111) — the previous position,
+# before that block, made L106/L107/L109/L110/L111 permanently
+# "missing" even when they ran.
+MANIFEST="$HERE/MANIFEST"
+if [ -f "$MANIFEST" ]; then
+  EMITTED=$(printf '%s\n' "$OUTPUT_LOG" | sed -n 's/^\(L[0-9][0-9]*[a-z]*\)\([^0-9a-z].*\)\{0,1\}$/\1/p' | sort -u)
+  MISSING=""
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    case "$id" in \#*) continue ;; esac
+    case "$id" in
+      *": "*)
+        want_id=${id%%: *} want_txt=${id#*: }
+        printf '%s\n' "$OUTPUT_LOG" | grep -F -- "$want_id " | grep -qF -- "$want_txt" ||
+          { fail "manifest $id" "no $want_id line containing [$want_txt] (check silently dropped?)"; }
+        ;;
+      *)
+        printf '%s\n' "$EMITTED" | grep -qxF "$id" || MISSING="$MISSING $id"
+        ;;
+    esac
+  done <"$MANIFEST"
+  if [ -n "$MISSING" ]; then
+    for id in $MISSING; do
+      fail "manifest $id" "test id $id produced no line (silently dropped?)"
+    done
+  fi
 fi
 
 # ----------------------------------------------------------------- summary

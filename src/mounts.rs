@@ -426,9 +426,13 @@ pub fn etc_masked(name: &str) -> bool {
 }
 
 /// Entries of `/etc` that are generated, never bound from the host.
-/// (`resolv.conf` is generated only for `network = "host"`; otherwise absent.)
-fn etc_generated(name: &str) -> bool {
-    matches!(name, "passwd" | "group" | "resolv.conf" | "nsswitch.conf")
+/// `resolv.conf` is generated for `network = "host"` and `"open"` and is
+/// absent for `"none"`. `nsswitch.conf` is generated only for `"open"`
+/// (ADR 0022); in `"none"` and `"host"` it is the host's (or the
+/// rootfs's) own file, bound like any other entry, exactly as in 0.5.1.
+fn etc_generated(name: &str, network: crate::policy::Network) -> bool {
+    matches!(name, "passwd" | "group" | "resolv.conf")
+        || (name == "nsswitch.conf" && network == crate::policy::Network::Open)
 }
 
 fn depth(p: &Path) -> usize {
@@ -550,7 +554,7 @@ pub fn plan(
         },
     ));
     for (name, kind) in &facts.etc {
-        if etc_masked(name) || etc_generated(name) {
+        if etc_masked(name) || etc_generated(name, policy.network) {
             continue;
         }
         let p = Path::new("/etc").join(name);
@@ -634,7 +638,7 @@ pub fn plan(
                 None => return Err(PlanError::EtcOverlap { path: p.clone() }),
                 Some(c) => {
                     let name = c.as_os_str().to_string_lossy().into_owned();
-                    if etc_masked(&name) || etc_generated(&name) {
+                    if etc_masked(&name) || etc_generated(&name, policy.network) {
                         return Err(PlanError::MaskedEtcOverlap {
                             path: p.clone(),
                             entry: name,
@@ -1099,6 +1103,41 @@ mod tests {
         let tmp = find(&ops, "/tmp").unwrap();
         let expected = 512u64 << 20;
         assert!(matches!(tmp.kind, MountKind::Tmpfs { size, .. } if size == expected));
+    }
+
+    #[test]
+    fn nsswitch_conf_is_generated_only_in_open_mode() {
+        // none and host keep the host's own /etc/nsswitch.conf, bound
+        // read-only like every other /etc entry (as in 0.5.1); only open
+        // replaces it and adds the loopback resolv.conf.
+        let mut f = facts();
+        f.etc.insert("nsswitch.conf".into(), EntryKind::File);
+        f.resolv_conf = Some(Ok("nameserver 1.1.1.1\n".into()));
+        for network in [Network::None, Network::Host] {
+            let mut p = pol("/work/p");
+            p.network = network;
+            let ops = plan(&p, &f, &[]).unwrap();
+            assert_eq!(
+                find(&ops, "/etc/nsswitch.conf").map(|o| &o.kind),
+                Some(&MountKind::BindRo { recursive: true }),
+                "{network:?}"
+            );
+        }
+        let mut p = pol("/work/p");
+        p.network = Network::Open;
+        let ops = plan(&p, &f, &[]).unwrap();
+        assert_eq!(
+            find(&ops, "/etc/nsswitch.conf").unwrap().kind,
+            MountKind::Generated {
+                content: "hosts: files dns\npasswd: files\ngroup: files\n".into()
+            }
+        );
+        assert_eq!(
+            find(&ops, "/etc/resolv.conf").unwrap().kind,
+            MountKind::Generated {
+                content: "nameserver 127.0.0.1\n".into()
+            }
+        );
     }
 
     #[test]

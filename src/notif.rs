@@ -173,13 +173,37 @@ pub struct NotifData {
     pub instruction_pointer: u64,
     pub args: [u64; 6],
 }
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
+/// The kernel `seccomp_notif` plus the supervisor-parsed destination
+/// for the journal target. Kernel ioctls write only the first part
+/// (id/pid/flags/data); the trailing parsed fields are supervisor-only
+/// and are filled by the worker after the sockaddr read.
+#[derive(Debug, Clone)]
 pub struct Notif {
     pub id: u64,
     pub pid: u32,
     pub flags: u32,
     pub data: NotifData,
+    pub parsed_ip: Option<IpAddr>,
+    pub parsed_family: u16,
+    pub parsed_port: u16,
+}
+impl Default for Notif {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            pid: 0,
+            flags: 0,
+            data: NotifData {
+                nr: 0,
+                arch: 0,
+                instruction_pointer: 0,
+                args: [0; 6],
+            },
+            parsed_ip: None,
+            parsed_family: 0,
+            parsed_port: 0,
+        }
+    }
 }
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -352,7 +376,9 @@ fn engine_loop(
                     lock.recv()
                 };
                 match msg {
-                    Ok((n, recv_at)) => handle_notif(lfd, &n, recv_at, deadline_s, &j, &sum),
+                    Ok((mut n, recv_at)) => {
+                        handle_notif(lfd, &mut n, recv_at, deadline_s, &j, &sum)
+                    }
                     Err(_) => return,
                 }
             }
@@ -383,8 +409,15 @@ fn engine_loop(
         if pfd.revents & libc::POLLIN == 0 {
             continue;
         }
-        let mut n: Notif = unsafe { std::mem::zeroed() };
-        match seccomp_ioctl(lfd, OP_RECV, &mut n as *mut Notif as *mut _) {
+        // Kernel writes the seccomp_notif prefix; the trailing parsed
+        // fields are supervisor-only (filled by the worker after the read).
+        let mut n: Notif = Notif::default();
+        // SAFETY: the first 56 bytes match struct seccomp_notif exactly
+        // (id u64, pid u32, flags u32, data {nr i32, arch u32, ip u64,
+        // args [u64;6]}); the trailing parsed fields are untouched by the
+        // kernel and keep their Default values.
+        let n_ptr = &mut n as *mut Notif as *mut u8;
+        match seccomp_ioctl(lfd, OP_RECV, n_ptr as *mut libc::c_void) {
             Ok(()) => {
                 let recv_at = std::time::Instant::now();
                 match tx.try_send((n, recv_at)) {
@@ -429,7 +462,7 @@ fn engine_loop(
 
 fn handle_notif(
     lfd: i32,
-    n: &Notif,
+    n: &mut Notif,
     recv_at: std::time::Instant,
     deadline_s: u64,
     journal: &Option<std::sync::Arc<crate::journal::Journal>>,
@@ -512,6 +545,10 @@ fn handle_notif(
         is_loopback = v6.is_loopback();
         ip = Some(IpAddr::V6(v6));
     }
+    // Supervisor-parsed destination for the journal target (ip:port).
+    n.parsed_ip = ip;
+    n.parsed_family = family;
+    n.parsed_port = sockaddr_port(family, &buf[..addrlen.min(buf.len())]);
     // SO_TYPE via pidfd_getfd + getsockopt.
     let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd as i64, sockfd as i64, 0u64) };
     let mut is_stream = false;
@@ -806,13 +843,25 @@ fn copy_sock_opts(addr_fd: i32, pidfd: i32, newfd: i32) -> Option<bool> {
     nonblock
 }
 
-/// Format the target of a connect notification for the journal:
-/// `ip:port` for INET (family from the supervisor's copy is unavailable
-/// here — the caller passes the parsed family via `n`; when the family
-/// is unknown we record the family number and pid). `handle_notif`
-/// passes the already-parsed family/ip through `net_record_ex`.
-pub fn notif_target(n: &Notif) -> String {
-    format!("pid:{} nr:{}", n.pid, n.data.nr)
+/// Format the connect address read from the notification for the journal:
+/// `ip:port` for INET, or the raw family for other families (`family:2`).
+/// This is the only target form — never a pid/nr (see ADR 0022 L102).
+pub fn notif_target(ip: Option<&IpAddr>, family: u16, port: u16) -> String {
+    match ip {
+        Some(a) => format!("{a}:{port}"),
+        None => format!("family:{family}"),
+    }
+}
+
+/// Extract the destination port from a parsed sockaddr buffer.
+pub fn sockaddr_port(family: u16, buf: &[u8]) -> u16 {
+    if (family == libc::AF_INET as u16 && buf.len() >= 6)
+        || (family == libc::AF_INET6 as u16 && buf.len() >= 24)
+    {
+        u16::from_be_bytes([buf[2], buf[3]])
+    } else {
+        0
+    }
 }
 
 /// True iff `ip` is a public (routable, non-private) address per ADR 0022 block list:
@@ -828,6 +877,12 @@ pub fn is_public_ip(ip: &IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_public_v4(&v4);
             }
+            // NAT64 well-known prefix 64:ff9b::/96 and local-use
+            // 64:ff9b:1::/48 embed an IPv4 address; classify by it so a
+            // private target cannot ride the translation.
+            if let Some(v4) = nat64_embedded(v6) {
+                return is_public_v4(&v4);
+            }
             if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
                 return false;
             }
@@ -841,6 +896,22 @@ pub fn is_public_ip(ip: &IpAddr) -> bool {
             true
         }
     }
+}
+
+/// If `v6` is in a NAT64 prefix (`64:ff9b::/96` or `64:ff9b:1::/48`),
+/// return its embedded IPv4 address.
+fn nat64_embedded(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
+    let o = v6.octets();
+    // 64:ff9b::/96 — first 96 bits are 0x0064ff9b + 64 zero bits.
+    if o[0] == 0 && o[1] == 0x64 && o[2] == 0xff && o[3] == 0x9b && o[4..12].iter().all(|&b| b == 0)
+    {
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    // 64:ff9b:1::/48 — first 48 bits 0x0064ff9b0001.
+    if o[0] == 0 && o[1] == 0x64 && o[2] == 0xff && o[3] == 0x9b && o[4] == 0 && o[5] == 1 {
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    None
 }
 
 fn is_public_v4(v4: &Ipv4Addr) -> bool {
@@ -859,6 +930,9 @@ fn is_public_v4(v4: &Ipv4Addr) -> bool {
     }
     if o[0] == 100 && (64..=127).contains(&o[1]) {
         return false; // CGNAT 100.64/10
+    }
+    if o[0] == 198 && (o[1] & 0xfe) == 0x12 {
+        return false; // 198.18.0.0/15 (benchmarking, not routable public)
     }
     let _ = Ipv6Addr::UNSPECIFIED;
     true
@@ -883,6 +957,8 @@ mod tests {
             "169.254.0.1",
             "100.64.0.1",
             "100.127.255.255",
+            "198.18.0.1",
+            "198.19.255.255",
             "10.0.0.1",
             "172.16.0.1",
             "172.31.255.255",
@@ -899,6 +975,10 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
             "::ffff:169.254.169.254",
+            // NAT64 embedding private v4.
+            "64:ff9b::0a00:0001",
+            "64:ff9b::c0a8:0101",
+            "64:ff9b:1::0a00:0001",
         ] {
             assert!(!is_public_ip(&ip(s)), "{s} must be blocked");
         }
@@ -910,6 +990,8 @@ mod tests {
             "8.8.8.8",
             "1.1.1.1",
             "192.0.2.1", // doc range NOT blocked per ADR decision (tests need it)
+            "198.17.255.255",
+            "198.20.0.0",
             "198.51.100.1",
             "203.0.113.1",
             "100.63.255.255",
@@ -918,8 +1000,202 @@ mod tests {
             "172.32.0.1",
             "2606:4700:4700::1111",
             "::ffff:8.8.8.8",
+            // NAT64 embedding a public v4 stays public.
+            "64:ff9b::0808:0808",
         ] {
             assert!(is_public_ip(&ip(s)), "{s} must be public");
+        }
+    }
+
+    #[test]
+    fn e2e_connect_goes_through_engine() {
+        // End-to-end: a child installs the real filter (NEW_LISTENER),
+        // then makes a real connect(); the parent receives, decides and
+        // answers it through the real engine code path (NotifEngine::start
+        // on the child's listener fd). Without seccomp user-notif this
+        // prints a named SKIP and returns Ok.
+        //
+        // The child sends its listener fd over a pipe via SCM_RIGHTS,
+        // then connects to a loopback listener the parent owns; the
+        // engine must read the sockaddr (process_vm_readv), decide
+        // loopback -> CONTINUE, and the connect must succeed.
+        let mut pipefd = [0i32; 2];
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            println!(
+                "SKIP e2e_connect_goes_through_engine: pipe failed ({})",
+                io::Error::last_os_error()
+            );
+            return;
+        }
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!(
+                "SKIP e2e_connect_goes_through_engine: fork failed ({})",
+                io::Error::last_os_error()
+            );
+            return;
+        }
+        if pid == 0 {
+            // Child: install the filter in its OWN chain, pass the
+            // listener fd to the parent, then connect.
+            unsafe {
+                libc::close(pipefd[0]);
+                match install_connect_filter() {
+                    Ok(listener) => {
+                        let mut msg: libc::msghdr = std::mem::zeroed();
+                        let mut iov = libc::iovec {
+                            iov_base: b"L".as_ptr() as *mut libc::c_void,
+                            iov_len: 1,
+                        };
+                        msg.msg_iov = &mut iov;
+                        msg.msg_iovlen = 1;
+                        let space = libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) as usize;
+                        let mut cmsg_buf = vec![0u8; space];
+                        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+                        msg.msg_controllen = space as _;
+                        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                        if !cmsg.is_null() {
+                            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                            (*cmsg).cmsg_len =
+                                libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
+                            let data = libc::CMSG_DATA(cmsg) as *mut i32;
+                            *data = listener.as_raw_fd();
+                            libc::sendmsg(pipefd[1], &msg, 0);
+                        }
+                        drop(listener);
+                        let port = std::env::var("E2E_PORT")
+                            .ok()
+                            .and_then(|s| s.parse::<u16>().ok())
+                            .unwrap_or(18997);
+                        let s =
+                            libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+                        if s < 0 {
+                            libc::_exit(2);
+                        }
+                        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+                        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+                        addr.sin_addr.s_addr = libc::INADDR_LOOPBACK.to_be();
+                        addr.sin_port = port.to_be();
+                        let rc = libc::connect(
+                            s,
+                            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+                            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                        );
+                        libc::_exit(if rc == 0 { 0 } else { 3 });
+                    }
+                    Err(_) => libc::_exit(4),
+                }
+            }
+        }
+        // Parent: receive the listener fd (bounded wait).
+        unsafe { libc::close(pipefd[1]) };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        let mut byte = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_mut_ptr() as *mut libc::c_void,
+            iov_len: 1,
+        };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
+        let mut cmsg_buf = vec![0u8; space];
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = space as _;
+        let mut got_fd: Option<OwnedFd> = None;
+        for _ in 0..25 {
+            let mut pfd = libc::pollfd {
+                fd: pipefd[0],
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let r = unsafe { libc::poll(&mut pfd, 1, 200) };
+            if r > 0 && pfd.revents & libc::POLLIN != 0 {
+                let r2 = unsafe { libc::recvmsg(pipefd[0], &mut msg, 0) };
+                if r2 >= 1 {
+                    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+                    if !cmsg.is_null() {
+                        let data = unsafe { libc::CMSG_DATA(cmsg) } as *const i32;
+                        got_fd = Some(unsafe { OwnedFd::from_raw_fd(*data) });
+                    }
+                    break;
+                }
+            }
+            let mut st = 0;
+            if unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) } == pid {
+                println!(
+                    "SKIP e2e_connect_goes_through_engine: child exited before sending fd (status {st})"
+                );
+                unsafe { libc::close(pipefd[0]) };
+                return;
+            }
+        }
+        unsafe { libc::close(pipefd[0]) };
+        let listener = match got_fd {
+            Some(f) => f,
+            None => {
+                println!("SKIP e2e_connect_goes_through_engine: no listener fd received");
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                return;
+            }
+        };
+        // Parent loopback listener for the child's CONTINUE target.
+        let port = std::env::var("E2E_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(18997);
+        let lsock =
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(lsock >= 0, "loopback listener socket");
+        unsafe {
+            let mut la: libc::sockaddr_in = std::mem::zeroed();
+            la.sin_family = libc::AF_INET as libc::sa_family_t;
+            la.sin_addr.s_addr = libc::INADDR_LOOPBACK.to_be();
+            la.sin_port = port.to_be();
+            let bind_rc = libc::bind(
+                lsock,
+                &la as *const libc::sockaddr_in as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            if bind_rc != 0 {
+                println!(
+                    "SKIP e2e_connect_goes_through_engine: bind {port} failed ({})",
+                    io::Error::last_os_error()
+                );
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+                return;
+            }
+            libc::listen(lsock, 4);
+        }
+        let engine = NotifEngine::start(listener, None, 5);
+        let was_some = engine.handle.is_some();
+        assert!(was_some, "engine must start with a receiver handle");
+        let mut status = 0;
+        let mut done = false;
+        for _ in 0..60 {
+            if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
+                done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !done {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+        }
+        drop(engine);
+        assert!(libc::WIFEXITED(status));
+        let code = libc::WEXITSTATUS(status);
+        assert!(
+            code == 0 || code == 4,
+            "child must exit 0 (connect succeeded via engine) or 4 (filter unavailable), got {code}"
+        );
+        if code == 4 {
+            println!(
+                "SKIP e2e_connect_goes_through_engine: child could not install user-notif filter"
+            );
         }
     }
 

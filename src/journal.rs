@@ -272,10 +272,11 @@ impl Journal {
     /// `verdict` is allow/refuse/continue/dns; `reason` is a short
     /// machine-readable cause. Seat attribution is None in 0.6.0 (the
     /// exec-table mapping is 0.7.0; L102 records session + target +
-    /// verdict + reason). `target` is the `ip:port` (or family) read
-    /// from the notification, when known.
+    /// verdict + reason). `target` is the `ip:port` (or family) parsed
+    /// from the notification's sockaddr by the supervisor.
     pub fn net_record(&self, verdict: &str, reason: &str, n: &crate::notif::Notif) {
-        let target = crate::notif::notif_target(n);
+        let target =
+            crate::notif::notif_target(n.parsed_ip.as_ref(), n.parsed_family, n.parsed_port);
         let data = serde_json::json!({
             "target": target,
             "notif_id": n.id,

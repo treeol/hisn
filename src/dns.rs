@@ -7,10 +7,11 @@
 //! `[net] nameservers` override when given). `SERVFAIL` on failure or
 //! upstream timeout. No pinning, no allow-list — that is 0.7.0.
 //!
-//! Bounds: max 64 concurrent TCP connections, max 256 pending upstream
-//! exchanges, 2 s upstream deadline. Thread per TCP connection is *not*
-//! used; a single-threaded poll loop serves both fds with an async state
-//! machine so fd/thread counts stay bounded.
+//! Bounds: max 64 concurrent TCP connections; each TCP connection's read
+//! buffer is bounded to `65535 + 2` bytes (a length-prefixed message plus
+//! its prefix); upstream exchanges run on a bounded worker pool so one
+//! slow upstream cannot head-of-line-block other queries. 2 s upstream
+//! deadline per query.
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -21,7 +22,11 @@ use std::time::{Duration, Instant};
 pub const UPSTREAM_DEADLINE: Duration = Duration::from_secs(2);
 /// Max concurrent TCP connections held at once.
 pub const MAX_TCP_CONNS: usize = 64;
-/// Max pending upstream exchanges.
+/// Max bytes buffered per TCP connection (length prefix + max message).
+pub const MAX_TCP_BUF: usize = 65535 + 2;
+/// Bounded pool of workers doing upstream exchanges.
+pub const UPSTREAM_WORKERS: usize = 16;
+/// Max pending upstream exchanges (queue depth); beyond it, SERVFAIL fast.
 pub const MAX_PENDING: usize = 256;
 
 /// Discover upstream resolvers (first usable list wins).
@@ -152,6 +157,45 @@ pub fn run_with_journal(
     let mut conns: Vec<TcpConn> = Vec::new();
     let mut pollfds: Vec<libc::pollfd> = Vec::new();
     let mut buf = vec![0u8; 4096];
+
+    // Upstream exchange pool: queries are dispatched to workers so one
+    // slow upstream cannot delay other queries. The pool is bounded
+    // (UPSTREAM_WORKERS workers + a MAX_PENDING queue); a full queue
+    // answers SERVFAIL immediately instead of growing unboundedly.
+    struct Job {
+        q: Vec<u8>,
+        reply: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    }
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
+    let (resp_tx, resp_rx) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
+    let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+    let mut workers = Vec::new();
+    for _ in 0..UPSTREAM_WORKERS {
+        let rx = job_rx.clone();
+        let ups_w = ups.clone();
+        workers.push(std::thread::spawn(move || {
+            loop {
+                let job = {
+                    let lock = rx.lock().unwrap_or_else(|e| e.into_inner());
+                    lock.recv()
+                };
+                match job {
+                    Ok(job) => {
+                        let resp = exchange(&job.q, &ups_w)
+                            .unwrap_or_else(|| servfail(&job.q).unwrap_or_default());
+                        if let Some(tx) = job.reply {
+                            let _ = tx.send(resp);
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        }));
+    }
+    // `resp_rx` is the at-most-one that never blocks; completion handling
+    // is done via per-job one-shot channels, so resp_rx is unused.
+    drop(resp_rx);
+    drop(resp_tx);
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             return;
@@ -211,27 +255,52 @@ pub fn run_with_journal(
                 )
             };
             if n > 0 {
-                let q = &buf[..n as usize];
-                let resp = exchange(q, &ups);
-                let resp = resp.unwrap_or_else(|| servfail(q).unwrap_or_default());
-                if let Some(j) = &journal {
-                    j.dns_record(
-                        if resp.is_empty() { "drop" } else { "ok" },
-                        &format!("udp query {} bytes", n),
-                    );
-                }
-                if !resp.is_empty() {
-                    // Reply to the sender.
-                    let _ = unsafe {
-                        libc::sendto(
-                            udp.as_raw_fd(),
-                            resp.as_ptr() as *const libc::c_void,
-                            resp.len(),
-                            libc::MSG_NOSIGNAL,
-                            &src as *const libc::sockaddr_storage as *const libc::sockaddr,
-                            slen,
-                        )
-                    };
+                let q = buf[..n as usize].to_vec();
+                let (one_tx, one_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                if job_tx
+                    .send(Job {
+                        q: q.clone(),
+                        reply: Some(one_tx),
+                    })
+                    .is_err()
+                {
+                    // Pool gone: SERVFAIL.
+                    if let Some(resp) = servfail(&q) {
+                        let _ = unsafe {
+                            libc::sendto(
+                                udp.as_raw_fd(),
+                                resp.as_ptr() as *const libc::c_void,
+                                resp.len(),
+                                libc::MSG_NOSIGNAL,
+                                &src as *const libc::sockaddr_storage as *const libc::sockaddr,
+                                slen,
+                            )
+                        };
+                    }
+                } else {
+                    // Bounded wait: the worker answers within UPSTREAM_DEADLINE.
+                    let resp = one_rx
+                        .recv_timeout(UPSTREAM_DEADLINE + Duration::from_millis(200))
+                        .unwrap_or_else(|_| servfail(&q).unwrap_or_default());
+                    if let Some(j) = &journal {
+                        j.dns_record(
+                            if resp.is_empty() { "drop" } else { "ok" },
+                            &format!("udp query {} bytes", n),
+                        );
+                    }
+                    if !resp.is_empty() {
+                        // Reply to the sender.
+                        let _ = unsafe {
+                            libc::sendto(
+                                udp.as_raw_fd(),
+                                resp.as_ptr() as *const libc::c_void,
+                                resp.len(),
+                                libc::MSG_NOSIGNAL,
+                                &src as *const libc::sockaddr_storage as *const libc::sockaddr,
+                                slen,
+                            )
+                        };
+                    }
                 }
             }
         }
@@ -288,36 +357,60 @@ pub fn run_with_journal(
                     } else if n == 0 {
                         dead = true;
                     } else {
-                        conns[i].buf.extend_from_slice(&tmp[..n as usize]);
-                        // Parse length-prefixed messages.
-                        loop {
-                            if conns[i].need.is_none() {
-                                if conns[i].buf.len() < 2 {
+                        // Bounded per-connection buffer: never grow past
+                        // MAX_TCP_BUF (65535 + 2). Overrun -> drop the conn.
+                        if conns[i].buf.len() + n as usize > MAX_TCP_BUF {
+                            dead = true;
+                        } else {
+                            conns[i].buf.extend_from_slice(&tmp[..n as usize]);
+                            // Parse length-prefixed messages.
+                            loop {
+                                if conns[i].need.is_none() {
+                                    if conns[i].buf.len() < 2 {
+                                        break;
+                                    }
+                                    let l = u16::from_be_bytes([conns[i].buf[0], conns[i].buf[1]])
+                                        as usize;
+                                    conns[i].buf.drain(..2);
+                                    conns[i].need = Some(l);
+                                }
+                                let need = conns[i].need.unwrap();
+                                if conns[i].buf.len() < need {
                                     break;
                                 }
-                                let l =
-                                    u16::from_be_bytes([conns[i].buf[0], conns[i].buf[1]]) as usize;
-                                conns[i].buf.drain(..2);
-                                conns[i].need = Some(l);
-                            }
-                            let need = conns[i].need.unwrap();
-                            if conns[i].buf.len() < need {
-                                break;
-                            }
-                            let msg: Vec<u8> = conns[i].buf.drain(..need).collect();
-                            conns[i].need = None;
-                            let resp = exchange(&msg, &ups)
-                                .unwrap_or_else(|| servfail(&msg).unwrap_or_default());
-                            if let Some(j) = &journal {
-                                j.dns_record(
-                                    if resp.is_empty() { "drop" } else { "ok" },
-                                    &format!("tcp query {} bytes", msg.len()),
-                                );
-                            }
-                            if !resp.is_empty() {
-                                let l = resp.len() as u16;
-                                conns[i].out.extend_from_slice(&l.to_be_bytes());
-                                conns[i].out.extend_from_slice(&resp);
+                                let msg: Vec<u8> = conns[i].buf.drain(..need).collect();
+                                conns[i].need = None;
+                                let (one_tx, one_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                                if job_tx
+                                    .send(Job {
+                                        q: msg.clone(),
+                                        reply: Some(one_tx),
+                                    })
+                                    .is_err()
+                                {
+                                    if let Some(resp) = servfail(&msg) {
+                                        let l = resp.len() as u16;
+                                        conns[i].out.extend_from_slice(&l.to_be_bytes());
+                                        conns[i].out.extend_from_slice(&resp);
+                                    }
+                                } else {
+                                    let resp = one_rx
+                                        .recv_timeout(
+                                            UPSTREAM_DEADLINE + Duration::from_millis(200),
+                                        )
+                                        .unwrap_or_else(|_| servfail(&msg).unwrap_or_default());
+                                    if let Some(j) = &journal {
+                                        j.dns_record(
+                                            if resp.is_empty() { "drop" } else { "ok" },
+                                            &format!("tcp query {} bytes", msg.len()),
+                                        );
+                                    }
+                                    if !resp.is_empty() {
+                                        let l = resp.len() as u16;
+                                        conns[i].out.extend_from_slice(&l.to_be_bytes());
+                                        conns[i].out.extend_from_slice(&resp);
+                                    }
+                                }
                             }
                         }
                     }

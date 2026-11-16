@@ -162,7 +162,10 @@ and related calls, and Landlock restricts writes as a second layer. The
 environment is rebuilt from scratch; values declared with `--env` or
 `--env-file` form a session snapshot that a request cannot override
 (`E_ENV_LOCKED`). The network is `none` (loopback only) by default; `host`
-needs Landlock abstract-socket scoping or an explicit flag.
+needs Landlock abstract-socket scoping or an explicit flag. `open` (0.6.0)
+keeps the empty netns but intercepts `connect()` (seccomp user-notif) so
+the supervisor bridges outbound public TCP; loopback/unix `CONTINUE`, and
+UDP beyond DNS, non-public and unknown-family targets are refused.
 
 **Authorized.** The control socket is mode 0600 and refuses any peer inside the
 sandbox's pid namespace. `authorize()` allows a request only when the client
@@ -183,8 +186,9 @@ file mode 0600) and is not mounted into sessions. It stores command lines as
 given, so it can contain secrets that were passed on a command line.
 
 **Not provided.** hisn is not a VM: the sandbox shares the host kernel, and a
-kernel vulnerability is outside the model. It does not filter network traffic;
-under `network = "host"` the session has the host's network. It does not limit
+kernel vulnerability is outside the model. Under `network = "host"` the session
+has the host's network; under `open` connections are intercepted per decision
+(ADR 0022 — public TCP only, private targets refused). It does not limit
 memory or cpu beyond `setrlimit` limits. The journal and the git change report record
 events; they do not prevent them. An egress proxy and cgroup v2 limits are
 planned, not yet scheduled ([roadmap](docs/ROADMAP.md)).

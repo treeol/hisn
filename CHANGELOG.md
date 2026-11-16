@@ -7,6 +7,39 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-16
+
+`network = "open"` (ADR 0022, mechanism only): outbound TCP from inside
+the empty netns via seccomp user-notif connect interception — the
+supervisor connects from the host netns and injects the socket. `none`
+(byte-identical to 0.5.1) and `host` are unchanged. Allowlist, DNS
+pinning, `net-policy-set` and `net explain` are 0.7.0 and do not exist
+in this release. See `docs/releases/v0.6.0.md` for the full notes,
+including the asserted limitations (no UDP beyond DNS, `bind()` before
+`connect()` loses its local address, non-blocking `connect()` waits
+for the supervisor, private targets refused in `open`).
+
+### Added
+- `Network::Open` end to end (policy, `--network open`, session.json).
+- Hand-written BPF `connect`→`USER_NOTIF` filter, supervisor NOTIF
+  engine (64 workers, 30 s deadline from recv, queue-full `EACCES`),
+  decision order unix/loopback `CONTINUE`, non-stream/private/unknown
+  `EACCES`, public stream `ADDFD|SETFD` injection.
+- Supervisor DNS responder on init-bound `127.0.0.1:53` fds (UDP+TCP,
+  `SERVFAIL` on failure); `open` sessions get a generated
+  `/etc/resolv.conf` + `/etc/nsswitch.conf`.
+- Journal `network/connect`, `network/dns`, `network/summary`;
+  4-file retention cap.
+- Fail-closed startup: kernel feature probe (floor 5.9, by
+  attempting), Yama `ptrace_scope >= 2` refusal, netns-differs
+  assertion, `extra_deny` `connect`/`socket` rejection.
+- `scripts/host-verify-network.sh` (hermetic host gate).
+- Leak cases L94, L96–L100, L102–L107, L109–L111 (0.6.0 subset).
+
+### Changed
+- `hisn check`: nothing new yet (feature probing happens at session
+  startup for `open`).
+
 ## [0.5.1] - 2026-11-15
 
 0.5.1 gives the journal's "who" substance: named **seats** with a

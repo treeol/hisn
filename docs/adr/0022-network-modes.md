@@ -4,7 +4,7 @@ Title: Controlled outbound network for sandboxed sessions — `none` (unchanged
 default), `allowlist`, and `open`, implemented by intercepting `connect()`
 with seccomp user notification and letting the supervisor decide.
 
-Status: Proposed. Date: 2026-11-16. Origin: the connect-interception
+Status: Accepted (implemented 0.6.0, open mode). Date: 2026-11-16. Origin: the connect-interception
 probe series (`.wakil/probes/connect-notify/`, passes 1–6; report
 `.wakil/reports/probe-connect-notify.md`). This ADR replaces the transport
 design of ADR 0018 (a host-side HTTP/SOCKS proxy) with a `connect()`
@@ -579,6 +579,23 @@ from the probe.
    + per-decision seat attribution (decision 8) is enough for v1.
 
 ## Review record
+
+### Implementation (0.6.0)
+
+Implemented on `work/0.6.0` (open mode only; allowlist is 0.7.0).
+Commits: phase 1 plumbing + filter/probe/classifier; phase 2 NOTIF
+engine + DNS responder + journal + init/exec/supervisor integration;
+phase 3 leak cases + host script + release docs. The pre-implementation
+review's BLOCKING points were folded in: exact connect order
+(af_unix/loopback `CONTINUE` before the non-stream refusal, so UDP
+DNS to 127.0.0.1:53 works), READY fd count validation, init closes its
+listener/DNS copies before fork, deadline from `NOTIF_RECV`,
+`OwnedFd` everywhere, private block as one named classifier with unit
+vectors, 0.6 test subset, 5.9 floor probing by attempt, per-tree
+netns assertion, fd-count discipline verified by the hermetic host
+script. `open` honours no `[net] allow` exceptions (private targets
+are unconditionally refused in 0.6.0; explicit IP/CIDR exceptions are
+0.7.0).
 
 Mashūra round 1 (open questions: "What is missing or wrong in this
 design? Where can it fail open? What would an agent other than Wakil

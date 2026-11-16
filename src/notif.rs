@@ -457,7 +457,7 @@ fn handle_notif(
     // process_vm_readv the sockaddr (at most sizeof(sockaddr_storage), once).
     let addr_fd = n.data.args[1] as i32;
     let addrlen = n.data.args[2] as usize;
-    if addrlen < 2 || addrlen > 128 {
+    if !(2..=128).contains(&addrlen) {
         if id_valid(lfd, n.id) {
             reply(lfd, n.id, -(libc::EINVAL), 0, 0);
         }

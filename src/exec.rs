@@ -767,12 +767,8 @@ fn helper_loop(chan: &OwnedFd, ctx: &ExecContext) -> io::Result<()> {
     // installing, so its own traffic is never intercepted.
     if ctx.policy.network == crate::policy::Network::Open {
         let _ = sys::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-        let listener = crate::notif::install_connect_filter().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("exec-tree connect filter: {e}"),
-            )
-        })?;
+        let listener = crate::notif::install_connect_filter()
+            .map_err(|e| io::Error::other(format!("exec-tree connect filter: {e}")))?;
         sys::send_with_fds(chan.as_raw_fd(), b"NETLISTENER", &[listener.as_raw_fd()])?;
         drop(listener);
     }

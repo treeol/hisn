@@ -11,11 +11,13 @@ const BPF_JEQ_K: u16 = 0x15;
 const BPF_RET_K: u16 = 0x06;
 
 const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+#[allow(dead_code)]
+const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
 
 #[cfg(target_arch = "x86_64")]
 const NATIVE_ARCH: u32 = AUDIT_ARCH_X86_64;
 #[cfg(target_arch = "aarch64")]
-const NATIVE_ARCH: u32 = 0xB7E1_51C0;
+const NATIVE_ARCH: u32 = AUDIT_ARCH_AARCH64;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const NATIVE_ARCH: u32 = 0;
 

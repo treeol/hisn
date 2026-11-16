@@ -4,7 +4,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JEQ_K: u16 = 0x15;
@@ -196,6 +196,597 @@ fn probe_features_inner() -> Result<Features, String> {
         continue_flag: SECCOMP_USER_NOTIF_FLAG_CONTINUE != 0,
         send_flag: SECCOMP_USER_NOTIF_FLAG_SEND != 0,
     })
+}
+
+/// Wire structs for seccomp user-notif ioctls (matching struct
+/// seccomp_notif / seccomp_notif_resp / seccomp_notif_addfd in
+/// linux/seccomp.h). `#[repr(C)]` and field order are ABI.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Notif {
+    pub pid: u32,
+    pub tid: u32,
+    pub id: u64,
+    pub data: NotifData,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NotifData {
+    pub nr: u32,
+    pub args: [u64; 6],
+    pub ret: i64,
+    pub flags: u32,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NotifResp {
+    pub id: u64,
+    pub error: i32,
+    pub val: i64,
+    pub flags: u32,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NotifAddFd {
+    pub request: Notif,
+    pub newfd: u32,
+    pub flags: u32,
+}
+const OP_RECV: u32 = 0;
+const OP_SEND: u32 = 1;
+const OP_ID_VALID: u32 = 7;
+const OP_ADDFD: u32 = 8;
+const FLAG_CONTINUE: u32 = 1;
+const FLAG_SETFD: u32 = 2;
+const FLAG_SEND: u32 = 4;
+
+/// Connect decision (pure; unit-tested).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Continue,
+    Refuse,
+    Allow,
+}
+
+/// Pure decision order (ADR 0022, Mashūra BLOCKING 1 order):
+/// AF_UNIX -> CONTINUE; loopback -> CONTINUE (any SO_TYPE, so UDP DNS to
+/// 127.0.0.1:53 works); unknown family -> Refuse; non-stream non-loopback
+/// IP -> Refuse; private -> Refuse; public stream -> Allow.
+pub fn decide(family: u16, is_loopback: bool, is_stream: bool, is_public: bool) -> Verdict {
+    use libc::{AF_INET, AF_INET6, AF_UNIX};
+    if family == AF_UNIX as u16 {
+        return Verdict::Continue;
+    }
+    if is_loopback {
+        return Verdict::Continue;
+    }
+    if family != AF_INET as u16 && family != AF_INET6 as u16 {
+        return Verdict::Refuse;
+    }
+    if !is_stream {
+        return Verdict::Refuse;
+    }
+    if !is_public {
+        return Verdict::Refuse;
+    }
+    Verdict::Allow
+}
+
+fn seccomp_ioctl(fd: i32, op: u32, ptr: *mut libc::c_void) -> io::Result<()> {
+    let r = unsafe { libc::syscall(libc::SYS_seccomp, op, fd, ptr) };
+    if r < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn id_valid(listener: i32, id: u64) -> bool {
+    let mut n = Notif {
+        pid: 0,
+        tid: 0,
+        id,
+        data: NotifData {
+            nr: 0,
+            args: [0; 6],
+            ret: 0,
+            flags: 0,
+        },
+    };
+    seccomp_ioctl(listener, OP_ID_VALID, &mut n as *mut Notif as *mut _).is_ok()
+}
+
+fn reply(listener: i32, id: u64, error: i32, val: i64, flags: u32) {
+    let mut resp = NotifResp {
+        id,
+        error,
+        val,
+        flags,
+    };
+    let _ = seccomp_ioctl(listener, OP_SEND, &mut resp as *mut NotifResp as *mut _);
+}
+
+/// SUPERVISOR NOTIF ENGINE (phase 2)
+/// Receiver thread + bounded worker pool. Deadline from RECV.
+pub struct NotifEngine {
+    pub shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl NotifEngine {
+    /// Start the engine on `listener`. `journal` is a clone of the
+    /// workspace journal (best-effort; verdict never waits on it — the
+    /// journal write happens on a bounded async queue inside `journal_net`).
+    /// `seat` attribution: None for now (exec-table mapping is 0.7.0;
+    /// L102 in the 0.6 subset records session + target + verdict).
+    pub fn start(
+        listener: OwnedFd,
+        journal: Option<std::sync::Arc<crate::journal::Journal>>,
+        deadline_s: u64,
+    ) -> Self {
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sd = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            engine_loop(listener, journal, deadline_s, &sd);
+        });
+        Self {
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for NotifEngine {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn engine_loop(
+    listener: OwnedFd,
+    journal: Option<std::sync::Arc<crate::journal::Journal>>,
+    deadline_s: u64,
+    shutdown: &std::sync::atomic::AtomicBool,
+) {
+    let lfd = listener.as_raw_fd();
+    // Receiver + 64 workers on a bounded queue (256 pending).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Notif, std::time::Instant)>(256);
+    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+    let mut workers = Vec::new();
+    for _ in 0..64 {
+        let rx = rx.clone();
+        let j = journal.clone();
+        workers.push(std::thread::spawn(move || {
+            loop {
+                let msg = {
+                    let lock = rx.lock().unwrap_or_else(|e| e.into_inner());
+                    lock.recv()
+                };
+                match msg {
+                    Ok((n, recv_at)) => handle_notif(lfd, &n, recv_at, deadline_s, &j),
+                    Err(_) => return,
+                }
+            }
+        }));
+    }
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let mut pfd = libc::pollfd {
+            fd: lfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let r = unsafe { libc::poll(&mut pfd, 1, 2000) };
+        if r < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        if r == 0 {
+            continue;
+        }
+        if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            return; // listener gone: clean exit
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            continue;
+        }
+        let mut n: Notif = unsafe { std::mem::zeroed() };
+        match seccomp_ioctl(lfd, OP_RECV, &mut n as *mut Notif as *mut _) {
+            Ok(()) => {
+                let recv_at = std::time::Instant::now();
+                match tx.try_send((n, recv_at)) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TrySendError::Full((n, _))) => {
+                        // Queue full: refuse immediately from the receiver
+                        // (fail closed), never wedge.
+                        if id_valid(lfd, n.id) {
+                            reply(lfd, n.id, -(libc::EACCES), 0, 0);
+                        }
+                        if let Some(j) = &journal {
+                            j.net_record("refuse", "queue-full", &n);
+                        }
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected((n, _))) => {
+                        if id_valid(lfd, n.id) {
+                            reply(lfd, n.id, -(libc::EAGAIN), 0, 0);
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn handle_notif(
+    lfd: i32,
+    n: &Notif,
+    recv_at: std::time::Instant,
+    deadline_s: u64,
+    journal: &Option<std::sync::Arc<crate::journal::Journal>>,
+) {
+    let deadline = recv_at + std::time::Duration::from_secs(deadline_s.max(1));
+    // ID_VALID before the read.
+    if !id_valid(lfd, n.id) {
+        return;
+    }
+    // pidfd for the notified task.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, n.pid as i64, 0u32) };
+    if pidfd < 0 {
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, -(libc::EACCES), 0, 0);
+        }
+        if let Some(j) = journal {
+            j.net_record("refuse", "pidfd-open-failed", n);
+        }
+        return;
+    }
+    let _pidfd_guard = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
+    // process_vm_readv the sockaddr (at most sizeof(sockaddr_storage), once).
+    let addr_fd = n.data.args[1] as i32;
+    let addrlen = n.data.args[2] as usize;
+    if addrlen < 2 || addrlen > 128 {
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, -(libc::EINVAL), 0, 0);
+        }
+        if let Some(j) = journal {
+            j.net_record("refuse", "bad-addrlen", n);
+        }
+        return;
+    }
+    let mut buf = [0u8; 128];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: addrlen,
+    };
+    let mut remote = libc::iovec {
+        iov_base: n.data.args[1] as *mut libc::c_void,
+        iov_len: addrlen,
+    };
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_process_vm_readv,
+            n.pid as i64,
+            &mut iov as *mut libc::iovec,
+            1usize,
+            &mut remote as *mut libc::iovec,
+            1usize,
+            0u64,
+        )
+    };
+    if r <= 0 {
+        // Read failed (EPERM: dumpable-0 or ptrace_scope>=2): fail closed.
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, -(libc::EACCES), 0, 0);
+        }
+        if let Some(j) = journal {
+            j.net_record("refuse", "read-failed", n);
+        }
+        return;
+    }
+    let family = u16::from_ne_bytes([buf[0], buf[1]]);
+    // Parse IP when INET/INET6.
+    let mut ip: Option<IpAddr> = None;
+    let mut is_loopback = false;
+    if family == libc::AF_INET as u16 && addrlen >= 16 {
+        let v4 = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+        is_loopback = v4.is_loopback();
+        ip = Some(IpAddr::V4(v4));
+    } else if family == libc::AF_INET6 as u16 && addrlen >= 28 {
+        let mut o = [0u8; 16];
+        o.copy_from_slice(&buf[8..24]);
+        let v6 = Ipv6Addr::from(o);
+        is_loopback = v6.is_loopback();
+        ip = Some(IpAddr::V6(v6));
+    }
+    // SO_TYPE via pidfd_getfd + getsockopt.
+    let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd as i64, addr_fd as i64, 0u64) };
+    let mut is_stream = false;
+    let mut sock_type = 0i32;
+    if dup >= 0 {
+        let dup_fd = unsafe { OwnedFd::from_raw_fd(dup as i32) };
+        let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                dup_fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                &mut sock_type as *mut i32 as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc == 0 {
+            // SOCK_STREAM=1, SOCK_DGRAM=2 (low nibble); strip SOCK_CLOEXEC/NONBLOCK bits.
+            is_stream = (sock_type & 0xf) == libc::SOCK_STREAM;
+        }
+        // dup_fd dropped here (OwnedFd discipline).
+    }
+    let is_public = ip.map(|a| is_public_ip(&a)).unwrap_or(false);
+    match decide(family, is_loopback, is_stream, is_public) {
+        Verdict::Continue => {
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
+            }
+            if let Some(j) = journal {
+                j.net_record("continue", "loopback-or-unix", n);
+            }
+        }
+        Verdict::Refuse => {
+            let reason = if family != libc::AF_UNIX as u16
+                && family != libc::AF_INET as u16
+                && family != libc::AF_INET6 as u16
+            {
+                "unknown-family"
+            } else if !is_stream {
+                "non-stream"
+            } else {
+                "private-or-unlisted"
+            };
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -(libc::EACCES), 0, 0);
+            }
+            if let Some(j) = journal {
+                j.net_record("refuse", reason, n);
+            }
+        }
+        Verdict::Allow => {
+            // Fresh socket in the supervisor's (host) netns.
+            let domain = family as i32;
+            let newfd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+            if newfd < 0 {
+                if id_valid(lfd, n.id) {
+                    reply(
+                        lfd,
+                        n.id,
+                        -(io::Error::last_os_error()
+                            .raw_os_error()
+                            .unwrap_or(libc::EIO)),
+                        0,
+                        0,
+                    );
+                }
+                return;
+            }
+            let _new_guard = unsafe { OwnedFd::from_raw_fd(newfd) };
+            // Copy options from the child's original socket (read once).
+            copy_sock_opts(addr_fd, pidfd as i32, newfd);
+            // Non-blocking connect with deadline.
+            let flags = unsafe { libc::fcntl(newfd, libc::F_GETFL) };
+            if flags >= 0 {
+                unsafe { libc::fcntl(newfd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            }
+            let cr = unsafe {
+                libc::connect(
+                    newfd,
+                    buf.as_ptr() as *const libc::sockaddr,
+                    addrlen as libc::socklen_t,
+                )
+            };
+            if cr < 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINPROGRESS) {
+                    if id_valid(lfd, n.id) {
+                        reply(lfd, n.id, -(e.raw_os_error().unwrap_or(libc::EIO)), 0, 0);
+                    }
+                    if let Some(j) = journal {
+                        j.net_record("refuse", "connect-failed", n);
+                    }
+                    return;
+                }
+                // Poll for completion until deadline.
+                let mut done = false;
+                while std::time::Instant::now() < deadline {
+                    let mut pfd = libc::pollfd {
+                        fd: newfd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let pr = unsafe { libc::poll(&mut pfd, 1, 1000) };
+                    if pr <= 0 {
+                        continue;
+                    }
+                    let mut err = 0i32;
+                    let mut elen = std::mem::size_of::<i32>() as libc::socklen_t;
+                    unsafe {
+                        libc::getsockopt(
+                            newfd,
+                            libc::SOL_SOCKET,
+                            libc::SO_ERROR,
+                            &mut err as *mut i32 as *mut libc::c_void,
+                            &mut elen,
+                        )
+                    };
+                    if err == 0 {
+                        done = true;
+                    } else {
+                        if id_valid(lfd, n.id) {
+                            reply(lfd, n.id, -err, 0, 0);
+                        }
+                        if let Some(j) = journal {
+                            j.net_record("refuse", "connect-error", n);
+                        }
+                        return;
+                    }
+                    break;
+                }
+                if !done {
+                    if id_valid(lfd, n.id) {
+                        reply(lfd, n.id, -(libc::ETIMEDOUT), 0, 0);
+                    }
+                    if let Some(j) = journal {
+                        j.net_record("refuse", "deadline", n);
+                    }
+                    return;
+                }
+            }
+            // Inject: ID_VALID before ADDFD, SETFD always.
+            if !id_valid(lfd, n.id) {
+                return;
+            }
+            let mut addfd: NotifAddFd = unsafe { std::mem::zeroed() };
+            addfd.request = *n;
+            addfd.newfd = n.data.args[0] as u32;
+            addfd.flags = FLAG_SETFD | FLAG_SEND;
+            let r = seccomp_ioctl(lfd, OP_ADDFD, &mut addfd as *mut NotifAddFd as *mut _);
+            match r {
+                Ok(()) => {
+                    reply(lfd, n.id, 0, 0, 0);
+                    if let Some(j) = journal {
+                        j.net_record("allow", "injected", n);
+                    }
+                }
+                Err(e) => {
+                    // Two-step fallback if FLAG_SEND unsupported: SETFD + NOTIF_SEND.
+                    let mut addfd2: NotifAddFd = unsafe { std::mem::zeroed() };
+                    addfd2.request = *n;
+                    addfd2.newfd = n.data.args[0] as u32;
+                    addfd2.flags = FLAG_SETFD;
+                    if seccomp_ioctl(lfd, OP_ADDFD, &mut addfd2 as *mut NotifAddFd as *mut _)
+                        .is_ok()
+                    {
+                        reply(lfd, n.id, 0, 0, 0);
+                        if let Some(j) = journal {
+                            j.net_record("allow", "injected-two-step", n);
+                        }
+                    } else if id_valid(lfd, n.id) {
+                        reply(lfd, n.id, -(e.raw_os_error().unwrap_or(libc::EIO)), 0, 0);
+                    }
+                }
+            }
+            // _new_guard drops the supervisor copy of the outbound socket
+            // (the injected copy is owned by the child now).
+        }
+    }
+}
+
+fn copy_sock_opts(addr_fd: i32, pidfd: i32, newfd: i32) {
+    let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd as i64, addr_fd as i64, 0u64) };
+    if dup < 0 {
+        return;
+    }
+    let src = unsafe { OwnedFd::from_raw_fd(dup as i32) };
+    // O_NONBLOCK via F_GETFL.
+    let fl = unsafe { libc::fcntl(src.as_raw_fd(), libc::F_GETFL) };
+    if fl >= 0 {
+        let nf = unsafe { libc::fcntl(newfd, libc::F_GETFL) };
+        if nf >= 0 {
+            unsafe {
+                libc::fcntl(
+                    newfd,
+                    libc::F_SETFL,
+                    (nf & !libc::O_NONBLOCK) | (fl & libc::O_NONBLOCK),
+                )
+            };
+        }
+    }
+    for (level, name) in [
+        (libc::SOL_SOCKET, libc::SO_REUSEADDR),
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+    ] {
+        let mut v = 0i32;
+        let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                src.as_raw_fd(),
+                level,
+                name,
+                &mut v as *mut i32 as *mut libc::c_void,
+                &mut len,
+            )
+        } == 0
+        {
+            unsafe {
+                libc::setsockopt(
+                    newfd,
+                    level,
+                    name,
+                    &v as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as libc::socklen_t,
+                )
+            };
+        }
+    }
+    // Buffers halved (case F: kernel doubles the read value).
+    for name in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+        let mut v: i32 = 0;
+        let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                src.as_raw_fd(),
+                libc::SOL_SOCKET,
+                name,
+                &mut v as *mut i32 as *mut libc::c_void,
+                &mut len,
+            )
+        } == 0
+        {
+            let half = v / 2;
+            unsafe {
+                libc::setsockopt(
+                    newfd,
+                    libc::SOL_SOCKET,
+                    name,
+                    &half as *const i32 as *const libc::c_void,
+                    std::mem::size_of::<i32>() as libc::socklen_t,
+                )
+            };
+        }
+    }
+    // TCP_NODELAY.
+    let mut v = 0i32;
+    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            src.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            &mut v as *mut i32 as *mut libc::c_void,
+            &mut len,
+        )
+    } == 0
+    {
+        unsafe {
+            libc::setsockopt(
+                newfd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                &v as *const i32 as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+    }
 }
 
 /// True iff `ip` is a public (routable, non-private) address per ADR 0022 block list:

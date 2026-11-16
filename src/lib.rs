@@ -6,6 +6,7 @@ pub mod authz;
 pub mod check;
 pub mod cli;
 pub mod control;
+pub mod dns;
 pub mod env;
 pub mod exec;
 pub mod execcli;

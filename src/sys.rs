@@ -574,6 +574,11 @@ pub fn recv_with_fd(sock: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<Ow
 /// head-room). A message with more is truncated by the kernel and rejected.
 pub const MAX_PASSED_FDS: usize = 4;
 
+/// READY carries root + pty? + listener? + dns x2 = up to 5 fds. Capped
+/// separately so the control-protocol cap stays at 4 (see
+/// `control::tests::too_many_descriptors_are_rejected_not_truncated_into_a_valid_request`).
+pub const MAX_READY_FDS: usize = 8;
+
 /// Send `data` plus any number of fds in a single `sendmsg`.
 pub fn send_with_fds(sock: RawFd, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
     let mut iov = libc::iovec {
@@ -624,14 +629,19 @@ pub struct Received {
 /// Receive bytes plus up to [`MAX_PASSED_FDS`] fds (all `CLOEXEC`). Every
 /// descriptor that arrived is wrapped, so none can leak even when rejected.
 pub fn recv_with_fds(sock: RawFd, buf: &mut [u8]) -> io::Result<Received> {
+    recv_with_fds_cap(sock, buf, MAX_PASSED_FDS)
+}
+
+/// Receive bytes plus up to `cap` fds (for callers with a larger legal
+/// message, e.g. READY with the open-mode listener + DNS fds).
+pub fn recv_with_fds_cap(sock: RawFd, buf: &mut [u8], cap: usize) -> io::Result<Received> {
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
     };
     // SAFETY: as in `send_with_fds`; received fds are wrapped immediately.
     unsafe {
-        let space =
-            libc::CMSG_SPACE((MAX_PASSED_FDS * std::mem::size_of::<c_int>()) as c_uint) as usize;
+        let space = libc::CMSG_SPACE((cap * std::mem::size_of::<c_int>()) as c_uint) as usize;
         let mut cbuf = vec![0u64; space.div_ceil(8)];
         let mut msg: libc::msghdr = std::mem::zeroed();
         msg.msg_iov = &mut iov;

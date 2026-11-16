@@ -423,6 +423,9 @@ pub struct ExecClient {
     next_id: std::sync::atomic::AtomicU64,
     /// How long to wait for a failed spawn's `C` to disappear.
     pub reap_grace: Duration,
+    /// ADR 0022 open mode: the exec-tree connect-filter listener fd,
+    /// received from E before the loop started (None for none/host).
+    pub net_listener: Option<OwnedFd>,
 }
 
 impl ExecClient {
@@ -431,7 +434,13 @@ impl ExecClient {
             chan: Mutex::new(Some(chan)),
             next_id: std::sync::atomic::AtomicU64::new(1),
             reap_grace: Duration::from_secs(2),
+            net_listener: None,
         }
+    }
+
+    /// Raw channel fd (supervisor side), for the one-time NETLISTENER read.
+    pub fn raw_fd(&self) -> RawFd {
+        self.chan.lock().unwrap().as_ref().unwrap().as_raw_fd()
     }
 
     /// Hand `spec` + its stdio to the helper and wait until the program has
@@ -749,6 +758,24 @@ pub fn helper_serve(chan: OwnedFd, ctx: ExecContext) -> ! {
 
 fn helper_loop(chan: &OwnedFd, ctx: &ExecContext) -> io::Result<()> {
     sys::prctl(1 /* PR_SET_PDEATHSIG */, libc::SIGKILL as u64, 0, 0, 0)?;
+    // ADR 0022 open mode: E installs its own connect filter (one listener
+    // per exec tree; the kernel allows exactly one per filter chain) and
+    // sends the listener fd to the supervisor over `chan` BEFORE the loop
+    // accepts work. NNP is set here first so the install needs no
+    // CAP_SYS_ADMIN. E's copy closes after the send; the supervisor owns
+    // the listener from then on. E itself never calls connect() after
+    // installing, so its own traffic is never intercepted.
+    if ctx.policy.network == crate::policy::Network::Open {
+        let _ = sys::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        let listener = crate::notif::install_connect_filter().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("exec-tree connect filter: {e}"),
+            )
+        })?;
+        sys::send_with_fds(chan.as_raw_fd(), b"NETLISTENER", &[listener.as_raw_fd()])?;
+        drop(listener);
+    }
     // Auto-reap every `C`: no zombies, and "C is gone" is observable by
     // `kill(pid, 0)` from the supervisor.
     // SAFETY: installing SIG_IGN for SIGCHLD is always valid.

@@ -426,7 +426,7 @@ pub fn etc_masked(name: &str) -> bool {
 /// Entries of `/etc` that are generated, never bound from the host.
 /// (`resolv.conf` is generated only for `network = "host"`; otherwise absent.)
 fn etc_generated(name: &str) -> bool {
-    matches!(name, "passwd" | "group" | "resolv.conf")
+    matches!(name, "passwd" | "group" | "resolv.conf" | "nsswitch.conf")
 }
 
 fn depth(p: &Path) -> usize {
@@ -596,6 +596,24 @@ pub fn plan(
             "/etc/resolv.conf",
             None,
             MountKind::Generated { content },
+        ));
+    }
+    // ADR 0022 open mode: session resolver points at the supervisor DNS
+    // responder on loopback; none mode gets neither file (byte-identical).
+    if policy.network == crate::policy::Network::Open {
+        ops.push(op(
+            "/etc/resolv.conf",
+            None,
+            MountKind::Generated {
+                content: "nameserver 127.0.0.1\n".into(),
+            },
+        ));
+        ops.push(op(
+            "/etc/nsswitch.conf",
+            None,
+            MountKind::Generated {
+                content: "hosts: files dns\npasswd: files\ngroup: files\n".into(),
+            },
         ));
     }
     if facts.ssl_private && matches!(facts.etc.get("ssl"), Some(EntryKind::Dir)) {

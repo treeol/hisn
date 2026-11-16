@@ -3127,14 +3127,33 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
         sandbox_pidns,
         mntns_fd,
         exec_ns,
+        net_listener,
+        dns_fds,
     } = start_namespaces(uid, gid, cfg, verbose, sdir)?;
     let mut guard = SessionGuard::new(pid);
+
+    // ADR 0022 open mode: netns-differs startup assertion (fails closed).
+    // The supervisor must NOT be in the sandbox netns; if it is (e.g. a
+    // missing CLONE_NEWNET), outbound connects would silently hit the
+    // sandbox namespace and interception is meaningless.
+    if policy.network == Network::Open {
+        let self_inode =
+            sys::ns_inode(std::process::id() as i32, "net").context("supervisor netns inode")?;
+        let init_inode = sys::ns_inode(pid, "net").context("sandbox netns inode")?;
+        if self_inode == init_inode {
+            bail!(
+                "refusing to start: supervisor shares the sandbox netns (inode {self_inode}); \
+                 CLONE_NEWNET is missing"
+            );
+        }
+        crate::notif::probe_features().map_err(|e| anyhow!(e))?;
+    }
 
     // Phase: helpers (grant helper + exec helper, still single-threaded).
     // The namespace fds are dropped as soon as the helpers are forked (the
     // helpers hold their own dups): the supervisor must not pin the
     // namespaces — and hold 7–8 extra fds — for the session's lifetime.
-    let (helper, exec_client) = start_helpers(
+    let (helper, mut exec_client) = start_helpers(
         &mntns_fd,
         exec_ns,
         exec_policy,
@@ -3143,6 +3162,12 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
         exec_seccomp,
     )?;
     drop(mntns_fd);
+
+    // ADR 0022: clone the journal handle for the notif engine before the
+    // original is moved into start_control (Journal is not Clone; the
+    // Arc shares one writer — appends are flock-serialised anyway).
+    let net_journal = journal.clone_for_engine();
+    let exec_net_listener = exec_client.net_listener.take();
 
     // Phase: control (shared state, listener, initial grants, forwards, SSH).
     let control = start_control(&mut SessionControlArgs {
@@ -3174,6 +3199,26 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     // start-time git-change snapshot; calling both recorded a duplicate
     // session/start, which the review flagged.
     shared.journal_session_start();
+    // ADR 0022 open mode: start the NOTIF engine on init's listener and
+    // the DNS responder on init's bound fds. Both are owned here for the
+    // session lifetime; dropping them (session end) shuts them down.
+    let _net_engine = net_listener.map(|l| {
+        crate::notif::NotifEngine::start(l, Some(Arc::new(net_journal.clone_for_engine())), 30)
+    });
+    // ADR 0022 open mode: the exec-tree listener (E's own filter chain).
+    if let Some(l) = exec_net_listener {
+        let _exec_engine =
+            crate::notif::NotifEngine::start(l, Some(Arc::new(net_journal.clone_for_engine())), 30);
+        std::mem::forget(_exec_engine);
+    }
+    let _dns_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some((udp, tcp)) = dns_fds {
+        let ups = crate::dns::upstreams(policy.nameservers.as_deref());
+        let sd = _dns_shutdown.clone();
+        std::thread::spawn(move || {
+            crate::dns::run(udp, tcp, ups, &sd);
+        });
+    }
     let listener = control.listener;
     let handler = control.handler;
     let ssh_agent_expose = control.ssh_agent_expose;
@@ -3409,6 +3454,11 @@ struct Namespaces {
     sandbox_pidns: u64,
     mntns_fd: OwnedFd,
     exec_ns: NsFds,
+    /// ADR 0022 open mode: the connect-filter listener fd from init
+    /// (None for none/host).
+    net_listener: Option<OwnedFd>,
+    /// ADR 0022 open mode: DNS responder fds from init (UDP, TCP).
+    dns_fds: Option<(OwnedFd, OwnedFd)>,
 }
 
 fn start_namespaces(
@@ -3465,16 +3515,39 @@ fn start_namespaces(
     let sandbox_pidns = sys::ns_inode(pid, "pid").context("sandbox pid namespace")?;
     sys::send_with_fd(sup_end.as_raw_fd(), &[MSG_GO], None)?;
     let mut buf = [0u8; 4096];
-    let ready =
-        sys::recv_with_fds(sup_end.as_raw_fd(), &mut buf).context("waiting for sandbox setup")?;
+    // READY may carry up to MAX_READY_FDS fds in open mode (root + pty? +
+    // listener + dns x2); the control cap (4) would truncate it.
+    let ready = sys::recv_with_fds_cap(sup_end.as_raw_fd(), &mut buf, sys::MAX_READY_FDS)
+        .context("waiting for sandbox setup")?;
     if ready.truncated {
         bail!("sandbox init sent an oversized setup message");
     }
     let n = ready.len;
-    // READY carries the sandbox root fd, then (with a pty) the pty master.
+    // READY fd order (ADR 0022): root, pty_master?, listener?, dns_udp?, dns_tcp?
+    // The ?s are present only in open mode. The count is validated exactly;
+    // a missing or extra fd is a startup failure (the startup-ownership
+    // contract from the pre-implementation review).
+    let is_open = cfg.policy.network == Network::Open;
     let mut ready_fds = ready.fds.into_iter();
     let ready_root = ready_fds.next();
     let master = ready_fds.next();
+    let (net_listener, dns_udp, dns_tcp) = if is_open {
+        let l = ready_fds.next();
+        let u = ready_fds.next();
+        let t = ready_fds.next();
+        if ready_fds.next().is_some() {
+            bail!("sandbox init sent READY with extra fds (expected root+pty?+3)");
+        }
+        (l, u, t)
+    } else {
+        if ready_fds.next().is_some() {
+            bail!("sandbox init sent READY with extra fds");
+        }
+        (None, None, None)
+    };
+    if is_open && (net_listener.is_none() || dns_udp.is_none() || dns_tcp.is_none()) {
+        bail!("sandbox init did not send open-mode fds (listener + DNS x2)");
+    }
     if n == 0 {
         let code = services::reap(pid);
         bail!(
@@ -3516,6 +3589,11 @@ fn start_namespaces(
         sandbox_pidns,
         mntns_fd,
         exec_ns,
+        net_listener,
+        dns_fds: match (dns_udp, dns_tcp) {
+            (Some(u), Some(t)) => Some((u, t)),
+            _ => None,
+        },
     })
 }
 
@@ -3950,6 +4028,7 @@ fn spawn_helper(mntns: &OwnedFd) -> Result<HelperClient> {
 /// Fork the exec helper `E` (still single-threaded, like the grant helper).
 fn spawn_exec_helper(ctx: ExecContext) -> Result<ExecClient> {
     let (parent_end, child_end) = sys::socketpair_seqpacket()?;
+    let is_open = ctx.policy.network == Network::Open;
     // SAFETY: single-threaded at this point; the child runs only `helper_serve`.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -3960,9 +4039,23 @@ fn spawn_exec_helper(ctx: ExecContext) -> Result<ExecClient> {
         exec::helper_serve(child_end, ctx);
     }
     drop(child_end);
+    // ADR 0022 open mode: E's first message is the exec-tree listener fd.
+    // Read it now (before any exec request is sent) and hand it back to
+    // the caller via the ExecClient's optional slot.
+    let mut client = ExecClient::new(parent_end);
+    if is_open {
+        let mut buf = vec![0u8; 4096];
+        let r = sys::recv_with_fds(client.raw_fd(), &mut buf)
+            .context("waiting for exec-tree listener")?;
+        if &buf[..r.len] != b"NETLISTENER" || r.fds.len() != 1 {
+            bail!("exec helper did not send its connect-filter listener");
+        }
+        let listener = r.fds.into_iter().next().unwrap();
+        client.net_listener = Some(listener);
+    }
     // The parent's copies of the namespace fds must not outlive this call.
     drop(ctx);
-    Ok(ExecClient::new(parent_end))
+    Ok(client)
 }
 
 // -------------------------------------------------------------- stdio relay

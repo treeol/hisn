@@ -209,6 +209,17 @@ impl Journal {
         self.failures.load(Ordering::Relaxed)
     }
 
+    /// A second handle to the same journal (ADR 0022 notif engine): shares
+    /// dir/session/failures; appends are flock-serialised per handle.
+    pub fn clone_for_engine(&self) -> Self {
+        Self {
+            dir: self.dir.clone(),
+            session: self.session.clone(),
+            failures: self.failures.clone(),
+            rotate_after: self.rotate_after,
+        }
+    }
+
     /// Sync the journal file (and its directory) to disk. Called on session
     /// stop and on rotation — the two points where durability is paid for.
     /// Best-effort: a sync failure is counted like a write failure and never
@@ -252,6 +263,35 @@ impl Journal {
             self.failures.fetch_add(1, Ordering::Relaxed);
             eprintln!("hisn: journal session marker write failed: {e}");
         }
+    }
+
+    /// 0.6.0 (ADR 0022): record one network decision. The verdict path
+    /// never waits on the journal: this goes through a bounded async
+    /// queue (see [`net_queue`]); a full queue drops the record and
+    /// increments the failure count instead of blocking the verdict.
+    /// `verdict` is allow/refuse/continue/dns; `reason` is a short
+    /// machine-readable cause. Seat attribution is None in 0.6.0 (the
+    /// exec-table mapping is 0.7.0; L102 records session + target +
+    /// verdict + reason).
+    pub fn net_record(&self, verdict: &str, reason: &str, n: &crate::notif::Notif) {
+        let data = serde_json::json!({
+            "target": format!("pid:{}", n.pid),
+            "notif_id": n.id,
+            "verdict": verdict,
+            "reason": reason,
+            "seat": Value::Null,
+        });
+        let _ = self.append("network/connect", None, data);
+    }
+
+    /// DNS decision record (network/dns), same async discipline.
+    pub fn dns_record(&self, verdict: &str, detail: &str) {
+        let data = serde_json::json!({
+            "verdict": verdict,
+            "detail": detail,
+            "seat": Value::Null,
+        });
+        let _ = self.append("network/dns", None, data);
     }
 
     /// Append one record. `kind` is the record kind (an audit `op` plus
@@ -324,6 +364,7 @@ impl Journal {
             rotate(&self.dir).map_err(|e| JournalError {
                 message: format!("rotate: {e}"),
             })?;
+            prune_journal_files(&self.dir, self.rotate_after);
             // `wseq` is recovered from the rotated file's tail (the new
             // file is empty, so `last_wseq` falls through to it).
             seq = next_wseq(&path)?;
@@ -638,6 +679,44 @@ pub fn journal_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = rotated.into_iter().map(|(_, p)| p).collect();
     files.push(dir.join(JOURNAL_FILE));
     files
+}
+
+/// 0.6.0 (ADR 0022): journal retention is capped at 4 files total
+/// (current + up to 3 rotated) once the *total* journal bytes exceed
+/// 4 × 64 MiB (the production ROTATE_AFTER, held as a constant so test
+/// thresholds do not shrink the budget). Pruning only happens past
+/// that byte budget, so a small journal that merely rotated a few
+/// times keeps every record; a flooded journal sheds its oldest
+/// rotated files first. Called under the flock after every rotation;
+/// best-effort (never fails the append).
+pub const MAX_JOURNAL_FILES: usize = 4;
+pub const JOURNAL_RETENTION_BYTES: u64 = 4 * 64 * 1024 * 1024;
+
+fn prune_journal_files(dir: &Path, _rotate_after: u64) {
+    let files = journal_files(dir);
+    if files.len() <= MAX_JOURNAL_FILES {
+        return;
+    }
+    let budget = JOURNAL_RETENTION_BYTES;
+    let total: u64 = files
+        .iter()
+        .filter_map(|f| fs::metadata(f).ok())
+        .map(|m| m.len())
+        .sum();
+    if total <= budget {
+        return;
+    }
+    // Over budget: delete oldest rotated files until under it.
+    let mut total = total;
+    for f in &files {
+        if files.len() <= MAX_JOURNAL_FILES && total <= budget {
+            break;
+        }
+        let len = fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+        if fs::remove_file(f).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
 }
 
 /// Consume the rest of the current (over-long) line, up to and including
@@ -1126,6 +1205,17 @@ fn summary_for(rec: &JournalRecord) -> String {
         "session/start" => "session started".to_owned(),
         "session/stop" => "session stopped".to_owned(),
         "git-change" => git_change_summary(d),
+        "network/connect" | "network/dns" => {
+            let target = d.get("target").and_then(|v| v.as_str()).unwrap_or("?");
+            let verdict = d.get("verdict").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("{} {}", escape_terminal(verdict), escape_terminal(target))
+        }
+        "network/summary" => {
+            let allow = d.get("allow").and_then(|v| v.as_u64()).unwrap_or(0);
+            let refuse = d.get("refuse").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cont = d.get("continue").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("allow={allow} refuse={refuse} continue={cont}")
+        }
         _ => format!(
             "unrecognized {} ({} bytes; use --json)",
             escape_terminal(&rec.kind),

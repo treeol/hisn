@@ -146,6 +146,21 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     // 11. No privileges, ever.
     sys::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0).context("no_new_privs")?;
     drop_all_caps().context("dropping capabilities")?;
+    // 11b. ADR 0022 open mode: bind the DNS responder sockets BEFORE the
+    // connect filter is installed (binding itself is not intercepted, but
+    // the responder must exist before any program runs), then install the
+    // connect filter with a NEW_LISTENER. The listener fd and both DNS
+    // fds go to the supervisor with READY (after this block); init closes
+    // its copies before the command fork. NNP is already set above, so
+    // the filter install needs no CAP_SYS_ADMIN.
+    let (net_listener, dns_udp, dns_tcp) = if cfg.policy.network == Network::Open {
+        let (udp, tcp) = crate::dns::bind_dns().context("binding DNS responder sockets")?;
+        let listener = crate::notif::install_connect_filter()
+            .context("installing connect filter (kernel >= 5.9 required)")?;
+        (Some(listener), Some(udp), Some(tcp))
+    } else {
+        (None, None, None)
+    };
     // 12. Seccomp (installs on init; the command inherits it).
     seccomp::install(&cfg.seccomp)?;
 
@@ -174,15 +189,33 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     let cwd_c = sys::cstr(&cfg.policy.cwd)?;
 
     // Tell the supervisor we are ready, handing over the pty master.
+    // ADR 0022 open mode: also hand over the connect-filter listener fd
+    // and both DNS responder fds. READY fd order is now:
+    //   root, pty_master?, listener?, dns_udp?, dns_tcp?
+    // (the ?s present only in open mode). The supervisor validates the
+    // exact count. Init closes its copies right after the send — the
+    // command must never inherit them.
     let (master, slave) = match pty {
         Some((m, s)) => (Some(m), Some(s)),
         None => (None, None),
     };
     let mut ready_fds = vec![root_fd.as_raw_fd()];
     ready_fds.extend(master.as_ref().map(AsRawFd::as_raw_fd));
+    if let Some(l) = &net_listener {
+        ready_fds.push(l.as_raw_fd());
+    }
+    if let Some(u) = &dns_udp {
+        ready_fds.push(u.as_raw_fd());
+    }
+    if let Some(t) = &dns_tcp {
+        ready_fds.push(t.as_raw_fd());
+    }
     sys::send_with_fds(chan.as_raw_fd(), &[MSG_READY], &ready_fds).context("reporting ready")?;
     drop(master);
     drop(root_fd);
+    drop(net_listener);
+    drop(dns_udp);
+    drop(dns_tcp);
     // Wait for the supervisor to apply initial grants before the command exists.
     let (n, _) = sys::recv_with_fd(chan.as_raw_fd(), &mut b).context("waiting for START")?;
     if n != 1 || b[0] != MSG_START {

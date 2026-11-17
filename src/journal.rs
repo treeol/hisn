@@ -184,6 +184,11 @@ pub struct Journal {
     session: String,
     failures: FailureCount,
     rotate_after: u64,
+    /// Total size above which the oldest rotated files are deleted after
+    /// a rotation. `None` keeps every file, as before 0.6.0; only the
+    /// writer of the network queue sets it (ADR 0022), so sessions
+    /// without open mode never delete journal files.
+    retention_bytes: Option<u64>,
     /// Bounded async queue for network records (0.6.0): the verdict path
     /// never waits on a journal write; a full queue drops and counts.
     net_queue: Option<Arc<NetQueue>>,
@@ -360,6 +365,7 @@ impl Journal {
             session,
             failures: Arc::new(AtomicU64::new(0)),
             rotate_after,
+            retention_bytes: None,
             net_queue: None,
         }
     }
@@ -384,6 +390,7 @@ impl Journal {
             session: self.session.clone(),
             failures: self.failures.clone(),
             rotate_after: self.rotate_after,
+            retention_bytes: self.retention_bytes,
             net_queue: None,
         }
     }
@@ -392,7 +399,15 @@ impl Journal {
         let mut j = self.plain_clone();
         j.net_queue = Some(match &self.net_queue {
             Some(q) => q.clone(),
-            None => NetQueue::new(self.plain_clone(), cap),
+            None => {
+                // The queue's writer is the one that can be flooded by a
+                // sandboxed program, so it is the one with a size limit.
+                let mut writer = self.plain_clone();
+                writer
+                    .retention_bytes
+                    .get_or_insert(JOURNAL_RETENTION_BYTES);
+                NetQueue::new(writer, cap)
+            }
         });
         j
     }
@@ -560,7 +575,9 @@ impl Journal {
             rotate(&self.dir).map_err(|e| JournalError {
                 message: format!("rotate: {e}"),
             })?;
-            prune_journal_files(&self.dir, self.rotate_after);
+            if let Some(budget) = self.retention_bytes {
+                prune_journal_files(&self.dir, budget);
+            }
             // `wseq` is recovered from the rotated file's tail (the new
             // file is empty, so `last_wseq` falls through to it).
             seq = next_wseq(&path)?;
@@ -877,24 +894,24 @@ pub fn journal_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// 0.6.0 (ADR 0022): journal retention is capped at 4 files total
-/// (current + up to 3 rotated) once the *total* journal bytes exceed
-/// 4 × 64 MiB (the production ROTATE_AFTER, held as a constant so test
-/// thresholds do not shrink the budget). Pruning only happens past
-/// that byte budget, so a small journal that merely rotated a few
-/// times keeps every record; a flooded journal sheds its oldest
-/// rotated files first. Called under the flock after every rotation;
-/// best-effort (never fails the append).
+/// 0.6.0 (ADR 0022): size limit for a journal that receives network
+/// records. After a rotation, while there are more than
+/// [`MAX_JOURNAL_FILES`] files or their total size is above the budget,
+/// the oldest rotated files are deleted, but only once the total exceeds
+/// the budget: a small journal keeps every file however often it
+/// rotated. The active file is never deleted. Called under the journal
+/// lock; best-effort (never fails the append).
 pub const MAX_JOURNAL_FILES: usize = 4;
-pub const JOURNAL_RETENTION_BYTES: u64 = 4 * 64 * 1024 * 1024;
+/// Budget of [`prune_journal_files`] in production: four files of the
+/// rotation size (4 x 64 MiB).
+pub const JOURNAL_RETENTION_BYTES: u64 = 4 * ROTATE_AFTER;
 
-fn prune_journal_files(dir: &Path, _rotate_after: u64) {
+fn prune_journal_files(dir: &Path, budget: u64) {
     let files = journal_files(dir);
     if files.len() <= MAX_JOURNAL_FILES {
         return;
     }
-    let budget = JOURNAL_RETENTION_BYTES;
-    let total: u64 = files
+    let mut total: u64 = files
         .iter()
         .filter_map(|f| fs::metadata(f).ok())
         .map(|m| m.len())
@@ -902,16 +919,14 @@ fn prune_journal_files(dir: &Path, _rotate_after: u64) {
     if total <= budget {
         return;
     }
-    // Over budget: delete oldest rotated files (never the current
-    // journal.jsonl, which is last in `files`) until under it.
+    // Oldest first (`journal_files` order); the active file is last.
     let mut remaining = files.len();
-    let mut total = total;
     for f in &files {
         if remaining <= MAX_JOURNAL_FILES && total <= budget {
             break;
         }
         if f.file_name().and_then(|n| n.to_str()) == Some(JOURNAL_FILE) {
-            continue; // never delete the active journal
+            continue;
         }
         let len = fs::metadata(f).map(|m| m.len()).unwrap_or(0);
         if fs::remove_file(f).is_ok() {
@@ -1810,6 +1825,38 @@ mod tests {
         // file carries — a tail-window undercount would duplicate 1..=100.
         let last = recs.iter().map(|r| r.wseq).max().unwrap();
         assert_eq!(last, 100, "the highest wseq must be 100");
+    }
+
+    #[test]
+    fn only_the_network_writer_deletes_old_journal_files() {
+        // Seven rotations of a tiny journal. A plain handle (every mode
+        // before 0.6.0, and none/host now) keeps all files; a handle
+        // with a retention budget deletes the oldest rotated ones.
+        let fill = |j: &Journal| {
+            for i in 0..8 {
+                j.append("note", None, json!({"text": "x".repeat(300), "i": i}))
+                    .unwrap();
+            }
+        };
+        let d = tempfile::tempdir().unwrap();
+        let plain = Journal::with_rotate_after(d.path().join("a"), "s".into(), 200);
+        assert_eq!(plain.retention_bytes, None);
+        fill(&plain);
+        assert_eq!(journal_files(&d.path().join("a")).len(), 8);
+
+        let mut limited = Journal::with_rotate_after(d.path().join("b"), "s".into(), 200);
+        limited.retention_bytes = Some(1000);
+        fill(&limited);
+        let files = journal_files(&d.path().join("b"));
+        assert_eq!(files.len(), MAX_JOURNAL_FILES);
+        assert!(files.last().unwrap().ends_with(JOURNAL_FILE));
+        // The newest records survive.
+        let (records, _) = read_records(&d.path().join("b"));
+        assert_eq!(records.last().unwrap().data["i"], 7);
+
+        // The network queue's writer is the handle that has the budget.
+        let engine = plain.clone_for_engine();
+        assert_eq!(engine.retention_bytes, None);
     }
 
     #[test]

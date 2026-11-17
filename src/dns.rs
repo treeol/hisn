@@ -317,37 +317,54 @@ fn exchange_udp(q: &[u8], up: SocketAddr, budget: Duration) -> Result<Vec<u8>, &
 }
 
 fn exchange_tcp(q: &[u8], up: SocketAddr, budget: Duration) -> Result<Vec<u8>, &'static str> {
+    const TIMEOUT: &str = "upstream-timeout";
+    const UNREACHABLE: &str = "upstream-unreachable";
+    // `budget` bounds the whole exchange: the time left is recomputed
+    // before every single read and write, so an upstream that sends one
+    // byte at a time cannot stretch it.
     let deadline = Instant::now() + budget;
-    let timed_out = |e: io::Error| match e.kind() {
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => "upstream-timeout",
-        _ => "upstream-unreachable",
-    };
-    let left = |deadline: Instant| {
+    let left = || {
         let d = deadline.saturating_duration_since(Instant::now());
-        if d.is_zero() {
-            Err("upstream-timeout")
-        } else {
-            Ok(d)
-        }
+        if d.is_zero() { Err(TIMEOUT) } else { Ok(d) }
     };
-    let mut s = TcpStream::connect_timeout(&up, left(deadline)?).map_err(timed_out)?;
+    let failed = |e: io::Error| match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => TIMEOUT,
+        _ => UNREACHABLE,
+    };
+    let mut s = TcpStream::connect_timeout(&up, left()?).map_err(failed)?;
     let mut msg = (q.len() as u16).to_be_bytes().to_vec();
     msg.extend_from_slice(q);
-    s.set_write_timeout(Some(left(deadline)?))
-        .map_err(timed_out)?;
-    s.write_all(&msg).map_err(timed_out)?;
+    let mut sent = 0;
+    while sent < msg.len() {
+        s.set_write_timeout(Some(left()?)).map_err(failed)?;
+        match s.write(&msg[sent..]) {
+            Ok(0) => return Err(UNREACHABLE),
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(failed(e)),
+        }
+    }
+    let mut read_full = |buf: &mut [u8]| -> Result<(), &'static str> {
+        let mut got = 0;
+        while got < buf.len() {
+            s.set_read_timeout(Some(left()?)).map_err(failed)?;
+            match s.read(&mut buf[got..]) {
+                Ok(0) => return Err(UNREACHABLE),
+                Ok(n) => got += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(failed(e)),
+            }
+        }
+        Ok(())
+    };
     let mut len = [0u8; 2];
-    s.set_read_timeout(Some(left(deadline)?))
-        .map_err(timed_out)?;
-    s.read_exact(&mut len).map_err(timed_out)?;
+    read_full(&mut len)?;
     let mut resp = vec![0u8; u16::from_be_bytes(len) as usize];
-    s.set_read_timeout(Some(left(deadline)?))
-        .map_err(timed_out)?;
-    s.read_exact(&mut resp).map_err(timed_out)?;
+    read_full(&mut resp)?;
     if answers(q, &resp) {
         Ok(resp)
     } else {
-        Err("upstream-unreachable")
+        Err(UNREACHABLE)
     }
 }
 
@@ -404,6 +421,9 @@ struct Shared {
     wake: OwnedFd,
     ups: Vec<SocketAddr>,
     journal: Option<Arc<Journal>>,
+    /// Set when the responder stops: workers drop the queries that are
+    /// still queued instead of forwarding them.
+    stopping: AtomicBool,
 }
 
 impl Shared {
@@ -455,6 +475,9 @@ fn worker(jobs: &Mutex<mpsc::Receiver<Job>>, shared: &Shared, done: &mpsc::Sende
             rx.recv()
         };
         let Ok(job) = job else { return };
+        if shared.stopping.load(Ordering::Relaxed) {
+            continue; // the session is ending: nobody waits for this
+        }
         let tcp = matches!(job.client, Client::Tcp { .. });
         let (result, upstream) = forward(&job.query, &shared.ups, tcp);
         let (resp, error) = match result {
@@ -480,6 +503,8 @@ struct TcpConn {
     out_pos: usize,
     in_flight: usize,
     last: Instant,
+    /// The client has finished sending (it may still read replies).
+    eof: bool,
 }
 
 impl TcpConn {
@@ -539,7 +564,18 @@ pub fn run(
         wake: unsafe { OwnedFd::from_raw_fd(wake) },
         ups,
         journal,
+        stopping: AtomicBool::new(false),
     });
+    // The listener must not block: a client can reset its connection
+    // between poll and accept, and a blocking accept would then stall
+    // the whole responder until the next client.
+    // SAFETY: fcntl on our own listening socket.
+    unsafe {
+        let fl = libc::fcntl(tcp.as_raw_fd(), libc::F_GETFL);
+        if fl < 0 || libc::fcntl(tcp.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+            return;
+        }
+    }
     let (job_tx, job_rx) = mpsc::sync_channel::<Job>(MAX_PENDING);
     let job_rx = Arc::new(Mutex::new(job_rx));
     let (done_tx, done_rx) = mpsc::channel::<(u64, Vec<u8>)>();
@@ -553,8 +589,10 @@ pub fn run(
 
     poll_loop(&shared, &tcp, &job_tx, &done_rx, shutdown);
 
-    // Workers end when the queue sender is gone; each finishes its
-    // current exchange first (bounded by UPSTREAM_DEADLINE).
+    // Workers end when the queue sender is gone. Each finishes the
+    // exchange it is in (bounded by UPSTREAM_DEADLINE) and drops what is
+    // still queued, so stopping takes about one deadline at most.
+    shared.stopping.store(true, Ordering::Relaxed);
     drop(job_tx);
     for w in workers {
         let _ = w.join();
@@ -618,13 +656,15 @@ fn poll_loop(
         pollfds.push(pfd(tcp.as_raw_fd(), accept));
         pollfds.push(pfd(shared.wake.as_raw_fd(), libc::POLLIN));
         for c in &conns {
-            // POLLOUT only with output pending, or poll would spin.
+            // POLLOUT only with output pending, and POLLIN only until
+            // the client's end of input, or poll would spin.
             let out = if c.out_pos < c.out.len() {
                 libc::POLLOUT
             } else {
                 0
             };
-            pollfds.push(pfd(c.fd.as_raw_fd(), libc::POLLIN | out));
+            let input = if c.eof { 0 } else { libc::POLLIN };
+            pollfds.push(pfd(c.fd.as_raw_fd(), input | out));
         }
         // SAFETY: pollfds is a valid array of pollfds.len() entries.
         let r = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, 250) };
@@ -690,8 +730,10 @@ fn poll_loop(
         let mut dead: Vec<u64> = Vec::new();
         for (i, c) in conns.iter_mut().enumerate().take(polled) {
             let revents = pollfds[FIXED + i].revents;
-            let mut closed = revents & bad != 0;
-            if !closed && revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            // After the client's end of input, POLLHUP means it is gone
+            // entirely.
+            let mut closed = revents & bad != 0 || (c.eof && revents & libc::POLLHUP != 0);
+            if !closed && !c.eof && revents & (libc::POLLIN | libc::POLLHUP) != 0 {
                 let mut tmp = [0u8; 4096];
                 // SAFETY: tmp is valid writable memory of tmp.len() bytes.
                 let n = unsafe {
@@ -707,7 +749,10 @@ fn poll_loop(
                     c.last = Instant::now();
                     closed = !take_tcp_queries(shared, job_tx, c);
                 } else if n == 0 {
-                    closed = true;
+                    // End of input. Queries already taken are still
+                    // answered (a client may shut down its sending side
+                    // and wait for the replies).
+                    c.eof = true;
                 } else {
                     let e = io::Error::last_os_error().kind();
                     closed = !matches!(e, io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted);
@@ -716,8 +761,9 @@ fn poll_loop(
             if !closed {
                 closed = c.drain_out().is_err() || c.out.len() - c.out_pos > MAX_TCP_OUT;
             }
-            let idle = c.in_flight == 0 && c.out.is_empty() && c.last.elapsed() > TCP_IDLE;
-            if closed || idle {
+            let settled = c.in_flight == 0 && c.out.is_empty();
+            let idle = settled && c.last.elapsed() > TCP_IDLE;
+            if closed || idle || (c.eof && settled) {
                 dead.push(c.id);
             }
         }
@@ -745,6 +791,7 @@ fn poll_loop(
                     out_pos: 0,
                     in_flight: 0,
                     last: Instant::now(),
+                    eof: false,
                 });
             }
         }
@@ -1091,10 +1138,11 @@ mod tests {
     }
 
     #[test]
-    fn tcp_query_is_answered_and_pipelining_works() {
+    fn tcp_framing_and_pipelining_with_an_unreachable_upstream() {
         // The fake upstream speaks UDP only, so a TCP query cannot be
         // forwarded: the client must still get a well-formed SERVFAIL
         // for each pipelined query, in a length-prefixed frame.
+        // (Forwarding over TCP is tested just below.)
         let r = Responder::start(vec![fake_upstream()], None);
         let mut s = TcpStream::connect(r.tcp).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
@@ -1114,6 +1162,132 @@ mod tests {
         }
         ids.sort_unstable();
         assert_eq!(ids, [21, 22]);
+    }
+
+    /// A TCP upstream on loopback. `trickle`: send the reply one byte
+    /// every 300 ms instead of at once.
+    fn fake_tcp_upstream(trickle: bool) -> SocketAddr {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { continue };
+                let mut len = [0u8; 2];
+                if s.read_exact(&mut len).is_err() {
+                    continue;
+                }
+                let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
+                if s.read_exact(&mut q).is_err() {
+                    continue;
+                }
+                q[2] |= 0x80;
+                let mut reply = (q.len() as u16).to_be_bytes().to_vec();
+                reply.extend_from_slice(&q);
+                if trickle {
+                    for b in reply {
+                        if s.write_all(&[b]).is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(300));
+                    }
+                } else {
+                    let _ = s.write_all(&reply);
+                }
+            }
+        });
+        addr
+    }
+
+    fn tcp_ask(r: &Responder, id: u16, half_close: bool) -> (u8, Duration) {
+        let start = Instant::now();
+        let mut s = TcpStream::connect(r.tcp).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+        let q = query(id, "fast.test", 1);
+        s.write_all(&(q.len() as u16).to_be_bytes()).unwrap();
+        s.write_all(&q).unwrap();
+        if half_close {
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+        }
+        let mut len = [0u8; 2];
+        s.read_exact(&mut len).unwrap();
+        let mut resp = vec![0u8; u16::from_be_bytes(len) as usize];
+        s.read_exact(&mut resp).unwrap();
+        assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), id);
+        (resp[3] & 0x0f, start.elapsed())
+    }
+
+    #[test]
+    fn tcp_query_is_forwarded_over_tcp() {
+        let r = Responder::start(vec![fake_tcp_upstream(false)], None);
+        assert_eq!(tcp_ask(&r, 31, false).0, 0, "NOERROR from the TCP upstream");
+        // A client that shuts down its sending side still gets the reply.
+        assert_eq!(
+            tcp_ask(&r, 32, true).0,
+            0,
+            "reply after the client's half-close"
+        );
+    }
+
+    #[test]
+    fn trickling_tcp_upstream_is_cut_off_at_the_deadline() {
+        // The reply would take about 9 s at one byte per 300 ms. The
+        // whole exchange is bounded by the upstream deadline (2 s).
+        let r = Responder::start(vec![fake_tcp_upstream(true)], None);
+        let (rcode, took) = tcp_ask(&r, 33, false);
+        assert_eq!(rcode, 2, "SERVFAIL");
+        assert!(took < Duration::from_secs(4), "took {took:?}");
+    }
+
+    #[test]
+    fn stopping_drops_the_queued_queries() {
+        // 60 queries for an upstream that never answers: 16 are being
+        // forwarded, the rest wait. Stopping must take about one upstream
+        // deadline, not the four it would take to work through them all.
+        let r = Responder::start(vec![fake_upstream()], None);
+        let clients: Vec<UdpSocket> = (0..60)
+            .map(|i| {
+                let c = r.client();
+                c.send(&query(200 + i, "slow.test", 1)).unwrap();
+                c
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(300));
+        let start = Instant::now();
+        drop(r);
+        let took = start.elapsed();
+        assert!(took < Duration::from_millis(3500), "stopping took {took:?}");
+        drop(clients);
+    }
+
+    #[test]
+    fn reset_before_accept_does_not_stall_the_responder() {
+        // Connections that are reset right after the handshake: the
+        // responder must keep answering UDP afterwards.
+        let r = Responder::start(vec![fake_upstream()], None);
+        for _ in 0..20 {
+            let s = TcpStream::connect(r.tcp).unwrap();
+            // SO_LINGER 0: close sends RST.
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // SAFETY: setsockopt on our own socket with a valid struct.
+            unsafe {
+                libc::setsockopt(
+                    s.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    &linger as *const libc::linger as *const libc::c_void,
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                )
+            };
+            drop(s);
+        }
+        let c = r.client();
+        c.send(&query(40, "fast.test", 1)).unwrap();
+        let mut buf = [0u8; 512];
+        c.recv(&mut buf).unwrap();
+        assert_eq!(buf[3] & 0x0f, 0);
     }
 
     #[test]

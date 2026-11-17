@@ -406,7 +406,8 @@ fn reply(listener: i32, id: u64, error: i32, val: i64, flags: u32) {
 /// Receiver thread + bounded worker pool. Deadline from RECV.
 pub struct NotifEngine {
     pub shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub handle: Option<std::thread::JoinHandle<()>>,
+    /// Receives one message (or a hang-up) when the engine has stopped.
+    done: std::sync::mpsc::Receiver<()>,
 }
 
 /// Max pending notifications between receiver and workers; a full queue
@@ -499,23 +500,30 @@ impl NotifEngine {
     ) -> Self {
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sd = shutdown.clone();
-        let handle = std::thread::spawn(move || {
+        let (done_tx, done) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
             engine_loop(listener, journal, cfg, &sd);
+            let _ = done_tx.send(());
         });
-        Self {
-            shutdown,
-            handle: Some(handle),
-        }
+        Self { shutdown, done }
     }
 }
+
+/// How long dropping an engine waits for its threads. The receiver
+/// looks at the shutdown flag every [`RECV_POLL_MS`], and a worker gives
+/// up a pending connect within a second once its task is gone, so this
+/// is normally not reached. It exists so that the end of a session never
+/// depends on a thread that is stuck in a system call: after it the
+/// threads are left behind (the supervisor process exits right after).
+const ENGINE_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Poll interval of the receiver, in milliseconds.
+const RECV_POLL_MS: i32 = 200;
 
 impl Drop for NotifEngine {
     fn drop(&mut self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        let _ = self.done.recv_timeout(ENGINE_STOP_WAIT);
     }
 }
 
@@ -559,12 +567,12 @@ fn engine_loop(
             events: libc::POLLIN,
             revents: 0,
         };
-        let r = unsafe { libc::poll(&mut pfd, 1, 2000) };
+        let r = unsafe { libc::poll(&mut pfd, 1, RECV_POLL_MS) };
         if r < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return;
+            break;
         }
         if r == 0 {
             continue;
@@ -627,6 +635,12 @@ fn handle_notif(
     journal: &Option<std::sync::Arc<crate::journal::Journal>>,
 ) {
     let deadline = recv_at + std::time::Duration::from_secs(cfg.deadline_s.max(1));
+    // The deadline runs from NOTIF_RECV and covers the time spent waiting
+    // for a worker: a notification that is already too old is answered
+    // ETIMEDOUT without any work.
+    if refuse_if_expired(lfd, n, deadline, journal) {
+        return;
+    }
     // A pidfd for the notified task (`n.pid` is a thread id), then
     // ID_VALID: once the id is confirmed, the pidfd refers to the task
     // that is suspended in this connect() and not to a recycled id.
@@ -673,6 +687,9 @@ fn handle_notif(
             return;
         }
     };
+    if refuse_if_expired(lfd, n, deadline, journal) {
+        return;
+    }
     let family = u16::from_ne_bytes([buf[0], buf[1]]);
     // Parse IP when INET/INET6.
     let mut ip: Option<IpAddr> = None;
@@ -695,6 +712,7 @@ fn handle_notif(
     // SO_TYPE via pidfd_getfd + getsockopt.
     let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd as i64, sockfd as i64, 0u64) };
     let mut is_stream = false;
+    let mut already_connected = false;
     let mut sock_type = 0i32;
     if dup >= 0 {
         let dup_fd = unsafe { OwnedFd::from_raw_fd(dup as i32) };
@@ -712,6 +730,16 @@ fn handle_notif(
             // SOCK_STREAM=1, SOCK_DGRAM=2 (low nibble); strip SOCK_CLOEXEC/NONBLOCK bits.
             is_stream = (sock_type & 0xf) == libc::SOCK_STREAM;
         }
+        // SAFETY: zeroed storage and its length are a valid out-buffer.
+        let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut peer_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        already_connected = unsafe {
+            libc::getpeername(
+                dup_fd.as_raw_fd(),
+                &mut peer as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+                &mut peer_len,
+            )
+        } == 0;
         // dup_fd dropped here (OwnedFd discipline).
     }
     let is_public = ip.map(|a| is_public_ip(&a)).unwrap_or(false);
@@ -740,6 +768,17 @@ fn handle_notif(
             }
             if let Some(j) = journal {
                 j.net_record("refuse", reason, n);
+            }
+        }
+        Verdict::Allow if already_connected => {
+            // connect() on a socket that is already connected: the kernel
+            // answers EISCONN. Replacing the socket here would silently
+            // drop the established connection.
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -(libc::EISCONN), 0, 0);
+            }
+            if let Some(j) = journal {
+                j.net_record("refuse", "already-connected", n);
             }
         }
         Verdict::Allow => {
@@ -797,6 +836,17 @@ fn handle_notif(
                         revents: 0,
                     };
                     let pr = unsafe { libc::poll(&mut pfd, 1, 1000) };
+                    if pr < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                        // poll itself failed: do not retry until the
+                        // deadline, answer now.
+                        if id_valid(lfd, n.id) {
+                            reply(lfd, n.id, -(libc::EIO), 0, 0);
+                        }
+                        if let Some(j) = journal {
+                            j.net_record("refuse", "connect-error", n);
+                        }
+                        return;
+                    }
                     if pr <= 0 {
                         // Still connecting. If the task has gone away
                         // meanwhile (killed, or the session is ending),
@@ -892,6 +942,26 @@ fn handle_notif(
             // (the injected copy is owned by the child now).
         }
     }
+}
+
+/// When `deadline` has passed: answer the notification ETIMEDOUT, journal
+/// `refuse/deadline`, and return true.
+fn refuse_if_expired(
+    lfd: i32,
+    n: &Notif,
+    deadline: std::time::Instant,
+    journal: &Option<std::sync::Arc<crate::journal::Journal>>,
+) -> bool {
+    if std::time::Instant::now() < deadline {
+        return false;
+    }
+    if id_valid(lfd, n.id) {
+        reply(lfd, n.id, -(libc::ETIMEDOUT), 0, 0);
+        if let Some(j) = journal {
+            j.net_record("refuse", "deadline", n);
+        }
+    }
+    true
 }
 
 /// Open a pidfd through which `tid`'s file descriptors can be taken.
@@ -1112,6 +1182,15 @@ pub fn is_public_ip(ip: &IpAddr) -> bool {
             if let Some(v4) = nat64_embedded(v6) {
                 return is_public_v4(&v4);
             }
+            let o = v6.octets();
+            // 64:ff9b:1::/48 is the local-use NAT64 prefix (RFC 8215).
+            // Where the IPv4 address sits in it depends on the prefix
+            // length the operator chose (RFC 6052), which is not known
+            // here, and the prefix is not public address space: refuse
+            // all of it.
+            if o[..6] == [0, 0x64, 0xff, 0x9b, 0, 1] {
+                return false;
+            }
             if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
                 return false;
             }
@@ -1146,17 +1225,11 @@ pub fn is_public_ip(ip: &IpAddr) -> bool {
     }
 }
 
-/// If `v6` is in a NAT64 prefix (`64:ff9b::/96` or `64:ff9b:1::/48`),
-/// return its embedded IPv4 address.
+/// The IPv4 address embedded in an address of the well-known NAT64
+/// prefix `64:ff9b::/96` (RFC 6052: the last 32 bits).
 fn nat64_embedded(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
     let o = v6.octets();
-    // 64:ff9b::/96 — first 96 bits are 0x0064ff9b + 64 zero bits.
-    if o[0] == 0 && o[1] == 0x64 && o[2] == 0xff && o[3] == 0x9b && o[4..12].iter().all(|&b| b == 0)
-    {
-        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
-    }
-    // 64:ff9b:1::/48 — first 48 bits 0x0064ff9b0001.
-    if o[0] == 0 && o[1] == 0x64 && o[2] == 0xff && o[3] == 0x9b && o[4] == 0 && o[5] == 1 {
+    if o[..4] == [0, 0x64, 0xff, 0x9b] && o[4..12].iter().all(|&b| b == 0) {
         return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
     }
     None
@@ -1226,6 +1299,11 @@ mod tests {
             "64:ff9b::0a00:0001",
             "64:ff9b::c0a8:0101",
             "64:ff9b:1::0a00:0001",
+            // Local-use NAT64 prefix: refused whatever it embeds and
+            // wherever (here 10.0.0.1 in the /48 position, bytes 6-7 and
+            // 9-10, with a public-looking tail; then a public tail only).
+            "64:ff9b:1:0a00:0:100:808:808",
+            "64:ff9b:1::808:808",
             // Site-local (deprecated).
             "fec0::1",
             "feff::1",
@@ -1310,7 +1388,8 @@ mod tests {
     }
 
     /// Child side of [`connecting_child`]. Exit code: `16 * refused +
-    /// connected`, or 2xx when the setup failed.
+    /// connected`; `100 + n` when all `n` connects timed out; 2xx when
+    /// the setup failed.
     fn child_body(sock: i32, n: usize, port: u16) -> i32 {
         // The filter install needs no_new_privs (or CAP_SYS_ADMIN).
         if crate::sys::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0).is_err() {
@@ -1332,15 +1411,23 @@ mod tests {
             }
             pids.push(p);
         }
-        let (mut connected, mut refused) = (0, 0);
+        let (mut connected, mut refused, mut timed_out) = (0, 0, 0);
         for p in pids {
             let mut st = 0;
             unsafe { libc::waitpid(p, &mut st, 0) };
             match libc::WEXITSTATUS(st) {
                 0 => connected += 1,
                 libc::EACCES => refused += 1,
+                libc::ETIMEDOUT => timed_out += 1,
                 _ => return 206,
             }
+        }
+        if timed_out > 0 {
+            return if timed_out == n as i32 {
+                100 + timed_out
+            } else {
+                207
+            };
         }
         16 * refused + connected
     }
@@ -1476,6 +1563,48 @@ mod tests {
     fn slow_reader(pid: u32, addr: u64, len: usize) -> io::Result<[u8; 128]> {
         std::thread::sleep(std::time::Duration::from_millis(1500));
         read_sockaddr(pid, addr, len)
+    }
+
+    #[test]
+    fn dropping_an_idle_engine_is_quick() {
+        let (pid, listener) = connecting_child(0, 1);
+        let engine = NotifEngine::start_with(listener, None, EngineConfig::new(30));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        drop(engine);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "stopping took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(child_exit(pid), 0);
+    }
+
+    #[test]
+    fn deadline_covers_queue_time_and_the_read() {
+        // Deadline 1 s, one worker whose read takes 1.5 s. The first
+        // connect is past the deadline when its read returns; the second
+        // waited 1.5 s for the worker and is past it before any work.
+        // Both get ETIMEDOUT; neither is continued, although the target
+        // is a loopback listener that would be allowed.
+        let (_l, port) = loopback_listener();
+        let (d, j) = engine_journal();
+        let (pid, listener) = connecting_child(2, port);
+        let cfg = EngineConfig {
+            workers: 1,
+            queue: 4,
+            reader: slow_reader,
+            ..EngineConfig::new(1)
+        };
+        let engine = NotifEngine::start_with(listener, Some(j.clone()), cfg);
+        assert_eq!(child_exit(pid), 102, "two connects, both ETIMEDOUT");
+        drop(engine);
+        let records = connect_records(&d, &j);
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(
+            records.iter().all(|r| r.0 == "refuse" && r.1 == "deadline"),
+            "{records:?}"
+        );
     }
 
     #[test]

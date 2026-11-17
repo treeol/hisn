@@ -3442,26 +3442,29 @@ fn prepare_session_env(a: &mut PrepareEnvArgs<'_>, rules: &mut Rules) -> Result<
 /// (ADR 0022 decision 6).
 const CONNECT_DEADLINE_S: u64 = 30;
 
-/// Yama ptrace_scope parse: true = must refuse (fail closed if >= 2).
-pub fn yama_refuse(content: &str) -> bool {
-    content
-        .trim()
-        .parse::<i32>()
-        .map(|v| v >= 2)
-        .unwrap_or(false)
+/// Decide from the content of `kernel/yama/ptrace_scope` whether open
+/// mode may start: only a number below 2 is accepted. 2 and 3 stop the
+/// supervisor from reading a connect address, and content that is not a
+/// number cannot be judged, so both refuse (fail closed).
+pub fn yama_allows(content: &str) -> bool {
+    content.trim().parse::<u32>().is_ok_and(|v| v < 2)
 }
 
 fn check_yama_ptrace_scope() -> Result<()> {
     const PATH: &str = "/proc/sys/kernel/yama/ptrace_scope";
     match fs::read_to_string(PATH) {
+        // No Yama in this kernel: nothing restricts the read.
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Ok(()), // absent/unreadable: fine per brief
-        Ok(c) if yama_refuse(&c) => bail!(
-            "refusing to start: Yama ptrace_scope >= 2 breaks process_vm_readv \
-             (kernel/yama/ptrace_scope={}); set it to 0 or 1",
+        Err(e) => bail!(
+            "refusing to start network = \"open\": cannot read {PATH} ({e}), \
+             so it is unknown whether connect addresses can be read"
+        ),
+        Ok(c) if yama_allows(&c) => Ok(()),
+        Ok(c) => bail!(
+            "refusing to start network = \"open\": {PATH} is {:?}; open mode reads \
+             connect addresses with process_vm_readv, which needs 0 or 1",
             c.trim()
         ),
-        Ok(_) => Ok(()),
     }
 }
 
@@ -4326,13 +4329,15 @@ mod tests {
     }
 
     #[test]
-    fn yama_refuse_parse() {
-        assert!(super::yama_refuse("2\n"));
-        assert!(super::yama_refuse("3"));
-        assert!(!super::yama_refuse("0"));
-        assert!(!super::yama_refuse("1\n"));
-        assert!(!super::yama_refuse(""));
-        assert!(!super::yama_refuse("garbage"));
+    fn yama_allows_only_a_number_below_two() {
+        assert!(super::yama_allows("0"));
+        assert!(super::yama_allows("1\n"));
+        assert!(!super::yama_allows("2\n"));
+        assert!(!super::yama_allows("3"));
+        // Not a number: cannot be judged, so refuse.
+        assert!(!super::yama_allows(""));
+        assert!(!super::yama_allows("garbage"));
+        assert!(!super::yama_allows("-1"));
     }
 
     #[test]

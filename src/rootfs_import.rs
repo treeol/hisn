@@ -880,10 +880,34 @@ mod tests {
     }
 
     // 14
+    /// The measurement compares the peak memory of the whole process
+    /// before and after the import, so it must not share a process with
+    /// other tests: tests run in parallel, and one that allocates at the
+    /// same time (some journal tests peak above 100 MB) was counted
+    /// against the importer, depending on scheduling. The test therefore
+    /// re-runs itself alone in a child process and measures there.
     #[test]
     fn streaming_512mb_stays_under_64mb_of_extra_rss() {
+        const NAME: &str = "rootfs_import::tests::streaming_512mb_stays_under_64mb_of_extra_rss";
+        const CHILD: &str = "HISN_RSS_TEST_CHILD";
         if std::env::var("HISN_BIG_TESTS").as_deref() != Ok("1") {
             eprintln!("skipped: set HISN_BIG_TESTS=1 to run the 512 MB streaming test");
+            return;
+        }
+        if std::env::var_os(CHILD).is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads", "1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            // Exactly this one test must have run and passed in the child.
+            assert!(
+                out.status.success() && stdout.contains("test result: ok. 1 passed"),
+                "child run failed ({}): {stdout}",
+                out.status
+            );
             return;
         }
         if vm_kb("VmHWM:").is_none() {
@@ -897,7 +921,8 @@ mod tests {
             eprintln!("skipped: scratch dir has {} MiB free (< 1 GiB)", free >> 20);
             return;
         }
-        // Reset the peak counter so other tests in this process do not count.
+        // Reset the peak counter so the start-up of this process does
+        // not count.
         let reset = fs::write("/proc/self/clear_refs", "5").is_ok();
         let base = if reset {
             vm_kb("VmRSS:").unwrap()

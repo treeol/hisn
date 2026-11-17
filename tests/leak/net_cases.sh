@@ -258,18 +258,18 @@ esac
 # address; one journal record with target and verdict.
 for _ in $(seq 100); do [ -s "$ACWD/main.out" ] && break; sleep 0.1; done
 check "L90 main command connects out through interception" "MAIN-OK HERMETIC-OK" cat "$ACWD/main.out"
-journal_is "L90 journal: allow 192.0.2.1:18090" "$AWS" 1 kind=network/connect target=192.0.2.1:18090 verdict=allow reason=injected
+journal_is "L90 journal: allow 192.0.2.1:18090" "$AWS" 1 kind=network/connect target=192.0.2.1:18090 verdict=allow reason=injected-inprogress
 
 # L103: a program started by `hisn exec` (the exec tree's own listener).
 check "L103 exec'd program connects out through interception" "CONNECT-OK" in_session "$A" in-connect 18102
 # L102: that connect is one record: session, target ip:port, verdict.
 journal_is "L102 journal record: session, target ip:port, verdict, reason" "$AWS" 1 \
-  kind=network/connect session="$A" target=192.0.2.1:18102 verdict=allow reason=injected seat=null
+  kind=network/connect session="$A" target=192.0.2.1:18102 verdict=allow reason=injected-inprogress seat=null
 
 # The same from a thread other than the program's main thread: the
 # notification then carries a thread id, not a process id.
 check "L103 connect from a second thread is intercepted and allowed" "THREAD-OK" in_session "$A" in-thread 18103
-journal_is "L103 journal: allow 192.0.2.1:18103 (second thread)" "$AWS" 1 kind=network/connect target=192.0.2.1:18103 verdict=allow reason=injected
+journal_is "L103 journal: allow 192.0.2.1:18103 (second thread)" "$AWS" 1 kind=network/connect target=192.0.2.1:18103 verdict=allow reason=injected-inprogress
 
 # L94: a hostname resolves through the files hisn ships and its responder.
 check "L94 hostname resolves through the shipped resolver files" "L94-OK" in_session "$A" in-dns
@@ -360,7 +360,7 @@ esac
 # decided and journaled (the supervisor owns the sandbox's user
 # namespace, so it can read the address; the program cannot hide).
 check "L110 non-dumpable program: connect is intercepted and allowed" "L110-OK" in_session "$A" in-dumpable 18110
-journal_is "L110 journal: allow 192.0.2.1:18110" "$AWS" 1 kind=network/connect target=192.0.2.1:18110 verdict=allow reason=injected
+journal_is "L110 journal: allow 192.0.2.1:18110" "$AWS" 1 kind=network/connect target=192.0.2.1:18110 verdict=allow reason=injected-inprogress
 
 # The open session's seccomp filter count, for the none comparison below.
 OPEN_STATUS=$(in_session "$A" in-status)

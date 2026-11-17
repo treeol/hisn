@@ -264,32 +264,29 @@ unchanged from the task; the rest are stated with their refinement.
    documented limitation L105; programs that bind before connect lose
    their local address choice. Epoll registrations are lost on fd
    replacement (probe F); the client re-registers after `connect()`
-   returns, same as with any fd replacement. **Non-blocking connect
-   (0.6.0 final):** when the program's own socket is non-blocking, the
-   supervisor creates its socket with `O_NONBLOCK`, copies options as
-   above, and calls `connect()`:
+   returns, same as with any fd replacement. **Blocking and
+   non-blocking sockets:** the supervisor creates its socket, copies
+   the options as above, sets `O_NONBLOCK` on it and calls `connect()`:
    - returns 0 → inject with `SETFD` to args[0], reply 0 (reason
      `injected`);
-   - returns `EINPROGRESS` → inject with `SETFD` to args[0] (without
-     `FLAG_SEND`), then reply `-EINPROGRESS` (reason
-     `injected-inprogress`); the program sees `EINPROGRESS` and later
-     `POLLOUT`/`SO_ERROR` on the same socket object, exactly like a
-     normal non-blocking connect. The supervisor keeps its own
-     duplicate of the socket, waits for completion in its poll loop
-     (never a blocking worker), bounded by the connect deadline, writes
-     one `network/connect-result` record (`target`, `result` ok or
-     errno name, `latency_ms`), and closes its duplicate. Tracking is
-     bounded ([`MAX_TRACKED`](https://github.com/treeol/hisn));
-     overflow is counted and journaled as `tracked_overflow` in the
-     next `network/summary`. An `EINPROGRESS` is only ever replied
-     after a successful injection: if it fails, the supervisor closes
-     its socket and replies `EACCES`.
-   - returns any other error immediately → no injection, reply that
-     `-errno` (`ECONNREFUSED`, `EHOSTUNREACH`, …), never a generic
-     `EACCES` (Mashūra finding 6).
-   A blocking program socket keeps the old behaviour: the supervisor
-   completes the connect under the deadline, injects, and replies 0 or
-   the connect's `-errno` (reason `injected`).
+   - returns any other error than `EINPROGRESS` → no injection, reply
+     that `-errno` (`ECONNREFUSED`, `EHOSTUNREACH`, …), never a generic
+     `EACCES` (Mashūra finding 6);
+   - returns `EINPROGRESS` and the program's socket is **blocking** →
+     wait for the result under the deadline, then inject and reply 0,
+     or reply the connect's `-errno` (`ETIMEDOUT` at the deadline);
+   - returns `EINPROGRESS` and the program's socket is **non-blocking**
+     → inject the connecting socket with `SETFD` to args[0] (`ADDFD`
+     without `FLAG_SEND`), then `NOTIF_SEND` with `-EINPROGRESS`
+     (reason `injected-inprogress`). The program sees `EINPROGRESS` and
+     later `POLLOUT`/`SO_ERROR` on that socket. `EINPROGRESS` is only
+     sent after the injection succeeded; if it fails the supervisor
+     closes its socket and replies `EACCES`. The supervisor keeps its
+     own descriptor of the socket and journals how the connect ended
+     (decision 8); it must never read `SO_ERROR` through it, because a
+     pending socket error is delivered to one reader only.
+   If the program's `O_NONBLOCK` state cannot be read the connect is
+   refused (`EACCES`), never guessed.
 8. **Every connect decision is a journal record.** One `network/connect`
    record per notification, workspace journal (ADR 0020): `target`
    (ip:port or unix path), `resolved_name` when the pin knows it,
@@ -448,10 +445,10 @@ Connect (allowlist/open), per notification, in this exact order:
    `SETFD` + separate `NOTIF_SEND` on 5.9–5.13), replies 0 with the
    injected fd. If the outbound connect fails, replies `-errno` from
    that connect (`ECONNREFUSED`, `EHOSTUNREACH`, …), never a generic
-   `EACCES`. Non-blocking semantics are preserved: a non-blocking
-   `connect()` suspended in user-notif returns through the injected fd;
-   the client's `poll(POLLOUT)`/`SO_ERROR` behaves as with a normal
-   connected socket (Q3). Journal failure never blocks a verdict.
+   `EACCES`. A non-blocking program socket is injected while the
+   connect is still in progress and answered `EINPROGRESS` (decision
+   7); the client's `poll(POLLOUT)`/`SO_ERROR` then report the outcome
+   of that connect. Journal failure never blocks a verdict.
 7. IPv4 and IPv6 are handled identically; the sockaddr family comes
    from the supervisor's copy. Deadline runs from `NOTIF_RECV`
    (decision 6).
@@ -680,20 +677,41 @@ does where it differs from or sharpens the text above:
   the address read, and during the outbound connect. A pending connect
   is given up as soon as its notification is no longer valid, so a
   session does not wait for it at its end.
-- **Already connected.** `connect()` on a connected socket is answered
-  `EISCONN`.
-- **Sizes.** 64 workers, queue 256 (full: `EACCES`,
-  `refuse/queue-full`). DNS: 16 workers, queue 256, 2 s per query
-  shared over the upstreams, at most 64 TCP clients.
+- **Already connected or connecting.** `connect()` on a connected
+  socket is answered `EISCONN`, on a socket whose connect is still
+  pending (`tcpi_state` SYN_SENT) `EALREADY`; nothing is injected.
+- **Sizes.** 16 dispatch threads read, decide and start the
+  (non-blocking) connect and never wait for a connection; 64 wait
+  threads hold the connects of blocking programs until they end. Each
+  pool has a queue of 256 (full: `EACCES`, `refuse/queue-full`). DNS:
+  16 workers, queue 256, 2 s per query shared over the upstreams, at
+  most 64 TCP clients.
+- **Completion tracking.** After `EINPROGRESS` the supervisor's own
+  descriptor of the injected socket goes to a tracker (at most
+  `MAX_TRACKED` = 1024 sockets, `src/notif.rs`; one more is not
+  tracked and counted). The receiver thread polls the tracked sockets
+  together with the listener, so no thread waits for them. The outcome
+  is read from `TCP_INFO` (`tcpi_state`; a socket in `CLOSE` with
+  `tcpi_bytes_acked` > 0 was connected and has been closed since), with
+  `getpeername` as fallback: `connected`, `failed`, or at the deadline
+  `pending-at-deadline`. `SO_ERROR` is never read: measured on kernel
+  7.3.3, a read through a duplicate returned `ECONNREFUSED` and the
+  program's own read then returned 0, while `TCP_INFO` and
+  `getpeername` on the duplicate left the program's `SO_ERROR` at
+  `ECONNREFUSED`. Tracked sockets are closed when the engine stops.
+- **`NOTIF_SEND` after an injection** is checked: if the answer does
+  not reach the task, the record's reason is `injected-reply-failed`,
+  nothing is tracked and the supervisor's descriptor is closed.
 - **Journal.** Network records pass through one bounded queue per
   session (4096 entries; full: the record is dropped and counted). At
   most 50 per second are written one by one, the rest are counted in
-  `network/summary` (`tracked_overflow` for completion-tracking
-  overflow). `network/connect` has no `latency_ms`, `resolved_name`
-  or seat attribution yet (`seat` is `null`). `network/connect-result`
-  is the completion of a non-blocking connect the supervisor answered
-  `EINPROGRESS` for (`target`, `result`, `latency_ms`); the same loop
-  that polls tracked duplicates writes it. `network/dns` carries
+  `network/summary` (with `result_connected`, `result_other` and
+  `tracked_overflow`). `network/connect` has no `latency_ms`,
+  `resolved_name` or seat attribution yet (`seat` is `null`).
+  `network/connect-result` (`target`, `result`, `latency_ms`, no
+  errno) is how a non-blocking connect ended that was answered
+  `EINPROGRESS`, or `failed` with latency 0 when it failed at once.
+  `network/dns` carries
   `name`, `qtype`, `proto`, `upstream`, `rcode` and `verdict`
   `ok` / `failed` / `error`. The size limit (oldest rotated files
   deleted beyond 256 MiB in more than four files) applies only to
@@ -715,9 +733,10 @@ had measured 20–25 µs extra with a single-threaded C supervisor. The
 
 Known gaps, accepted for 0.6.0 and listed in the release notes: an
 epoll registration or a duplicate made before `connect()` refers to
-the old socket; only a few socket options are carried over. (The
-0.6.0 non-blocking `connect()` limitation — the call waited for the
-result — is fixed in 0.6.0 final: see decision 7 above and case L117.)
+the old socket; only a few socket options are carried over; another
+thread of the program that closes and reuses the descriptor number
+while `connect()` is suspended gets the socket injected at that
+number.
 
 Mashūra round 1 (open questions: "What is missing or wrong in this
 design? Where can it fail open? What would an agent other than Wakil

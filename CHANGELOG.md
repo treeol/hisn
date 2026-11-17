@@ -29,19 +29,33 @@ allowlist in this release. `none` (the default) and `host` behave as in
   and all their threads: unix and loopback continue; other families,
   non-stream sockets and non-public targets get `EACCES`; public stream
   targets are connected by the supervisor. 30 s deadline
-  (`ETIMEDOUT`), 64 workers, queue of 256 (full: `EACCES`).
+  (`ETIMEDOUT`), queue of 256 (full: `EACCES`).
+- A `connect()` on a non-blocking socket returns `EINPROGRESS` at once:
+  the supervisor injects its connecting socket and the program follows
+  the connect itself (`POLLOUT`, `SO_ERROR`). A `connect()` on a
+  blocking socket returns when the connection is established or has
+  failed. 16 threads decide and start connects and never wait for one;
+  up to 64 blocking connects wait at a time in a second pool, so a
+  non-blocking connect is not held up by them. A second `connect()` on
+  a socket whose connect is pending gets `EALREADY`, on a connected one
+  `EISCONN`.
 - DNS responder on the session's `127.0.0.1:53` (UDP and TCP),
   forwarding to the host's resolvers; `open` sessions get a generated
   `/etc/resolv.conf` and `/etc/nsswitch.conf`. Without a usable
   upstream the session does not start.
 - Journal kinds `network/connect`, `network/dns` (real response code;
-  `ok` / `failed` / `error`) and `network/summary` (records beyond 50
-  per second are counted, not written one by one).
+  `ok` / `failed` / `error`), `network/connect-result` (how a
+  non-blocking connect ended: `connected`, `failed` or
+  `pending-at-deadline`, with `latency_ms`; no errno, the supervisor
+  never reads the socket's pending error) and `network/summary`
+  (records beyond 50 per second are counted, not written one by one).
 - Start-up checks for `open`: kernel support (5.9 or newer, by trying
   the operations), separate network namespace, Yama `ptrace_scope`
   0 or 1; `extra_deny` with `connect` or `socket` is rejected.
 - `scripts/host-verify-network.sh` and the hermetic network cases
-  `tests/leak/net_cases.sh` (L90, L94, L96–L100, L102–L107, L109–L116).
+  `tests/leak/net_cases.sh` (L90, L94, L96–L100, L102–L107, L109–L117,
+  L119–L123), including a Node and a Go client; the `--real` step also
+  runs node `fetch` and Go `http.Get` against github.com (L118).
 
 ### Changed
 - For a session in `open`, the workspace journal deletes its oldest
@@ -52,33 +66,6 @@ allowlist in this release. `none` (the default) and `host` behave as in
 - The 512 MB import test measured the memory of the whole test process
   and could fail because of other tests running in parallel; it now
   measures in its own process.
-
-## [Unreleased — 0.6.0 final fix]
-
-Non-blocking `connect()` must not block. The 0.6.0 limitation (the call
-returned only when the supervisor's connect finished, up to the 30 s
-deadline, so async clients blocked one round trip per connect) is
-fixed: when the program's own socket is non-blocking, the supervisor
-injects the replacement socket and replies `EINPROGRESS` at once, and
-the program sees later `POLLOUT`/`SO_ERROR` on the same socket object.
-The supervisor tracks the completion of its duplicate (bounded, never
-delaying a verdict) and writes one `network/connect-result` record.
-
-### Added
-- `network/connect-result` journal records (`target`, `result` ok or
-  errno name, `latency_ms`) for non-blocking connects the supervisor
-  answered `EINPROGRESS` for; `connect` records now carry reason
-  `injected` (immediate completion) and `injected-inprogress`;
-  `network/summary` carries `tracked_overflow`.
-- Hermetic cases L117 (non-blocking to the blackhole, the listener and
-  a closed port; Node event-loop and Go client runs; journal records),
-  and the real-network cases L118 (node `fetch` and Go `http.Get` to
-  github.com; SKIP when the tool is missing).
-
-### Changed
-- The v0.6.0 release notes, README and ADR 0022 no longer list the
-  non-blocking `connect()` wait as a limitation; they describe the new
-  behaviour.
 
 ## [0.5.1] - 2026-11-15
 

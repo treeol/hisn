@@ -64,7 +64,10 @@ if ! cp -L "$REAL" "$DIR/node"; then
   exit 0
 fi
 chmod 755 "$DIR/node"
-LDD=$(ldd "$DIR/node" 2>&1)
+# A session does not inherit this environment: what node needs is
+# judged without the caller's LD_LIBRARY_PATH, which is only used below
+# as a place to copy missing libraries from.
+LDD=$(env -u LD_LIBRARY_PATH ldd "$DIR/node" 2>&1)
 LOADER=$(printf '%s\n' "$LDD" | awk '/ld-linux|ld-musl/ { for (i = 1; i <= NF; i++) if ($i ~ /^\//) { print $i; exit } }')
 MISSING=$(printf '%s\n' "$LDD" | awk '/not found/ { print $1 }')
 mkdir -p "$DIR/lib"
@@ -95,7 +98,7 @@ else
   printf '#!/bin/sh\nd=$(dirname "$0")\nexec "$d/node" "$@"\n' >"$DIR/run-node"
 fi
 chmod 755 "$DIR/run-node"
-if NODE_VERSION=$(sh "$DIR/run-node" --version 2>&1); then
+if NODE_VERSION=$(env -u LD_LIBRARY_PATH sh "$DIR/run-node" --version 2>&1); then
   node_status "ok $NODE_VERSION ($REAL)"
 else
   node_status "broken the copied node does not start: $(printf '%s' "$NODE_VERSION" | tr '\n' ' ' | head -c 300)"

@@ -233,12 +233,24 @@ struct NetCounts {
     refuse: u64,
     cont: u64,
     dns: u64,
+    result_ok: u64,
+    result_err: u64,
 }
 
 impl NetCounts {
     fn add(&mut self, kind: &str, data: &Value) {
         if kind == "network/dns" {
             self.dns += 1;
+            return;
+        }
+        if kind == "network/connect-result" {
+            // A completion record is not a verdict: it must never be
+            // counted as `refuse` (it carries no `verdict` field).
+            if data.get("result").and_then(Value::as_str) == Some("ok") {
+                self.result_ok += 1;
+            } else {
+                self.result_err += 1;
+            }
             return;
         }
         match data.get("verdict").and_then(Value::as_str) {
@@ -248,7 +260,7 @@ impl NetCounts {
         }
     }
     fn total(&self) -> u64 {
-        self.allow + self.refuse + self.cont + self.dns
+        self.allow + self.refuse + self.cont + self.dns + self.result_ok + self.result_err
     }
 }
 
@@ -319,7 +331,9 @@ fn net_writer(
     let mut over = NetCounts::default();
     let summary = |over: &mut NetCounts| {
         let lost = dropped.swap(0, Ordering::Relaxed);
-        let over_tracked = tracked_overflow.load(Ordering::Relaxed);
+        // Consume the count like `dropped`: a nonzero value must not
+        // trigger a summary every second forever.
+        let over_tracked = tracked_overflow.swap(0, Ordering::Relaxed);
         if over.total() == 0 && lost == 0 && over_tracked == 0 {
             return;
         }
@@ -328,6 +342,8 @@ fn net_writer(
             "refuse": over.refuse,
             "continue": over.cont,
             "dns": over.dns,
+            "result_ok": over.result_ok,
+            "result_err": over.result_err,
             "dropped": lost,
             "tracked_overflow": over_tracked,
         });
@@ -1471,6 +1487,16 @@ fn summary_for(rec: &JournalRecord) -> String {
             let verdict = d.get("verdict").and_then(|v| v.as_str()).unwrap_or("?");
             format!("{} {}", escape_terminal(verdict), escape_terminal(target))
         }
+        "network/connect-result" => {
+            let target = d.get("target").and_then(|v| v.as_str()).unwrap_or("?");
+            let result = d.get("result").and_then(|v| v.as_str()).unwrap_or("?");
+            let latency = d.get("latency_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!(
+                "connect-result {} {} {latency}ms",
+                escape_terminal(target),
+                escape_terminal(result),
+            )
+        }
         "network/dns" => {
             let field = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or("?");
             format!(
@@ -1484,11 +1510,13 @@ fn summary_for(rec: &JournalRecord) -> String {
         "network/summary" => {
             let n = |k: &str| d.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
             format!(
-                "not recorded one by one: allow={} refuse={} continue={} dns={} dropped={} tracked_overflow={}",
+                "not recorded one by one: allow={} refuse={} continue={} dns={} result_ok={} result_err={} dropped={} tracked_overflow={}",
                 n("allow"),
                 n("refuse"),
                 n("continue"),
                 n("dns"),
+                n("result_ok"),
+                n("result_err"),
                 n("dropped"),
                 n("tracked_overflow"),
             )

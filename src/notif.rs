@@ -588,6 +588,17 @@ impl Tracked {
             .collect()
     }
 
+    /// Remove every entry and return their fds, so the caller can close
+    /// any leftover tracked duplicates on shutdown (no fd leak, and no
+    /// double close: the entries are gone from the tracker).
+    pub fn drain(&self) -> Vec<i32> {
+        let mut pend = self.pend.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *pend)
+            .into_iter()
+            .map(|(fd, _, _)| fd)
+            .collect()
+    }
+
     /// Remove and return the entry for `fd`, if present.
     fn take(&self, fd: i32) -> Option<(String, std::time::Instant)> {
         let mut pend = self.pend.lock().unwrap_or_else(|e| e.into_inner());
@@ -680,6 +691,14 @@ fn engine_loop(
         // Completion of tracked non-blocking connects: journal one
         // network/connect-result and close the supervisor's duplicate.
         // Closing our dup never affects the program's injected socket.
+        //
+        // The duplicate refers to the *same* socket the program owns,
+        // and SO_ERROR is socket state, not per-descriptor state: a
+        // getsockopt here does not clear the value the program
+        // reads (confirmed by reading `man socket(7)` before this
+        // edit — the errno remains until a successful connect or a
+        // new connect; the tracker read is idempotent). The result
+        // recorded is therefore the same value the program sees.
         for pfd in pfds.iter().skip(1) {
             if pfd.revents == 0 {
                 continue;
@@ -763,6 +782,12 @@ fn engine_loop(
     drop(tx);
     for w in workers {
         let _ = w.join();
+    }
+    // Close any leftover tracked duplicates (Tracked holds raw fds with
+    // no Drop of its own): workers are joined, so nothing can add or
+    // take an entry concurrently now.
+    for fd in tracker.drain() {
+        unsafe { libc::close(fd) };
     }
     drop(listener);
 }
@@ -945,10 +970,21 @@ fn handle_notif(
             // This also records the child's original O_NONBLOCK state so we
             // can restore it before injection.
             let orig_nonblock = copy_sock_opts(sockfd, pidfd as i32, newfd);
-            // Non-blocking connect with deadline.
+            // Non-blocking connect with deadline. Fail closed if
+            // O_NONBLOCK cannot be set on the supervisor socket: a
+            // blocking connect (or a wrong-flag socket) must never
+            // be injected. The guard closes `newfd` on return.
             let flags = unsafe { libc::fcntl(newfd, libc::F_GETFL) };
-            if flags >= 0 {
-                unsafe { libc::fcntl(newfd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            let nonblock_ok = flags >= 0
+                && unsafe { libc::fcntl(newfd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0;
+            if !nonblock_ok {
+                if id_valid(lfd, n.id) {
+                    reply(lfd, n.id, -(libc::EACCES), 0, 0);
+                }
+                if let Some(j) = journal {
+                    j.net_record("refuse", "nonblock-failed", n);
+                }
+                return;
             }
             let cr = unsafe {
                 libc::connect(
@@ -968,15 +1004,27 @@ fn handle_notif(
                     // Inject first, then reply EINPROGRESS: an EINPROGRESS
                     // without the replacement socket would leave the
                     // program polling an unconnected socket forever.
+                    // Restoring the client's O_NONBLOCK state before
+                    // injection is part of the EINPROGRESS contract: if
+                    // it cannot be set, fail closed instead of injecting
+                    // a socket with the wrong flags (guard closes newfd).
                     if let Some(nb) = orig_nonblock {
                         let nf = unsafe { libc::fcntl(newfd, libc::F_GETFL) };
-                        if nf >= 0 {
-                            let want = if nb {
-                                nf | libc::O_NONBLOCK
-                            } else {
-                                nf & !libc::O_NONBLOCK
-                            };
-                            unsafe { libc::fcntl(newfd, libc::F_SETFL, want) };
+                        let want = if nb {
+                            nf | libc::O_NONBLOCK
+                        } else {
+                            nf & !libc::O_NONBLOCK
+                        };
+                        if nf < 0
+                            || unsafe { libc::fcntl(newfd, libc::F_SETFL, want) } < 0
+                        {
+                            if id_valid(lfd, n.id) {
+                                reply(lfd, n.id, -(libc::EACCES), 0, 0);
+                            }
+                            if let Some(j) = journal {
+                                j.net_record("refuse", "nonblock-failed", n);
+                            }
+                            return;
                         }
                     }
                     if !id_valid(lfd, n.id) {
@@ -1001,7 +1049,9 @@ fn handle_notif(
                             // Keep a duplicate for completion tracking:
                             // dup the supervisor fd, then hand tracking the
                             // dup to the receiver thread's poll loop.
-                            let dup_fd = unsafe { libc::dup(newfd) };
+                            let dup_fd = unsafe {
+                                libc::fcntl(newfd, libc::F_DUPFD_CLOEXEC, 0)
+                            };
                             if dup_fd >= 0 {
                                 let target = notif_target(
                                     n.parsed_ip.as_ref(),
@@ -1013,9 +1063,16 @@ fn handle_notif(
                                 }
                             }
                         }
-                        Err(e) => {
+                        Err(_e) => {
+                            // ADDFD failure contract: -EACCES, like every
+                            // other supervisor-side refusal. The guard
+                            // closes `newfd`; nothing injected, nothing
+                            // extra to close.
                             if id_valid(lfd, n.id) {
-                                reply(lfd, n.id, -(e.raw_os_error().unwrap_or(libc::EIO)), 0, 0);
+                                reply(lfd, n.id, -(libc::EACCES), 0, 0);
+                                if let Some(j) = journal {
+                                    j.net_record("refuse", "addfd-failed", n);
+                                }
                             }
                             return;
                         }

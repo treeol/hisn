@@ -20,9 +20,11 @@
 # Output: one line per check,
 #   PASS  <name>
 #   FAIL: <name> -- <detail>
+#   SKIP  <name> -- <reason>
 #   INFO  <text>
-# and a last line `NET-CASES: pass=<n> fail=<n>`, which the caller
-# compares with the lines it counted. Exit 0 iff fail=0 and pass>0.
+# and a last line `NET-CASES: pass=<n> fail=<n> skip=<n>`, which the
+# caller compares with the lines it counted. Exit 0 iff fail=0 and
+# pass>0.
 #
 # A check passes only when its command exits 0, prints the expected
 # text, and prints no line starting with `FAIL:`. Every session-based
@@ -39,18 +41,20 @@ TOKEN=${3:?usage: net_cases.sh HISN WORKDIR TOKEN}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 HELPER="$HERE/net_helper.py"
 
-PASSES=0 FAILS=0
+PASSES=0 FAILS=0 SKIPS=0
 pass() { PASSES=$((PASSES + 1)); printf 'PASS  %s\n' "$1"; }
+skip() { SKIPS=$((SKIPS + 1)); printf 'SKIP  %s -- %s\n' "$1" "$2"; }
 fail() { FAILS=$((FAILS + 1)); printf 'FAIL: %s -- %s\n' "$1" "$(printf '%s' "$2" | tr '\n' ' ' | head -c 600)"; }
 info() { printf 'INFO  %s\n' "$*"; }
 finish() {
-  printf 'NET-CASES: pass=%d fail=%d\n' "$PASSES" "$FAILS"
+  printf 'NET-CASES: pass=%d fail=%d skip=%d\n' "$PASSES" "$FAILS" "$SKIPS"
   [ "$FAILS" -eq 0 ] && [ "$PASSES" -gt 0 ]
   exit $?
 }
 
 [ -x "$HISN" ] || { fail "net harness setup" "hisn binary $HISN is not executable"; finish; }
 [ -d "$T" ] || { fail "net harness setup" "work dir $T does not exist"; finish; }
+command -v ss >/dev/null 2>&1 || { fail "net harness setup" "the ss command (iproute2) is not installed"; finish; }
 OUTER_NETNS=$(readlink /proc/self/ns/net)
 # A fresh network namespace has exactly one interface, lo. (Asked through
 # netlink: /sys/class/net keeps showing the namespace sysfs was mounted in.)
@@ -193,9 +197,26 @@ check() {
 
 journal() { timeout 20 "$HISN" journal --workspace "$1" --json </dev/null 2>/dev/null; }
 
+# Outbound connects of a supervisor to the blackhole address that are in
+# flight: sockets in SYN-SENT in this namespace (the supervisors run in
+# it; the sandboxes have their own). This is how a test knows that a
+# connect() really is pending in the supervisor.
+pending_connects() { ss -Htn state syn-sent dst 192.0.2.98 2>/dev/null | grep -c .; }
+wait_pending() { # WANT (0 or 1): true once "a connect is pending" equals WANT
+  local i n
+  for i in $(seq 100); do
+    n=$(pending_connects)
+    if [ "$1" -eq 0 ] && [ "$n" -eq 0 ]; then return 0; fi
+    if [ "$1" -eq 1 ] && [ "$n" -ge 1 ]; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
 # journal_is NAME WS WANT K=V...: PASS iff exactly WANT journal records
 # match every K=V. Network records are written by a queue, so the count
-# is polled for up to 5 s before it is judged.
+# is polled for up to 5 s before it is judged. A journal that cannot be
+# read or has no records at all never matches, also not for WANT = 0.
 journal_is() {
   local name=$1 ws=$2 want=$3 got="" i
   shift 3
@@ -276,6 +297,7 @@ check "L97 host unix socket is not visible (ENOENT)" "L97-OK" in_session "$A" in
 check "L98 sendto and fast-open to an outside address fail ENETUNREACH" "L98-OK" in_session "$A" in-sendto
 check "L99 non-blocking connect completes and keeps O_NONBLOCK" "L99-OK" in_session "$A" in-nonblock
 check "L99 close-on-exec flag of the socket survives the connect" "CLOEXEC-OK" in_session "$A" in-cloexec
+check "L99 connect() on a connected socket fails EISCONN, connection kept" "RECONNECT-OK" in_session "$A" in-reconnect
 check "L104 connect() on a datagram socket is refused EACCES" "L104-OK" in_session "$A" in-dgram
 journal_is "L104 journal: refuse non-stream" "$AWS" 1 kind=network/connect target=192.0.2.1:18080 verdict=refuse reason=non-stream
 check "L105 bind before connect: connected, source port not kept" "L105-OK" in_session "$A" in-bind
@@ -284,7 +306,13 @@ journal_is "L103 journal: no connect was refused for an unreadable task" "$AWS" 
 check "L107 private, link-local, CGNAT, ULA and embedded-IPv4 targets refused EACCES" "L107-OK" in_session "$A" in-private
 journal_is "L107 journal: refuse 192.168.1.1:80" "$AWS" 1 kind=network/connect target=192.168.1.1:80 verdict=refuse reason=private-or-unlisted
 journal_is "L107 journal: refuse 6to4 form of 10.0.0.1" "$AWS" 1 kind=network/connect target=2002:a00:1::1:80 verdict=refuse reason=private-or-unlisted
-check "L109 netlink and vsock connects are refused EACCES" "L109-OK" in_session "$A" in-family
+check "L109 netlink connect is refused EACCES" "NETLINK-REFUSED" in_session "$A" in-netlink
+VSOCK=$(in_session "$A" in-vsock)
+case "$VSOCK" in
+  VSOCK-REFUSED) pass "L109 vsock connect is refused EACCES" ;;
+  VSOCK-UNAVAILABLE*) skip "L109 vsock connect is refused EACCES" "this kernel cannot create a vsock socket ($VSOCK)" ;;
+  *) fail "L109 vsock connect is refused EACCES" "[$VSOCK]" ;;
+esac
 
 # L110: a program that made itself non-dumpable is still intercepted,
 # decided and journaled (the supervisor owns the sandbox's user
@@ -348,30 +376,31 @@ else
   if [ -z "$SUP" ] || ! tr '\0' ' ' <"/proc/$SUP/cmdline" 2>/dev/null | grep -qF -- "--session-id $B "; then
     fail "$L100" "no supervisor pid for $B in $BDIR/supervisor.pid whose command line names the session (pid [$SUP]); nothing was killed"
   else
-    in_session "$B" in-pending >"$T/l100.out" 2>&1 &
-    EXEC_PID=$!
-    # The connect is pending once the program sits in connect(): wait
-    # until it exists, then give it a moment.
-    for _ in $(seq 50); do pgrep -f "net_helper.py in-pending" >/dev/null && break; sleep 0.1; done
-    sleep 1
-    if ! pgrep -f "net_helper.py in-pending" >/dev/null; then
-      fail "$L100" "the connecting program is not running before the kill: [$(cat "$T/l100.out")]"
+    if ! wait_pending 0; then
+      fail "$L100" "an outbound connect of an earlier case is still pending; cannot tell this one apart"
     else
-      kill -9 "$SUP"
-      GONE=1
-      for _ in $(seq 100); do
-        kill -0 "$EXEC_PID" 2>/dev/null || { GONE=0; break; }
-        sleep 0.1
-      done
-      wait "$EXEC_PID" 2>/dev/null
-      EXEC_RC=$?
-      sleep 0.3
-      LEFT=$(pgrep -f "net_helper.py in-pending" | tr '\n' ' ')
-      STATE=$(session_field "$B" state)
-      if [ "$GONE" -eq 0 ] && [ "$EXEC_RC" -ne 0 ] && [ -z "$LEFT" ] && ! kill -0 "$SUP" 2>/dev/null && [ "$STATE" = crashed ]; then
-        pass "$L100"
+      in_session "$B" in-pending "$B" >"$T/l100.out" 2>&1 &
+      EXEC_PID=$!
+      # Precondition: the supervisor's outbound connect is in flight.
+      if ! wait_pending 1; then
+        fail "$L100" "the supervisor never had the connect pending before the kill: [$(cat "$T/l100.out")]"
       else
-        fail "$L100" "exec client returned=$((1 - GONE)) rc=$EXEC_RC, programs left=[$LEFT], session state=[$STATE], output=[$(cat "$T/l100.out")]"
+        kill -9 "$SUP"
+        GONE=1
+        for _ in $(seq 100); do
+          kill -0 "$EXEC_PID" 2>/dev/null || { GONE=0; break; }
+          sleep 0.1
+        done
+        wait "$EXEC_PID" 2>/dev/null
+        EXEC_RC=$?
+        sleep 0.3
+        LEFT=$(pgrep -f "net_helper.py in-pending $B" | tr '\n' ' ')
+        STATE=$(session_field "$B" state)
+        if [ "$GONE" -eq 0 ] && [ "$EXEC_RC" -ne 0 ] && [ -z "$LEFT" ] && ! kill -0 "$SUP" 2>/dev/null && [ "$STATE" = crashed ]; then
+          pass "$L100"
+        else
+          fail "$L100" "exec client returned=$((1 - GONE)) rc=$EXEC_RC, programs left=[$LEFT], session state=[$STATE], output=[$(cat "$T/l100.out")]"
+        fi
       fi
     fi
   fi
@@ -379,22 +408,38 @@ fi
 
 # ============================ session end with a connect still pending
 # The main command exits while a child of it sits in a connect() that
-# never completes. The session must end promptly, not after the 30 s
-# connect deadline.
+# the supervisor has in flight and that never completes. The session
+# must end promptly, not after the 30 s connect deadline.
 E="$TOKEN-end"
 ECWD="$T/e-cwd"
+L106E="L106 session ends within 10 s while a connect is still pending"
 mkdir -p "$ECWD"
 cp "$HELPER" "$ECWD/net_helper.py"
 write_open_profile "$T/e.toml" "$ECWD"
-STARTED+=("$E")
-E_T0=$(date +%s)
-timeout 60 "$HISN" run --profile "$T/e.toml" --session-id "$E" -- python3 "$ECWD/net_helper.py" in-leave-pending </dev/null >"$T/$E.log" 2>&1
-E_RC=$?
-E_TOOK=$(($(date +%s) - E_T0))
-if [ "$E_RC" -eq 0 ] && [ "$E_TOOK" -le 10 ]; then
-  pass "L106 session ends within 10 s while a connect is still pending (${E_TOOK} s)"
+if ! wait_pending 0; then
+  fail "$L106E" "an outbound connect of an earlier case is still pending; cannot tell this one apart"
 else
-  fail "L106 session ends within 10 s while a connect is still pending" "exit $E_RC after ${E_TOOK} s: [$(cat "$T/$E.log")]"
+  STARTED+=("$E")
+  "$HISN" run --profile "$T/e.toml" --session-id "$E" -- python3 "$ECWD/net_helper.py" in-leave-pending "$ECWD/go" </dev/null >"$T/$E.log" 2>&1 &
+  E_PID=$!
+  if ! wait_pending 1; then
+    : >"$ECWD/go"
+    fail "$L106E" "the supervisor never had the connect pending: [$(cat "$T/$E.log")]"
+  else
+    : >"$ECWD/go" # the main command exits now
+    E_ENDED=1
+    for _ in $(seq 100); do
+      kill -0 "$E_PID" 2>/dev/null || { E_ENDED=0; break; }
+      sleep 0.1
+    done
+    if [ "$E_ENDED" -ne 0 ]; then
+      fail "$L106E" "hisn run is still running 10 s after its command exited"
+    elif ! wait "$E_PID"; then
+      fail "$L106E" "hisn run exited non-zero: [$(cat "$T/$E.log")]"
+    else
+      pass "$L106E"
+    fi
+  fi
 fi
 
 # ============================================================ none session
@@ -426,12 +471,8 @@ else
       ;;
   esac
   NWS=$(session_field "$N" workspace.id)
-  NREC=$(journal "$NWS" | python3 "$HELPER" journal-dump | wc -l)
-  if [ -n "$NWS" ] && [ "$NREC" -eq 0 ]; then
-    pass "L115 none: journal has no network records"
-  else
-    fail "L115 none: journal has no network records" "workspace [$NWS] has $NREC"
-  fi
+  journal_is "L115 none: journal has its session/start record" "$NWS" 1 kind=session/start session="$N"
+  journal_is "L115 none: journal has no network records" "$NWS" 0 'kind=network/*'
   check "L115 none session stops cleanly" "" timeout 30 "$HISN" stop --session "$N" </dev/null
 fi
 

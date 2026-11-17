@@ -4068,10 +4068,15 @@ else
     done <"$NET_WORK/supervisor.pids"
   fi
   rm -rf "$NET_WORK"
-  NET_P=0 NET_F=0
+  NET_P=0 NET_F=0 NET_S=0
   while IFS= read -r line; do
     case "$line" in
       "PASS  "*) NET_P=$((NET_P + 1)); pass "${line#PASS  }" ;;
+      "SKIP  "*)
+        NET_S=$((NET_S + 1))
+        rest=${line#SKIP  }
+        skip "${rest%% -- *}" "${rest#* -- }"
+        ;;
       "FAIL: "*)
         NET_F=$((NET_F + 1))
         rest=${line#FAIL: }
@@ -4086,8 +4091,8 @@ else
   printf '%s\n' "${NET_TRAILER:-NET-CASES: (no summary line)}"
   if [ "$NET_RC" -eq 124 ]; then
     fail "net cases complete" "net_cases.sh timed out after 900 s"
-  elif [ "$NET_TRAILER" != "NET-CASES: pass=$NET_P fail=$NET_F" ]; then
-    fail "net cases complete" "summary [$NET_TRAILER] does not match the $NET_P PASS and $NET_F FAIL lines read (exit $NET_RC); last output: $(tail -n 3 "$WORK/net-cases.out" | tr '\n' ' ')"
+  elif [ "$NET_TRAILER" != "NET-CASES: pass=$NET_P fail=$NET_F skip=$NET_S" ]; then
+    fail "net cases complete" "summary [$NET_TRAILER] does not match the $NET_P PASS, $NET_F FAIL and $NET_S SKIP lines read (exit $NET_RC); last output: $(tail -n 3 "$WORK/net-cases.out" | tr '\n' ' ')"
   elif [ "$NET_RC" -ne 0 ] && [ "$NET_F" -eq 0 ]; then
     fail "net cases complete" "net_cases.sh exited $NET_RC without a FAIL line"
   else

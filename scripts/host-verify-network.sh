@@ -132,7 +132,7 @@ run_step() {
 
 # gate_results NAME MIN: print the leak-suite RESULT lines of a gate log
 # (pipe run and pty run) and require each to have 0 failed and at least
-# MIN passed.
+# MIN passed, and the open-mode network cases to have run in each.
 gate_results() {
   local name=$1 min=$2 log="$LOGDIR/$1.log" n=0 line passed failed
   while IFS= read -r line; do
@@ -147,6 +147,15 @@ gate_results() {
     fi
   done < <(grep '^RESULT: ' "$log")
   [ "$n" -ge 1 ] || fail "$name leak suite" "no RESULT line in $log"
+  # The open-mode cases must have run in every leak-suite run of the
+  # gate; the pass count alone would not show that they were skipped.
+  local net
+  net=$(grep -c '^PASS  net cases complete' "$log")
+  if [ "$n" -ge 1 ] && [ "$net" -eq "$n" ]; then
+    pass "$name: the open-mode network cases ran in all $n leak suite runs"
+  else
+    fail "$name: the open-mode network cases ran in every leak suite run" "$net of $n runs have the line [PASS  net cases complete]"
+  fi
   say "$name: $(grep '^release-gate: summary' "$log" | tail -n 1)"
   grep '^WEAK' "$log" | sort -u | sed "s/^/$name: /" | tee -a "$SUMMARY"
 }
@@ -187,10 +196,15 @@ else
   timeout 900 unshare -Urn bash "$ROOT/tests/leak/net_cases.sh" "$HISN" "$TMP/net" "$TOKEN" \
     </dev/null >"$NETLOG" 2>&1
   RC=$?
-  NP=0 NF=0
+  NP=0 NF=0 NS=0
   while IFS= read -r line; do
     case "$line" in
       "PASS  "*) NP=$((NP + 1)); pass "${line#PASS  }" ;;
+      "SKIP  "*)
+        NS=$((NS + 1))
+        rest=${line#SKIP  }
+        skip "${rest%% -- *}" "${rest#* -- }"
+        ;;
       "FAIL: "*)
         NF=$((NF + 1))
         rest=${line#FAIL: }
@@ -203,8 +217,8 @@ else
   TRAILER=$(grep '^NET-CASES: ' "$NETLOG" | tail -n 1)
   if [ "$RC" -eq 124 ]; then
     tmout "net cases complete" 900
-  elif [ "$TRAILER" != "NET-CASES: pass=$NP fail=$NF" ]; then
-    fail "net cases complete" "summary [$TRAILER] does not match the $NP PASS and $NF FAIL lines read (exit $RC)"
+  elif [ "$TRAILER" != "NET-CASES: pass=$NP fail=$NF skip=$NS" ]; then
+    fail "net cases complete" "summary [$TRAILER] does not match the $NP PASS, $NF FAIL and $NS SKIP lines read (exit $RC)"
   elif [ "$RC" -ne 0 ] && [ "$NF" -eq 0 ]; then
     fail "net cases complete" "net_cases.sh exited $RC without a FAIL line"
   else

@@ -174,11 +174,24 @@ def _field(record, key):
 
 
 def journal_count(conditions):
+    """Number of records matching every K=V; `kind=network/*` matches
+    every network record. Prints EMPTY when the journal has no records
+    at all: every session journal has at least its session/start, so
+    an empty one means the journal could not be read, and a count of
+    zero must not be concluded from it."""
     wanted = [c.split('=', 1) for c in conditions]
+    records = _records()
+    if not records:
+        print('EMPTY')
+        return
     count = 0
-    for record in _records():
+    for record in records:
         for key, value in wanted:
             got = _field(record, key)
+            if key == 'kind' and value == 'network/*':
+                if not str(got).startswith('network/'):
+                    break
+                continue
             if (value == 'null') != (got is None):
                 break
             if got is not None and str(got) != value:
@@ -498,8 +511,8 @@ def in_private():
     print('L107-OK')
 
 
-def in_family():
-    """Families other than INET/INET6/UNIX are refused."""
+def in_netlink():
+    """Families other than INET/INET6/UNIX are refused: netlink."""
     netlink = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)
     try:
         netlink.connect((0, 0))
@@ -507,11 +520,16 @@ def in_family():
     except OSError as e:
         if e.errno != EACCES:
             fail(f'netlink connect: errno {e.errno} (want EACCES)')
+    print('NETLINK-REFUSED')
+
+
+def in_vsock():
+    """AF_VSOCK connect is refused. Prints VSOCK-UNAVAILABLE when this
+    kernel cannot create a vsock socket (then there is no connect)."""
     try:
         vsock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
     except OSError as e:
-        # No vsock in this kernel: there is no connect to refuse.
-        print(f'L109-OK netlink refused; vsock unavailable (errno {e.errno})')
+        print(f'VSOCK-UNAVAILABLE errno {e.errno}')
         return
     try:
         vsock.connect((2, 1234))
@@ -519,7 +537,24 @@ def in_family():
     except OSError as e:
         if e.errno != EACCES:
             fail(f'vsock connect: errno {e.errno} (want EACCES)')
-    print('L109-OK netlink refused; vsock refused')
+    print('VSOCK-REFUSED')
+
+
+def in_reconnect():
+    """connect() on a socket that is already connected fails EISCONN and
+    leaves the connection alone."""
+    sock = socket.socket()
+    sock.settimeout(10)
+    sock.connect((LISTEN_IP, 18080))
+    try:
+        sock.connect((LISTEN_IP, 18080))
+        fail('a second connect() on a connected socket succeeded')
+    except OSError as e:
+        if e.errno != 106:  # EISCONN
+            fail(f'second connect(): errno {e.errno} (want EISCONN)')
+    if sock.recv(100) != GREETING:
+        fail('the first connection was replaced or lost')
+    print('RECONNECT-OK')
 
 
 def in_dumpable(port):
@@ -554,19 +589,24 @@ def in_status():
 
 
 def in_pending():
-    """Stay in a connect() that never completes (L100)."""
+    """Stay in a connect() that never completes (L100). An extra
+    argument (the session id) only makes the command line unique."""
     rc = _connect_errno(socket.AF_INET, socket.SOCK_STREAM, BLACKHOLE, 120)
     print(f'PENDING-RETURNED errno {rc}')
 
 
-def in_leave_pending():
+def in_leave_pending(go_path):
     """Main command of a session: leave a child in a connect() that never
-    completes, then exit. The session must end without waiting for the
-    connect deadline."""
+    completes, wait until `go_path` exists (the test creates it once it
+    has seen the pending connect), then exit."""
     if os.fork() == 0:
         _connect_errno(socket.AF_INET, socket.SOCK_STREAM, BLACKHOLE, 120)
         os._exit(0)
-    time.sleep(1)
+    for _ in range(600):
+        if os.path.exists(go_path):
+            return
+        time.sleep(0.1)
+    fail('the test never released the main command')
 
 
 def in_none():
@@ -643,12 +683,14 @@ def main(argv):
         'in-concurrent': in_concurrent,
         'in-thread': lambda: in_thread(int(args[0])),
         'in-private': in_private,
-        'in-family': in_family,
+        'in-netlink': in_netlink,
+        'in-vsock': in_vsock,
+        'in-reconnect': in_reconnect,
         'in-dumpable': lambda: in_dumpable(int(args[0])),
         'in-flood': lambda: in_flood(int(args[0]), int(args[1])),
         'in-status': in_status,
         'in-pending': in_pending,
-        'in-leave-pending': in_leave_pending,
+        'in-leave-pending': lambda: in_leave_pending(args[0]),
         'in-none': in_none,
         'in-timing': in_timing,
         'in-tcp': lambda: in_tcp(args[0], int(args[1])),

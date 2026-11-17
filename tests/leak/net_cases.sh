@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Hermetic network cases for hisn open mode (ADR 0022): L90, L94,
 # L96-L100, L102-L107, L109-L113, the journal flood cap (L114), the
-# none-mode comparison (L115) and extra_deny validation (L116).
+# none-mode comparison (L115), extra_deny validation (L116),
+# non-blocking connects incl. a Node and a Go client (L117), plain
+# blocking sockets (L119), connect() on a pending socket (L120),
+# non-blocking behind blocking connects (L121), the connect deadline
+# (L122) and session stop with a tracked connect (L123).
 #
 # Usage (always through unshare; this script refuses to run otherwise):
 #   unshare -Urn bash tests/leak/net_cases.sh HISN WORKDIR TOKEN
@@ -200,11 +204,11 @@ journal() { timeout 20 "$HISN" journal --workspace "$1" --json </dev/null 2>/dev
 # flight: sockets in SYN-SENT in this namespace (the supervisors run in
 # it; the sandboxes have their own), read from /proc/net/tcp. This is
 # how a test knows that a connect() really is pending in the supervisor.
-pending_connects() { python3 "$HELPER" pending-count 2>/dev/null; }
-wait_pending() { # WANT (0 or 1): true once "a connect is pending" equals WANT
+pending_connects() { python3 "$HELPER" pending-count "$@" 2>/dev/null; }
+wait_pending() { # WANT (0 or 1) [PORT]: true once "a connect is pending" equals WANT
   local i n
   for i in $(seq 100); do
-    n=$(pending_connects)
+    n=$(pending_connects "${@:2}")
     case "$n" in ""|*[!0-9]*) return 1 ;; esac # cannot tell: never a pass
     if [ "$1" -eq 0 ] && [ "$n" -eq 0 ]; then return 0; fi
     if [ "$1" -eq 1 ] && [ "$n" -ge 1 ]; then return 0; fi
@@ -227,6 +231,19 @@ journal_is() {
   done
   if [ "$got" = "$want" ]; then pass "$name"; else fail "$name" "$got records match [$*], want $want"; fi
 }
+
+# tool_state FILE: first word of a status file of net_tools.sh (ok,
+# missing, broken); tool_detail FILE: the rest of the line.
+tool_state() { [ -r "$1" ] && cut -d' ' -f1 "$1" || echo broken; }
+tool_detail() { [ -r "$1" ] && cut -d' ' -f2- "$1" || echo "net_tools.sh wrote no $1"; }
+
+# The Node and Go clients, prepared here, outside any session: a session
+# sees the host's /usr only, so they are copied into its working
+# directory as a node binary and static Go binaries.
+TOOLS="$T/tools"
+bash "$HERE/net_tools.sh" "$TOOLS" >"$T/net_tools.log" 2>&1
+info "node: $(tool_detail "$TOOLS/node.status" | sed "s/^/$(tool_state "$TOOLS/node.status") /")"
+info "go:   $(tool_detail "$TOOLS/go.status" | sed "s/^/$(tool_state "$TOOLS/go.status") /")"
 
 # ============================================================ open session
 A="$TOKEN-open"
@@ -257,11 +274,15 @@ esac
 # L90: the session's main command (init's listener) reaches a public
 # address; one journal record with target and verdict.
 for _ in $(seq 100); do [ -s "$ACWD/main.out" ] && break; sleep 0.1; done
-check "L90 main command connects out through interception" "MAIN-OK HERMETIC-OK" cat "$ACWD/main.out"
+# The main command uses a socket with a timeout. Python implements the
+# timeout by putting the socket into non-blocking mode; the helper prints
+# the O_NONBLOCK flag it read with fcntl right before connect()
+# (nonblock=1). Such a connect is injected while still in progress.
+check "L90 main command connects out through interception (timeout socket: O_NONBLOCK set)" "MAIN-OK HERMETIC-OK nonblock=1" cat "$ACWD/main.out"
 journal_is "L90 journal: allow 192.0.2.1:18090" "$AWS" 1 kind=network/connect target=192.0.2.1:18090 verdict=allow reason=injected-inprogress
 
 # L103: a program started by `hisn exec` (the exec tree's own listener).
-check "L103 exec'd program connects out through interception" "CONNECT-OK" in_session "$A" in-connect 18102
+check "L103 exec'd program connects out through interception (timeout socket: O_NONBLOCK set)" "CONNECT-OK nonblock=1" in_session "$A" in-connect 18102
 # L102: that connect is one record: session, target ip:port, verdict.
 journal_is "L102 journal record: session, target ip:port, verdict, reason" "$AWS" 1 \
   kind=network/connect session="$A" target=192.0.2.1:18102 verdict=allow reason=injected-inprogress seat=null
@@ -296,48 +317,128 @@ journal_is "L96 journal: continue 127.0.0.1:19001" "$AWS" 1 kind=network/connect
 check "L97 host unix socket is not visible (ENOENT)" "L97-OK" in_session "$A" in-unix "$T/host.sock"
 check "L98 sendto and fast-open to an outside address fail ENETUNREACH" "L98-OK" in_session "$A" in-sendto
 check "L99 non-blocking connect completes and keeps O_NONBLOCK" "L99-OK" in_session "$A" in-nonblock
-# L117: non-blocking connect() no longer blocks the program. The
-# supervisor injects the replacement socket and replies EINPROGRESS at
-# once; the program sees EINPROGRESS and later POLLOUT/SO_ERROR.
-check "L117 non-blocking connect to the blackhole returns EINPROGRESS in under 100 ms" "NB-BLACKHOLE-OK" in_session "$A" in-nonblock-blackhole
-check "L117 non-blocking connect to the listener gives POLLOUT, SO_ERROR 0 and data exchange" "NB-LISTEN-OK" in_session "$A" in-nonblock-listen 18081
-check "L117 non-blocking connect to a closed port on the listener address gives ECONNREFUSED" "NB-REFUSED-OK" in_session "$A" in-nonblock-refused 18444
-journal_is "L117 journal: connect-result ok for the non-blocking listener connect" "$AWS" 1 \
-  kind=network/connect-result target=192.0.2.1:18081 result=ok
-journal_is "L117 journal: connect-result ECONNREFUSED for the closed port" "$AWS" 1 \
-  kind=network/connect-result target=192.0.2.1:18444 result=ECONNREFUSED
+# L117: a non-blocking connect() returns at once. The supervisor injects
+# its connecting socket and replies EINPROGRESS; the program sees
+# POLLOUT / SO_ERROR on that socket like after any non-blocking connect.
+check "L117 non-blocking connect to the blackhole returns EINPROGRESS in under 100 ms, poll times out at the client's 1 s" "NB-BLACKHOLE-OK" in_session "$A" in-nonblock-blackhole
 journal_is "L117 journal: injected-inprogress for the non-blocking blackhole connect" "$AWS" 1 \
   kind=network/connect target=192.0.2.98:18181 verdict=allow reason=injected-inprogress
-# L117 (node step 4): a node script starts an HTTP request to the blackhole
-# and one to the listener while a setInterval ticks every 10 ms; the
-# listener request completes and the interval keeps ticking (no gap above
-# 100 ms). Runs only when node is present in the session; SKIP names the
-# missing tool otherwise.
-cp "$HERE/nb_node.js" "$ACWD/nb_node.js"
-NBSRC=$(in_session "$A" in-tool-probe 2>/dev/null)
-if printf '%s\n' "$NBSRC" | grep -q '^TOOL node yes$'; then
-  check "L117 node event loop: listener request completes while the blackhole request is pending, interval ticks" \
-    "NODE-OK" timeout 60 "$HISN" exec --no-tty --session "$A" -- node "$ACWD/nb_node.js" \
-    "http://192.0.2.1:18080" "http://192.0.2.98:18181"
-else
-  skip "L117 node event loop" "node is not present in the session"
+check "L117 non-blocking connect to the listener gives POLLOUT, SO_ERROR 0 and data exchange" "NB-LISTEN-OK" in_session "$A" in-nonblock-listen 18081
+journal_is "L117 journal: injected-inprogress for the non-blocking listener connect" "$AWS" 1 \
+  kind=network/connect target=192.0.2.1:18081 verdict=allow reason=injected-inprogress
+journal_is "L117 journal: connect-result connected for the non-blocking listener connect" "$AWS" 1 \
+  kind=network/connect-result target=192.0.2.1:18081 result=connected
+# Regression (the supervisor once read SO_ERROR through its duplicate
+# and so took the error away from the program): the program's own
+# SO_ERROR, read one second after POLLOUT, i.e. after the supervisor's
+# tracking has settled this connect, is still ECONNREFUSED.
+check "L117 non-blocking connect to a closed port: the program's own SO_ERROR after POLLOUT is ECONNREFUSED" "NB-REFUSED-OK via=so_error SO_ERROR=ECONNREFUSED" in_session "$A" in-nonblock-refused 18444
+journal_is "L117 journal: connect-result failed for the closed port" "$AWS" 1 \
+  kind=network/connect-result target=192.0.2.1:18444 result=failed
+journal_is "L117 journal: no connect-result carries an errno name" "$AWS" 0 \
+  kind=network/connect-result result=ECONNREFUSED
+
+# L117, Node: an HTTP request to the blackhole and one to the listener
+# while a setInterval ticks every 10 ms. The node binary was copied into
+# the session's working directory by net_tools.sh.
+NODE_RUN=0 GO_RUN=0
+L117N="L117 node event loop: listener request completes, 10 ms interval keeps ticking (no gap above 100 ms) while the blackhole request is pending"
+case "$(tool_state "$TOOLS/node.status")" in
+  ok)
+    mkdir -p "$ACWD/tools" && cp -R "$TOOLS/node" "$TOOLS/run-node" "$TOOLS/lib" "$ACWD/tools/" &&
+      cp "$HERE/nb_node.js" "$ACWD/nb_node.js"
+    OUT=$(timeout 60 "$HISN" exec --no-tty --session "$A" -- sh "$ACWD/tools/run-node" "$ACWD/nb_node.js" \
+      "http://192.0.2.1:18140/" "http://192.0.2.98:18181/" </dev/null 2>&1)
+    RC=$?
+    if [ "$RC" -eq 0 ] && printf '%s\n' "$OUT" | grep -q '^NODE-OK ' && ! printf '%s\n' "$OUT" | grep -q '^FAIL:'; then
+      pass "$L117N: $(printf '%s\n' "$OUT" | grep '^NODE-OK ')"
+      NODE_RUN=1
+    else
+      fail "$L117N" "exit $RC: [$OUT]"
+    fi
+    ;;
+  missing) skip "$L117N" "$(tool_detail "$TOOLS/node.status")" ;;
+  *) fail "$L117N" "$(tool_detail "$TOOLS/node.status")" ;;
+esac
+
+# L117, Go: net/http GET to the listener and a dial to the blackhole
+# with a 1 s timeout. The binary was built statically by net_tools.sh.
+L117G="L117 go client: net/http GET to the listener, dial to the blackhole times out at its own 1 s"
+case "$(tool_state "$TOOLS/go.status")" in
+  ok)
+    mkdir -p "$ACWD/tools" && cp "$TOOLS/nb_go" "$ACWD/tools/nb_go"
+    OUT=$(timeout 60 "$HISN" exec --no-tty --session "$A" -- "$ACWD/tools/nb_go" \
+      "http://192.0.2.1:18140/" "192.0.2.98:18181" </dev/null 2>&1)
+    RC=$?
+    if [ "$RC" -eq 0 ] && printf '%s\n' "$OUT" | grep -q '^GO-OK ' && ! printf '%s\n' "$OUT" | grep -q '^FAIL:'; then
+      pass "$L117G: $(printf '%s\n' "$OUT" | grep '^GO-OK ')"
+      GO_RUN=1
+    else
+      fail "$L117G" "exit $RC: [$OUT]"
+    fi
+    ;;
+  missing) skip "$L117G" "$(tool_detail "$TOOLS/go.status")" ;;
+  *) fail "$L117G" "$(tool_detail "$TOOLS/go.status")" ;;
+esac
+if [ $((NODE_RUN + GO_RUN)) -gt 0 ]; then
+  journal_is "L117 journal: injected-inprogress for the node/go requests to the listener ($((NODE_RUN + GO_RUN)))" "$AWS" $((NODE_RUN + GO_RUN)) \
+    kind=network/connect target=192.0.2.1:18140 verdict=allow reason=injected-inprogress
+  journal_is "L117 journal: connect-result connected for the node/go requests to the listener ($((NODE_RUN + GO_RUN)))" "$AWS" $((NODE_RUN + GO_RUN)) \
+    kind=network/connect-result target=192.0.2.1:18140 result=connected
 fi
-if printf '%s\n' "$NBSRC" | grep -q '^TOOL go yes$'; then
-  # The Go case runs a statically linked binary built by the host script
-  # (or by the caller of net_cases.sh, which must place it at $T/nb_go
-  # before starting this script); the binary is copied into the session
-  # cwd, which is mounted rw, so a running session can execute it.
-  if [ -x "$T/nb_go" ]; then
-    cp "$T/nb_go" "$ACWD/nb_go"
-    check "L117 go client: http GET to the listener and a dial to the blackhole with a 1 s timeout" \
-      "GO-OK" timeout 60 "$HISN" exec --no-tty --session "$A" -- "$ACWD/nb_go" \
-      "http://192.0.2.1:18080" "192.0.2.98:18181"
-  else
-    skip "L117 go client" "no pre-built go test binary at $T/nb_go"
-  fi
+
+# L119: plain blocking sockets (no timeout, O_NONBLOCK clear; the helper
+# prints the flag: nonblock=0) keep the old behaviour: connect() returns
+# when the supervisor's connect has finished, with 0 or its errno, and
+# the journal reason is `injected`.
+check "L119 blocking socket, exec'd program: connect() returns 0 connected (O_NONBLOCK clear)" "CONNECT-OK nonblock=0" in_session "$A" in-connect 18131 blocking
+journal_is "L119 journal: blocking exec'd connect is allow/injected" "$AWS" 1 \
+  kind=network/connect target=192.0.2.1:18131 verdict=allow reason=injected
+journal_is "L119 journal: a blocking connect has no connect-result record" "$AWS" 0 \
+  kind=network/connect-result target=192.0.2.1:18131
+check "L119 blocking socket, closed port: connect() itself returns ECONNREFUSED" "BLOCKING-REFUSED-OK" in_session "$A" in-blocking-refused 18445
+journal_is "L119 journal: blocking connect to a closed port is refuse/connect-error" "$AWS" 1 \
+  kind=network/connect target=192.0.2.1:18445 verdict=refuse reason=connect-error
+
+# L120: connect() again on the socket of a non-blocking connect.
+check "L120 connect() on a socket whose connect is pending fails EALREADY, on a connected one EISCONN" "REPENDING-OK pending=EALREADY connected=EISCONN" in_session "$A" in-reconnect-pending
+journal_is "L120 journal: refuse already-pending, nothing injected" "$AWS" 1 \
+  kind=network/connect target=192.0.2.98:18181 verdict=refuse reason=already-pending
+
+# L121: 64 blocking connects to the blackhole are pending in the
+# supervisor (counted in /proc/net/tcp); a non-blocking connect is still
+# answered EINPROGRESS in under 100 ms.
+L121="L121 non-blocking connect returns EINPROGRESS in under 100 ms while 64 blocking connects are pending"
+rm -f "$ACWD/pool.go"
+in_session "$A" in-pool "$ACWD/pool.go" 64 >"$T/l121.out" 2>&1 &
+POOL_PID=$!
+POOL_N=0
+for _ in $(seq 100); do
+  POOL_N=$(pending_connects 18183)
+  [ "$POOL_N" = 64 ] && break
+  sleep 0.1
+done
+: >"$ACWD/pool.go"
+wait "$POOL_PID"
+POOL_RC=$?
+if [ "$POOL_N" != 64 ]; then
+  fail "$L121" "precondition: $POOL_N of 64 blocking connects were pending in the supervisor; output [$(cat "$T/l121.out")]"
+elif [ "$POOL_RC" -eq 0 ] && grep -q '^POOL-OK ' "$T/l121.out" && ! grep -q '^FAIL:' "$T/l121.out"; then
+  pass "$L121: $(grep '^POOL-OK ' "$T/l121.out")"
 else
-  skip "L117 go client" "go is not present in the session"
+  fail "$L121" "exit $POOL_RC: [$(cat "$T/l121.out")]"
 fi
+
+# L122: the connect deadline (30 s) against the blackhole. A blocking
+# connect() returns ETIMEDOUT at the deadline, as before. A non-blocking
+# one got EINPROGRESS at once; the supervisor stops tracking it at the
+# deadline and journals pending-at-deadline.
+check "L122 blocking connect to the blackhole returns ETIMEDOUT at the 30 s deadline" "DEADLINE-OK" timeout 90 "$HISN" exec --no-tty --session "$A" -- python3 net_helper.py in-deadline
+journal_is "L122 journal: blocking connect is refuse/deadline" "$AWS" 1 \
+  kind=network/connect target=192.0.2.98:18182 verdict=refuse reason=deadline
+journal_is "L122 journal: tracked non-blocking connect ends as pending-at-deadline" "$AWS" 1 \
+  kind=network/connect-result target=192.0.2.98:18182 result=pending-at-deadline
+
 check "L99 close-on-exec flag of the socket survives the connect" "CLOEXEC-OK" in_session "$A" in-cloexec
 check "L99 connect() on a connected socket fails EISCONN, connection kept" "RECONNECT-OK" in_session "$A" in-reconnect
 check "L104 connect() on a datagram socket is refused EACCES" "L104-OK" in_session "$A" in-dgram
@@ -387,19 +488,63 @@ fi
 # direct ones from this namespace (median of three runs each).
 info "timing intercepted: $(in_session "$A" in-timing)"
 info "timing direct:      $(timeout 60 python3 "$HELPER" in-timing 2>&1)"
-info "network records of session $A (first of each kind/verdict/reason):"
+info "network records of session $A (first of each kind/verdict/reason/result):"
 journal "$AWS" | python3 "$HELPER" journal-dump | python3 -c '
 import json, sys
 seen = set()
 for line in sys.stdin:
     r = json.loads(line); d = r["data"]
-    key = (r["kind"], d.get("verdict"), d.get("reason"), d.get("rcode"))
+    key = (r["kind"], d.get("verdict"), d.get("reason"), d.get("rcode"), d.get("result"))
     if key not in seen:
         seen.add(key); print("INFO    " + line.strip())'
 
 check "net harness: open session stops cleanly" "" timeout 30 "$HISN" stop --session "$A" </dev/null
 for _ in $(seq 50); do [ "$(session_field "$A" state)" != running ] && break; sleep 0.1; done
 check "net harness: open session is no longer running" "stopped" session_field "$A" state
+
+# ================================= L119: blocking socket, main command
+# The session's main command connects with a plain blocking socket.
+M="$TOKEN-blocking"
+MCWD="$T/m-cwd"
+write_open_profile "$T/m.toml" "$MCWD"
+if ! start_session "$M" "$MCWD" --profile "$T/m.toml" python3 "$MCWD/net_helper.py" in-main 18130 "$MCWD/main.out" blocking; then
+  fail "L119 blocking socket, main command" "session $M is not running: [$(cat "$T/$M.log" 2>/dev/null)]"
+else
+  MWS=$(session_field "$M" workspace.id)
+  for _ in $(seq 100); do [ -s "$MCWD/main.out" ] && break; sleep 0.1; done
+  check "L119 blocking socket, main command: connect() returns 0 connected (O_NONBLOCK clear)" "MAIN-OK HERMETIC-OK nonblock=0" cat "$MCWD/main.out"
+  journal_is "L119 journal: blocking main-command connect is allow/injected" "$MWS" 1 \
+    kind=network/connect target=192.0.2.1:18130 verdict=allow reason=injected
+  journal_is "L119 journal: blocking main-command connect has no connect-result record" "$MWS" 0 \
+    kind=network/connect-result
+
+  # L123: stop a session while the supervisor still tracks a connect.
+  # The program started a non-blocking connect to the blackhole and has
+  # exited; only the supervisor's duplicate keeps that socket alive
+  # (seen in SYN-SENT in /proc/net/tcp). `hisn stop` must end the
+  # session cleanly and the socket must be gone afterwards.
+  L123="L123 session with a tracked pending connect stops cleanly and the socket is closed"
+  if ! wait_pending 0 18184; then
+    fail "$L123" "a connect to 192.0.2.98:18184 is pending before the case starts"
+  else
+    LEFT=$(in_session "$M" in-leave-tracked)
+    if [ "$LEFT" != LEFT-TRACKED ] || ! wait_pending 1 18184; then
+      fail "$L123" "precondition: the supervisor is not holding the pending socket after the program exited: [$LEFT], pending=$(pending_connects 18184)"
+    else
+      STOP_T0=$(date +%s)
+      timeout 30 "$HISN" stop --session "$M" </dev/null >"$T/l123.out" 2>&1
+      STOP_RC=$?
+      STOP_S=$(($(date +%s) - STOP_T0))
+      for _ in $(seq 50); do [ "$(session_field "$M" state)" != running ] && break; sleep 0.1; done
+      STATE=$(session_field "$M" state)
+      if [ "$STOP_RC" -eq 0 ] && [ "$STATE" = stopped ] && [ "$STOP_S" -le 10 ] && wait_pending 0 18184; then
+        pass "$L123 (stop took ${STOP_S} s, state stopped, 0 sockets left in SYN-SENT)"
+      else
+        fail "$L123" "stop exit $STOP_RC after ${STOP_S} s, state [$STATE], sockets still pending: $(pending_connects 18184), output [$(cat "$T/l123.out")]"
+      fi
+    fi
+  fi
+fi
 
 # ====================================== L100: supervisor killed mid-connect
 # The supervisor is found only through the file hisn writes for this

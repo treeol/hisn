@@ -1,33 +1,61 @@
-// Event-loop test (L117): while a Node HTTP request to the blackhole is
-// pending (connect stays pending), a setInterval ticks every 10 ms and a
-// request to the listener completes. PASS only if the interval never
-// stalls (no gap over 100 ms) while the blackhole request is pending.
-// Args: LISTEN_URL BLACKHOLE_URL
-const [listenUrl, blackholeUrl] = process.argv.slice(2);
+// Node event-loop case (L117). Args: LISTENER_URL BLACKHOLE_URL
+//
+// A setInterval ticks every 10 ms. One HTTP request goes to the
+// blackhole (its connect never completes) and one to the listener.
+// For WINDOW_MS the script records the largest gap between two ticks.
+// PASS (exit 0, one line starting with NODE-OK): the listener request
+// completed with status 200 and the expected body, the blackhole
+// request is still pending at the end of the window, and no gap between
+// ticks is above 100 ms. Otherwise one line starting with FAIL:.
+'use strict';
+const http = require('http');
+const {performance} = require('perf_hooks');
+
+const [listenerUrl, blackholeUrl] = process.argv.slice(2);
+const WINDOW_MS = 2000;
+const MAX_GAP_MS = 100;
+
+let ticks = 0;
 let maxGap = 0;
-let last = Date.now();
-let done = false;
+let last = performance.now();
 const ticker = setInterval(() => {
-  const now = Date.now();
-  const gap = now - last;
-  if (gap > maxGap) maxGap = gap;
+  const now = performance.now();
+  maxGap = Math.max(maxGap, now - last);
   last = now;
+  ticks += 1;
 }, 10);
-let listenOk = false;
-let blackholeEnded = false;
-const finish = () => {
-  if (!done || blackholeEnded) return;
-  blackholeEnded = true;
+
+let blackholeState = 'pending';
+const blackhole = http.get(blackholeUrl, (res) => {
+  blackholeState = 'answered ' + res.statusCode;
+  res.resume();
+});
+blackhole.on('error', (e) => {
+  if (blackholeState === 'pending') blackholeState = 'error ' + e.code;
+});
+
+let listener = 'no answer';
+let listenerMs = -1;
+const started = performance.now();
+http.get(listenerUrl, (res) => {
+  let body = '';
+  res.setEncoding('utf8');
+  res.on('data', (chunk) => { body += chunk; });
+  res.on('end', () => {
+    listener = res.statusCode + ' ' + body;
+    listenerMs = performance.now() - started;
+  });
+}).on('error', (e) => { listener = 'error ' + e.code; });
+
+setTimeout(() => {
   clearInterval(ticker);
-  if (listenOk && maxGap <= 100) {
-    console.log('NODE-OK max-gap-ms ' + maxGap);
-    process.exit(0);
-  }
-  console.log('FAIL: node listener=' + listenOk + ' max-gap=' + maxGap);
-  process.exit(1);
-};
-fetch(listenUrl).then((res) => {
-  if (res.status === 200 && res.ok) listenOk = true;
-}).catch(() => {}).finally(() => { done = true; setTimeout(finish, 50); });
-fetch(blackholeUrl).then(() => {}).catch(() => {}).finally(() => { setTimeout(finish, 2000); });
-setTimeout(finish, 15000);
+  const pending = blackholeState;
+  blackhole.destroy();
+  const detail = 'listener=[' + listener + '] after ' + listenerMs.toFixed(1) +
+      ' ms, blackhole=' + pending + ', ticks=' + ticks + ' in ' + WINDOW_MS +
+      ' ms, max-gap-ms=' + maxGap.toFixed(1) + ', node ' + process.version;
+  const ok = listener === '200 HERMETIC-OK' && pending === 'pending' &&
+      maxGap <= MAX_GAP_MS && ticks >= WINDOW_MS / 10 / 2;
+  console.log((ok ? 'NODE-OK ' : 'FAIL: node event loop: ') + detail);
+  process.exit(ok ? 0 : 1);
+}, WINDOW_MS);

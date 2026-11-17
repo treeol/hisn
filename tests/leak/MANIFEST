@@ -147,14 +147,28 @@ L110: non-dumpable program
 L113: no failed lookup recorded as ok
 L114: single records
 L115: host's own nsswitch.conf
-# 0.6.0 final fix (non-blocking connect must not block): L117 (hermetic),
-# L118 (real-network step; SKIP when node/go is missing).
+# 0.6.0, non-blocking connect returns at once: L117, L119-L123, all in
+# net_cases.sh. L118 is the real-network step of
+# scripts/host-verify-network.sh (node fetch, Go http.Get); it is not a
+# leak-suite case and is not listed here.
 L117
-L118
-L117: injected-inprogress
-L117: non-blocking connect to a closed port
-L117: connect-result ECONNREFUSED
+L119
+L120
+L121
+L122
+L123
+L90: timeout socket: O_NONBLOCK set
+L117: non-blocking connect to the blackhole returns EINPROGRESS in under 100 ms
+L117: the program's own SO_ERROR after POLLOUT is ECONNREFUSED
+L117: connect-result failed for the closed port
+L117: connect-result connected for the non-blocking listener connect
 L117: node event loop
 L117: go client
-L118: node fetch
-L118: go http.Get
+L119: blocking socket, main command: connect() returns 0
+L119: blocking socket, exec'd program: connect() returns 0
+L119: blocking exec'd connect is allow/injected
+L120: fails EALREADY
+L121: 64 blocking connects are pending
+L122: returns ETIMEDOUT at the 30 s deadline
+L122: pending-at-deadline
+L123: stops cleanly

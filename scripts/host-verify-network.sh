@@ -11,14 +11,19 @@
 #      wakil-dev in the rootfs store, HISN_BIG_TESTS=1; the environment
 #      wins). The rootfs run is SKIPped only when no rootfs is found.
 #   3. tests/leak/net_cases.sh inside `unshare -Urn`: the hermetic
-#      open-mode cases (L90, L94, L96-L100, L102-L107, L109-L117). No
-#      traffic leaves the machine.
+#      open-mode cases (L90, L94, L96-L100, L102-L107, L109-L117,
+#      L119-L123). No traffic leaves the machine.
 #   4. only with --real: one open session against the real network (TCP
 #      to 1.1.1.1:53, DNS, curl, git, node fetch and Go http.Get to
-#      github.com, and the LAN gateway, which must be refused). This is
-#      the only step that sends traffic off the machine. The node and Go
-#      cases run only when the tool is present in the session (probe via
-#      net_helper.py in-tool-probe); otherwise they SKIP.
+#      github.com (L118), and the LAN gateway, which must be refused).
+#      This is the only step that sends traffic off the machine.
+#
+# Node and Go (L117, L118): tests/leak/net_tools.sh takes the machine's
+# own `node` and `go` from PATH, outside any session, builds the Go
+# clients statically and copies them and the node binary into the
+# session's working directory. If a tool is not installed on this
+# machine its cases print a SKIP that names it; everything else must
+# still pass.
 #
 # Steps 3 and 4 run hisn with its runtime and state directories inside
 # a temp dir of this run, so they neither see nor disturb other hisn
@@ -190,17 +195,6 @@ else
 fi
 
 note "step 3: hermetic open-mode cases (unshare -Urn; nothing leaves the machine)"
-# Build the Go test binary statically; net_cases.sh copies it into the
-# session cwd so the L117 go case can run it. Missing go: the case SKIPs.
-NBCASE_GO_BIN="$TMP/net/nb_go"
-mkdir -p "$TMP/net"
-if command -v go >/dev/null 2>&1; then
-  if CGO_ENABLED=0 go build -o "$NBCASE_GO_BIN" "$ROOT/tests/leak/nb_go.go" 2>"$LOGDIR/nb_go-build.log"; then
-    note "built the L117 go test binary (static)"
-  else
-    note "go build of the L117 test binary failed ($(head -c 200 "$LOGDIR/nb_go-build.log"))"
-  fi
-fi
 if ! command -v ip >/dev/null 2>&1 || ! timeout 10 unshare -Urn true 2>/dev/null; then
   fail "net cases" "unshare -Urn or the ip command is not available on this machine"
 else
@@ -300,28 +294,40 @@ if [ -x /usr/bin/git ]; then
 else
   skip "real: git ls-remote https://github.com/treeol/hisn" "/usr/bin/git is not installed (a session sees /usr, not a git elsewhere)"
 fi
-# L118: node fetch and Go http.Get through the same interception. Both
-# need the tool inside the session (PATH lookup); missing tool = SKIP.
-cp "$ROOT/tests/leak/nb_real.js" "$R/cwd/nb_real.js"
-REAL_TOOLS=$(rexec python3 net_helper.py in-tool-probe 2>/dev/null)
-if printf '%s\n' "$REAL_TOOLS" | grep -q '^TOOL node yes$'; then
-  real_check "L118 node fetch(https://github.com)" "^NODE-REAL-OK" node "$R/cwd/nb_real.js" "https://github.com"
-else
-  skip "L118 node fetch(https://github.com)" "node is not present in the session"
-fi
-if printf '%s\n' "$REAL_TOOLS" | grep -q '^TOOL go yes$'; then
-  if command -v go >/dev/null 2>&1; then
-    if CGO_ENABLED=0 go build -o "$R/cwd/nb_real" "$ROOT/tests/leak/nb_real.go" 2>"$LOGDIR/nb_real-build.log"; then
-      real_check "L118 go http.Get(https://github.com)" "^GO-REAL-OK" "$R/cwd/nb_real" "https://github.com"
-    else
-      skip "L118 go http.Get(https://github.com)" "go build of the test binary failed ($(head -c 200 "$LOGDIR/nb_real-build.log"))"
-    fi
-  else
-    skip "L118 go http.Get(https://github.com)" "go is not present on this machine to build the test binary"
-  fi
-else
-  skip "L118 go http.Get(https://github.com)" "go is not present in the session"
-fi
+# L118: node fetch() and Go http.Get() to github.com through the
+# interception. The clients are prepared outside the session by
+# net_tools.sh and run from the session's working directory.
+RTOOLS="$R/tools"
+bash "$ROOT/tests/leak/net_tools.sh" "$RTOOLS" >"$LOGDIR/real-net-tools.log" 2>&1
+tool_state() { [ -r "$1" ] && cut -d' ' -f1 "$1" || echo broken; }
+tool_detail() { [ -r "$1" ] && cut -d' ' -f2- "$1" || echo "net_tools.sh wrote no $1"; }
+REAL_URL=https://github.com
+REAL_CLIENTS=0
+L118N="L118 real: node fetch($REAL_URL)"
+case "$(tool_state "$RTOOLS/node.status")" in
+  ok)
+    mkdir -p "$R/cwd/tools" && cp -R "$RTOOLS/node" "$RTOOLS/run-node" "$RTOOLS/lib" "$R/cwd/tools/" &&
+      cp "$ROOT/tests/leak/nb_real.js" "$R/cwd/nb_real.js"
+    note "node: $(tool_detail "$RTOOLS/node.status")"
+    BEFORE=$PASS
+    real_check "$L118N" "^NODE-REAL-OK " sh "$R/cwd/tools/run-node" "$R/cwd/nb_real.js" "$REAL_URL"
+    [ "$PASS" -gt "$BEFORE" ] && REAL_CLIENTS=$((REAL_CLIENTS + 1))
+    ;;
+  missing) skip "$L118N" "$(tool_detail "$RTOOLS/node.status")" ;;
+  *) fail "$L118N" "$(tool_detail "$RTOOLS/node.status")" ;;
+esac
+L118G="L118 real: go http.Get($REAL_URL)"
+case "$(tool_state "$RTOOLS/go.status")" in
+  ok)
+    mkdir -p "$R/cwd/tools" && cp "$RTOOLS/nb_real" "$R/cwd/tools/nb_real"
+    note "go: $(tool_detail "$RTOOLS/go.status")"
+    BEFORE=$PASS
+    real_check "$L118G" "^GO-REAL-OK " "$R/cwd/tools/nb_real" "$REAL_URL"
+    [ "$PASS" -gt "$BEFORE" ] && REAL_CLIENTS=$((REAL_CLIENTS + 1))
+    ;;
+  missing) skip "$L118G" "$(tool_detail "$RTOOLS/go.status")" ;;
+  *) fail "$L118G" "$(tool_detail "$RTOOLS/go.status")" ;;
+esac
 GATEWAY=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
 if [ -n "$GATEWAY" ]; then
   real_check "real: LAN gateway $GATEWAY:80 is refused EACCES" "^REFUSED-OK" python3 net_helper.py in-refused "$GATEWAY" 80
@@ -338,6 +344,8 @@ for line in sys.stdin:
     r = json.loads(line); d = r["data"]
     if r["kind"] == "network/connect":
         print("  connect  %-7s %-20s %s" % (d["verdict"], d["reason"], d["target"]))
+    elif r["kind"] == "network/connect-result":
+        print("  result   %-7s %-20s %s (%s ms)" % ("", d["result"], d["target"], d["latency_ms"]))
     elif r["kind"] == "network/dns":
         print("  dns      %-7s %-20s %s %s via %s" % (d["verdict"], d["rcode"], d["name"], d["qtype"], d["upstream"]))
     else:
@@ -347,6 +355,21 @@ if [ "$N_ALLOW" = 1 ]; then
   pass "real: journal has the allow record for $TARGET:53"
 else
   fail "real: journal has the allow record for $TARGET:53" "$N_ALLOW matching records, want 1"
+fi
+
+# L118 journal: every node/go request that passed is an HTTPS connect
+# from a non-blocking socket: one allow/injected-inprogress record and
+# one connect-result `connected` each, to port 443. (curl and git use
+# port 443 too, so the counts are lower bounds.)
+if [ "$REAL_CLIENTS" -gt 0 ]; then
+  N_INJ=$(python3 "$HELPER" journal-count kind=network/connect verdict=allow reason=injected-inprogress 'target$=:443' <"$LOGDIR/real-journal.jsonl")
+  N_RES=$(python3 "$HELPER" journal-count kind=network/connect-result result=connected 'target$=:443' <"$LOGDIR/real-journal.jsonl")
+  case "$N_INJ$N_RES" in *[!0-9]*|"") N_INJ=0; N_RES=0 ;; esac
+  if [ "$N_INJ" -ge "$REAL_CLIENTS" ] && [ "$N_RES" -ge "$REAL_CLIENTS" ]; then
+    pass "L118 real: journal has injected-inprogress ($N_INJ) and connect-result connected ($N_RES) records to port 443 for the $REAL_CLIENTS node/go requests"
+  else
+    fail "L118 real: journal has the node/go records" "$N_INJ injected-inprogress and $N_RES connect-result connected records to port 443, want at least $REAL_CLIENTS each"
+  fi
 fi
 
 if rhisn 30 stop --session "$REAL_ID" >/dev/null 2>&1; then

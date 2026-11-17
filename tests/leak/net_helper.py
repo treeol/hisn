@@ -32,13 +32,23 @@ import time
 LISTEN_IP = '192.0.2.1'
 DNS_IP = '192.0.2.2'
 BLACKHOLE = ('192.0.2.98', 18181)
-TCP_PORTS = (18080, 18090, 18102, 18103, 18110, 18120, 18081)
+TCP_PORTS = (18080, 18081, 18090, 18102, 18103, 18110, 18120, 18130, 18131)
+HTTP_PORT = 18140
+CLOSED_PORT = 18444
+# Further ports on the blackhole address, so that a case can count its
+# own pending connects and journal records.
+DEADLINE_BLACKHOLE = ('192.0.2.98', 18182)
+POOL_BLACKHOLE = ('192.0.2.98', 18183)
+TRACKED_BLACKHOLE = ('192.0.2.98', 18184)
 HOST_LOOPBACK_PORT = 18070
 GREETING = b'HERMETIC-OK'
 ENETUNREACH = 101
 EACCES = 13
 ECONNREFUSED = 111
 ETIMEDOUT = 110
+EINPROGRESS = 115
+EALREADY = 114
+EISCONN = 106
 
 
 def fail(reason):
@@ -57,6 +67,32 @@ def _greet_forever(sock, greeting):
         except OSError:
             pass
         conn.close()
+
+
+def _http_forever(sock):
+    """A minimal HTTP/1.1 server: every request gets 200 and GREETING."""
+    body = GREETING
+    reply = (b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n'
+             b'Content-Length: ' + str(len(body)).encode() +
+             b'\r\nConnection: close\r\n\r\n' + body)
+
+    def serve_one(conn):
+        try:
+            conn.settimeout(5)
+            data = b''
+            while b'\r\n\r\n' not in data and len(data) < 65536:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            conn.sendall(reply)
+        except OSError:
+            pass
+        conn.close()
+
+    while True:
+        conn, _ = sock.accept()
+        threading.Thread(target=serve_one, args=(conn,), daemon=True).start()
 
 
 def _dns_answer(query):
@@ -128,6 +164,8 @@ def serve(ready_path, unix_path):
             threads.append((_greet_forever,
                             (listen(socket.AF_INET, (LISTEN_IP, port)),
                              GREETING)))
+        threads.append((_http_forever,
+                        (listen(socket.AF_INET, (LISTEN_IP, HTTP_PORT)),)))
         threads.append((_greet_forever,
                         (listen(socket.AF_INET,
                                 ('127.0.0.1', HOST_LOOPBACK_PORT)),
@@ -176,7 +214,7 @@ def _field(record, key):
 
 def journal_count(conditions):
     """Number of records matching every K=V; `kind=network/*` matches
-    every network record. Prints EMPTY when the journal has no records
+    every network record, `K$=V` matches a value ending in V. Prints EMPTY when the journal has no records
     at all: every session journal has at least its session/start, so
     an empty one means the journal could not be read, and a count of
     zero must not be concluded from it."""
@@ -193,6 +231,10 @@ def journal_count(conditions):
                 if not str(got).startswith('network/'):
                     break
                 continue
+            if key.endswith('$'):
+                if not str(_field(record, key[:-1])).endswith(value):
+                    break
+                continue
             if (value == 'null') != (got is None):
                 break
             if got is not None and str(got) != value:
@@ -202,20 +244,21 @@ def journal_count(conditions):
     print(count)
 
 
-def pending_count():
+def pending_count(port=BLACKHOLE[1]):
     """Number of TCP sockets in this network namespace that are in
-    SYN-SENT towards the blackhole address, from /proc/net/tcp: the
-    supervisors' outbound connects that are in flight."""
+    SYN-SENT towards the blackhole address and `port`, from
+    /proc/net/tcp: the supervisors' outbound connects that are in
+    flight."""
     import struct
     count = 0
     with open('/proc/net/tcp', encoding='ascii') as f:
         next(f)
         for line in f:
             fields = line.split()
-            address, port = fields[2].split(':')
+            address, port_hex = fields[2].split(':')
             ip = socket.inet_ntoa(struct.pack('=I', int(address, 16)))
             syn_sent = int(fields[3], 16) == 2
-            if syn_sent and (ip, int(port, 16)) == BLACKHOLE:
+            if syn_sent and (ip, int(port_hex, 16)) == (BLACKHOLE[0], port):
                 count += 1
     print(count)
 
@@ -248,7 +291,9 @@ def journal_dump():
 
 
 def _connect_errno(family, kind, address, timeout=10):
-    """errno of connect(), 0 on success."""
+    """errno of connect(), 0 on success. timeout=None: a plain blocking
+    socket (the connect() call itself waits); otherwise Python puts the
+    socket into non-blocking mode."""
     sock = socket.socket(family, kind)
     sock.settimeout(timeout)
     try:
@@ -260,26 +305,46 @@ def _connect_errno(family, kind, address, timeout=10):
         sock.close()
 
 
-def _greeting_from(port):
+def _nonblock_flag(sock):
+    """1 when the socket's descriptor has O_NONBLOCK, else 0."""
+    import fcntl
+    return 1 if fcntl.fcntl(sock, fcntl.F_GETFL) & os.O_NONBLOCK else 0
+
+
+def _greeting_from(port, blocking=False, flag=None):
+    """Connect to the listener and read its greeting.
+
+    Default: a socket with a timeout, which Python puts into non-blocking
+    mode (O_NONBLOCK on the descriptor; connect() is then EINPROGRESS
+    plus poll inside Python). blocking=True: a plain blocking socket, no
+    timeout. `flag`, a list, receives the socket's O_NONBLOCK state as it
+    is right before connect().
+    """
     sock = socket.socket()
-    sock.settimeout(10)
+    if not blocking:
+        sock.settimeout(10)
+    if flag is not None:
+        flag.append(_nonblock_flag(sock))
     sock.connect((LISTEN_IP, port))
     data = sock.recv(100)
     sock.close()
     return data
 
 
-def in_connect(port):
-    data = _greeting_from(port)
+def in_connect(port, mode='timeout'):
+    flag = []
+    data = _greeting_from(port, mode == 'blocking', flag)
     if data != GREETING:
         fail(f'connected, but read {data!r}')
-    print('CONNECT-OK')
+    print(f'CONNECT-OK nonblock={flag[0]}')
 
 
-def in_main(port, out_path):
+def in_main(port, out_path, mode='timeout'):
     """The session's main command: one connect, then stay alive."""
+    flag = []
     try:
-        result = 'MAIN-OK ' + _greeting_from(port).decode()
+        data = _greeting_from(port, mode == 'blocking', flag)
+        result = f'MAIN-OK {data.decode()} nonblock={flag[0]}'
     except OSError as e:
         result = f'MAIN-ERR {e}'
     with open(out_path + '.tmp', 'w', encoding='ascii') as f:
@@ -435,73 +500,213 @@ def in_nonblock():
 
 
 def in_nonblock_blackhole():
-    """A non-blocking connect to the blackhole: EINPROGRESS in under 100 ms,
-    then poll for POLLOUT times out at the client's own 1 s timeout. No
-    30 s wait (the supervisor answers EINPROGRESS at once)."""
-    import fcntl
+    """A non-blocking connect to the blackhole: EINPROGRESS in under
+    100 ms, then the socket does not become writable within the
+    client's own 1 s timeout. No 30 s wait."""
     import select
     sock = socket.socket()
     sock.setblocking(False)
     start = time.monotonic()
     rc = sock.connect_ex(BLACKHOLE)
     took_ms = (time.monotonic() - start) * 1000
-    if rc != 115:  # EINPROGRESS
-        fail(f'non-blocking blackhole connect returned errno {rc}, want EINPROGRESS')
+    if rc != EINPROGRESS:
+        fail(f'non-blocking blackhole connect returned errno {rc}, '
+             'want EINPROGRESS')
     if took_ms >= 100:
-        fail(f'non-blocking connect to the blackhole took {took_ms:.0f} ms, want < 100 ms')
-    if not select.select([], [sock], [], 1)[1]:
-        print('NB-BLACKHOLE-OK')
-        return
-    fail('blackhole socket became writable within the 1 s poll')
+        fail(f'non-blocking connect to the blackhole took {took_ms:.1f} ms, '
+             'want < 100 ms')
+    start = time.monotonic()
+    if select.select([], [sock], [], 1)[1]:
+        fail('blackhole socket became writable within the 1 s poll')
+    waited = time.monotonic() - start
+    print(f'NB-BLACKHOLE-OK connect returned EINPROGRESS in {took_ms:.1f} ms, '
+          f'poll timed out after {waited:.2f} s')
 
 
 def in_nonblock_listen(port):
     """A non-blocking connect to the listener: EINPROGRESS or 0, then
     POLLOUT, SO_ERROR 0, and data exchange works."""
-    import fcntl
     import select
     sock = socket.socket()
     sock.setblocking(False)
     rc = sock.connect_ex((LISTEN_IP, port))
-    if rc not in (0, 115):
+    if rc not in (0, EINPROGRESS):
         fail(f'non-blocking listen connect returned errno {rc}')
     if not select.select([], [sock], [], 10)[1]:
         fail('socket never became writable')
     if sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) != 0:
         fail('SO_ERROR is non-zero after POLLOUT')
-    if not fcntl.fcntl(sock, fcntl.F_GETFL) & os.O_NONBLOCK:
+    if not _nonblock_flag(sock):
         fail('the socket lost O_NONBLOCK')
     if not select.select([sock], [], [], 10)[0] or sock.recv(100) != GREETING:
         fail('no greeting on the socket')
-    print('NB-LISTEN-OK')
+    print(f'NB-LISTEN-OK connect returned {rc}')
 
 
 def in_nonblock_refused(port):
-    """A non-blocking connect to a closed port on the listener address:
-    POLLOUT with SO_ERROR ECONNREFUSED (or an immediate ECONNREFUSED)."""
+    """A non-blocking connect to a closed port on the listener address.
+
+    Prints `via=so_error` when connect() returned EINPROGRESS and the
+    program's own SO_ERROR after POLLOUT is ECONNREFUSED, `via=immediate`
+    when connect() itself returned ECONNREFUSED.
+
+    The SO_ERROR read is delayed by one second after POLLOUT on purpose:
+    by then the supervisor's completion tracking has looked at its
+    duplicate of this socket. If that had consumed the pending error,
+    this read would return 0.
+    """
     import select
     sock = socket.socket()
     sock.setblocking(False)
     rc = sock.connect_ex((LISTEN_IP, port))
     if rc == ECONNREFUSED:
-        print('NB-REFUSED-OK')
+        print('NB-REFUSED-OK via=immediate')
         return
-    if rc not in (0, 115):
+    if rc != EINPROGRESS:
         fail(f'non-blocking closed-port connect returned errno {rc}')
     if not select.select([], [sock], [], 10)[1]:
         fail('socket never became writable')
+    time.sleep(1.0)
     error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
     if error != ECONNREFUSED:
-        fail(f'SO_ERROR is {error}, want ECONNREFUSED')
-    print('NB-REFUSED-OK')
+        fail(f'the program\'s SO_ERROR after POLLOUT is {error}, '
+             f'want ECONNREFUSED ({ECONNREFUSED})')
+    print('NB-REFUSED-OK via=so_error SO_ERROR=ECONNREFUSED '
+          '(read 1 s after POLLOUT)')
 
 
-def in_tool_probe():
-    """Print the tools present in this session (PATH lookup), one per line:
-    `TOOL node yes|no`, `TOOL go yes|no`, `TOOL curl yes|no`, `TOOL git yes|no`."""
-    import shutil
-    for name in ('node', 'go', 'curl', 'git'):
-        print(f'TOOL {name} {"yes" if shutil.which(name) else "no"}')
+def in_reconnect_pending():
+    """connect() again on a socket whose connect is in flight fails
+    EALREADY and leaves the pending connect alone; on a socket that a
+    non-blocking connect has connected it fails EISCONN and the
+    connection keeps working."""
+    import select
+    pending = socket.socket()
+    pending.setblocking(False)
+    rc = pending.connect_ex(BLACKHOLE)
+    if rc != EINPROGRESS:
+        fail(f'first connect to the blackhole: errno {rc}, want EINPROGRESS')
+    rc = pending.connect_ex(BLACKHOLE)
+    if rc != EALREADY:
+        fail(f'second connect on a pending socket: errno {rc}, want EALREADY')
+    if select.select([], [pending], [], 0.3)[1]:
+        fail('the pending socket became writable after the second connect')
+    done = socket.socket()
+    done.setblocking(False)
+    rc = done.connect_ex((LISTEN_IP, 18080))
+    if rc not in (0, EINPROGRESS):
+        fail(f'non-blocking connect to the listener: errno {rc}')
+    if not select.select([], [done], [], 10)[1]:
+        fail('listener socket never became writable')
+    rc = done.connect_ex((LISTEN_IP, 18080))
+    if rc != EISCONN:
+        fail(f'second connect on a connected socket: errno {rc}, want EISCONN')
+    if not select.select([done], [], [], 10)[0] or done.recv(100) != GREETING:
+        fail('the connection was replaced or lost by the second connect')
+    print('REPENDING-OK pending=EALREADY connected=EISCONN')
+
+
+def in_pool(go_path, count):
+    """`count` blocking connects to the blackhole stay pending; once
+    `go_path` exists (the test creates it after it has seen them in the
+    supervisor) a non-blocking connect must still return EINPROGRESS in
+    under 100 ms."""
+    returned = []
+
+    def blocked():
+        sock = socket.socket()
+        if _nonblock_flag(sock):
+            returned.append('socket is not blocking')
+            return
+        returned.append(sock.connect_ex(POOL_BLACKHOLE))
+
+    for _ in range(count):
+        threading.Thread(target=blocked, daemon=True).start()
+    for _ in range(600):
+        if os.path.exists(go_path):
+            break
+        time.sleep(0.05)
+    else:
+        fail('the test never released the pool case')
+    if returned:
+        fail(f'{len(returned)} blocking connects returned early: '
+             f'{returned[:3]}')
+    sock = socket.socket()
+    sock.setblocking(False)
+    start = time.monotonic()
+    rc = sock.connect_ex(POOL_BLACKHOLE)
+    took_ms = (time.monotonic() - start) * 1000
+    if rc != EINPROGRESS:
+        fail(f'non-blocking connect behind {count} blocking ones: errno {rc}')
+    if took_ms >= 100:
+        fail(f'non-blocking connect behind {count} blocking ones took '
+             f'{took_ms:.1f} ms, want < 100 ms')
+    if returned:
+        fail(f'blocking connects returned meanwhile: {returned[:3]}')
+    print(f'POOL-OK non-blocking connect returned EINPROGRESS in '
+          f'{took_ms:.1f} ms with {count} blocking connects pending')
+    sys.stdout.flush()
+    os._exit(0)
+
+
+def in_blocking_refused(port):
+    """A plain blocking connect to a closed port: connect() itself
+    returns ECONNREFUSED (nothing is injected)."""
+    sock = socket.socket()
+    flag = _nonblock_flag(sock)
+    rc = sock.connect_ex((LISTEN_IP, port))
+    if flag or rc != ECONNREFUSED:
+        fail(f'blocking connect to a closed port: nonblock={flag} errno {rc}, '
+             'want nonblock=0 ECONNREFUSED')
+    print('BLOCKING-REFUSED-OK nonblock=0 connect()=ECONNREFUSED')
+
+
+def in_deadline():
+    """The connect deadline, for both kinds of socket, against the
+    blackhole. A plain blocking connect() stays in the call and returns
+    ETIMEDOUT at the deadline (30 s); a non-blocking one returned
+    EINPROGRESS at once and its socket is still not writable then."""
+    import select
+    result = []
+
+    def blocked():
+        sock = socket.socket()
+        start = time.monotonic()
+        rc = sock.connect_ex(DEADLINE_BLACKHOLE)
+        result.append((rc, time.monotonic() - start))
+
+    thread = threading.Thread(target=blocked, daemon=True)
+    thread.start()
+    sock = socket.socket()
+    sock.setblocking(False)
+    rc = sock.connect_ex(DEADLINE_BLACKHOLE)
+    if rc != EINPROGRESS:
+        fail(f'non-blocking connect to the blackhole: errno {rc}')
+    time.sleep(2)
+    if result:
+        fail(f'the blocking connect returned after 2 s: {result}')
+    thread.join(45)
+    if not result:
+        fail('the blocking connect did not return within 47 s')
+    rc, took = result[0]
+    if rc != ETIMEDOUT or not 28 <= took <= 34:
+        fail(f'blocking connect: errno {rc} after {took:.1f} s, '
+             'want ETIMEDOUT after 28..34 s')
+    if select.select([], [sock], [], 0)[1]:
+        fail('the non-blocking socket became writable')
+    print(f'DEADLINE-OK blocking connect()=ETIMEDOUT after {took:.1f} s, '
+          'non-blocking socket still pending')
+
+
+def in_leave_tracked():
+    """Start a non-blocking connect to the blackhole and exit: the
+    supervisor keeps tracking its duplicate of the socket."""
+    sock = socket.socket()
+    sock.setblocking(False)
+    rc = sock.connect_ex(TRACKED_BLACKHOLE)
+    if rc != EINPROGRESS:
+        fail(f'non-blocking connect to the blackhole: errno {rc}')
+    print('LEFT-TRACKED')
 
 
 def in_dgram():
@@ -549,7 +754,8 @@ def in_concurrent():
 
     def slow():
         slow_result.append(
-            _connect_errno(socket.AF_INET, socket.SOCK_STREAM, BLACKHOLE, 60))
+            _connect_errno(socket.AF_INET, socket.SOCK_STREAM, BLACKHOLE,
+                           None))
 
     slow_thread = threading.Thread(target=slow, daemon=True)
     slow_thread.start()
@@ -680,7 +886,7 @@ def in_status():
 def in_pending():
     """Stay in a connect() that never completes (L100). An extra
     argument (the session id) only makes the command line unique."""
-    rc = _connect_errno(socket.AF_INET, socket.SOCK_STREAM, BLACKHOLE, 120)
+    rc = _connect_errno(socket.AF_INET, socket.SOCK_STREAM, BLACKHOLE, None)
     print(f'PENDING-RETURNED errno {rc}')
 
 
@@ -689,7 +895,7 @@ def in_leave_pending(go_path):
     completes, wait until `go_path` exists (the test creates it once it
     has seen the pending connect), then exit."""
     if os.fork() == 0:
-        _connect_errno(socket.AF_INET, socket.SOCK_STREAM, BLACKHOLE, 120)
+        _connect_errno(socket.AF_INET, socket.SOCK_STREAM, BLACKHOLE, None)
         os._exit(0)
     for _ in range(600):
         if os.path.exists(go_path):
@@ -757,10 +963,10 @@ def main(argv):
         'ls-get': lambda: ls_get(args[0], args[1]),
         'journal-count': lambda: journal_count(args),
         'journal-flood': lambda: journal_flood(int(args[0])),
-        'pending-count': pending_count,
+        'pending-count': lambda: pending_count(*map(int, args[:1])),
         'journal-dump': journal_dump,
-        'in-connect': lambda: in_connect(int(args[0])),
-        'in-main': lambda: in_main(int(args[0]), args[1]),
+        'in-connect': lambda: in_connect(int(args[0]), *args[1:2]),
+        'in-main': lambda: in_main(int(args[0]), args[1], *args[2:3]),
         'in-dns': in_dns,
         'in-dns-raw': lambda: in_dns_raw(args[0], args[1]),
         'in-loopback': in_loopback,
@@ -789,7 +995,11 @@ def main(argv):
         'in-nonblock-blackhole': in_nonblock_blackhole,
         'in-nonblock-listen': lambda: in_nonblock_listen(int(args[0])),
         'in-nonblock-refused': lambda: in_nonblock_refused(int(args[0])),
-        'in-tool-probe': in_tool_probe,
+        'in-reconnect-pending': in_reconnect_pending,
+        'in-pool': lambda: in_pool(args[0], int(args[1])),
+        'in-blocking-refused': lambda: in_blocking_refused(int(args[0])),
+        'in-deadline': in_deadline,
+        'in-leave-tracked': in_leave_tracked,
     }
     if cmd not in commands:
         fail(f'unknown subcommand {cmd}')

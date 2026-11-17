@@ -38,7 +38,7 @@ allowlist in this release. `none` (the default) and `host` behave as in
   up to 64 blocking connects wait at a time in a second pool, so a
   non-blocking connect is not held up by them. A second `connect()` on
   a socket whose connect is pending gets `EALREADY`, on a connected one
-  `EISCONN`.
+  `EISCONN`, on one whose connect failed that failure.
 - DNS responder on the session's `127.0.0.1:53` (UDP and TCP),
   forwarding to the host's resolvers; `open` sessions get a generated
   `/etc/resolv.conf` and `/etc/nsswitch.conf`. Without a usable
@@ -54,7 +54,7 @@ allowlist in this release. `none` (the default) and `host` behave as in
   0 or 1; `extra_deny` with `connect` or `socket` is rejected.
 - `scripts/host-verify-network.sh` and the hermetic network cases
   `tests/leak/net_cases.sh` (L90, L94, L96–L100, L102–L107, L109–L117,
-  L119–L123), including a Node and a Go client; the `--real` step also
+  L119–L124), including a Node and a Go client; the `--real` step also
   runs node `fetch` and Go `http.Get` against github.com (L118).
 
 ### Changed

@@ -679,7 +679,11 @@ does where it differs from or sharpens the text above:
   session does not wait for it at its end.
 - **Already connected or connecting.** `connect()` on a connected
   socket is answered `EISCONN`, on a socket whose connect is still
-  pending (`tcpi_state` SYN_SENT) `EALREADY`; nothing is injected.
+  pending (`tcpi_state` SYN_SENT or SYN_RECV) `EALREADY`; nothing is
+  injected. On a socket whose earlier connect failed (closed, but
+  `tcpi_segs_out` > 0) the supervisor makes the `connect()` on the
+  program's own socket and passes on the kernel's answer (the pending
+  error, or `ECONNABORTED`): the socket is not replaced.
 - **Sizes.** 16 dispatch threads read, decide and start the
   (non-blocking) connect and never wait for a connection; 64 wait
   threads hold the connects of blocking programs until they end. Each

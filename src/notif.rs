@@ -581,13 +581,27 @@ const TCP_SYN_RECV: u8 = 3;
 const TCP_CLOSE: u8 = 7;
 const TCP_LISTEN: u8 = 10;
 
-/// `tcpi_state` and `tcpi_bytes_acked` of a TCP socket from `TCP_INFO`,
-/// or None when the option cannot be read (not a TCP socket). Reading it
-/// changes nothing on the socket. `bytes_acked` is None on a kernel
-/// whose `tcp_info` is too short to carry it.
-fn tcp_info(fd: i32) -> Option<(u8, Option<u64>)> {
-    // Offset of tcpi_bytes_acked in struct tcp_info (linux/tcp.h).
+/// What the engine reads from `TCP_INFO`. Reading it changes nothing on
+/// the socket.
+#[derive(Debug, Clone, Copy)]
+struct TcpInfo {
+    /// `tcpi_state`.
+    state: u8,
+    /// `tcpi_bytes_acked`; the peer's acknowledgement of the SYN counts
+    /// as one byte. None on a kernel whose `tcp_info` is too short.
+    bytes_acked: Option<u64>,
+    /// `tcpi_segs_out`: segments sent since the socket was created or
+    /// last reset. None on a kernel whose `tcp_info` is too short.
+    segs_out: Option<u32>,
+}
+
+/// `TCP_INFO` of a TCP socket, or None when the option cannot be read
+/// (not a TCP socket).
+fn tcp_info(fd: i32) -> Option<TcpInfo> {
+    // Offsets in struct tcp_info (linux/tcp.h) on the 64-bit targets the
+    // connect filter supports.
     const BYTES_ACKED: usize = 120;
+    const SEGS_OUT: usize = 136;
     let mut info = [0u8; 256];
     let mut len = info.len() as libc::socklen_t;
     // SAFETY: `info` and `len` describe a valid out-buffer.
@@ -603,17 +617,34 @@ fn tcp_info(fd: i32) -> Option<(u8, Option<u64>)> {
     if rc != 0 || len < 1 {
         return None;
     }
-    let acked = (len as usize >= BYTES_ACKED + 8).then(|| {
+    let len = len as usize;
+    let bytes_acked = (len >= BYTES_ACKED + 8).then(|| {
         let mut raw = [0u8; 8];
         raw.copy_from_slice(&info[BYTES_ACKED..BYTES_ACKED + 8]);
         u64::from_ne_bytes(raw)
     });
-    Some((info[0], acked))
+    let segs_out = (len >= SEGS_OUT + 4).then(|| {
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&info[SEGS_OUT..SEGS_OUT + 4]);
+        u32::from_ne_bytes(raw)
+    });
+    Some(TcpInfo {
+        state: info[0],
+        bytes_acked,
+        segs_out,
+    })
 }
 
 /// `tcpi_state` alone, see [`tcp_info`].
 fn tcp_state(fd: i32) -> Option<u8> {
-    tcp_info(fd).map(|(state, _)| state)
+    tcp_info(fd).map(|i| i.state)
+}
+
+/// True for a TCP socket that has been used for a connect before and is
+/// not connected or connecting now: closed, but it has sent segments. A
+/// socket that was never connected has sent none.
+fn used_and_closed(fd: i32) -> bool {
+    tcp_info(fd).is_some_and(|i| i.state == TCP_CLOSE && i.segs_out.is_some_and(|n| n > 0))
 }
 
 /// How a tracked connect stands, read without changing the socket.
@@ -644,8 +675,9 @@ pub enum ConnState {
 /// `had_event` only matters for the fallback, where a socket without a
 /// peer is `Failed` if poll reported an event and `Pending` otherwise.
 pub fn conn_state(fd: i32, had_event: bool) -> ConnState {
-    if let Some((state, acked)) = tcp_info(fd) {
-        return match state {
+    if let Some(info) = tcp_info(fd) {
+        let acked = info.bytes_acked;
+        return match info.state {
             TCP_SYN_SENT | TCP_SYN_RECV => ConnState::Pending,
             // CLOSE is also the state of a connection that was
             // established and has been closed again since (a program
@@ -1102,6 +1134,8 @@ fn handle_notif(
     let mut is_stream = false;
     let mut already_connected = false;
     let mut already_pending = false;
+    let mut already_used = false;
+    let mut used_sock: Option<OwnedFd> = None;
     let mut sock_type = 0i32;
     if dup >= 0 {
         let dup_fd = unsafe { OwnedFd::from_raw_fd(dup as i32) };
@@ -1131,8 +1165,22 @@ fn handle_notif(
         } == 0;
         // A stream socket whose connect is still in flight: the one an
         // earlier non-blocking connect() put there.
-        already_pending =
-            is_stream && !already_connected && tcp_state(dup_fd.as_raw_fd()) == Some(TCP_SYN_SENT);
+        already_pending = is_stream
+            && !already_connected
+            && matches!(
+                tcp_state(dup_fd.as_raw_fd()),
+                Some(TCP_SYN_SENT | TCP_SYN_RECV)
+            );
+        // A stream socket an earlier connect has ended on without a
+        // connection: the one a non-blocking connect() put there, after
+        // that connect failed.
+        already_used = is_stream
+            && !already_connected
+            && !already_pending
+            && used_and_closed(dup_fd.as_raw_fd());
+        if already_used {
+            used_sock = Some(dup_fd);
+        }
         // dup_fd dropped here (OwnedFd discipline).
     }
     let is_public = ip.map(|a| is_public_ip(&a)).unwrap_or(false);
@@ -1184,6 +1232,49 @@ fn handle_notif(
             }
             if let Some(j) = journal {
                 j.net_record("refuse", "already-pending", n);
+            }
+        }
+        Verdict::Allow if already_used => {
+            // connect() again on a socket whose earlier connect failed.
+            // Some programs learn the outcome of a non-blocking connect
+            // this way instead of reading SO_ERROR. The kernel's answer
+            // is the pending error (ECONNREFUSED, ...), or ECONNABORTED
+            // once the error has been read, and the socket is fresh
+            // again afterwards. Replacing the socket here would hide the
+            // failure and start a second connection instead.
+            //
+            // The supervisor makes this very connect() on the program's
+            // own socket and passes on the result: the error is taken by
+            // the call the program made, as it would be without hisn.
+            // The target has passed every check above.
+            let rc = match &used_sock {
+                Some(sock) => unsafe {
+                    libc::connect(
+                        sock.as_raw_fd(),
+                        buf.as_ptr() as *const libc::sockaddr,
+                        addrlen as libc::socklen_t,
+                    )
+                },
+                None => -1,
+            };
+            let errno = if rc == 0 {
+                0
+            } else {
+                io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO)
+            };
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -errno, 0, 0);
+            }
+            if let Some(j) = journal {
+                if errno == 0 || errno == libc::EINPROGRESS {
+                    // The socket was reset in between and this call
+                    // started a connect on it.
+                    j.net_record("allow", "own-socket", n);
+                } else {
+                    j.net_record("refuse", "earlier-connect-failed", n);
+                }
             }
         }
         Verdict::Allow => {
@@ -2281,6 +2372,25 @@ mod tests {
         assert!(wait_writable(&refused, 5000));
         assert_eq!(tcp_state(refused.as_raw_fd()), Some(TCP_CLOSE));
         assert_eq!(conn_state(refused.as_raw_fd(), true), ConnState::Failed);
+    }
+
+    #[test]
+    fn a_socket_whose_connect_failed_is_told_from_a_fresh_one() {
+        let (failed, errno) = nonblocking_connect(closed_port());
+        assert_eq!(errno, libc::EINPROGRESS);
+        assert!(wait_writable(&failed, 5000));
+        assert!(used_and_closed(failed.as_raw_fd()));
+        let fresh =
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        let fresh = unsafe { OwnedFd::from_raw_fd(fresh) };
+        assert!(!used_and_closed(fresh.as_raw_fd()));
+        let (l, port) = loopback_listener();
+        let (connected, _) = nonblocking_connect(port);
+        assert!(wait_writable(&connected, 5000));
+        assert!(!used_and_closed(connected.as_raw_fd()));
+        drop(l);
+        // The check itself leaves the pending error to the program.
+        assert_eq!(so_error(&failed), libc::ECONNREFUSED);
     }
 
     #[test]

@@ -47,6 +47,7 @@ EACCES = 13
 ECONNREFUSED = 111
 ETIMEDOUT = 110
 EINPROGRESS = 115
+ECONNABORTED = 103
 EALREADY = 114
 EISCONN = 106
 
@@ -606,6 +607,42 @@ def in_reconnect_pending():
     print('REPENDING-OK pending=EALREADY connected=EISCONN')
 
 
+def in_reconnect_failed(port, port_read):
+    """connect() again on a socket whose non-blocking connect failed.
+
+    Without hisn the second connect() returns the pending error
+    (ECONNREFUSED) when SO_ERROR was not read, and ECONNABORTED when it
+    was; it does not start a new connection. Some programs check the
+    outcome of a non-blocking connect this way.
+    """
+    import select
+    sock = socket.socket()
+    sock.setblocking(False)
+    rc = sock.connect_ex((LISTEN_IP, port))
+    if rc != EINPROGRESS:
+        fail(f'first connect to the closed port: errno {rc}')
+    if not select.select([], [sock], [], 10)[1]:
+        fail('socket never became writable')
+    rc = sock.connect_ex((LISTEN_IP, port))
+    if rc != ECONNREFUSED:
+        fail(f'second connect, SO_ERROR unread: errno {rc}, '
+             'want ECONNREFUSED')
+    sock = socket.socket()
+    sock.setblocking(False)
+    rc = sock.connect_ex((LISTEN_IP, port_read))
+    if rc != EINPROGRESS:
+        fail(f'first connect to the closed port: errno {rc}')
+    if not select.select([], [sock], [], 10)[1]:
+        fail('socket never became writable')
+    error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+    if error != ECONNREFUSED:
+        fail(f'SO_ERROR is {error}, want ECONNREFUSED')
+    rc = sock.connect_ex((LISTEN_IP, port_read))
+    if rc != ECONNABORTED:
+        fail(f'second connect, SO_ERROR read: errno {rc}, want ECONNABORTED')
+    print('REFAILED-OK unread=ECONNREFUSED read=ECONNABORTED')
+
+
 def in_pool(go_path, count):
     """`count` blocking connects to the blackhole stay pending; once
     `go_path` exists (the test creates it after it has seen them in the
@@ -996,6 +1033,8 @@ def main(argv):
         'in-nonblock-listen': lambda: in_nonblock_listen(int(args[0])),
         'in-nonblock-refused': lambda: in_nonblock_refused(int(args[0])),
         'in-reconnect-pending': in_reconnect_pending,
+        'in-reconnect-failed': lambda: in_reconnect_failed(
+            int(args[0]), int(args[1])),
         'in-pool': lambda: in_pool(args[0], int(args[1])),
         'in-blocking-refused': lambda: in_blocking_refused(int(args[0])),
         'in-deadline': in_deadline,

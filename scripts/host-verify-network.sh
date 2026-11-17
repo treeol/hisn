@@ -12,7 +12,7 @@
 #      wins). The rootfs run is SKIPped only when no rootfs is found.
 #   3. tests/leak/net_cases.sh inside `unshare -Urn`: the hermetic
 #      open-mode cases (L90, L94, L96-L100, L102-L107, L109-L117,
-#      L119-L123). No traffic leaves the machine.
+#      L119-L124). No traffic leaves the machine.
 #   4. only with --real: one open session against the real network (TCP
 #      to 1.1.1.1:53, DNS, curl, git, node fetch and Go http.Get to
 #      github.com (L118), and the LAN gateway, which must be refused).

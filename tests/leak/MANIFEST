@@ -147,7 +147,7 @@ L110: non-dumpable program
 L113: no failed lookup recorded as ok
 L114: single records
 L115: host's own nsswitch.conf
-# 0.6.0, non-blocking connect returns at once: L117, L119-L123, all in
+# 0.6.0, non-blocking connect returns at once: L117, L119-L124, all in
 # net_cases.sh. L118 is the real-network step of
 # scripts/host-verify-network.sh (node fetch, Go http.Get); it is not a
 # leak-suite case and is not listed here.
@@ -157,6 +157,7 @@ L120
 L121
 L122
 L123
+L124
 L90: timeout socket: O_NONBLOCK set
 L117: non-blocking connect to the blackhole returns EINPROGRESS in under 100 ms
 L117: the program's own SO_ERROR after POLLOUT is ECONNREFUSED
@@ -172,3 +173,4 @@ L121: 64 blocking connects are pending
 L122: returns ETIMEDOUT at the 30 s deadline
 L122: pending-at-deadline
 L123: stops cleanly
+L124: returns ECONNREFUSED

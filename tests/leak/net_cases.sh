@@ -5,7 +5,8 @@
 # non-blocking connects incl. a Node and a Go client (L117), plain
 # blocking sockets (L119), connect() on a pending socket (L120),
 # non-blocking behind blocking connects (L121), the connect deadline
-# (L122) and session stop with a tracked connect (L123).
+# (L122), session stop with a tracked connect (L123) and connect() on a
+# socket whose connect failed (L124).
 #
 # Usage (always through unshare; this script refuses to run otherwise):
 #   unshare -Urn bash tests/leak/net_cases.sh HISN WORKDIR TOKEN
@@ -404,6 +405,18 @@ journal_is "L119 journal: blocking connect to a closed port is refuse/connect-er
 check "L120 connect() on a socket whose connect is pending fails EALREADY, on a connected one EISCONN" "REPENDING-OK pending=EALREADY connected=EISCONN" in_session "$A" in-reconnect-pending
 journal_is "L120 journal: refuse already-pending, nothing injected" "$AWS" 1 \
   kind=network/connect target=192.0.2.98:18181 verdict=refuse reason=already-pending
+
+# L124: connect() again on a socket whose non-blocking connect failed
+# returns that failure (ECONNREFUSED; ECONNABORTED once SO_ERROR was
+# read), as without hisn. It does not replace the socket and start a
+# second connection: each port sees exactly one injected connect.
+check "L124 connect() on a socket whose connect failed returns ECONNREFUSED (ECONNABORTED after SO_ERROR was read)" "REFAILED-OK unread=ECONNREFUSED read=ECONNABORTED" in_session "$A" in-reconnect-failed 18446 18447
+journal_is "L124 journal: one injected connect to the first closed port, no second one" "$AWS" 1 \
+  kind=network/connect target=192.0.2.1:18446 verdict=allow
+journal_is "L124 journal: one injected connect to the second closed port, no second one" "$AWS" 1 \
+  kind=network/connect target=192.0.2.1:18447 verdict=allow
+journal_is "L124 journal: the second connect is refuse/earlier-connect-failed" "$AWS" 1 \
+  kind=network/connect target=192.0.2.1:18446 verdict=refuse reason=earlier-connect-failed
 
 # L121: 64 blocking connects to the blackhole are pending in the
 # supervisor (counted in /proc/net/tcp); a non-blocking connect is still

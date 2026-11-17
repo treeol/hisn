@@ -1015,9 +1015,7 @@ fn handle_notif(
                         } else {
                             nf & !libc::O_NONBLOCK
                         };
-                        if nf < 0
-                            || unsafe { libc::fcntl(newfd, libc::F_SETFL, want) } < 0
-                        {
+                        if nf < 0 || unsafe { libc::fcntl(newfd, libc::F_SETFL, want) } < 0 {
                             if id_valid(lfd, n.id) {
                                 reply(lfd, n.id, -(libc::EACCES), 0, 0);
                             }
@@ -1049,9 +1047,7 @@ fn handle_notif(
                             // Keep a duplicate for completion tracking:
                             // dup the supervisor fd, then hand tracking the
                             // dup to the receiver thread's poll loop.
-                            let dup_fd = unsafe {
-                                libc::fcntl(newfd, libc::F_DUPFD_CLOEXEC, 0)
-                            };
+                            let dup_fd = unsafe { libc::fcntl(newfd, libc::F_DUPFD_CLOEXEC, 0) };
                             if dup_fd >= 0 {
                                 let target = notif_target(
                                     n.parsed_ip.as_ref(),
@@ -1090,11 +1086,8 @@ fn handle_notif(
                         // known result too: journal it as a connect-result
                         // (no tracking needed, the answer is already here).
                         if client_nonblock {
-                            let target = notif_target(
-                                n.parsed_ip.as_ref(),
-                                n.parsed_family,
-                                n.parsed_port,
-                            );
+                            let target =
+                                notif_target(n.parsed_ip.as_ref(), n.parsed_family, n.parsed_port);
                             j.net_connect_result(&target, errno, 0);
                         }
                     }

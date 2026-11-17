@@ -265,11 +265,7 @@ impl NetCounts {
 }
 
 impl NetQueue {
-    fn new(
-        journal: Journal,
-        cap: usize,
-        tracked_overflow: Arc<AtomicU64>,
-    ) -> Arc<Self> {
+    fn new(journal: Journal, cap: usize, tracked_overflow: Arc<AtomicU64>) -> Arc<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<NetMsg>(cap.max(1));
         let dropped = Arc::new(AtomicU64::new(0));
         let failures = journal.failures.clone();

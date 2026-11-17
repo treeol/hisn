@@ -581,10 +581,13 @@ const TCP_SYN_RECV: u8 = 3;
 const TCP_CLOSE: u8 = 7;
 const TCP_LISTEN: u8 = 10;
 
-/// `tcpi_state` of a TCP socket from `TCP_INFO`, or None when the option
-/// cannot be read (not a TCP socket). Reading it changes nothing on the
-/// socket.
-fn tcp_state(fd: i32) -> Option<u8> {
+/// `tcpi_state` and `tcpi_bytes_acked` of a TCP socket from `TCP_INFO`,
+/// or None when the option cannot be read (not a TCP socket). Reading it
+/// changes nothing on the socket. `bytes_acked` is None on a kernel
+/// whose `tcp_info` is too short to carry it.
+fn tcp_info(fd: i32) -> Option<(u8, Option<u64>)> {
+    // Offset of tcpi_bytes_acked in struct tcp_info (linux/tcp.h).
+    const BYTES_ACKED: usize = 120;
     let mut info = [0u8; 256];
     let mut len = info.len() as libc::socklen_t;
     // SAFETY: `info` and `len` describe a valid out-buffer.
@@ -597,7 +600,20 @@ fn tcp_state(fd: i32) -> Option<u8> {
             &mut len,
         )
     };
-    (rc == 0 && len >= 1).then_some(info[0])
+    if rc != 0 || len < 1 {
+        return None;
+    }
+    let acked = (len as usize >= BYTES_ACKED + 8).then(|| {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&info[BYTES_ACKED..BYTES_ACKED + 8]);
+        u64::from_ne_bytes(raw)
+    });
+    Some((info[0], acked))
+}
+
+/// `tcpi_state` alone, see [`tcp_info`].
+fn tcp_state(fd: i32) -> Option<u8> {
+    tcp_info(fd).map(|(state, _)| state)
 }
 
 /// How a tracked connect stands, read without changing the socket.
@@ -613,8 +629,9 @@ pub enum ConnState {
     Pending,
 }
 
-/// State of a connecting TCP socket from `TCP_INFO` (`tcpi_state`), with
-/// `getpeername` as the fallback when `TCP_INFO` is not available.
+/// State of a connecting TCP socket from `TCP_INFO` (`tcpi_state`,
+/// `tcpi_bytes_acked`), with `getpeername` as the fallback when
+/// `TCP_INFO` is not available.
 ///
 /// Neither call consumes anything. In particular this never reads
 /// `SO_ERROR`: the descriptor is a duplicate of the socket the program
@@ -627,9 +644,15 @@ pub enum ConnState {
 /// `had_event` only matters for the fallback, where a socket without a
 /// peer is `Failed` if poll reported an event and `Pending` otherwise.
 pub fn conn_state(fd: i32, had_event: bool) -> ConnState {
-    if let Some(state) = tcp_state(fd) {
+    if let Some((state, acked)) = tcp_info(fd) {
         return match state {
             TCP_SYN_SENT | TCP_SYN_RECV => ConnState::Pending,
+            // CLOSE is also the state of a connection that was
+            // established and has been closed again since (a program
+            // that is done within milliseconds). The peer's
+            // acknowledgement of the SYN counts as one acked byte, so a
+            // socket that never got that far has acked nothing.
+            TCP_CLOSE if acked.is_some_and(|n| n > 0) => ConnState::Connected,
             TCP_CLOSE | TCP_LISTEN => ConnState::Failed,
             _ => ConnState::Connected,
         };
@@ -676,6 +699,11 @@ struct TrackedConn {
 /// the next `network/summary`).
 pub struct Tracked {
     pend: std::sync::Mutex<Vec<TrackedConn>>,
+    /// eventfd the receiver polls: written when a socket is added, so
+    /// the receiver starts polling it now and not at its next timeout
+    /// (`latency_ms` would otherwise be up to [`RECV_POLL_MS`] too
+    /// long). None if the eventfd could not be created.
+    wake: Option<OwnedFd>,
     /// Most sockets tracked at a time ([`MAX_TRACKED`]).
     cap: usize,
     /// Connects that were not tracked for lack of room. Shared with the
@@ -686,8 +714,12 @@ pub struct Tracked {
 impl Tracked {
     /// A tracker with the given journal overflow counter.
     pub fn with_overflow(overflow: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        // SAFETY: eventfd returns a fresh descriptor or -1.
+        let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         Self {
             pend: std::sync::Mutex::new(Vec::new()),
+            // SAFETY: a non-negative eventfd result is an owned fd.
+            wake: (wake >= 0).then(|| unsafe { OwnedFd::from_raw_fd(wake) }),
             cap: MAX_TRACKED,
             overflow,
         }
@@ -708,7 +740,29 @@ impl Tracked {
             started: std::time::Instant::now(),
             muted: false,
         });
+        drop(pend);
+        if let Some(wake) = &self.wake {
+            let one = 1u64.to_ne_bytes();
+            // SAFETY: writes 8 bytes from a valid buffer; a full
+            // counter (EAGAIN) means a wake-up is pending already.
+            unsafe { libc::write(wake.as_raw_fd(), one.as_ptr() as *const _, 8) };
+        }
         true
+    }
+
+    /// The descriptor that becomes readable when a socket was added
+    /// (-1, which poll ignores, without an eventfd).
+    fn wake_fd(&self) -> i32 {
+        self.wake.as_ref().map_or(-1, |w| w.as_raw_fd())
+    }
+
+    /// Reset the wake-up after poll reported it.
+    fn drain_wake(&self) {
+        if let Some(wake) = &self.wake {
+            let mut buf = [0u8; 8];
+            // SAFETY: reads 8 bytes into a valid buffer (non-blocking).
+            unsafe { libc::read(wake.as_raw_fd(), buf.as_mut_ptr() as *mut _, 8) };
+        }
     }
 
     /// Number of tracked sockets.
@@ -865,9 +919,14 @@ fn engine_loop(
         // timeout stays RECV_POLL_MS, so shutdown and the deadline of
         // tracked sockets are both noticed promptly.
         let fds = tracker.pollfds();
-        let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(fds.len() + 1);
+        let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(fds.len() + 2);
         pfds.push(libc::pollfd {
             fd: lfd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        pfds.push(libc::pollfd {
+            fd: tracker.wake_fd(),
             events: libc::POLLIN,
             revents: 0,
         });
@@ -885,9 +944,12 @@ fn engine_loop(
             }
             break;
         }
+        if pfds[1].revents != 0 {
+            tracker.drain_wake();
+        }
         let ready: Vec<i32> = pfds
             .iter()
-            .skip(1)
+            .skip(2)
             .filter(|p| p.revents != 0)
             .map(|p| p.fd)
             .collect();
@@ -2186,6 +2248,55 @@ mod tests {
         assert!(unsafe { libc::poll(&mut pfd, 1, 5000) } > 0);
         let got = unsafe { libc::read(program.as_raw_fd(), byte.as_mut_ptr() as *mut _, 1) };
         assert_eq!((got, byte[0]), (1, b'x'));
+    }
+
+    #[test]
+    fn a_connection_closed_before_tracking_looks_is_still_connected() {
+        // The program connects, is done and closes within milliseconds;
+        // the socket (kept alive by the tracker's duplicate) is then in
+        // the same TCP state as after a refused connect. It was
+        // connected and must be recorded so.
+        let (l, port) = loopback_listener();
+        let (program, _) = nonblocking_connect(port);
+        assert!(wait_writable(&program, 5000));
+        let dup = program.try_clone().unwrap();
+        let (peer, _) = l.accept().unwrap();
+        unsafe { libc::shutdown(program.as_raw_fd(), libc::SHUT_RDWR) };
+        drop(program);
+        drop(peer);
+        for _ in 0..100 {
+            if tcp_state(dup.as_raw_fd()) == Some(TCP_CLOSE) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            tcp_state(dup.as_raw_fd()),
+            Some(TCP_CLOSE),
+            "precondition: the closed connection reads as TCP_CLOSE"
+        );
+        assert_eq!(conn_state(dup.as_raw_fd(), true), ConnState::Connected);
+        // A refused connect, in the same TCP state, is Failed.
+        let (refused, _) = nonblocking_connect(closed_port());
+        assert!(wait_writable(&refused, 5000));
+        assert_eq!(tcp_state(refused.as_raw_fd()), Some(TCP_CLOSE));
+        assert_eq!(conn_state(refused.as_raw_fd(), true), ConnState::Failed);
+    }
+
+    #[test]
+    fn adding_a_tracked_socket_wakes_the_receiver() {
+        let tracker = Tracked::default();
+        let mut pfd = libc::pollfd {
+            fd: tracker.wake_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pfd, 1, 0) }, 0);
+        let (a, _b) = crate::sys::socketpair_seqpacket().unwrap();
+        assert!(tracker.slot(a, "t".into()));
+        assert_eq!(unsafe { libc::poll(&mut pfd, 1, 0) }, 1);
+        tracker.drain_wake();
+        assert_eq!(unsafe { libc::poll(&mut pfd, 1, 0) }, 0);
     }
 
     #[test]

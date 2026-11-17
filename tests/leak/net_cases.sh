@@ -54,7 +54,6 @@ finish() {
 
 [ -x "$HISN" ] || { fail "net harness setup" "hisn binary $HISN is not executable"; finish; }
 [ -d "$T" ] || { fail "net harness setup" "work dir $T does not exist"; finish; }
-command -v ss >/dev/null 2>&1 || { fail "net harness setup" "the ss command (iproute2) is not installed"; finish; }
 OUTER_NETNS=$(readlink /proc/self/ns/net)
 # A fresh network namespace has exactly one interface, lo. (Asked through
 # netlink: /sys/class/net keeps showing the namespace sysfs was mounted in.)
@@ -199,13 +198,14 @@ journal() { timeout 20 "$HISN" journal --workspace "$1" --json </dev/null 2>/dev
 
 # Outbound connects of a supervisor to the blackhole address that are in
 # flight: sockets in SYN-SENT in this namespace (the supervisors run in
-# it; the sandboxes have their own). This is how a test knows that a
-# connect() really is pending in the supervisor.
-pending_connects() { ss -Htn state syn-sent dst 192.0.2.98 2>/dev/null | grep -c .; }
+# it; the sandboxes have their own), read from /proc/net/tcp. This is
+# how a test knows that a connect() really is pending in the supervisor.
+pending_connects() { python3 "$HELPER" pending-count 2>/dev/null; }
 wait_pending() { # WANT (0 or 1): true once "a connect is pending" equals WANT
   local i n
   for i in $(seq 100); do
     n=$(pending_connects)
+    case "$n" in ""|*[!0-9]*) return 1 ;; esac # cannot tell: never a pass
     if [ "$1" -eq 0 ] && [ "$n" -eq 0 ]; then return 0; fi
     if [ "$1" -eq 1 ] && [ "$n" -ge 1 ]; then return 0; fi
     sleep 0.1

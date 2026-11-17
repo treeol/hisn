@@ -12,6 +12,7 @@ Standard library only. Three groups of subcommands:
   journal-count K=V ...    host side: number of journal records on stdin
                            (JSON lines) matching every K=V
   journal-flood PORT       host side: single and summarized record counts
+  pending-count            host side: connects in flight to the blackhole
   journal-dump             host side: the network records, one per line
   in-*                     inside a session: one probe each; prints one
                            result line, or `FAIL: <reason>` and exits 1
@@ -198,6 +199,24 @@ def journal_count(conditions):
                 break
         else:
             count += 1
+    print(count)
+
+
+def pending_count():
+    """Number of TCP sockets in this network namespace that are in
+    SYN-SENT towards the blackhole address, from /proc/net/tcp: the
+    supervisors' outbound connects that are in flight."""
+    import struct
+    count = 0
+    with open('/proc/net/tcp', encoding='ascii') as f:
+        next(f)
+        for line in f:
+            fields = line.split()
+            address, port = fields[2].split(':')
+            ip = socket.inet_ntoa(struct.pack('=I', int(address, 16)))
+            syn_sent = int(fields[3], 16) == 2
+            if syn_sent and (ip, int(port, 16)) == BLACKHOLE:
+                count += 1
     print(count)
 
 
@@ -668,6 +687,7 @@ def main(argv):
         'ls-get': lambda: ls_get(args[0], args[1]),
         'journal-count': lambda: journal_count(args),
         'journal-flood': lambda: journal_flood(int(args[0])),
+        'pending-count': pending_count,
         'journal-dump': journal_dump,
         'in-connect': lambda: in_connect(int(args[0])),
         'in-main': lambda: in_main(int(args[0]), args[1]),

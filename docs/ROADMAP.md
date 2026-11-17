@@ -42,7 +42,9 @@
 - **Egress proxy.** A `network = "proxy"` mode: the sandbox gets a network
   namespace whose only route is a forwarder to a host-side proxy that enforces
   a hostname allowlist (CONNECT and DNS by name) and audits every request.
-  Not implemented; today hisn offers only `network = "none"` and `"host"`.
+  Not implemented. Since 0.6.0 `network = "open"` gives outbound TCP to all
+  public addresses by intercepting `connect()` (ADR 0022), without a
+  hostname allowlist; the allowlist is planned on that mechanism.
 - **cgroup v2 limits.** Memory, pids and cpu through a delegated cgroup subtree,
   falling back to rlimits with a warning. `hisn check` already reports whether
   cgroup v2 is mounted. Not implemented; today only `setrlimit` limits apply.

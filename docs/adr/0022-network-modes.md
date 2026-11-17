@@ -4,7 +4,7 @@ Title: Controlled outbound network for sandboxed sessions — `none` (unchanged
 default), `allowlist`, and `open`, implemented by intercepting `connect()`
 with seccomp user notification and letting the supervisor decide.
 
-Status: Accepted (implemented 0.6.0, open mode). Date: 2026-11-16. Origin: the connect-interception
+Status: Accepted (implemented 0.6.0, open mode). Date: 2026-11-16, implementation note 2026-11-17. Origin: the connect-interception
 probe series (`.wakil/probes/connect-notify/`, passes 1–6; report
 `.wakil/reports/probe-connect-notify.md`). This ADR replaces the transport
 design of ADR 0018 (a host-side HTTP/SOCKS proxy) with a `connect()`
@@ -98,7 +98,7 @@ host output pasted after each pass; pass-6 host results are pending.
 | ~20–25 µs extra per intercepted connect (5.2 ms/100 vs 3.3 ms/100) | Q5 | PASS |
 | Supervisor death → pending `connect()` returns `ENOSYS` (38) | Q5/G | PASS |
 | Supervisor (ancestor in the owning userns) reads the `sockaddr` of the exec'd program via `process_vm_readv` **and** `/proc/<pid>/mem`; execve resets dumpable to 1 even with NNP so the program is readable; `NOTIF_ID_VALID=0` after the read | B2 | PASS |
-| A non-dumpable process that never exec'd cannot be read (EPERM) | B1 | INFO (as expected) |
+| A non-dumpable process that never exec'd cannot be read (EPERM). This does not carry over to a program inside a hisn sandbox, see the correction under connect-flow step 2. | B1 | INFO (as expected) |
 | Loopback, unix-path and abstract-unix connects continue via `CONTINUE` | C1–C3 | PASS |
 | `CONTINUE` is subject to a TOCTOU race (child rewrites the buffer): 22 of 2000 rewrites won (`continued=1975, refused=25`); harmless only because the netns is empty. Pass 6 measured `enetunreach=47, refused=25, continued=1975, attempts=2000, toctou_wins=22`. | C4 pass 6 | INFO (race measured) |
 | `sendto`/`sendmsg`/`sendmmsg`/`MSG_FASTOPEN` to outside addresses fail `ENETUNREACH` in the empty netns; control from host namespace reaches | E1–E4, E-control | PASS |
@@ -238,9 +238,13 @@ unchanged from the task; the rest are stated with their refinement.
    refused with `EACCES` immediately (fail closed). Outbound connects
    in the supervisor are made **non-blocking** with an async completion
    state machine; the deadline applies to the completion, not to a
-   blocking syscall. Supervisor death gives `ENOSYS` (kernel
-   behaviour, Q5/G). `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (5.19)
-   is optional hardening, not the deadline mechanism.
+   blocking syscall. Supervisor death: the probe measured `ENOSYS`
+   for a pending `connect()` (kernel behaviour, Q5/G), but a program
+   in a hisn session never sees it, because sandbox init and the exec
+   helper are killed with the supervisor (`PR_SET_PDEATHSIG`) and every
+   program dies with them (L100).
+   `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (5.19) is optional
+   hardening, not the deadline mechanism.
 7. **Atomic handover with option copy — `SETFD` is mandatory, always.**
    The socket is injected with
    `SECCOMP_IOCTL_NOTIF_ADDFD` + `SECCOMP_ADDFD_FLAG_SETFD` +
@@ -382,10 +386,18 @@ Connect (allowlist/open), per notification, in this exact order:
    `sizeof(sockaddr_storage)` bytes, **once**, into a private buffer
    (B2; a racing rewrite after the read is harmless — the supervisor
    acts on its copy). `NOTIF_ID_VALID` again before replying. If the
-   read fails (`EPERM`: the program set `PR_SET_DUMPABLE=0` after exec,
-   or host `ptrace_scope >= 2`) → reply `-EACCES`, journal
-   `refuse/read-failed`. Stated in the agent-facing docs: a
-   dumpable-0 program cannot be intercepted and gets refused.
+   read fails → reply `-EACCES`, journal `refuse/read-failed` (fail
+   closed; covered by a unit test that simulates a failed read).
+   **Correction (0.6.0, measured on kernel 7.3.3):** an earlier version
+   of this step said that a program which sets `PR_SET_DUMPABLE=0`
+   after exec cannot be read and is refused. That is wrong. After exec
+   inside the sandbox the program's memory belongs to the sandbox user
+   namespace, which the supervisor owns, so the supervisor holds
+   `CAP_SYS_PTRACE` there and may read a non-dumpable target. The
+   probe's B1 `EPERM` came from a process that never exec'd, whose
+   memory still belonged to the initial namespace. A program therefore
+   cannot hide its connects by making itself non-dumpable: the connect
+   is intercepted, decided and journaled like any other (L110).
 3. **Loopback and `AF_UNIX` `CONTINUE` — before the `SOCK_STREAM` check.**
    `AF_UNIX` (path/abstract, decision 5) always `CONTINUE`s. Loopback
    (`127.0.0.0/8`, `::1`) always `CONTINUE`s *regardless of socket type*,
@@ -399,10 +411,12 @@ Connect (allowlist/open), per notification, in this exact order:
    unspecified, multicast, link-local (`169.254.0.0/16`, `fe80::/10`,
    incl. the metadata address `169.254.169.254`), CGNAT
    (`100.64.0.0/10`), RFC1918, ULA (`fc00::/7`), `198.18.0.0/15`
-   (benchmarking), IPv4-mapped forms of any of those, and NAT64
-   prefixes `64:ff9b::/96` / `64:ff9b:1::/48` classified by their
-   embedded IPv4 address — **unless** an explicit IP/CIDR rule matches
-   that exact target. Loopback is *not* in this list: loopback always
+   (benchmarking), site-local `fec0::/10`, and the forms that embed an
+   IPv4 address, classified by that address: IPv4-mapped, IPv4-compatible
+   `::/96`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16` and Teredo `2001::/32`
+   (the client address is stored inverted). The local-use NAT64 prefix
+   `64:ff9b:1::/48` is refused as a whole — **unless** an explicit
+   IP/CIDR rule matches that exact target (0.7.0; 0.6.0 has no rules). Loopback is *not* in this list: loopback always
    stays inside the sandbox netns (step 3, never forwarded; host
    services only via `[[host_services]]`/`[[forward]]`). A DNS pin
    alone never authorises a non-public address. This is what stops
@@ -426,8 +440,13 @@ Connect (allowlist/open), per notification, in this exact order:
 **DNS flow (decision 3, as shipped).** The responder socket is bound by
 init on `127.0.0.1:53` (UDP+TCP, before caps drop) and handed to the
 supervisor over `SCM_RIGHTS`. The supervisor forwards queries to the
-host resolver discovery (host `/etc/resolv.conf` → upstream list →
-`[net] nameservers` override) and answers `SERVFAIL` on failure. The
+first of these that names a resolver: `[net] nameservers`,
+`/run/systemd/resolve/resolv.conf`,
+`/run/NetworkManager/no-stub-resolv.conf`, `/etc/resolv.conf`.
+Loopback resolvers such as `127.0.0.53` are valid, because the
+supervisor is in the host netns. If none names a resolver, the session
+does not start and the error lists the files. The responder answers
+`SERVFAIL` when the upstream fails or does not answer in 2 s. The
 sandbox ships its *own* `/etc/resolv.conf` (`nameserver 127.0.0.1`) and
 `/etc/nsswitch.conf` (`hosts: files dns`) so the host's nss chain is
 not in the path. The earlier DNS probe failed (`dns_queries=0`)
@@ -444,8 +463,9 @@ be reached through the shipped files + responder).
 Errors returned to the program: allow → 0 (connected); path unix not
 in view is **not** hisn's verdict — `CONTINUE` lets the kernel return
 `ENOENT` for a hidden path; IP not allowed / private / wrong family /
-non-stream → `EACCES`; deadline → `ETIMEDOUT`; supervisor died →
-`ENOSYS` (kernel, not hisn's choice); `ENETUNREACH` can only come from
+non-stream → `EACCES`; deadline → `ETIMEDOUT`; a socket that is
+already connected → `EISCONN`; supervisor died → the program is killed
+with the sandbox (see decision 6); `ENETUNREACH` can only come from
 the netns itself (e.g. a rewritten loopback CONTINUE, C4), never from
 hisn's refusal.
 
@@ -554,7 +574,7 @@ result:
 - `L97` host unix socket invisible (connect to `/run/...` fails `ENOENT` — the path does not exist in the view, not a net decision)
 - `L98` `sendto` to an outside address fails `ENETUNREACH` (no connect, no leak)
 - `L99` non-blocking connect + poll works through the mechanism
-- `L100` supervisor killed mid-connect: program gets `ENOSYS`, no hang
+- `L100` supervisor killed mid-connect: nothing hangs; the sandbox and the connecting program die with the supervisor, the exec client exits non-zero, the session is listed as crashed
 - `L101` policy change mid-session affects only new connects, journaled
 - `L102` journal has a `network/connect` record per decision with seat attribution (attribution = the exec's `client` for `hisn exec` programs, `null` for the main command and in-sandbox services, which have no seat — the pid→exec mapping is the exec table's, stated here so it is not discovered by accident)
 - `L103` an **exec'd** program (not only the main command) is intercepted (the listener is per exec tree, where the listener is created (refined)) — `hisn exec curl` through the mechanism
@@ -564,7 +584,12 @@ result:
 - `L107` host-loopback, link-local (incl. `169.254.169.254`-style), RFC1918 and ULA targets refused in `open` unless explicitly listed (the private-address block, connect-flow step 6)
 - `L108` an allowed name resolving to a private IP is refused (pins never authorise non-public addresses)
 - `L109` `AF_VSOCK` connect refused `EACCES` in all modes
-- `L110` dumpable-0 program (sets `PR_SET_DUMPABLE=0` after exec, before `connect`) gets `EACCES` (read fails closed), journaled
+- `L110` dumpable-0 program (sets `PR_SET_DUMPABLE=0` after exec, before `connect`): the connect is intercepted, decided and journaled with target ip:port like any other (see the correction under connect-flow step 2)
+- `L112` DNS over a connected UDP socket and over TCP to `127.0.0.1:53`
+- `L113` a failed lookup is never journaled as `ok` (NXDOMAIN → `failed`, upstream timeout → `error` with `SERVFAIL`)
+- `L114` journal flood cap: at most 50 records per second one by one, the rest counted in `network/summary`
+- `L115` `none` mode: no route, no interception, no generated resolver files
+- `L116` `extra_deny = ["connect"]` rejected under `open`, accepted under `none`
 - `L111` sandbox netns differs from the supervisor's (`/proc/self/ns/net` inode) — startup assertion, fails closed
 
 Host verification, one script `scripts/host-verify-network.sh` (run on a
@@ -605,7 +630,8 @@ from the probe.
   policy + per-decision journaling is the v1 boundary.
 - **Yama `ptrace_scope >= 2` refuses to start** (`open`/`allowlist`
   fail closed at startup; absent or `< 2` is fine — `process_vm_readv`
-  would otherwise fail every connect at read time).
+  would otherwise fail every connect at read time). As implemented, a
+  file that exists but cannot be read or is not a number also refuses.
 - **E (the exec helper) sets `PR_SET_NO_NEW_PRIVS` itself** before
   installing its connect filter; the filter install never relies on
   `CAP_SYS_ADMIN`.
@@ -616,24 +642,59 @@ from the probe.
 
 ### Implementation (0.6.0)
 
-Implemented on `work/0.6.0` (open mode only; allowlist is 0.7.0).
-Commits: phase 1 plumbing + filter/probe/classifier; phase 2 NOTIF
-engine + DNS responder + journal + init/exec/supervisor integration;
-phase 3 leak cases + host script + release docs; review-fix commits
-(real `ioctl` ABI, `args[0]` sockfd, two-step `SETFD` injection,
-`O_NONBLOCK` restore, READY fd count gated on PTY, DNS bind before
-caps drop, bounded worker pool, NAT64/`198.18/15` block, `ip:port`
-journal targets, e2e integration test). The pre-implementation
-review's BLOCKING points were folded in: exact connect order
-(af_unix/loopback `CONTINUE` before the non-stream refusal, so UDP
-DNS to 127.0.0.1:53 works), READY fd count validation, init closes its
-listener/DNS copies before fork, deadline from `NOTIF_RECV`,
-`OwnedFd` everywhere, private block as one named classifier with unit
-vectors, 0.6 test subset, 5.9 floor probing by attempt, per-tree
-netns assertion, fd-count discipline verified by the hermetic host
-script. `open` honours no `[net] allow` exceptions (private targets
-are unconditionally refused in 0.6.0; explicit IP/CIDR exceptions are
-0.7.0).
+Implemented on `work/0.6.0`: `open` only; `allowlist`, the policy
+format, `net-policy-set` and `net explain` are 0.7.0. What the code
+does where it differs from or sharpens the text above:
+
+- **Injection** is always two steps, `ADDFD` with `SETFD` and then
+  `NOTIF_SEND` with value 0, on every kernel. `SECCOMP_ADDFD_FLAG_SEND`
+  is not used, so the path described for 5.9–5.13 is the only path.
+  The descriptor's close-on-exec flag is carried over.
+- **`NOTIF_ID_VALID`** uses the number `0x80082102`, which every
+  kernel since 5.0 accepts. The start-up probe counts an operation as
+  present only when an unknown notification id gives `ENOENT`.
+- **Threads.** A notification carries a thread id. The supervisor
+  opens it with `PIDFD_THREAD` (Linux 6.9); on older kernels it opens
+  the process and verifies with `kcmp` that the thread shares its
+  descriptor table, otherwise the connect is refused.
+- **Deadline.** 30 s from `NOTIF_RECV`, checked before any work, after
+  the address read, and during the outbound connect. A pending connect
+  is given up as soon as its notification is no longer valid, so a
+  session does not wait for it at its end.
+- **Already connected.** `connect()` on a connected socket is answered
+  `EISCONN`.
+- **Sizes.** 64 workers, queue 256 (full: `EACCES`,
+  `refuse/queue-full`). DNS: 16 workers, queue 256, 2 s per query
+  shared over the upstreams, at most 64 TCP clients.
+- **Journal.** Network records pass through one bounded queue per
+  session (4096 entries; full: the record is dropped and counted). At
+  most 50 per second are written one by one, the rest are counted in
+  `network/summary`. `network/connect` has no `latency_ms`,
+  `resolved_name` or seat attribution yet (`seat` is `null`).
+  `network/dns` carries `name`, `qtype`, `proto`, `upstream`, `rcode`
+  and `verdict` `ok` / `failed` / `error`. The size limit (oldest
+  rotated files deleted beyond 256 MiB in more than four files)
+  applies only to journals of sessions in `open`.
+- **`nsswitch.conf`** is generated only in `open`; `none` and `host`
+  keep the host's file.
+- **No `[net] allow` exceptions**: private targets are always refused.
+- **Not implemented from decision 3**: the responder forwards every
+  name and keeps no pins (that is the allowlist's part).
+
+Measured on kernel 7.3.3-300.fc45.x86_64 (Fedora 45, Yama
+`ptrace_scope = 1`), commit `44e3c90`:
+`scripts/host-verify-network.sh --real` ended with
+`RESULT: pass=70 fail=0 timeout=0 skipped=1`. 100 connects cost
+about 100 µs each through interception (medians 103.2, 99.0,
+109.6 µs) against about 22 µs direct (21.6, 24.4, 21.9 µs); the probe
+had measured 20–25 µs extra with a single-threaded C supervisor. The
+`kcmp` fallback for kernels before 6.9 has unit coverage only.
+
+Known gaps, accepted for 0.6.0 and listed in the release notes: a
+non-blocking `connect()` waits for the result instead of returning
+`EINPROGRESS`; an epoll registration or a duplicate made before
+`connect()` refers to the old socket; only a few socket options are
+carried over.
 
 Mashūra round 1 (open questions: "What is missing or wrong in this
 design? Where can it fail open? What would an agent other than Wakil

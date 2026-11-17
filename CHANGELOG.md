@@ -7,38 +7,51 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-11-16
+## [0.6.0] - 2026-11-17
 
-`network = "open"` (ADR 0022, mechanism only): outbound TCP from inside
-the empty netns via seccomp user-notif connect interception — the
-supervisor connects from the host netns and injects the socket. `none`
-(byte-identical to 0.5.1) and `host` are unchanged. Allowlist, DNS
-pinning, `net-policy-set` and `net explain` are 0.7.0 and do not exist
-in this release. See `docs/releases/v0.6.0.md` for the full notes,
-including the asserted limitations (no UDP beyond DNS, `bind()` before
-`connect()` loses its local address, non-blocking `connect()` waits
-for the supervisor, private targets refused in `open`).
+`network = "open"` (ADR 0022): outbound TCP for a session in an empty
+network namespace. Each `connect()` is intercepted with seccomp user
+notification; the supervisor connects from the host network namespace
+and injects the socket. `open` allows every public address; there is no
+allowlist in this release. `none` (the default) and `host` behave as in
+0.5.1. Details, limitations and what was measured:
+`docs/releases/v0.6.0.md`.
+
+**Evidence (test machine, kernel 7.3.3, at `44e3c90`):**
+`scripts/host-verify-network.sh --real` ended with
+`RESULT: pass=70 fail=0 timeout=0 skipped=1`; leak suite
+`421 passed, 0 failed, 10 skipped, 4 weak`, with a rootfs and
+`HISN_BIG_TESTS=1` `434 passed, 0 failed, 6 skipped, 4 weak`.
 
 ### Added
-- `Network::Open` end to end (policy, `--network open`, session.json).
-- Hand-written BPF `connect`→`USER_NOTIF` filter, supervisor NOTIF
-  engine (64 workers, 30 s deadline from recv, queue-full `EACCES`),
-  decision order unix/loopback `CONTINUE`, non-stream/private/unknown
-  `EACCES`, public stream `ADDFD|SETFD` injection.
-- Supervisor DNS responder on init-bound `127.0.0.1:53` fds (UDP+TCP,
-  `SERVFAIL` on failure); `open` sessions get a generated
-  `/etc/resolv.conf` + `/etc/nsswitch.conf`.
-- Journal `network/connect`, `network/dns`, `network/summary`;
-  4-file retention cap.
-- Fail-closed startup: kernel feature probe (floor 5.9, by
-  attempting), Yama `ptrace_scope >= 2` refusal, netns-differs
-  assertion, `extra_deny` `connect`/`socket` rejection.
-- `scripts/host-verify-network.sh` (hermetic host gate).
-- Leak cases L94, L96–L100, L102–L107, L109–L111 (0.6.0 subset).
+- `session.network = "open"` and `--network open`.
+- Connect interception for the main command, `hisn exec`, `hisn attach`
+  and all their threads: unix and loopback continue; other families,
+  non-stream sockets and non-public targets get `EACCES`; public stream
+  targets are connected by the supervisor. 30 s deadline
+  (`ETIMEDOUT`), 64 workers, queue of 256 (full: `EACCES`).
+- DNS responder on the session's `127.0.0.1:53` (UDP and TCP),
+  forwarding to the host's resolvers; `open` sessions get a generated
+  `/etc/resolv.conf` and `/etc/nsswitch.conf`. Without a usable
+  upstream the session does not start.
+- Journal kinds `network/connect`, `network/dns` (real response code;
+  `ok` / `failed` / `error`) and `network/summary` (records beyond 50
+  per second are counted, not written one by one).
+- Start-up checks for `open`: kernel support (5.9 or newer, by trying
+  the operations), separate network namespace, Yama `ptrace_scope`
+  0 or 1; `extra_deny` with `connect` or `socket` is rejected.
+- `scripts/host-verify-network.sh` and the hermetic network cases
+  `tests/leak/net_cases.sh` (L90, L94, L96–L100, L102–L107, L109–L116).
 
 ### Changed
-- `hisn check`: nothing new yet (feature probing happens at session
-  startup for `open`).
+- For a session in `open`, the workspace journal deletes its oldest
+  rotated files once it exceeds 256 MiB in more than four files.
+  Sessions in `none` and `host` keep every journal file, as before.
+
+### Fixed
+- The 512 MB import test measured the memory of the whole test process
+  and could fail because of other tests running in parallel; it now
+  measures in its own process.
 
 ## [0.5.1] - 2026-11-15
 

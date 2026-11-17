@@ -14,7 +14,7 @@ version = "hisn-policy/v1"          # required, exact string
 cwd      = "."          # path; relative → resolved against the policy file's directory
                         #   (or the process cwd for --cwd / built-in defaults)
 home     = "tmpfs"      # "tmpfs" | absolute host path (persistent, rw)
-network  = "none"       # "none" | "host"
+network  = "none"       # "none" | "host" | "open"
 hostname = "hisn"       # RFC 1123 label, ≤ 63 chars
 shm      = false        # mount /dev/shm (tmpfs); 0.2.1
 shm_size = 64           # /dev/shm size in MiB (1..=65536); 0.2.1
@@ -46,7 +46,7 @@ nproc  = 4096
 | `version` | string | — (required) | must equal `hisn-policy/v1` |
 | `session.cwd` | path | `.` | canonicalised; must exist, be a directory, and satisfy §4 rules; mounted **rw at the identical path** |
 | `session.home` | `"tmpfs"` \| abs path | `"tmpfs"` | a path must exist, be owned by the caller, and not overlap runtime dir |
-| `session.network` | enum | `"none"` | `"host"` additionally requires Landlock scope support (DESIGN §7) or CLI `--allow-host-abstract-sockets` |
+| `session.network` | enum | `"none"` | `"host"` additionally requires Landlock scope support (DESIGN §7) or CLI `--allow-host-abstract-sockets`. `"open"` (0.6.0) needs kernel 5.9 or newer and Yama `ptrace_scope` 0 or 1, and rejects `seccomp.extra_deny` entries `connect` and `socket` |
 | `session.hostname` | string | `"hisn"` | |
 | `session.shm` | bool | `false` | mount `/dev/shm` (tmpfs); 0.2.1. Default off = no `/dev/shm` (0.2 behavior) |
 | `session.shm_size` | u64 (MiB) | `64` | `/dev/shm` size; range `1..=65536`; 0.2.1 |
@@ -119,6 +119,14 @@ Violations are errors (`E_PATH_FORBIDDEN`), never silently adjusted.
 * **network = "none"**: new net ns, `lo` up, nothing else. `127.0.0.1` works
   inside; any non-loopback destination fails with `ENETUNREACH`.
   **"host"**: no net ns; no filtering of any kind.
+  **"open"** (0.6.0, ADR 0022): new net ns with `lo` only, as in `"none"`,
+  plus interception of `connect()`: stream connects to public addresses
+  are made by the supervisor from the host net ns; private targets,
+  non-stream sockets and other address families fail with `EACCES`;
+  `sendto` to a non-loopback destination still fails with `ENETUNREACH`.
+  `/etc/resolv.conf` (`nameserver 127.0.0.1`) and `/etc/nsswitch.conf`
+  are generated, and a responder in the supervisor forwards DNS to the
+  host's resolvers (or `[net] nameservers` of the profile).
 * **env**: DESIGN §8. `pass` of an unset name is a no-op.
 * **limits**: applied in init before `execve`; inherited by all descendants.
 
@@ -127,7 +135,7 @@ Violations are errors (`E_PATH_FORBIDDEN`), never silently adjusted.
 | CLI | policy equivalent |
 |-----|-------------------|
 | `--cwd DIR` | `session.cwd` |
-| `--network none\|host` | `session.network` |
+| `--network none\|host\|open` | `session.network` |
 | `--grant PATH[:ro\|rw]` | initial grant, **same code path as a dynamic grant** (performed through the control logic right after `ready`), and thus subject to `grantable_rw` for `rw` |
 | `--session-id ID` | none (`[A-Za-z0-9._-]{1,64}`; collision with a live session is an error) |
 
@@ -185,6 +193,7 @@ construct expressible in `config.json` for the v2 conformance work.
 | no `/sys` | omit the `sysfs` mount |
 | `session.network = "none"` | `linux.namespaces` includes `{type:"network"}` (no path), loopback set up by runtime |
 | `session.network = "host"` | `linux.namespaces` omits `network` |
+| `session.network = "open"` | as `"none"`; the connect interception has no OCI equivalent |
 | user/mnt/pid/ipc/uts ns | `linux.namespaces[]` types `user mount pid ipc uts` |
 | uid/gid single map | `linux.uidMappings[]`, `linux.gidMappings[]` = `{containerID:u, hostID:u, size:1}` |
 | `session.hostname` | `hostname` |

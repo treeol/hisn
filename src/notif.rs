@@ -415,6 +415,14 @@ pub struct NotifEngine {
 pub const MAX_PENDING: usize = 256;
 /// Worker threads per listener.
 pub const WORKERS: usize = 64;
+/// Non-blocking connects whose completion the supervisor still tracks
+/// after replying EINPROGRESS. Bounded so a program opening thousands of
+/// pending connects cannot grow supervisor memory without limit: past
+/// this many, the socket is still injected and EINPROGRESS is still
+/// replied (the program's own poll/SO_ERROR is unaffected), but no
+/// completion record is tracked and the overflow is counted in the next
+/// network/summary (journal `tracked_overflow`).
+pub const MAX_TRACKED: usize = 1024;
 
 /// Reads the `sockaddr` a notified task passed to `connect()`:
 /// `(pid, remote address, length) -> bytes`. Production uses
@@ -483,7 +491,8 @@ impl NotifEngine {
     /// `journal` is an engine handle of the workspace journal
     /// ([`crate::journal::Journal::clone_for_engine`]): its network records
     /// go through a bounded queue, so a verdict never waits on a journal
-    /// write. Seat attribution is not recorded in 0.6.0.
+    /// write. Seat attribution is not recorded in 0.6.0. The engine shares
+    /// the queue's tracked-overflow counter with the journal writer.
     pub fn start(
         listener: OwnedFd,
         journal: Option<std::sync::Arc<crate::journal::Journal>>,
@@ -501,8 +510,14 @@ impl NotifEngine {
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sd = shutdown.clone();
         let (done_tx, done) = std::sync::mpsc::channel::<()>();
+        let tracker = match &journal {
+            Some(j) => j.tracked_overflow().map(Tracked::with_overflow),
+            None => None,
+        }
+        .unwrap_or_default();
+        let tracker = std::sync::Arc::new(tracker);
         std::thread::spawn(move || {
-            engine_loop(listener, journal, cfg, &sd);
+            engine_loop(listener, journal, cfg, &sd, &tracker);
             let _ = done_tx.send(());
         });
         Self { shutdown, done }
@@ -527,11 +542,85 @@ impl Drop for NotifEngine {
     }
 }
 
+/// Completion tracking for non-blocking connects the supervisor has
+/// already answered EINPROGRESS for. One shared tracker per engine: the
+/// receiver thread (`engine_loop`) owns the poll over the tracked
+/// duplicates, so tracking never delays or blocks a verdict — workers
+/// reply and return at once, and only the receiver waits (with a poll
+/// timeout, so shutdown stays responsive). The count is bounded by
+/// [`MAX_TRACKED`]; the overflow counter is journaled in the next
+/// `network/summary` (`tracked_overflow`, read by the journal writer).
+pub struct Tracked {
+    /// `(supervisor fd, target, started)` of pending non-blocking connects.
+    pend: std::sync::Mutex<Vec<(i32, String, std::time::Instant)>>,
+    /// Tracked connects dropped for lack of room (never a verdict delay).
+    /// Shared with the journal's network queue, which reports the count
+    /// in the next `network/summary`.
+    overflow: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Tracked {
+    /// A tracker with the given journal overflow counter.
+    pub fn with_overflow(overflow: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            pend: std::sync::Mutex::new(Vec::new()),
+            overflow,
+        }
+    }
+
+    fn slot(&self, fd: i32, target: String) -> Result<(), ()> {
+        let mut pend = self.pend.lock().unwrap_or_else(|e| e.into_inner());
+        if pend.len() >= MAX_TRACKED {
+            self.overflow
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(());
+        }
+        pend.push((fd, target, std::time::Instant::now()));
+        Ok(())
+    }
+
+    fn fds(&self) -> Vec<i32> {
+        self.pend
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(fd, _, _)| *fd)
+            .collect()
+    }
+
+    /// Remove and return the entry for `fd`, if present.
+    fn take(&self, fd: i32) -> Option<(String, std::time::Instant)> {
+        let mut pend = self.pend.lock().unwrap_or_else(|e| e.into_inner());
+        let pos = pend.iter().position(|(f, _, _)| *f == fd)?;
+        let (_, target, started) = pend.remove(pos);
+        Some((target, started))
+    }
+
+    /// One `(fd, age_ms)` per tracked socket older than `deadline_ms` from
+    /// its start, for the caller to journal and close.
+    fn expired(&self, deadline_ms: u128) -> Vec<(i32, u128)> {
+        let pend = self.pend.lock().unwrap_or_else(|e| e.into_inner());
+        pend.iter()
+            .filter_map(|(fd, _, started)| {
+                let age = started.elapsed().as_millis();
+                (age >= deadline_ms).then_some((*fd, age))
+            })
+            .collect()
+    }
+}
+
+impl Default for Tracked {
+    fn default() -> Self {
+        Self::with_overflow(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))
+    }
+}
+
 fn engine_loop(
     listener: OwnedFd,
     journal: Option<std::sync::Arc<crate::journal::Journal>>,
     cfg: EngineConfig,
     shutdown: &std::sync::atomic::AtomicBool,
+    tracker: &std::sync::Arc<Tracked>,
 ) {
     // Keep the listener alive until every worker has joined: workers hold
     // only the raw fd number, so dropping it first would be use-after-close.
@@ -545,6 +634,7 @@ fn engine_loop(
     for _ in 0..cfg.workers.max(1) {
         let rx = rx.clone();
         let j = journal.clone();
+        let tracker = tracker.clone();
         workers.push(std::thread::spawn(move || {
             loop {
                 let msg = {
@@ -552,7 +642,7 @@ fn engine_loop(
                     lock.recv()
                 };
                 match msg {
-                    Ok((mut n, recv_at)) => handle_notif(lfd, &mut n, recv_at, &cfg, &j),
+                    Ok((mut n, recv_at)) => handle_notif(lfd, &mut n, recv_at, &cfg, &j, &tracker),
                     Err(_) => return,
                 }
             }
@@ -562,21 +652,71 @@ fn engine_loop(
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        let mut pfd = libc::pollfd {
+        // Poll the listener and every tracked duplicate in one call, so
+        // completion tracking lives in this loop and never blocks a
+        // verdict. The poll timeout stays RECV_POLL_MS, so shutdown and
+        // deadline expiry for tracked sockets are both prompt.
+        let fds = tracker.fds();
+        let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(fds.len() + 1);
+        pfds.push(libc::pollfd {
             fd: lfd,
             events: libc::POLLIN,
             revents: 0,
-        };
-        let r = unsafe { libc::poll(&mut pfd, 1, RECV_POLL_MS) };
+        });
+        for fd in &fds {
+            pfds.push(libc::pollfd {
+                fd: *fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            });
+        }
+        let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, RECV_POLL_MS) };
         if r < 0 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             break;
         }
+        // Completion of tracked non-blocking connects: journal one
+        // network/connect-result and close the supervisor's duplicate.
+        // Closing our dup never affects the program's injected socket.
+        for pfd in pfds.iter().skip(1) {
+            if pfd.revents == 0 {
+                continue;
+            }
+            if let Some((target, started)) = tracker.take(pfd.fd) {
+                let mut err = 0i32;
+                let mut elen = std::mem::size_of::<i32>() as libc::socklen_t;
+                unsafe {
+                    libc::getsockopt(
+                        pfd.fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        &mut err as *mut i32 as *mut libc::c_void,
+                        &mut elen,
+                    )
+                };
+                if let Some(j) = &journal {
+                    j.net_connect_result(&target, err, started.elapsed().as_millis());
+                }
+                unsafe { libc::close(pfd.fd) };
+            }
+        }
+        // Tracked sockets past the deadline: journal the timeout and
+        // close the duplicate.
+        let deadline_ms = (cfg.deadline_s.max(1) as u128) * 1000;
+        for (fd, age_ms) in tracker.expired(deadline_ms) {
+            if let Some((target, _)) = tracker.take(fd) {
+                if let Some(j) = &journal {
+                    j.net_connect_result(&target, libc::ETIMEDOUT, age_ms);
+                }
+                unsafe { libc::close(fd) };
+            }
+        }
         if r == 0 {
             continue;
         }
+        let pfd = pfds[0];
         if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
             break; // listener gone: clean exit
         }
@@ -633,6 +773,7 @@ fn handle_notif(
     recv_at: std::time::Instant,
     cfg: &EngineConfig,
     journal: &Option<std::sync::Arc<crate::journal::Journal>>,
+    tracker: &std::sync::Arc<Tracked>,
 ) {
     let deadline = recv_at + std::time::Duration::from_secs(cfg.deadline_s.max(1));
     // The deadline runs from NOTIF_RECV and covers the time spent waiting
@@ -816,8 +957,71 @@ fn handle_notif(
                     addrlen as libc::socklen_t,
                 )
             };
+            // EINPROGRESS fast path (0.6.0 fix): when the program's own
+            // socket is non-blocking, a supervisor connect that would
+            // block must not block the program — see below. Blocking
+            // sockets take the poll-for-completion loop as before.
+            let client_nonblock = orig_nonblock.unwrap_or(false);
             if cr < 0 {
                 let e = io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EINPROGRESS) && client_nonblock {
+                    // Inject first, then reply EINPROGRESS: an EINPROGRESS
+                    // without the replacement socket would leave the
+                    // program polling an unconnected socket forever.
+                    if let Some(nb) = orig_nonblock {
+                        let nf = unsafe { libc::fcntl(newfd, libc::F_GETFL) };
+                        if nf >= 0 {
+                            let want = if nb {
+                                nf | libc::O_NONBLOCK
+                            } else {
+                                nf & !libc::O_NONBLOCK
+                            };
+                            unsafe { libc::fcntl(newfd, libc::F_SETFL, want) };
+                        }
+                    }
+                    if !id_valid(lfd, n.id) {
+                        return;
+                    }
+                    let mut addfd: NotifAddFd = unsafe { std::mem::zeroed() };
+                    addfd.id = n.id;
+                    addfd.flags = FLAG_SETFD;
+                    addfd.srcfd = newfd as u32;
+                    addfd.newfd = n.data.args[0] as u32;
+                    addfd.newfd_flags = if task_fd_cloexec(n.pid, sockfd) {
+                        libc::O_CLOEXEC as u32
+                    } else {
+                        0
+                    };
+                    match seccomp_ioctl(lfd, OP_ADDFD, &mut addfd as *mut NotifAddFd as *mut _) {
+                        Ok(()) => {
+                            reply(lfd, n.id, -(libc::EINPROGRESS), 0, 0);
+                            if let Some(j) = journal {
+                                j.net_record("allow", "injected-inprogress", n);
+                            }
+                            // Keep a duplicate for completion tracking:
+                            // dup the supervisor fd, then hand tracking the
+                            // dup to the receiver thread's poll loop.
+                            let dup_fd = unsafe { libc::dup(newfd) };
+                            if dup_fd >= 0 {
+                                let target = notif_target(
+                                    n.parsed_ip.as_ref(),
+                                    n.parsed_family,
+                                    n.parsed_port,
+                                );
+                                if tracker.slot(dup_fd, target).is_err() {
+                                    unsafe { libc::close(dup_fd) };
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if id_valid(lfd, n.id) {
+                                reply(lfd, n.id, -(e.raw_os_error().unwrap_or(libc::EIO)), 0, 0);
+                            }
+                            return;
+                        }
+                    }
+                    return;
+                }
                 if e.raw_os_error() != Some(libc::EINPROGRESS) {
                     if id_valid(lfd, n.id) {
                         reply(lfd, n.id, -(e.raw_os_error().unwrap_or(libc::EIO)), 0, 0);
@@ -827,7 +1031,8 @@ fn handle_notif(
                     }
                     return;
                 }
-                // Poll for completion until deadline.
+                // EINPROGRESS on a blocking socket: poll for completion
+                // until the deadline (unchanged behaviour).
                 let mut done = false;
                 while std::time::Instant::now() < deadline {
                     let mut pfd = libc::pollfd {
@@ -1136,6 +1341,18 @@ fn copy_sock_opts(addr_fd: i32, pidfd: i32, newfd: i32) -> Option<bool> {
         };
     }
     nonblock
+}
+
+/// The errno name used in a `network/connect-result` record.
+pub fn errno_name(errno: i32) -> String {
+    match errno {
+        x if x == libc::ECONNREFUSED => "ECONNREFUSED".to_owned(),
+        x if x == libc::ETIMEDOUT => "ETIMEDOUT".to_owned(),
+        x if x == libc::EHOSTUNREACH => "EHOSTUNREACH".to_owned(),
+        x if x == libc::ENETUNREACH => "ENETUNREACH".to_owned(),
+        x if x == libc::ECONNRESET => "ECONNRESET".to_owned(),
+        _ => format!("errno:{errno}"),
+    }
 }
 
 /// Format the connect address read from the notification for the journal:

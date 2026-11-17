@@ -147,3 +147,14 @@ L110: non-dumpable program
 L113: no failed lookup recorded as ok
 L114: single records
 L115: host's own nsswitch.conf
+# 0.6.0 final fix (non-blocking connect must not block): L117 (hermetic),
+# L118 (real-network step; SKIP when node/go is missing).
+L117
+L118
+L117: injected-inprogress
+L117: non-blocking connect to a closed port
+L117: connect-result ECONNREFUSED
+L117: node event loop
+L117: go client
+L118: node fetch
+L118: go http.Get

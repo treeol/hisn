@@ -296,6 +296,48 @@ journal_is "L96 journal: continue 127.0.0.1:19001" "$AWS" 1 kind=network/connect
 check "L97 host unix socket is not visible (ENOENT)" "L97-OK" in_session "$A" in-unix "$T/host.sock"
 check "L98 sendto and fast-open to an outside address fail ENETUNREACH" "L98-OK" in_session "$A" in-sendto
 check "L99 non-blocking connect completes and keeps O_NONBLOCK" "L99-OK" in_session "$A" in-nonblock
+# L117: non-blocking connect() no longer blocks the program. The
+# supervisor injects the replacement socket and replies EINPROGRESS at
+# once; the program sees EINPROGRESS and later POLLOUT/SO_ERROR.
+check "L117 non-blocking connect to the blackhole returns EINPROGRESS in under 100 ms" "NB-BLACKHOLE-OK" in_session "$A" in-nonblock-blackhole
+check "L117 non-blocking connect to the listener gives POLLOUT, SO_ERROR 0 and data exchange" "NB-LISTEN-OK" in_session "$A" in-nonblock-listen 18080
+check "L117 non-blocking connect to a closed port on the listener address gives ECONNREFUSED" "NB-REFUSED-OK" in_session "$A" in-nonblock-refused 18444
+journal_is "L117 journal: connect-result ok for the non-blocking listener connect" "$AWS" 1 \
+  kind=network/connect-result target=192.0.2.1:18080 result=ok
+journal_is "L117 journal: connect-result ECONNREFUSED for the closed port" "$AWS" 1 \
+  kind=network/connect-result target=192.0.2.1:18444 result=ECONNREFUSED
+journal_is "L117 journal: injected-inprogress for the non-blocking blackhole connect" "$AWS" 1 \
+  kind=network/connect target=192.0.2.98:18181 verdict=allow reason=injected-inprogress
+# L117 (node step 4): a node script starts an HTTP request to the blackhole
+# and one to the listener while a setInterval ticks every 10 ms; the
+# listener request completes and the interval keeps ticking (no gap above
+# 100 ms). Runs only when node is present in the session; SKIP names the
+# missing tool otherwise.
+cp "$HERE/nb_node.js" "$ACWD/nb_node.js"
+NBSRC=$(in_session "$A" in-tool-probe 2>/dev/null)
+if printf '%s\n' "$NBSRC" | grep -q '^TOOL node yes$'; then
+  check "L117 node event loop: listener request completes while the blackhole request is pending, interval ticks" \
+    "NODE-OK" timeout 60 "$HISN" exec --no-tty --session "$A" -- node "$ACWD/nb_node.js" \
+    "http://192.0.2.1:18080" "http://192.0.2.98:18181"
+else
+  skip "L117 node event loop" "node is not present in the session"
+fi
+if printf '%s\n' "$NBSRC" | grep -q '^TOOL go yes$'; then
+  # The Go case runs a statically linked binary built by the host script
+  # (or by the caller of net_cases.sh, which must place it at $T/nb_go
+  # before starting this script); the binary is copied into the session
+  # cwd, which is mounted rw, so a running session can execute it.
+  if [ -x "$T/nb_go" ]; then
+    cp "$T/nb_go" "$ACWD/nb_go"
+    check "L117 go client: http GET to the listener and a dial to the blackhole with a 1 s timeout" \
+      "GO-OK" timeout 60 "$HISN" exec --no-tty --session "$A" -- "$ACWD/nb_go" \
+      "http://192.0.2.1:18080" "192.0.2.98:18181"
+  else
+    skip "L117 go client" "no pre-built go test binary at $T/nb_go"
+  fi
+else
+  skip "L117 go client" "go is not present in the session"
+fi
 check "L99 close-on-exec flag of the socket survives the connect" "CLOEXEC-OK" in_session "$A" in-cloexec
 check "L99 connect() on a connected socket fails EISCONN, connection kept" "RECONNECT-OK" in_session "$A" in-reconnect
 check "L104 connect() on a datagram socket is refused EACCES" "L104-OK" in_session "$A" in-dgram

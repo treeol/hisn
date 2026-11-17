@@ -4039,12 +4039,13 @@ else
 fi
 
 # === 0.6.0 network cases (ADR 0022, open mode): L90, L94, L96-L100,
-# L102-L107, L109-L116. They live in net_cases.sh, which
+# L102-L107, L109-L117. They live in net_cases.sh, which
 # scripts/host-verify-network.sh runs too. It runs inside a throwaway
 # user + network namespace (`unshare -Urn`) that has only loopback and a
 # dummy interface, so no traffic can leave the machine, and with hisn's
-# runtime and state directories inside its own work dir.
-NET_IDS="L90 L94 L96 L97 L98 L99 L100 L102 L103 L104 L105 L106 L107 L109 L110 L111 L112 L113 L114 L115 L116"
+# runtime and state directories inside its own work dir. The L118
+# real-network cases run only through the host script's --real step.
+NET_IDS="L90 L94 L96 L97 L98 L99 L100 L102 L103 L104 L105 L106 L107 L109 L110 L111 L112 L113 L114 L115 L116 L117 L118"
 NET_MISSING=""
 command -v ip >/dev/null 2>&1 || NET_MISSING="the ip command (iproute2) is not installed"
 [ -n "$NET_MISSING" ] || timeout 10 unshare -Urn true 2>/dev/null ||
@@ -4053,6 +4054,10 @@ if [ -n "$NET_MISSING" ]; then
   for id in $NET_IDS; do
     skip "$id open-mode network case" "$NET_MISSING"
   done
+  # L118 runs only through the host script's --real step; in the leak
+  # suite it reports the missing fixture as its own SKIP.
+  skip "L118 node fetch" "$NET_MISSING (the real-network step runs through scripts/host-verify-network.sh --real)"
+  skip "L118 go http.Get" "$NET_MISSING (the real-network step runs through scripts/host-verify-network.sh --real)"
 else
   NET_WORK=$(mktemp -d /tmp/hisn-net.XXXXXX)
   NET_TOKEN="net$$"

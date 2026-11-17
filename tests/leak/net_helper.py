@@ -434,6 +434,76 @@ def in_nonblock():
     print('L99-OK')
 
 
+def in_nonblock_blackhole():
+    """A non-blocking connect to the blackhole: EINPROGRESS in under 100 ms,
+    then poll for POLLOUT times out at the client's own 1 s timeout. No
+    30 s wait (the supervisor answers EINPROGRESS at once)."""
+    import fcntl
+    import select
+    sock = socket.socket()
+    sock.setblocking(False)
+    start = time.monotonic()
+    rc = sock.connect_ex(BLACKHOLE)
+    took_ms = (time.monotonic() - start) * 1000
+    if rc != 115:  # EINPROGRESS
+        fail(f'non-blocking blackhole connect returned errno {rc}, want EINPROGRESS')
+    if took_ms >= 100:
+        fail(f'non-blocking connect to the blackhole took {took_ms:.0f} ms, want < 100 ms')
+    if not select.select([], [sock], [], 1)[1]:
+        print('NB-BLACKHOLE-OK')
+        return
+    fail('blackhole socket became writable within the 1 s poll')
+
+
+def in_nonblock_listen(port):
+    """A non-blocking connect to the listener: EINPROGRESS or 0, then
+    POLLOUT, SO_ERROR 0, and data exchange works."""
+    import fcntl
+    import select
+    sock = socket.socket()
+    sock.setblocking(False)
+    rc = sock.connect_ex((LISTEN_IP, port))
+    if rc not in (0, 115):
+        fail(f'non-blocking listen connect returned errno {rc}')
+    if not select.select([], [sock], [], 10)[1]:
+        fail('socket never became writable')
+    if sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) != 0:
+        fail('SO_ERROR is non-zero after POLLOUT')
+    if not fcntl.fcntl(sock, fcntl.F_GETFL) & os.O_NONBLOCK:
+        fail('the socket lost O_NONBLOCK')
+    if not select.select([sock], [], [], 10)[0] or sock.recv(100) != GREETING:
+        fail('no greeting on the socket')
+    print('NB-LISTEN-OK')
+
+
+def in_nonblock_refused(port):
+    """A non-blocking connect to a closed port on the listener address:
+    POLLOUT with SO_ERROR ECONNREFUSED (or an immediate ECONNREFUSED)."""
+    import select
+    sock = socket.socket()
+    sock.setblocking(False)
+    rc = sock.connect_ex((LISTEN_IP, port))
+    if rc == ECONNREFUSED:
+        print('NB-REFUSED-OK')
+        return
+    if rc not in (0, 115):
+        fail(f'non-blocking closed-port connect returned errno {rc}')
+    if not select.select([], [sock], [], 10)[1]:
+        fail('socket never became writable')
+    error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+    if error != ECONNREFUSED:
+        fail(f'SO_ERROR is {error}, want ECONNREFUSED')
+    print('NB-REFUSED-OK')
+
+
+def in_tool_probe():
+    """Print the tools present in this session (PATH lookup), one per line:
+    `TOOL node yes|no`, `TOOL go yes|no`, `TOOL curl yes|no`, `TOOL git yes|no`."""
+    import shutil
+    for name in ('node', 'go', 'curl', 'git'):
+        print(f'TOOL {name} {"yes" if shutil.which(name) else "no"}')
+
+
 def in_dgram():
     rc = _connect_errno(socket.AF_INET, socket.SOCK_DGRAM, (LISTEN_IP, 18080))
     if rc != EACCES:
@@ -716,6 +786,10 @@ def main(argv):
         'in-tcp': lambda: in_tcp(args[0], int(args[1])),
         'in-resolve': lambda: in_resolve(args[0]),
         'in-refused': lambda: in_refused(args[0], int(args[1])),
+        'in-nonblock-blackhole': in_nonblock_blackhole,
+        'in-nonblock-listen': lambda: in_nonblock_listen(int(args[0])),
+        'in-nonblock-refused': lambda: in_nonblock_refused(int(args[0])),
+        'in-tool-probe': in_tool_probe,
     }
     if cmd not in commands:
         fail(f'unknown subcommand {cmd}')

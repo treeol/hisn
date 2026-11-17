@@ -264,13 +264,32 @@ unchanged from the task; the rest are stated with their refinement.
    documented limitation L105; programs that bind before connect lose
    their local address choice. Epoll registrations are lost on fd
    replacement (probe F); the client re-registers after `connect()`
-   returns, same as with any fd replacement. **Non-blocking connect:**
-   the supervisor completes the outbound connect synchronously (or
-   async, decision 6) and replies 0 with the injected fd; the client's
-   `poll(POLLOUT)`/`SO_ERROR` behaves as with a normal connected
-   socket (Q3). If the outbound connect fails, the supervisor replies
-   `-errno` from its own `connect()` (`ECONNREFUSED`, `EHOSTUNREACH`,
-   …), **never** a generic `EACCES` (Mashūra finding 6).
+   returns, same as with any fd replacement. **Non-blocking connect
+   (0.6.0 final):** when the program's own socket is non-blocking, the
+   supervisor creates its socket with `O_NONBLOCK`, copies options as
+   above, and calls `connect()`:
+   - returns 0 → inject with `SETFD` to args[0], reply 0 (reason
+     `injected`);
+   - returns `EINPROGRESS` → inject with `SETFD` to args[0] (without
+     `FLAG_SEND`), then reply `-EINPROGRESS` (reason
+     `injected-inprogress`); the program sees `EINPROGRESS` and later
+     `POLLOUT`/`SO_ERROR` on the same socket object, exactly like a
+     normal non-blocking connect. The supervisor keeps its own
+     duplicate of the socket, waits for completion in its poll loop
+     (never a blocking worker), bounded by the connect deadline, writes
+     one `network/connect-result` record (`target`, `result` ok or
+     errno name, `latency_ms`), and closes its duplicate. Tracking is
+     bounded ([`MAX_TRACKED`](https://github.com/treeol/hisn));
+     overflow is counted and journaled as `tracked_overflow` in the
+     next `network/summary`. An `EINPROGRESS` is only ever replied
+     after a successful injection: if it fails, the supervisor closes
+     its socket and replies `EACCES`.
+   - returns any other error immediately → no injection, reply that
+     `-errno` (`ECONNREFUSED`, `EHOSTUNREACH`, …), never a generic
+     `EACCES` (Mashūra finding 6).
+   A blocking program socket keeps the old behaviour: the supervisor
+   completes the connect under the deadline, injects, and replies 0 or
+   the connect's `-errno` (reason `injected`).
 8. **Every connect decision is a journal record.** One `network/connect`
    record per notification, workspace journal (ADR 0020): `target`
    (ip:port or unix path), `resolved_name` when the pin knows it,
@@ -669,12 +688,16 @@ does where it differs from or sharpens the text above:
 - **Journal.** Network records pass through one bounded queue per
   session (4096 entries; full: the record is dropped and counted). At
   most 50 per second are written one by one, the rest are counted in
-  `network/summary`. `network/connect` has no `latency_ms`,
-  `resolved_name` or seat attribution yet (`seat` is `null`).
-  `network/dns` carries `name`, `qtype`, `proto`, `upstream`, `rcode`
-  and `verdict` `ok` / `failed` / `error`. The size limit (oldest
-  rotated files deleted beyond 256 MiB in more than four files)
-  applies only to journals of sessions in `open`.
+  `network/summary` (`tracked_overflow` for completion-tracking
+  overflow). `network/connect` has no `latency_ms`, `resolved_name`
+  or seat attribution yet (`seat` is `null`). `network/connect-result`
+  is the completion of a non-blocking connect the supervisor answered
+  `EINPROGRESS` for (`target`, `result`, `latency_ms`); the same loop
+  that polls tracked duplicates writes it. `network/dns` carries
+  `name`, `qtype`, `proto`, `upstream`, `rcode` and `verdict`
+  `ok` / `failed` / `error`. The size limit (oldest rotated files
+  deleted beyond 256 MiB in more than four files) applies only to
+  journals of sessions in `open`.
 - **`nsswitch.conf`** is generated only in `open`; `none` and `host`
   keep the host's file.
 - **No `[net] allow` exceptions**: private targets are always refused.
@@ -690,11 +713,11 @@ about 100 µs each through interception (medians 103.2, 99.0,
 had measured 20–25 µs extra with a single-threaded C supervisor. The
 `kcmp` fallback for kernels before 6.9 has unit coverage only.
 
-Known gaps, accepted for 0.6.0 and listed in the release notes: a
-non-blocking `connect()` waits for the result instead of returning
-`EINPROGRESS`; an epoll registration or a duplicate made before
-`connect()` refers to the old socket; only a few socket options are
-carried over.
+Known gaps, accepted for 0.6.0 and listed in the release notes: an
+epoll registration or a duplicate made before `connect()` refers to
+the old socket; only a few socket options are carried over. (The
+0.6.0 non-blocking `connect()` limitation — the call waited for the
+result — is fixed in 0.6.0 final: see decision 7 above and case L117.)
 
 Mashūra round 1 (open questions: "What is missing or wrong in this
 design? Where can it fail open? What would an agent other than Wakil

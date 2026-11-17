@@ -192,8 +192,9 @@ given, so it can contain secrets that were passed on a command line.
 **Not provided.** hisn is not a VM: the sandbox shares the host kernel, and a
 kernel vulnerability is outside the model. Under `network = "host"` the session
 has the host's network; under `open` it can reach any public address over
-TCP (there is no allowlist yet), and a non-blocking `connect()` returns only
-when the connection is established or has failed. It does not limit
+TCP (there is no allowlist yet); a non-blocking `connect()` returns
+`EINPROGRESS` at once and completes through the usual `POLLOUT`/`SO_ERROR`,
+exactly like a normal non-blocking connect. It does not limit
 memory or cpu beyond `setrlimit` limits. The journal and the git change report record
 events; they do not prevent them. An egress proxy and cgroup v2 limits are
 planned, not yet scheduled ([roadmap](docs/ROADMAP.md)).

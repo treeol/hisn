@@ -11,12 +11,14 @@
 #      wakil-dev in the rootfs store, HISN_BIG_TESTS=1; the environment
 #      wins). The rootfs run is SKIPped only when no rootfs is found.
 #   3. tests/leak/net_cases.sh inside `unshare -Urn`: the hermetic
-#      open-mode cases (L90, L94, L96-L100, L102-L107, L109-L116). No
+#      open-mode cases (L90, L94, L96-L100, L102-L107, L109-L117). No
 #      traffic leaves the machine.
 #   4. only with --real: one open session against the real network (TCP
-#      to 1.1.1.1:53, DNS, curl and git to github.com, and the LAN
-#      gateway, which must be refused). This is the only step that sends
-#      traffic off the machine.
+#      to 1.1.1.1:53, DNS, curl, git, node fetch and Go http.Get to
+#      github.com, and the LAN gateway, which must be refused). This is
+#      the only step that sends traffic off the machine. The node and Go
+#      cases run only when the tool is present in the session (probe via
+#      net_helper.py in-tool-probe); otherwise they SKIP.
 #
 # Steps 3 and 4 run hisn with its runtime and state directories inside
 # a temp dir of this run, so they neither see nor disturb other hisn
@@ -188,6 +190,17 @@ else
 fi
 
 note "step 3: hermetic open-mode cases (unshare -Urn; nothing leaves the machine)"
+# Build the Go test binary statically; net_cases.sh copies it into the
+# session cwd so the L117 go case can run it. Missing go: the case SKIPs.
+NBCASE_GO_BIN="$TMP/net/nb_go"
+mkdir -p "$TMP/net"
+if command -v go >/dev/null 2>&1; then
+  if CGO_ENABLED=0 go build -o "$NBCASE_GO_BIN" "$ROOT/tests/leak/nb_go.go" 2>"$LOGDIR/nb_go-build.log"; then
+    note "built the L117 go test binary (static)"
+  else
+    note "go build of the L117 test binary failed ($(head -c 200 "$LOGDIR/nb_go-build.log"))"
+  fi
+fi
 if ! command -v ip >/dev/null 2>&1 || ! timeout 10 unshare -Urn true 2>/dev/null; then
   fail "net cases" "unshare -Urn or the ip command is not available on this machine"
 else
@@ -286,6 +299,28 @@ if [ -x /usr/bin/git ]; then
   real_check "real: git ls-remote https://github.com/treeol/hisn" "^[0-9a-f]\{40\}" /usr/bin/git ls-remote https://github.com/treeol/hisn HEAD
 else
   skip "real: git ls-remote https://github.com/treeol/hisn" "/usr/bin/git is not installed (a session sees /usr, not a git elsewhere)"
+fi
+# L118: node fetch and Go http.Get through the same interception. Both
+# need the tool inside the session (PATH lookup); missing tool = SKIP.
+cp "$ROOT/tests/leak/nb_real.js" "$R/cwd/nb_real.js"
+REAL_TOOLS=$(rexec python3 net_helper.py in-tool-probe 2>/dev/null)
+if printf '%s\n' "$REAL_TOOLS" | grep -q '^TOOL node yes$'; then
+  real_check "L118 node fetch(https://github.com)" "^NODE-REAL-OK" node "$R/cwd/nb_real.js" "https://github.com"
+else
+  skip "L118 node fetch(https://github.com)" "node is not present in the session"
+fi
+if printf '%s\n' "$REAL_TOOLS" | grep -q '^TOOL go yes$'; then
+  if command -v go >/dev/null 2>&1; then
+    if CGO_ENABLED=0 go build -o "$R/cwd/nb_real" "$ROOT/tests/leak/nb_real.go" 2>"$LOGDIR/nb_real-build.log"; then
+      real_check "L118 go http.Get(https://github.com)" "^GO-REAL-OK" "$R/cwd/nb_real" "https://github.com"
+    else
+      skip "L118 go http.Get(https://github.com)" "go build of the test binary failed ($(head -c 200 "$LOGDIR/nb_real-build.log"))"
+    fi
+  else
+    skip "L118 go http.Get(https://github.com)" "go is not present on this machine to build the test binary"
+  fi
+else
+  skip "L118 go http.Get(https://github.com)" "go is not present in the session"
 fi
 GATEWAY=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
 if [ -n "$GATEWAY" ]; then

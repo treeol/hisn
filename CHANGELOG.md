@@ -53,6 +53,33 @@ allowlist in this release. `none` (the default) and `host` behave as in
   and could fail because of other tests running in parallel; it now
   measures in its own process.
 
+## [Unreleased — 0.6.0 final fix]
+
+Non-blocking `connect()` must not block. The 0.6.0 limitation (the call
+returned only when the supervisor's connect finished, up to the 30 s
+deadline, so async clients blocked one round trip per connect) is
+fixed: when the program's own socket is non-blocking, the supervisor
+injects the replacement socket and replies `EINPROGRESS` at once, and
+the program sees later `POLLOUT`/`SO_ERROR` on the same socket object.
+The supervisor tracks the completion of its duplicate (bounded, never
+delaying a verdict) and writes one `network/connect-result` record.
+
+### Added
+- `network/connect-result` journal records (`target`, `result` ok or
+  errno name, `latency_ms`) for non-blocking connects the supervisor
+  answered `EINPROGRESS` for; `connect` records now carry reason
+  `injected` (immediate completion) and `injected-inprogress`;
+  `network/summary` carries `tracked_overflow`.
+- Hermetic cases L117 (non-blocking to the blackhole, the listener and
+  a closed port; Node event-loop and Go client runs; journal records),
+  and the real-network cases L118 (node `fetch` and Go `http.Get` to
+  github.com; SKIP when the tool is missing).
+
+### Changed
+- The v0.6.0 release notes, README and ADR 0022 no longer list the
+  non-blocking `connect()` wait as a limitation; they describe the new
+  behaviour.
+
 ## [0.5.1] - 2026-11-15
 
 0.5.1 gives the journal's "who" substance: named **seats** with a

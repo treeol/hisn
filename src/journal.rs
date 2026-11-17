@@ -209,6 +209,10 @@ pub struct NetQueue {
     tx: std::sync::mpsc::SyncSender<NetMsg>,
     dropped: Arc<AtomicU64>,
     failures: FailureCount,
+    /// Completion-tracking overflows of the connect engine (see
+    /// `notif::Tracked`): shared with the engine at construction, so the
+    /// writer can include the count in the next `network/summary`.
+    tracked_overflow: Arc<AtomicU64>,
 }
 
 enum NetMsg {
@@ -249,19 +253,25 @@ impl NetCounts {
 }
 
 impl NetQueue {
-    fn new(journal: Journal, cap: usize) -> Arc<Self> {
+    fn new(
+        journal: Journal,
+        cap: usize,
+        tracked_overflow: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<NetMsg>(cap.max(1));
         let dropped = Arc::new(AtomicU64::new(0));
         let failures = journal.failures.clone();
         let writer_dropped = dropped.clone();
+        let writer_tracked = tracked_overflow.clone();
         // Detached: the thread owns its own Journal value and ends when
         // the last sender is gone. `Journal::net_flush` is how a caller
         // waits for it.
-        std::thread::spawn(move || net_writer(&journal, &rx, &writer_dropped));
+        std::thread::spawn(move || net_writer(&journal, &rx, &writer_dropped, &writer_tracked));
         Arc::new(Self {
             tx,
             dropped,
             failures,
+            tracked_overflow,
         })
     }
 
@@ -296,7 +306,12 @@ impl NetQueue {
     }
 }
 
-fn net_writer(journal: &Journal, rx: &std::sync::mpsc::Receiver<NetMsg>, dropped: &AtomicU64) {
+fn net_writer(
+    journal: &Journal,
+    rx: &std::sync::mpsc::Receiver<NetMsg>,
+    dropped: &AtomicU64,
+    tracked_overflow: &AtomicU64,
+) {
     use std::sync::mpsc::RecvTimeoutError;
     let second = std::time::Duration::from_secs(1);
     let mut window = std::time::Instant::now();
@@ -304,7 +319,8 @@ fn net_writer(journal: &Journal, rx: &std::sync::mpsc::Receiver<NetMsg>, dropped
     let mut over = NetCounts::default();
     let summary = |over: &mut NetCounts| {
         let lost = dropped.swap(0, Ordering::Relaxed);
-        if over.total() == 0 && lost == 0 {
+        let over_tracked = tracked_overflow.load(Ordering::Relaxed);
+        if over.total() == 0 && lost == 0 && over_tracked == 0 {
             return;
         }
         let data = json!({
@@ -313,6 +329,7 @@ fn net_writer(journal: &Journal, rx: &std::sync::mpsc::Receiver<NetMsg>, dropped
             "continue": over.cont,
             "dns": over.dns,
             "dropped": lost,
+            "tracked_overflow": over_tracked,
         });
         *over = NetCounts::default();
         if journal.append_inner("network/summary", None, data).is_err() {
@@ -406,10 +423,18 @@ impl Journal {
                 writer
                     .retention_bytes
                     .get_or_insert(JOURNAL_RETENTION_BYTES);
-                NetQueue::new(writer, cap)
+                NetQueue::new(writer, cap, Arc::new(AtomicU64::new(0)))
             }
         });
         j
+    }
+
+    /// The shared completion-tracking overflow counter of the network
+    /// queue (see `notif::Tracked`): the connect engine bumps it when a
+    /// tracked socket is dropped for lack of room, and the queue writer
+    /// reports it in the next `network/summary` as `tracked_overflow`.
+    pub fn tracked_overflow(&self) -> Option<Arc<AtomicU64>> {
+        self.net_queue.as_ref().map(|q| q.tracked_overflow.clone())
     }
 
     /// Wait (bounded) until the network records queued so far are in the
@@ -487,6 +512,25 @@ impl Journal {
             "seat": Value::Null,
         });
         self.net_enqueue("network/connect", data);
+    }
+
+    /// Completion of a non-blocking connect the supervisor already
+    /// answered EINPROGRESS for (`network/connect-result`): `target`,
+    /// `result` (`ok` or the errno name), `latency_ms` from the
+    /// supervisor's `connect()` to completion. Best-effort like every
+    /// network record: `net_enqueue` only queues, never blocks.
+    pub fn net_connect_result(&self, target: &str, errno: i32, latency_ms: u128) {
+        let result = if errno == 0 {
+            "ok".to_owned()
+        } else {
+            crate::notif::errno_name(errno)
+        };
+        let data = json!({
+            "target": target,
+            "result": result,
+            "latency_ms": latency_ms,
+        });
+        self.net_enqueue("network/connect-result", data);
     }
 
     /// One DNS query the responder answered (`network/dns`); `data` is
@@ -1440,12 +1484,13 @@ fn summary_for(rec: &JournalRecord) -> String {
         "network/summary" => {
             let n = |k: &str| d.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
             format!(
-                "not recorded one by one: allow={} refuse={} continue={} dns={} dropped={}",
+                "not recorded one by one: allow={} refuse={} continue={} dns={} dropped={} tracked_overflow={}",
                 n("allow"),
                 n("refuse"),
                 n("continue"),
                 n("dns"),
                 n("dropped"),
+                n("tracked_overflow"),
             )
         }
         _ => format!(

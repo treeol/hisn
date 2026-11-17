@@ -233,8 +233,8 @@ struct NetCounts {
     refuse: u64,
     cont: u64,
     dns: u64,
-    result_ok: u64,
-    result_err: u64,
+    result_connected: u64,
+    result_other: u64,
 }
 
 impl NetCounts {
@@ -246,10 +246,10 @@ impl NetCounts {
         if kind == "network/connect-result" {
             // A completion record is not a verdict: it must never be
             // counted as `refuse` (it carries no `verdict` field).
-            if data.get("result").and_then(Value::as_str) == Some("ok") {
-                self.result_ok += 1;
+            if data.get("result").and_then(Value::as_str) == Some("connected") {
+                self.result_connected += 1;
             } else {
-                self.result_err += 1;
+                self.result_other += 1;
             }
             return;
         }
@@ -260,7 +260,7 @@ impl NetCounts {
         }
     }
     fn total(&self) -> u64 {
-        self.allow + self.refuse + self.cont + self.dns + self.result_ok + self.result_err
+        self.allow + self.refuse + self.cont + self.dns + self.result_connected + self.result_other
     }
 }
 
@@ -338,8 +338,8 @@ fn net_writer(
             "refuse": over.refuse,
             "continue": over.cont,
             "dns": over.dns,
-            "result_ok": over.result_ok,
-            "result_err": over.result_err,
+            "result_connected": over.result_connected,
+            "result_other": over.result_other,
             "dropped": lost,
             "tracked_overflow": over_tracked,
         });
@@ -526,17 +526,14 @@ impl Journal {
         self.net_enqueue("network/connect", data);
     }
 
-    /// Completion of a non-blocking connect the supervisor already
+    /// How a non-blocking connect ended that the supervisor had already
     /// answered EINPROGRESS for (`network/connect-result`): `target`,
-    /// `result` (`ok` or the errno name), `latency_ms` from the
-    /// supervisor's `connect()` to completion. Best-effort like every
-    /// network record: `net_enqueue` only queues, never blocks.
-    pub fn net_connect_result(&self, target: &str, errno: i32, latency_ms: u128) {
-        let result = if errno == 0 {
-            "ok".to_owned()
-        } else {
-            crate::notif::errno_name(errno)
-        };
+    /// `result` (`connected`, `failed` or `pending-at-deadline`) and
+    /// `latency_ms` from the supervisor's `connect()` to the result. No
+    /// errno: the supervisor does not read the socket's pending error,
+    /// which belongs to the program. Best-effort like every network
+    /// record: `net_enqueue` only queues, never blocks.
+    pub fn net_connect_result(&self, target: &str, result: &str, latency_ms: u128) {
         let data = json!({
             "target": target,
             "result": result,
@@ -1506,13 +1503,13 @@ fn summary_for(rec: &JournalRecord) -> String {
         "network/summary" => {
             let n = |k: &str| d.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
             format!(
-                "not recorded one by one: allow={} refuse={} continue={} dns={} result_ok={} result_err={} dropped={} tracked_overflow={}",
+                "not recorded one by one: allow={} refuse={} continue={} dns={} result_connected={} result_other={} dropped={} tracked_overflow={}",
                 n("allow"),
                 n("refuse"),
                 n("continue"),
                 n("dns"),
-                n("result_ok"),
-                n("result_err"),
+                n("result_connected"),
+                n("result_other"),
                 n("dropped"),
                 n("tracked_overflow"),
             )

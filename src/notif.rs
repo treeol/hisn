@@ -392,14 +392,24 @@ fn id_valid(listener: i32, id: u64) -> bool {
     .is_ok()
 }
 
-fn reply(listener: i32, id: u64, error: i32, val: i64, flags: u32) {
+/// Answer a notification (`SECCOMP_IOCTL_NOTIF_SEND`). An error means
+/// the answer did not reach the task: it was killed, or a signal ended
+/// the system call (ENOENT).
+fn send_reply(listener: i32, id: u64, error: i32, val: i64, flags: u32) -> io::Result<()> {
     let mut resp = NotifResp {
         id,
         val,
         error,
         flags,
     };
-    let _ = seccomp_ioctl(listener, OP_SEND, &mut resp as *mut NotifResp as *mut _);
+    seccomp_ioctl(listener, OP_SEND, &mut resp as *mut NotifResp as *mut _)
+}
+
+/// [`send_reply`] for answers after which nothing is left to undo: a
+/// refusal or CONTINUE that does not arrive concerns a task that is no
+/// longer in the call.
+fn reply(listener: i32, id: u64, error: i32, val: i64, flags: u32) {
+    let _ = send_reply(listener, id, error, val, flags);
 }
 
 /// SUPERVISOR NOTIF ENGINE (phase 2)
@@ -408,13 +418,19 @@ pub struct NotifEngine {
     pub shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Receives one message (or a hang-up) when the engine has stopped.
     done: std::sync::mpsc::Receiver<()>,
+    /// The engine's completion tracker (see [`Tracked`]).
+    tracker: std::sync::Arc<Tracked>,
 }
 
 /// Max pending notifications between receiver and workers; a full queue
 /// refuses EACCES immediately (journaled refuse/queue-full).
 pub const MAX_PENDING: usize = 256;
-/// Worker threads per listener.
-pub const WORKERS: usize = 64;
+/// Dispatch threads per listener. They never wait for a connection.
+pub const WORKERS: usize = 16;
+/// Wait threads per listener: connects of blocking programs that can be
+/// in flight at the same time. One more waits in the queue, counted
+/// against its deadline, as before.
+pub const WAITERS: usize = 64;
 /// Non-blocking connects whose completion the supervisor still tracks
 /// after replying EINPROGRESS. Bounded so a program opening thousands of
 /// pending connects cannot grow supervisor memory without limit: past
@@ -434,8 +450,14 @@ pub type SockaddrReader = fn(u32, u64, usize) -> io::Result<[u8; 128]>;
 pub struct EngineConfig {
     /// Outbound connect deadline in seconds, counted from `NOTIF_RECV`.
     pub deadline_s: u64,
+    /// Dispatch threads: read, decide, start the connect. Never wait
+    /// for a connection.
     pub workers: usize,
-    /// Notifications that may wait for a worker; one more is refused.
+    /// Wait threads: one per blocking program's connect that is still
+    /// in flight.
+    pub waiters: usize,
+    /// Notifications that may wait for a dispatch thread, and blocking
+    /// connects that may wait for a wait thread; one more is refused.
     pub queue: usize,
     pub reader: SockaddrReader,
 }
@@ -445,6 +467,7 @@ impl EngineConfig {
         Self {
             deadline_s,
             workers: WORKERS,
+            waiters: WAITERS,
             queue: MAX_PENDING,
             reader: read_sockaddr,
         }
@@ -501,6 +524,11 @@ impl NotifEngine {
         Self::start_with(listener, journal, EngineConfig::new(deadline_s))
     }
 
+    /// Number of non-blocking connects whose completion is tracked now.
+    pub fn tracked(&self) -> usize {
+        self.tracker.len()
+    }
+
     /// Start the engine with an explicit configuration.
     pub fn start_with(
         listener: OwnedFd,
@@ -516,11 +544,16 @@ impl NotifEngine {
         }
         .unwrap_or_default();
         let tracker = std::sync::Arc::new(tracker);
+        let engine_tracker = tracker.clone();
         std::thread::spawn(move || {
-            engine_loop(listener, journal, cfg, &sd, &tracker);
+            engine_loop(listener, journal, cfg, &sd, &engine_tracker);
             let _ = done_tx.send(());
         });
-        Self { shutdown, done }
+        Self {
+            shutdown,
+            done,
+            tracker,
+        }
     }
 }
 
@@ -542,20 +575,111 @@ impl Drop for NotifEngine {
     }
 }
 
+// `tcpi_state` values (include/net/tcp_states.h).
+const TCP_SYN_SENT: u8 = 2;
+const TCP_SYN_RECV: u8 = 3;
+const TCP_CLOSE: u8 = 7;
+const TCP_LISTEN: u8 = 10;
+
+/// `tcpi_state` of a TCP socket from `TCP_INFO`, or None when the option
+/// cannot be read (not a TCP socket). Reading it changes nothing on the
+/// socket.
+fn tcp_state(fd: i32) -> Option<u8> {
+    let mut info = [0u8; 256];
+    let mut len = info.len() as libc::socklen_t;
+    // SAFETY: `info` and `len` describe a valid out-buffer.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            info.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && len >= 1).then_some(info[0])
+}
+
+/// How a tracked connect stands, read without changing the socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnState {
+    /// The handshake completed (the socket may have been closed by the
+    /// peer since).
+    Connected,
+    /// The connect ended without a connection (refused, unreachable,
+    /// reset).
+    Failed,
+    /// The handshake is still in flight.
+    Pending,
+}
+
+/// State of a connecting TCP socket from `TCP_INFO` (`tcpi_state`), with
+/// `getpeername` as the fallback when `TCP_INFO` is not available.
+///
+/// Neither call consumes anything. In particular this never reads
+/// `SO_ERROR`: the descriptor is a duplicate of the socket the program
+/// owns, and a pending error is handed to exactly one reader. Measured
+/// on kernel 7.3.3: after a refused connect a `SO_ERROR` read through a
+/// duplicate returned ECONNREFUSED and the program's own read then
+/// returned 0, whereas after `TCP_INFO` and `getpeername` on the
+/// duplicate the program still read ECONNREFUSED.
+///
+/// `had_event` only matters for the fallback, where a socket without a
+/// peer is `Failed` if poll reported an event and `Pending` otherwise.
+pub fn conn_state(fd: i32, had_event: bool) -> ConnState {
+    if let Some(state) = tcp_state(fd) {
+        return match state {
+            TCP_SYN_SENT | TCP_SYN_RECV => ConnState::Pending,
+            TCP_CLOSE | TCP_LISTEN => ConnState::Failed,
+            _ => ConnState::Connected,
+        };
+    }
+    // SAFETY: zeroed storage and its length are a valid out-buffer.
+    let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut peer_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let has_peer = unsafe {
+        libc::getpeername(
+            fd,
+            &mut peer as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut peer_len,
+        )
+    } == 0;
+    if has_peer {
+        ConnState::Connected
+    } else if had_event {
+        ConnState::Failed
+    } else {
+        ConnState::Pending
+    }
+}
+
+/// One non-blocking connect the supervisor answered EINPROGRESS for.
+struct TrackedConn {
+    /// The supervisor's own descriptor of the socket the program holds.
+    /// Closing it does not close the program's descriptor.
+    fd: OwnedFd,
+    target: String,
+    started: std::time::Instant,
+    /// Poll reported an event while the handshake was still in flight.
+    /// The entry is then left out of the poll set, so it cannot make the
+    /// receiver spin, and is settled at the deadline.
+    muted: bool,
+}
+
 /// Completion tracking for non-blocking connects the supervisor has
-/// already answered EINPROGRESS for. One shared tracker per engine: the
-/// receiver thread (`engine_loop`) owns the poll over the tracked
-/// duplicates, so tracking never delays or blocks a verdict — workers
-/// reply and return at once, and only the receiver waits (with a poll
-/// timeout, so shutdown stays responsive). The count is bounded by
-/// [`MAX_TRACKED`]; the overflow counter is journaled in the next
-/// `network/summary` (`tracked_overflow`, read by the journal writer).
+/// already answered EINPROGRESS for. One tracker per engine. The
+/// receiver thread polls the tracked sockets together with the listener
+/// and settles them in [`Tracked::sweep`]; no worker ever waits for a
+/// tracked socket, so tracking does not hold up a verdict. At most
+/// [`MAX_TRACKED`] sockets are tracked; one more is injected and
+/// answered as usual but not tracked, and counted (`tracked_overflow` in
+/// the next `network/summary`).
 pub struct Tracked {
-    /// `(supervisor fd, target, started)` of pending non-blocking connects.
-    pend: std::sync::Mutex<Vec<(i32, String, std::time::Instant)>>,
-    /// Tracked connects dropped for lack of room (never a verdict delay).
-    /// Shared with the journal's network queue, which reports the count
-    /// in the next `network/summary`.
+    pend: std::sync::Mutex<Vec<TrackedConn>>,
+    /// Most sockets tracked at a time ([`MAX_TRACKED`]).
+    cap: usize,
+    /// Connects that were not tracked for lack of room. Shared with the
+    /// journal's network queue, which reports and resets it.
     overflow: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -564,59 +688,101 @@ impl Tracked {
     pub fn with_overflow(overflow: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
         Self {
             pend: std::sync::Mutex::new(Vec::new()),
+            cap: MAX_TRACKED,
             overflow,
         }
     }
 
-    fn slot(&self, fd: i32, target: String) -> Result<(), ()> {
+    /// Track `fd`. False (and `fd` closed, overflow counted) when the
+    /// tracker is full.
+    fn slot(&self, fd: OwnedFd, target: String) -> bool {
         let mut pend = self.pend.lock().unwrap_or_else(|e| e.into_inner());
-        if pend.len() >= MAX_TRACKED {
+        if pend.len() >= self.cap {
             self.overflow
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(());
+            return false;
         }
-        pend.push((fd, target, std::time::Instant::now()));
-        Ok(())
+        pend.push(TrackedConn {
+            fd,
+            target,
+            started: std::time::Instant::now(),
+            muted: false,
+        });
+        true
     }
 
-    fn fds(&self) -> Vec<i32> {
+    /// Number of tracked sockets.
+    pub fn len(&self) -> usize {
+        self.pend.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// True when nothing is tracked.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The descriptors to poll for POLLOUT.
+    fn pollfds(&self) -> Vec<i32> {
         self.pend
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(fd, _, _)| *fd)
+            .filter(|c| !c.muted)
+            .map(|c| c.fd.as_raw_fd())
             .collect()
     }
 
-    /// Remove every entry and return their fds, so the caller can close
-    /// any leftover tracked duplicates on shutdown (no fd leak, and no
-    /// double close: the entries are gone from the tracker).
-    pub fn drain(&self) -> Vec<i32> {
-        let mut pend = self.pend.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *pend)
-            .into_iter()
-            .map(|(fd, _, _)| fd)
-            .collect()
+    /// Settle what can be settled: sockets poll reported in `ready`
+    /// whose connect has ended, and sockets older than `deadline`. Each
+    /// settled socket gets one `network/connect-result` record
+    /// (`connected`, `failed` or `pending-at-deadline`) and is closed.
+    /// Returns the number settled. The journal is written after the lock
+    /// is released.
+    fn sweep(
+        &self,
+        ready: &[i32],
+        deadline: std::time::Duration,
+        journal: Option<&crate::journal::Journal>,
+    ) -> usize {
+        let ready: std::collections::HashSet<i32> = ready.iter().copied().collect();
+        let mut settled: Vec<(String, &'static str, u128)> = Vec::new();
+        {
+            let mut pend = self.pend.lock().unwrap_or_else(|e| e.into_inner());
+            pend.retain_mut(|c| {
+                let fd = c.fd.as_raw_fd();
+                let had_event = ready.contains(&fd);
+                let expired = c.started.elapsed() >= deadline;
+                if !had_event && !expired {
+                    return true;
+                }
+                let result = match conn_state(fd, had_event) {
+                    ConnState::Connected => "connected",
+                    ConnState::Failed => "failed",
+                    ConnState::Pending if expired => "pending-at-deadline",
+                    ConnState::Pending => {
+                        c.muted = true;
+                        return true;
+                    }
+                };
+                settled.push((
+                    std::mem::take(&mut c.target),
+                    result,
+                    c.started.elapsed().as_millis(),
+                ));
+                false // dropped: the OwnedFd closes the descriptor
+            });
+        }
+        if let Some(j) = journal {
+            for (target, result, latency_ms) in &settled {
+                j.net_connect_result(target, result, *latency_ms);
+            }
+        }
+        settled.len()
     }
 
-    /// Remove and return the entry for `fd`, if present.
-    fn take(&self, fd: i32) -> Option<(String, std::time::Instant)> {
-        let mut pend = self.pend.lock().unwrap_or_else(|e| e.into_inner());
-        let pos = pend.iter().position(|(f, _, _)| *f == fd)?;
-        let (_, target, started) = pend.remove(pos);
-        Some((target, started))
-    }
-
-    /// One `(fd, age_ms)` per tracked socket older than `deadline_ms` from
-    /// its start, for the caller to journal and close.
-    fn expired(&self, deadline_ms: u128) -> Vec<(i32, u128)> {
-        let pend = self.pend.lock().unwrap_or_else(|e| e.into_inner());
-        pend.iter()
-            .filter_map(|(fd, _, started)| {
-                let age = started.elapsed().as_millis();
-                (age >= deadline_ms).then_some((*fd, age))
-            })
-            .collect()
+    /// Close every tracked socket without a record (engine shutdown).
+    fn clear(&self) {
+        self.pend.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -637,15 +803,27 @@ fn engine_loop(
     // only the raw fd number, so dropping it first would be use-after-close.
     let listener = std::sync::Arc::new(listener);
     let lfd = listener.as_raw_fd();
-    // Receiver + workers on a bounded queue. The receiver only
-    // dispatches; a full queue is answered by the receiver itself.
+    // Two pools, each behind a bounded queue.
+    //
+    // Dispatch pool: reads and decides every notification and makes the
+    // supervisor's (always non-blocking) connect. It never waits for a
+    // connection, so a non-blocking connect is answered at once whatever
+    // else is pending.
+    //
+    // Wait pool: holds the connects of blocking programs until they are
+    // established, have failed, or reach the deadline.
+    //
+    // The receiver only dispatches; a full queue is answered EACCES.
     let (tx, rx) = std::sync::mpsc::sync_channel::<(Notif, std::time::Instant)>(cfg.queue.max(1));
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+    let (wait_tx, wait_rx) = std::sync::mpsc::sync_channel::<Waiting>(cfg.queue.max(1));
+    let wait_rx = std::sync::Arc::new(std::sync::Mutex::new(wait_rx));
     let mut workers = Vec::new();
     for _ in 0..cfg.workers.max(1) {
         let rx = rx.clone();
         let j = journal.clone();
         let tracker = tracker.clone();
+        let wait_tx = wait_tx.clone();
         workers.push(std::thread::spawn(move || {
             loop {
                 let msg = {
@@ -653,21 +831,40 @@ fn engine_loop(
                     lock.recv()
                 };
                 match msg {
-                    Ok((mut n, recv_at)) => handle_notif(lfd, &mut n, recv_at, &cfg, &j, &tracker),
+                    Ok((mut n, recv_at)) => {
+                        handle_notif(lfd, &mut n, recv_at, &cfg, &j, &tracker, &wait_tx)
+                    }
                     Err(_) => return,
                 }
             }
         }));
     }
+    let mut waiters = Vec::new();
+    for _ in 0..cfg.waiters.max(1) {
+        let wait_rx = wait_rx.clone();
+        let j = journal.clone();
+        waiters.push(std::thread::spawn(move || {
+            loop {
+                let msg = {
+                    let lock = wait_rx.lock().unwrap_or_else(|e| e.into_inner());
+                    lock.recv()
+                };
+                match msg {
+                    Ok(w) => finish_blocking(lfd, &w, &j),
+                    Err(_) => return,
+                }
+            }
+        }));
+    }
+    let deadline = std::time::Duration::from_secs(cfg.deadline_s.max(1));
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        // Poll the listener and every tracked duplicate in one call, so
-        // completion tracking lives in this loop and never blocks a
-        // verdict. The poll timeout stays RECV_POLL_MS, so shutdown and
-        // deadline expiry for tracked sockets are both prompt.
-        let fds = tracker.fds();
+        // Poll the listener and the tracked sockets in one call. The
+        // timeout stays RECV_POLL_MS, so shutdown and the deadline of
+        // tracked sockets are both noticed promptly.
+        let fds = tracker.pollfds();
         let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(fds.len() + 1);
         pfds.push(libc::pollfd {
             fd: lfd,
@@ -688,53 +885,13 @@ fn engine_loop(
             }
             break;
         }
-        // Completion of tracked non-blocking connects: journal one
-        // network/connect-result and close the supervisor's duplicate.
-        // Closing our dup never affects the program's injected socket.
-        //
-        // The duplicate refers to the *same* socket the program owns,
-        // and SO_ERROR is socket state, not per-descriptor state: a
-        // getsockopt here does not clear the value the program
-        // reads (confirmed by reading `man socket(7)` before this
-        // edit — the errno remains until a successful connect or a
-        // new connect; the tracker read is idempotent). The result
-        // recorded is therefore the same value the program sees.
-        for pfd in pfds.iter().skip(1) {
-            if pfd.revents == 0 {
-                continue;
-            }
-            if let Some((target, started)) = tracker.take(pfd.fd) {
-                let mut err = 0i32;
-                let mut elen = std::mem::size_of::<i32>() as libc::socklen_t;
-                unsafe {
-                    libc::getsockopt(
-                        pfd.fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_ERROR,
-                        &mut err as *mut i32 as *mut libc::c_void,
-                        &mut elen,
-                    )
-                };
-                if let Some(j) = &journal {
-                    j.net_connect_result(&target, err, started.elapsed().as_millis());
-                }
-                unsafe { libc::close(pfd.fd) };
-            }
-        }
-        // Tracked sockets past the deadline: journal the timeout and
-        // close the duplicate.
-        let deadline_ms = (cfg.deadline_s.max(1) as u128) * 1000;
-        for (fd, age_ms) in tracker.expired(deadline_ms) {
-            if let Some((target, _)) = tracker.take(fd) {
-                if let Some(j) = &journal {
-                    j.net_connect_result(&target, libc::ETIMEDOUT, age_ms);
-                }
-                unsafe { libc::close(fd) };
-            }
-        }
-        if r == 0 {
-            continue;
-        }
+        let ready: Vec<i32> = pfds
+            .iter()
+            .skip(1)
+            .filter(|p| p.revents != 0)
+            .map(|p| p.fd)
+            .collect();
+        tracker.sweep(&ready, deadline, journal.as_deref());
         let pfd = pfds[0];
         if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
             break; // listener gone: clean exit
@@ -777,18 +934,20 @@ fn engine_loop(
             }
         }
     }
-    // Drop the queue sender so workers drain and exit; join them before
-    // the listener Arc is released.
+    // Drop the queue senders so both pools drain and exit; join them
+    // before the listener Arc is released. The dispatch workers hold
+    // clones of the wait queue's sender, so they are joined first.
     drop(tx);
     for w in workers {
         let _ = w.join();
     }
-    // Close any leftover tracked duplicates (Tracked holds raw fds with
-    // no Drop of its own): workers are joined, so nothing can add or
-    // take an entry concurrently now.
-    for fd in tracker.drain() {
-        unsafe { libc::close(fd) };
+    drop(wait_tx);
+    for w in waiters {
+        let _ = w.join();
     }
+    // Close the tracked sockets that are still connecting. Both pools
+    // are joined, so nothing can add an entry now.
+    tracker.clear();
     drop(listener);
 }
 
@@ -798,7 +957,8 @@ fn handle_notif(
     recv_at: std::time::Instant,
     cfg: &EngineConfig,
     journal: &Option<std::sync::Arc<crate::journal::Journal>>,
-    tracker: &std::sync::Arc<Tracked>,
+    tracker: &Tracked,
+    wait_tx: &std::sync::mpsc::SyncSender<Waiting>,
 ) {
     let deadline = recv_at + std::time::Duration::from_secs(cfg.deadline_s.max(1));
     // The deadline runs from NOTIF_RECV and covers the time spent waiting
@@ -879,6 +1039,7 @@ fn handle_notif(
     let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd as i64, sockfd as i64, 0u64) };
     let mut is_stream = false;
     let mut already_connected = false;
+    let mut already_pending = false;
     let mut sock_type = 0i32;
     if dup >= 0 {
         let dup_fd = unsafe { OwnedFd::from_raw_fd(dup as i32) };
@@ -906,6 +1067,10 @@ fn handle_notif(
                 &mut peer_len,
             )
         } == 0;
+        // A stream socket whose connect is still in flight: the one an
+        // earlier non-blocking connect() put there.
+        already_pending =
+            is_stream && !already_connected && tcp_state(dup_fd.as_raw_fd()) == Some(TCP_SYN_SENT);
         // dup_fd dropped here (OwnedFd discipline).
     }
     let is_public = ip.map(|a| is_public_ip(&a)).unwrap_or(false);
@@ -947,6 +1112,18 @@ fn handle_notif(
                 j.net_record("refuse", "already-connected", n);
             }
         }
+        Verdict::Allow if already_pending => {
+            // connect() on a socket whose connect is still in flight (the
+            // socket an earlier non-blocking connect injected): the kernel
+            // answers EALREADY. Replacing the socket here would abandon
+            // the pending connection.
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -(libc::EALREADY), 0, 0);
+            }
+            if let Some(j) = journal {
+                j.net_record("refuse", "already-pending", n);
+            }
+        }
         Verdict::Allow => {
             // Fresh socket in the supervisor's (host) netns.
             let domain = family as i32;
@@ -965,25 +1142,25 @@ fn handle_notif(
                 }
                 return;
             }
-            let _new_guard = unsafe { OwnedFd::from_raw_fd(newfd) };
-            // Copy options from the child's original socket (read once).
-            // This also records the child's original O_NONBLOCK state so we
-            // can restore it before injection.
-            let orig_nonblock = copy_sock_opts(sockfd, pidfd as i32, newfd);
-            // Non-blocking connect with deadline. Fail closed if
-            // O_NONBLOCK cannot be set on the supervisor socket: a
-            // blocking connect (or a wrong-flag socket) must never
-            // be injected. The guard closes `newfd` on return.
+            let new_guard = unsafe { OwnedFd::from_raw_fd(newfd) };
+            // Copy options from the program's socket (read once). This
+            // also tells whether that socket is non-blocking, which
+            // selects the path below. If the flags cannot be read the
+            // connect is refused: guessing "blocking" would make a
+            // non-blocking program wait, guessing "non-blocking" would
+            // hand EINPROGRESS to a program that does not expect it.
+            let Some(client_nonblock) = copy_sock_opts(sockfd, pidfd, newfd) else {
+                refuse(lfd, n, libc::EACCES, "flags-unreadable", journal);
+                return;
+            };
+            // The supervisor's own connect is always non-blocking, so no
+            // thread of the dispatch pool ever waits in connect(). Fail
+            // closed if the flag cannot be set.
             let flags = unsafe { libc::fcntl(newfd, libc::F_GETFL) };
             let nonblock_ok = flags >= 0
                 && unsafe { libc::fcntl(newfd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0;
             if !nonblock_ok {
-                if id_valid(lfd, n.id) {
-                    reply(lfd, n.id, -(libc::EACCES), 0, 0);
-                }
-                if let Some(j) = journal {
-                    j.net_record("refuse", "nonblock-failed", n);
-                }
+                refuse(lfd, n, libc::EACCES, "nonblock-failed", journal);
                 return;
             }
             let cr = unsafe {
@@ -993,229 +1170,268 @@ fn handle_notif(
                     addrlen as libc::socklen_t,
                 )
             };
-            // EINPROGRESS fast path (0.6.0 fix): when the program's own
-            // socket is non-blocking, a supervisor connect that would
-            // block must not block the program — see below. Blocking
-            // sockets take the poll-for-completion loop as before.
-            let client_nonblock = orig_nonblock.unwrap_or(false);
-            if cr < 0 {
-                let e = io::Error::last_os_error();
-                if e.raw_os_error() == Some(libc::EINPROGRESS) && client_nonblock {
-                    // Inject first, then reply EINPROGRESS: an EINPROGRESS
-                    // without the replacement socket would leave the
-                    // program polling an unconnected socket forever.
-                    // Restoring the client's O_NONBLOCK state before
-                    // injection is part of the EINPROGRESS contract: if
-                    // it cannot be set, fail closed instead of injecting
-                    // a socket with the wrong flags (guard closes newfd).
-                    if let Some(nb) = orig_nonblock {
-                        let nf = unsafe { libc::fcntl(newfd, libc::F_GETFL) };
-                        let want = if nb {
-                            nf | libc::O_NONBLOCK
-                        } else {
-                            nf & !libc::O_NONBLOCK
-                        };
-                        if nf < 0 || unsafe { libc::fcntl(newfd, libc::F_SETFL, want) } < 0 {
-                            if id_valid(lfd, n.id) {
-                                reply(lfd, n.id, -(libc::EACCES), 0, 0);
-                            }
-                            if let Some(j) = journal {
-                                j.net_record("refuse", "nonblock-failed", n);
-                            }
-                            return;
-                        }
-                    }
-                    if !id_valid(lfd, n.id) {
-                        return;
-                    }
-                    let mut addfd: NotifAddFd = unsafe { std::mem::zeroed() };
-                    addfd.id = n.id;
-                    addfd.flags = FLAG_SETFD;
-                    addfd.srcfd = newfd as u32;
-                    addfd.newfd = n.data.args[0] as u32;
-                    addfd.newfd_flags = if task_fd_cloexec(n.pid, sockfd) {
-                        libc::O_CLOEXEC as u32
-                    } else {
-                        0
-                    };
-                    match seccomp_ioctl(lfd, OP_ADDFD, &mut addfd as *mut NotifAddFd as *mut _) {
-                        Ok(()) => {
-                            reply(lfd, n.id, -(libc::EINPROGRESS), 0, 0);
-                            if let Some(j) = journal {
-                                j.net_record("allow", "injected-inprogress", n);
-                            }
-                            // Keep a duplicate for completion tracking:
-                            // dup the supervisor fd, then hand tracking the
-                            // dup to the receiver thread's poll loop.
-                            let dup_fd = unsafe { libc::fcntl(newfd, libc::F_DUPFD_CLOEXEC, 0) };
-                            if dup_fd >= 0 {
-                                let target = notif_target(
-                                    n.parsed_ip.as_ref(),
-                                    n.parsed_family,
-                                    n.parsed_port,
-                                );
-                                if tracker.slot(dup_fd, target).is_err() {
-                                    unsafe { libc::close(dup_fd) };
-                                }
-                            }
-                        }
-                        Err(_e) => {
-                            // ADDFD failure contract: -EACCES, like every
-                            // other supervisor-side refusal. The guard
-                            // closes `newfd`; nothing injected, nothing
-                            // extra to close.
-                            if id_valid(lfd, n.id) {
-                                reply(lfd, n.id, -(libc::EACCES), 0, 0);
-                                if let Some(j) = journal {
-                                    j.net_record("refuse", "addfd-failed", n);
-                                }
-                            }
-                            return;
-                        }
-                    }
-                    return;
-                }
-                if e.raw_os_error() != Some(libc::EINPROGRESS) {
-                    let errno = e.raw_os_error().unwrap_or(libc::EIO);
-                    if id_valid(lfd, n.id) {
-                        reply(lfd, n.id, -(errno), 0, 0);
-                    }
-                    if let Some(j) = journal {
-                        j.net_record("refuse", "connect-failed", n);
-                        // A non-blocking client's immediate failure is a
-                        // known result too: journal it as a connect-result
-                        // (no tracking needed, the answer is already here).
-                        if client_nonblock {
-                            let target =
-                                notif_target(n.parsed_ip.as_ref(), n.parsed_family, n.parsed_port);
-                            j.net_connect_result(&target, errno, 0);
-                        }
-                    }
-                    return;
-                }
-                // EINPROGRESS on a blocking socket: poll for completion
-                // until the deadline (unchanged behaviour).
-                let mut done = false;
-                while std::time::Instant::now() < deadline {
-                    let mut pfd = libc::pollfd {
-                        fd: newfd,
-                        events: libc::POLLOUT,
-                        revents: 0,
-                    };
-                    let pr = unsafe { libc::poll(&mut pfd, 1, 1000) };
-                    if pr < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                        // poll itself failed: do not retry until the
-                        // deadline, answer now.
-                        if id_valid(lfd, n.id) {
-                            reply(lfd, n.id, -(libc::EIO), 0, 0);
-                        }
-                        if let Some(j) = journal {
-                            j.net_record("refuse", "connect-error", n);
-                        }
-                        return;
-                    }
-                    if pr <= 0 {
-                        // Still connecting. If the task has gone away
-                        // meanwhile (killed, or the session is ending),
-                        // nobody waits for this socket: stop now instead
-                        // of holding the worker until the deadline.
-                        if !id_valid(lfd, n.id) {
-                            return;
-                        }
-                        continue;
-                    }
-                    let mut err = 0i32;
-                    let mut elen = std::mem::size_of::<i32>() as libc::socklen_t;
-                    unsafe {
-                        libc::getsockopt(
-                            newfd,
-                            libc::SOL_SOCKET,
-                            libc::SO_ERROR,
-                            &mut err as *mut i32 as *mut libc::c_void,
-                            &mut elen,
-                        )
-                    };
-                    if err == 0 {
-                        done = true;
-                    } else {
-                        if id_valid(lfd, n.id) {
-                            reply(lfd, n.id, -err, 0, 0);
-                        }
-                        if let Some(j) = journal {
-                            j.net_record("refuse", "connect-error", n);
-                        }
-                        return;
-                    }
-                    break;
-                }
-                if !done {
-                    if id_valid(lfd, n.id) {
-                        reply(lfd, n.id, -(libc::ETIMEDOUT), 0, 0);
-                    }
-                    if let Some(j) = journal {
-                        j.net_record("refuse", "deadline", n);
-                    }
-                    return;
-                }
-            }
-            // The supervisor's connect completed immediately (cr == 0).
-            // Record it, then fall through to restore + inject below.
             if cr == 0 {
+                // Connected at once: inject and reply 0, for a blocking
+                // and a non-blocking program alike.
+                inject_connected(lfd, n, &new_guard, sockfd, client_nonblock, journal);
+                return;
+            }
+            let errno = io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            if errno != libc::EINPROGRESS {
+                // Failed at once: nothing is injected, the program gets
+                // the connect's own errno.
+                if id_valid(lfd, n.id) {
+                    reply(lfd, n.id, -errno, 0, 0);
+                }
                 if let Some(j) = journal {
-                    j.net_record("allow", "injected", n);
+                    j.net_record("refuse", "connect-failed", n);
+                    if client_nonblock {
+                        j.net_connect_result(&target_of(n), "failed", 0);
+                    }
+                }
+                return;
+            }
+            if client_nonblock {
+                // The program's socket is non-blocking: it gets the
+                // connecting socket and EINPROGRESS now, and watches the
+                // outcome itself (POLLOUT, SO_ERROR).
+                inject_inprogress(lfd, n, new_guard, sockfd, journal, tracker);
+                return;
+            }
+            // The program's socket is blocking: its connect() returns
+            // when the connection is established or has failed. That
+            // wait happens in the wait pool, never in this (dispatch)
+            // pool, so a non-blocking connect is not held up by it.
+            let waiting = Waiting {
+                n: n.clone(),
+                newfd: new_guard,
+                sockfd,
+                deadline,
+            };
+            match wait_tx.try_send(waiting) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(w)) => {
+                    refuse(lfd, &w.n, libc::EACCES, "queue-full", journal);
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(w)) => {
+                    if id_valid(lfd, w.n.id) {
+                        reply(lfd, w.n.id, -(libc::EAGAIN), 0, 0);
+                    }
                 }
             }
-            // Restore the child's original O_NONBLOCK state before injection
-            // (the poll above forced O_NONBLOCK on the supervisor socket;
-            // a blocking client must get a blocking socket back).
-            if let Some(nb) = orig_nonblock {
-                let nf = unsafe { libc::fcntl(newfd, libc::F_GETFL) };
-                if nf >= 0 {
-                    let want = if nb {
-                        nf | libc::O_NONBLOCK
-                    } else {
-                        nf & !libc::O_NONBLOCK
-                    };
-                    unsafe { libc::fcntl(newfd, libc::F_SETFL, want) };
-                }
-            }
-            // Inject: ID_VALID before ADDFD. Two-step SETFD + NOTIF_SEND
-            // (val=0) so the child's connect() returns 0, not the fd number.
+        }
+    }
+}
+
+/// A blocking program's connect whose outcome is awaited by the wait
+/// pool: the notification, the supervisor's connecting socket, the
+/// program's descriptor number and the deadline counted from NOTIF_RECV.
+struct Waiting {
+    n: Notif,
+    newfd: OwnedFd,
+    sockfd: i32,
+    deadline: std::time::Instant,
+}
+
+/// The journal target (`ip:port`) of a parsed notification.
+fn target_of(n: &Notif) -> String {
+    notif_target(n.parsed_ip.as_ref(), n.parsed_family, n.parsed_port)
+}
+
+/// Answer `-errno` (if the notification is still valid) and journal
+/// `refuse/<reason>`.
+fn refuse(
+    lfd: i32,
+    n: &Notif,
+    errno: i32,
+    reason: &str,
+    journal: &Option<std::sync::Arc<crate::journal::Journal>>,
+) {
+    if id_valid(lfd, n.id) {
+        reply(lfd, n.id, -errno, 0, 0);
+    }
+    if let Some(j) = journal {
+        j.net_record("refuse", reason, n);
+    }
+}
+
+/// Wait-pool side of a blocking program's connect: wait until the
+/// supervisor's socket is connected or has failed, at most until the
+/// deadline, then inject and reply 0, or reply the connect's errno
+/// (ETIMEDOUT at the deadline).
+fn finish_blocking(
+    lfd: i32,
+    w: &Waiting,
+    journal: &Option<std::sync::Arc<crate::journal::Journal>>,
+) {
+    let n = &w.n;
+    let newfd = w.newfd.as_raw_fd();
+    let mut done = false;
+    while std::time::Instant::now() < w.deadline {
+        let mut pfd = libc::pollfd {
+            fd: newfd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let pr = unsafe { libc::poll(&mut pfd, 1, 1000) };
+        if pr < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            // poll itself failed: do not retry until the deadline,
+            // answer now.
+            refuse(lfd, n, libc::EIO, "connect-error", journal);
+            return;
+        }
+        if pr <= 0 {
+            // Still connecting. If the task has gone away meanwhile
+            // (killed, or the session is ending), nobody waits for this
+            // socket: stop now instead of holding the thread until the
+            // deadline.
             if !id_valid(lfd, n.id) {
                 return;
             }
-            let mut addfd: NotifAddFd = unsafe { std::mem::zeroed() };
-            addfd.id = n.id;
-            addfd.flags = FLAG_SETFD;
-            addfd.srcfd = newfd as u32;
-            addfd.newfd = n.data.args[0] as u32;
-            // SETFD replaces the task's descriptor, including its
-            // close-on-exec flag: carry the original flag over, so a
-            // socket opened with SOCK_CLOEXEC does not start leaking into
-            // programs the task executes.
-            addfd.newfd_flags = if task_fd_cloexec(n.pid, sockfd) {
-                libc::O_CLOEXEC as u32
-            } else {
-                0
-            };
-            let r = seccomp_ioctl(lfd, OP_ADDFD, &mut addfd as *mut NotifAddFd as *mut _);
-            match r {
-                Ok(()) => {
-                    reply(lfd, n.id, 0, 0, 0);
-                    if let Some(j) = journal {
-                        j.net_record("allow", "injected", n);
-                    }
-                }
-                Err(e) => {
-                    if id_valid(lfd, n.id) {
-                        reply(lfd, n.id, -(e.raw_os_error().unwrap_or(libc::EIO)), 0, 0);
-                    }
-                }
+            continue;
+        }
+        // This socket is still the supervisor's alone (nothing was
+        // injected yet), so reading SO_ERROR takes nothing away from
+        // the program.
+        let mut err = 0i32;
+        let mut elen = std::mem::size_of::<i32>() as libc::socklen_t;
+        unsafe {
+            libc::getsockopt(
+                newfd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut err as *mut i32 as *mut libc::c_void,
+                &mut elen,
+            )
+        };
+        if err == 0 {
+            done = true;
+        } else {
+            refuse(lfd, n, err, "connect-error", journal);
+            return;
+        }
+        break;
+    }
+    if !done {
+        refuse(lfd, n, libc::ETIMEDOUT, "deadline", journal);
+        return;
+    }
+    inject_connected(lfd, n, &w.newfd, w.sockfd, false, journal);
+}
+
+/// The `seccomp_notif_addfd` that puts `newfd` at the program's own
+/// descriptor number (`args[0]`, SETFD), carrying over the close-on-exec
+/// flag of the descriptor it replaces: a socket opened with SOCK_CLOEXEC
+/// must not start leaking into programs the task executes.
+fn addfd_for(n: &Notif, newfd: i32, sockfd: i32) -> NotifAddFd {
+    let mut addfd: NotifAddFd = unsafe { std::mem::zeroed() };
+    addfd.id = n.id;
+    addfd.flags = FLAG_SETFD;
+    addfd.srcfd = newfd as u32;
+    addfd.newfd = n.data.args[0] as u32;
+    addfd.newfd_flags = if task_fd_cloexec(n.pid, sockfd) {
+        libc::O_CLOEXEC as u32
+    } else {
+        0
+    };
+    addfd
+}
+
+/// Inject a connected socket and answer 0. `client_nonblock` is the
+/// O_NONBLOCK state of the program's socket, restored on the injected
+/// one (the supervisor's connect forced O_NONBLOCK on).
+fn inject_connected(
+    lfd: i32,
+    n: &Notif,
+    newfd: &OwnedFd,
+    sockfd: i32,
+    client_nonblock: bool,
+    journal: &Option<std::sync::Arc<crate::journal::Journal>>,
+) {
+    let newfd = newfd.as_raw_fd();
+    let nf = unsafe { libc::fcntl(newfd, libc::F_GETFL) };
+    if nf >= 0 {
+        let want = if client_nonblock {
+            nf | libc::O_NONBLOCK
+        } else {
+            nf & !libc::O_NONBLOCK
+        };
+        unsafe { libc::fcntl(newfd, libc::F_SETFL, want) };
+    }
+    // Inject: ID_VALID before ADDFD. Two-step SETFD + NOTIF_SEND (val=0)
+    // so the program's connect() returns 0, not the fd number.
+    if !id_valid(lfd, n.id) {
+        return;
+    }
+    let mut addfd = addfd_for(n, newfd, sockfd);
+    match seccomp_ioctl(lfd, OP_ADDFD, &mut addfd as *mut NotifAddFd as *mut _) {
+        Ok(()) => {
+            let sent = send_reply(lfd, n.id, 0, 0, 0);
+            if let Some(j) = journal {
+                let reason = if sent.is_ok() {
+                    "injected"
+                } else {
+                    "injected-reply-failed"
+                };
+                j.net_record("allow", reason, n);
             }
-            // _new_guard drops the supervisor copy of the outbound socket
-            // (the injected copy is owned by the child now).
+        }
+        Err(e) => {
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -(e.raw_os_error().unwrap_or(libc::EIO)), 0, 0);
+            }
         }
     }
+    // The caller's OwnedFd closes the supervisor's copy of the socket
+    // (the injected copy is the program's now).
+}
+
+/// Non-blocking program, supervisor connect in progress: inject the
+/// connecting socket at the program's descriptor number, then answer
+/// EINPROGRESS. EINPROGRESS is sent only after the injection succeeded:
+/// without the replacement socket the program would poll an unconnected
+/// socket forever. If the injection fails the answer is EACCES and the
+/// supervisor's socket is closed.
+///
+/// After the answer the supervisor's own descriptor of that socket goes
+/// to the tracker, which journals how the connect ended.
+fn inject_inprogress(
+    lfd: i32,
+    n: &Notif,
+    newfd: OwnedFd,
+    sockfd: i32,
+    journal: &Option<std::sync::Arc<crate::journal::Journal>>,
+    tracker: &Tracked,
+) {
+    // The socket is non-blocking already (the supervisor's connect
+    // forced the flag on), which is what the program's socket was.
+    if !id_valid(lfd, n.id) {
+        return;
+    }
+    let mut addfd = addfd_for(n, newfd.as_raw_fd(), sockfd);
+    if seccomp_ioctl(lfd, OP_ADDFD, &mut addfd as *mut NotifAddFd as *mut _).is_err() {
+        // Nothing was injected. `newfd` is closed when it goes out of
+        // scope.
+        refuse(lfd, n, libc::EACCES, "addfd-failed", journal);
+        return;
+    }
+    if send_reply(lfd, n.id, -(libc::EINPROGRESS), 0, 0).is_err() {
+        // The socket is in the task, but the answer did not reach it
+        // (the task was killed, or a signal ended the call). Nothing is
+        // tracked; the supervisor's descriptor is closed on return. A
+        // restarted connect() finds the socket connecting and gets
+        // EALREADY.
+        if let Some(j) = journal {
+            j.net_record("allow", "injected-reply-failed", n);
+        }
+        return;
+    }
+    if let Some(j) = journal {
+        j.net_record("allow", "injected-inprogress", n);
+    }
+    tracker.slot(newfd, target_of(n));
 }
 
 /// When `deadline` has passed: answer the notification ETIMEDOUT, journal
@@ -1410,18 +1626,6 @@ fn copy_sock_opts(addr_fd: i32, pidfd: i32, newfd: i32) -> Option<bool> {
         };
     }
     nonblock
-}
-
-/// The errno name used in a `network/connect-result` record.
-pub fn errno_name(errno: i32) -> String {
-    match errno {
-        x if x == libc::ECONNREFUSED => "ECONNREFUSED".to_owned(),
-        x if x == libc::ETIMEDOUT => "ETIMEDOUT".to_owned(),
-        x if x == libc::EHOSTUNREACH => "EHOSTUNREACH".to_owned(),
-        x if x == libc::ENETUNREACH => "ENETUNREACH".to_owned(),
-        x if x == libc::ECONNRESET => "ECONNRESET".to_owned(),
-        _ => format!("errno:{errno}"),
-    }
 }
 
 /// Format the connect address read from the notification for the journal:
@@ -1819,6 +2023,264 @@ mod tests {
                 format!("127.0.0.1:{port}")
             )]
         );
+    }
+
+    // ---- completion tracking ---------------------------------------------
+
+    /// A non-blocking loopback socket whose connect to `port` has been
+    /// started, and the errno connect() returned.
+    fn nonblocking_connect(port: u16) -> (OwnedFd, i32) {
+        // SAFETY: plain socket + connect on a fresh fd.
+        unsafe {
+            let s = libc::socket(
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+            );
+            assert!(s >= 0);
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr.sin_addr.s_addr = libc::INADDR_LOOPBACK.to_be();
+            addr.sin_port = port.to_be();
+            let rc = libc::connect(
+                s,
+                &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            let errno = if rc == 0 {
+                0
+            } else {
+                *libc::__errno_location()
+            };
+            (OwnedFd::from_raw_fd(s), errno)
+        }
+    }
+
+    fn wait_writable(fd: &OwnedFd, ms: i32) -> bool {
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
+    }
+
+    fn so_error(fd: &OwnedFd) -> i32 {
+        let mut err = -1i32;
+        let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut err as *mut i32 as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        err
+    }
+
+    /// A loopback port nothing listens on.
+    fn closed_port() -> u16 {
+        let (l, port) = loopback_listener();
+        drop(l);
+        port
+    }
+
+    /// `(target, result)` of every network/connect-result record.
+    fn result_records(d: &tempfile::TempDir, j: &crate::journal::Journal) -> Vec<(String, String)> {
+        assert!(j.net_flush(std::time::Duration::from_secs(10)));
+        let (records, _) = crate::journal::read_records(&d.path().join("ws"));
+        records
+            .iter()
+            .filter(|r| r.kind == "network/connect-result")
+            .map(|r| {
+                (
+                    r.data["target"].as_str().unwrap_or("").to_owned(),
+                    r.data["result"].as_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// A loopback listener whose accept queue is full, so that a further
+    /// connect stays in SYN_SENT (the kernel drops its SYN), and the
+    /// filler sockets that keep the queue full.
+    fn saturated_listener() -> (std::net::TcpListener, u16, Vec<OwnedFd>) {
+        // SAFETY: socket/bind/listen on a fresh fd; backlog 0.
+        let l = unsafe {
+            let s = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            assert!(s >= 0);
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            addr.sin_addr.s_addr = libc::INADDR_LOOPBACK.to_be();
+            let alen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            assert_eq!(
+                libc::bind(s, &addr as *const _ as *const libc::sockaddr, alen),
+                0
+            );
+            assert_eq!(libc::listen(s, 0), 0);
+            <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(s)
+        };
+        let port = l.local_addr().unwrap().port();
+        let mut fill = Vec::new();
+        for _ in 0..4 {
+            let (fd, _) = nonblocking_connect(port);
+            wait_writable(&fd, 200);
+            fill.push(fd);
+        }
+        (l, port, fill)
+    }
+
+    #[test]
+    fn tracking_a_refused_connect_leaves_so_error_to_the_program() {
+        // The tracker holds a duplicate of the program's socket. After it
+        // has settled the connect as `failed`, the program's own SO_ERROR
+        // must still be ECONNREFUSED.
+        let (d, j) = engine_journal();
+        let (program, errno) = nonblocking_connect(closed_port());
+        assert_eq!(errno, libc::EINPROGRESS);
+        assert!(wait_writable(&program, 5000));
+        let tracker = Tracked::default();
+        let dup = program.try_clone().unwrap();
+        let dup_fd = dup.as_raw_fd();
+        assert!(tracker.slot(dup, "t:1".into()));
+        let settled = tracker.sweep(&[dup_fd], std::time::Duration::from_secs(30), Some(&*j));
+        assert_eq!(settled, 1);
+        assert!(tracker.is_empty());
+        assert_eq!(so_error(&program), libc::ECONNREFUSED);
+        assert_eq!(
+            result_records(&d, &j),
+            [("t:1".to_owned(), "failed".to_owned())]
+        );
+    }
+
+    #[test]
+    fn tracking_reports_connected_and_closes_only_its_own_descriptor() {
+        let (l, port) = loopback_listener();
+        let (d, j) = engine_journal();
+        let (program, errno) = nonblocking_connect(port);
+        assert!(errno == 0 || errno == libc::EINPROGRESS, "errno {errno}");
+        assert!(wait_writable(&program, 5000));
+        let tracker = Tracked::default();
+        let dup = program.try_clone().unwrap();
+        let dup_fd = dup.as_raw_fd();
+        assert!(tracker.slot(dup, "t:2".into()));
+        tracker.sweep(&[dup_fd], std::time::Duration::from_secs(30), Some(&*j));
+        assert!(tracker.is_empty());
+        assert_eq!(
+            result_records(&d, &j),
+            [("t:2".to_owned(), "connected".to_owned())]
+        );
+        // The tracker closed its duplicate; the program's socket works.
+        assert_eq!(so_error(&program), 0);
+        let (mut peer, _) = l.accept().unwrap();
+        std::io::Write::write_all(&mut peer, b"x").unwrap();
+        let mut byte = [0u8; 1];
+        let mut pfd = libc::pollfd {
+            fd: program.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert!(unsafe { libc::poll(&mut pfd, 1, 5000) } > 0);
+        let got = unsafe { libc::read(program.as_raw_fd(), byte.as_mut_ptr() as *mut _, 1) };
+        assert_eq!((got, byte[0]), (1, b'x'));
+    }
+
+    #[test]
+    fn tracking_expires_a_pending_connect_at_the_deadline() {
+        let (_l, port, _fill) = saturated_listener();
+        let (d, j) = engine_journal();
+        let (program, errno) = nonblocking_connect(port);
+        assert_eq!(errno, libc::EINPROGRESS);
+        assert_eq!(
+            tcp_state(program.as_raw_fd()),
+            Some(TCP_SYN_SENT),
+            "precondition: the connect must be pending (accept queue full)"
+        );
+        let tracker = Tracked::default();
+        let dup = program.try_clone().unwrap();
+        let dup_fd = dup.as_raw_fd();
+        assert!(tracker.slot(dup, "t:3".into()));
+        let deadline = std::time::Duration::from_millis(300);
+        // Before the deadline, without an event: stays tracked.
+        assert_eq!(tracker.sweep(&[], deadline, Some(&*j)), 0);
+        // A spurious event while still connecting: stays tracked, but is
+        // no longer polled.
+        assert_eq!(tracker.sweep(&[dup_fd], deadline, Some(&*j)), 0);
+        assert_eq!(tracker.len(), 1);
+        assert!(tracker.pollfds().is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        assert_eq!(tracker.sweep(&[], deadline, Some(&*j)), 1);
+        assert!(tracker.is_empty());
+        assert_eq!(
+            result_records(&d, &j),
+            [("t:3".to_owned(), "pending-at-deadline".to_owned())]
+        );
+        // The program's socket is untouched: still connecting.
+        assert_eq!(tcp_state(program.as_raw_fd()), Some(TCP_SYN_SENT));
+    }
+
+    #[test]
+    fn tracker_is_bounded_and_counts_overflow() {
+        let overflow = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut tracker = Tracked::with_overflow(overflow.clone());
+        tracker.cap = 2;
+        let sock = || {
+            let (a, _b) = crate::sys::socketpair_seqpacket().unwrap();
+            a
+        };
+        assert!(tracker.slot(sock(), "a".into()));
+        assert!(tracker.slot(sock(), "b".into()));
+        assert!(!tracker.slot(sock(), "c".into()));
+        assert!(!tracker.slot(sock(), "d".into()));
+        assert_eq!(tracker.len(), 2);
+        assert_eq!(overflow.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn stopping_an_engine_closes_its_tracked_sockets() {
+        // An engine is dropped while it still tracks a socket: the drop
+        // returns promptly and the socket is closed (its peer sees EOF).
+        let (pid, listener) = connecting_child(0, 1);
+        let engine = NotifEngine::start_with(listener, None, EngineConfig::new(30));
+        let (tracked, peer) = crate::sys::socketpair_seqpacket().unwrap();
+        assert!(engine.tracker.slot(tracked, "t:4".into()));
+        let t = std::time::Instant::now();
+        drop(engine);
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(2),
+            "stop with a tracked socket took {:?}",
+            t.elapsed()
+        );
+        let mut pfd = libc::pollfd {
+            fd: peer.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert!(unsafe { libc::poll(&mut pfd, 1, 2000) } > 0);
+        assert_ne!(pfd.revents & libc::POLLHUP, 0, "tracked socket not closed");
+        assert_eq!(child_exit(pid), 0);
+    }
+
+    #[test]
+    fn pending_and_connected_program_sockets_are_told_apart() {
+        // What the engine reads from the program's socket before it
+        // decides: SYN_SENT is "connect pending" (EALREADY), a fresh
+        // socket is not.
+        let (_l, port, _fill) = saturated_listener();
+        let (pending, errno) = nonblocking_connect(port);
+        assert_eq!(errno, libc::EINPROGRESS);
+        assert_eq!(tcp_state(pending.as_raw_fd()), Some(TCP_SYN_SENT));
+        assert_eq!(conn_state(pending.as_raw_fd(), false), ConnState::Pending);
+        let fresh =
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        let fresh = unsafe { OwnedFd::from_raw_fd(fresh) };
+        assert_eq!(tcp_state(fresh.as_raw_fd()), Some(TCP_CLOSE));
+        let udp = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        let udp = unsafe { OwnedFd::from_raw_fd(udp) };
+        assert_eq!(tcp_state(udp.as_raw_fd()), None);
     }
 
     fn failing_reader(_pid: u32, _addr: u64, _len: usize) -> io::Result<[u8; 128]> {

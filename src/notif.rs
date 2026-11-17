@@ -1080,11 +1080,23 @@ fn handle_notif(
                     return;
                 }
                 if e.raw_os_error() != Some(libc::EINPROGRESS) {
+                    let errno = e.raw_os_error().unwrap_or(libc::EIO);
                     if id_valid(lfd, n.id) {
-                        reply(lfd, n.id, -(e.raw_os_error().unwrap_or(libc::EIO)), 0, 0);
+                        reply(lfd, n.id, -(errno), 0, 0);
                     }
                     if let Some(j) = journal {
                         j.net_record("refuse", "connect-failed", n);
+                        // A non-blocking client's immediate failure is a
+                        // known result too: journal it as a connect-result
+                        // (no tracking needed, the answer is already here).
+                        if client_nonblock {
+                            let target = notif_target(
+                                n.parsed_ip.as_ref(),
+                                n.parsed_family,
+                                n.parsed_port,
+                            );
+                            j.net_connect_result(&target, errno, 0);
+                        }
                     }
                     return;
                 }
@@ -1151,6 +1163,13 @@ fn handle_notif(
                         j.net_record("refuse", "deadline", n);
                     }
                     return;
+                }
+            }
+            // The supervisor's connect completed immediately (cr == 0).
+            // Record it, then fall through to restore + inject below.
+            if cr == 0 {
+                if let Some(j) = journal {
+                    j.net_record("allow", "injected", n);
                 }
             }
             // Restore the child's original O_NONBLOCK state before injection

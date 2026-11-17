@@ -300,10 +300,10 @@ check "L99 non-blocking connect completes and keeps O_NONBLOCK" "L99-OK" in_sess
 # supervisor injects the replacement socket and replies EINPROGRESS at
 # once; the program sees EINPROGRESS and later POLLOUT/SO_ERROR.
 check "L117 non-blocking connect to the blackhole returns EINPROGRESS in under 100 ms" "NB-BLACKHOLE-OK" in_session "$A" in-nonblock-blackhole
-check "L117 non-blocking connect to the listener gives POLLOUT, SO_ERROR 0 and data exchange" "NB-LISTEN-OK" in_session "$A" in-nonblock-listen 18080
+check "L117 non-blocking connect to the listener gives POLLOUT, SO_ERROR 0 and data exchange" "NB-LISTEN-OK" in_session "$A" in-nonblock-listen 18081
 check "L117 non-blocking connect to a closed port on the listener address gives ECONNREFUSED" "NB-REFUSED-OK" in_session "$A" in-nonblock-refused 18444
 journal_is "L117 journal: connect-result ok for the non-blocking listener connect" "$AWS" 1 \
-  kind=network/connect-result target=192.0.2.1:18080 result=ok
+  kind=network/connect-result target=192.0.2.1:18081 result=ok
 journal_is "L117 journal: connect-result ECONNREFUSED for the closed port" "$AWS" 1 \
   kind=network/connect-result target=192.0.2.1:18444 result=ECONNREFUSED
 journal_is "L117 journal: injected-inprogress for the non-blocking blackhole connect" "$AWS" 1 \

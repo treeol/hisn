@@ -1204,6 +1204,13 @@ fn matches_query(r: &JournalRecord, q: &Query) -> bool {
             // a credentialed client must not impersonate another seat in the
             // journal by choosing a label. The label match stays as the
             // legacy behaviour for records without a seat field.
+            //
+            // 0.6.1: network records carry their seat in the payload
+            // (`data.seat`), not in the client identity, so `--seat`
+            // selects them by that field too.
+            if let Some(seat_in_data) = r.data.get("seat") {
+                return seat_in_data.as_str() == Some(seat.as_str());
+            }
             r.client.as_ref().is_some_and(|c| match &c.seat {
                 Some(s) => s == seat,
                 None => c.label == *seat,
@@ -1593,6 +1600,15 @@ fn summary_for(rec: &JournalRecord) -> String {
                 n("tracked_overflow"),
             )
         }
+        "journal/pruned" => {
+            let s = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+            format!(
+                "pruned {} files, {} bytes: {}",
+                d.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
+                d.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0),
+                s("files"),
+            )
+        }
         _ => format!(
             "unrecognized {} ({} bytes; use --json)",
             escape_terminal(&rec.kind),
@@ -1840,6 +1856,32 @@ mod tests {
     }
 
     #[test]
+    fn seat_query_selects_network_records_by_data_seat() {
+        // 0.6.1 (Mashūra round 1): `journal --seat <name>` must select
+        // `network/*` records by their `data.seat`, not only records
+        // whose client identity is the seat. Without this, the seat
+        // filter drops every network record (they have no client).
+        let (_d, j) = test_journal();
+        let ej = j.clone_for_engine();
+        let mut seated = test_notif(443);
+        seated.seat = Some("member1".to_owned());
+        ej.net_record("allow", "injected", &seated);
+        ej.net_record("allow", "injected", &test_notif(443));
+        assert!(ej.net_flush(std::time::Duration::from_secs(10)));
+        let (recs, _) = read_records(&j.dir);
+        let selected = query(
+            &recs,
+            &Query {
+                seat: Some("member1".into()),
+                kind: Some("network/connect".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(selected.len(), 1, "selected {selected:?}");
+        assert_eq!(selected[0].data["seat"], "member1");
+    }
+
+    #[test]
     fn net_record_does_not_wait_for_a_blocked_journal() {
         // The journal lock is held elsewhere, so every append blocks for
         // its 1 s lock budget. An engine handle must return at once.
@@ -2071,12 +2113,7 @@ mod tests {
         // may be the last one the reader sees).
         let (records, _) = read_records(&dir);
         assert_eq!(
-            records
-                .iter()
-                .filter(|r| r.kind == "note")
-                .next_back()
-                .unwrap()
-                .data["i"],
+            records.iter().rfind(|r| r.kind == "note").unwrap().data["i"],
             9
         );
         // At least one pruned record was written, naming deleted files

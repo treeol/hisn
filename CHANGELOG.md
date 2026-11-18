@@ -7,6 +7,24 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Journal retention now applies to every session, whatever its network
+  mode (once per workspace, 64 MiB), with a `journal/pruned` record
+  naming each deletion.
+- `connect()` on an already-connected socket returns `EISCONN` for any
+  target, private included.
+- `tcp_info` fields are read by definition, not by hardcoded offset.
+
+### Added
+- `network/connect` and `network/connect-result` records name the seat of
+  the exec that caused them; the main command and in-sandbox services
+  stay `seat: null`. DNS records stay unattributed (a query cannot be
+  tied to one exec tree without guessing).
+
+### Changed
+- Shipped text no longer names private hosts or addresses; the release
+  gate now fails if those names or a private LAN address reappear.
+
 ## [0.6.0] - 2026-11-17
 
 `network = "open"` (ADR 0022): outbound TCP for a session in an empty

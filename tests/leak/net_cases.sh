@@ -304,10 +304,13 @@ if [ -n "$SEAT_TOK" ]; then
   fi
   journal_is "0.6.1 journal: exec'd program's network/connect names its seat" "$AWS" 1 \
     kind=network/connect target=192.0.2.1:18104 verdict=allow reason=injected-inprogress seat=member1
-  if timeout 20 "$HISN" journal --workspace "$AWS" --seat member1 --json </dev/null 2>/dev/null | grep -q '"seat":"member1"'; then
+  # `journal --seat` must return the network/connect record itself (not
+  # only the exec/* records the exec wrote): filter on the kind as
+  # well.
+  if timeout 20 "$HISN" journal --workspace "$AWS" --seat member1 --kind network/connect --json </dev/null 2>/dev/null | grep -q '"seat":"member1"'; then
     pass "0.6.1 journal --seat selects the seat's network record"
   else
-    fail "0.6.1 journal --seat selects the seat's network record" "no member1 record selected"
+    fail "0.6.1 journal --seat selects the seat's network record" "no member1 network/connect record selected"
   fi
   # The main command's connect has seat null (already checked above for
   # L102's exec; the main command is the init tree).

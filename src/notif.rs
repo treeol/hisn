@@ -597,13 +597,31 @@ struct TcpInfo {
     segs_out: Option<u32>,
 }
 
+/// The kernel `struct tcp_info` prefix hisn reads (`linux/tcp.h`):
+/// `tcpi_state` (u8) at 0, `tcpi_bytes_acked` (u64) and `tcpi_segs_out`
+/// (u32) at their defined offsets. Fields are read by *definition*,
+/// not by hardcoded numbers: the offsets are derived from this layout
+/// with `core::mem::offset_of!`, and the asserts below pin the layout
+/// against the values the old hardcoded offsets encoded. Older kernels
+/// return a shorter `tcp_info`; the length checks keep those fields
+/// `None`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct KernelTcpInfo {
+    state: u8,
+    _pad: [u8; 119],
+    bytes_acked: u64,
+    _pad2: [u8; 8],
+    segs_out: u32,
+}
+const _: () = assert!(core::mem::offset_of!(KernelTcpInfo, state) == 0);
+const _: () = assert!(core::mem::offset_of!(KernelTcpInfo, bytes_acked) == 120);
+const _: () = assert!(core::mem::offset_of!(KernelTcpInfo, segs_out) == 136);
+const _: () = assert!(core::mem::size_of::<KernelTcpInfo>() >= 140);
+
 /// `TCP_INFO` of a TCP socket, or None when the option cannot be read
 /// (not a TCP socket).
 fn tcp_info(fd: i32) -> Option<TcpInfo> {
-    // Offsets in struct tcp_info (linux/tcp.h) on the 64-bit targets the
-    // connect filter supports.
-    const BYTES_ACKED: usize = 120;
-    const SEGS_OUT: usize = 136;
     let mut info = [0u8; 256];
     let mut len = info.len() as libc::socklen_t;
     // SAFETY: `info` and `len` describe a valid out-buffer.
@@ -620,18 +638,24 @@ fn tcp_info(fd: i32) -> Option<TcpInfo> {
         return None;
     }
     let len = len as usize;
-    let bytes_acked = (len >= BYTES_ACKED + 8).then(|| {
+    // Fields are read from the buffer by their defined offsets
+    // (`offset_of!` on `KernelTcpInfo`), with unaligned reads: the
+    // buffer is a byte array, so no alignment is assumed. The length
+    // checks guard each wider field, as before.
+    let field =
+        |off: usize, n: usize| -> Option<&[u8]> { (len >= off + n).then(|| &info[off..off + n]) };
+    let bytes_acked = field(core::mem::offset_of!(KernelTcpInfo, bytes_acked), 8).map(|b| {
         let mut raw = [0u8; 8];
-        raw.copy_from_slice(&info[BYTES_ACKED..BYTES_ACKED + 8]);
+        raw.copy_from_slice(b);
         u64::from_ne_bytes(raw)
     });
-    let segs_out = (len >= SEGS_OUT + 4).then(|| {
+    let segs_out = field(core::mem::offset_of!(KernelTcpInfo, segs_out), 4).map(|b| {
         let mut raw = [0u8; 4];
-        raw.copy_from_slice(&info[SEGS_OUT..SEGS_OUT + 4]);
+        raw.copy_from_slice(b);
         u32::from_ne_bytes(raw)
     });
     Some(TcpInfo {
-        state: info[0],
+        state: info[core::mem::offset_of!(KernelTcpInfo, state)],
         bytes_acked,
         segs_out,
     })

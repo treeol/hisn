@@ -539,6 +539,25 @@ impl Journal {
         self.net_enqueue("network/connect", data);
     }
 
+    /// One implicit-connect or bind/listen call the open-mode engine
+    /// saw (`network/implicit`). `verdict` is
+    /// `continue` (sandbox socket, kernel carries on) or `refuse`
+    /// (host-side socket, or the namespace could not be resolved);
+    /// `reason` names the case. Same queue discipline as
+    /// [`Journal::net_record`].
+    pub fn net_implicit_record(&self, n: &crate::notif::Notif, verdict: &str, reason: &str) {
+        let target = format!("nr:{} {}", n.data.nr, reason);
+        let data = json!({
+            "target": target,
+            "notif_id": n.id,
+            "pid": n.pid,
+            "verdict": verdict,
+            "reason": reason,
+            "seat": n.seat.as_deref().map(Value::from).unwrap_or(Value::Null),
+        });
+        self.net_enqueue("network/implicit", data);
+    }
+
     /// How a non-blocking connect ended that the supervisor had already
     /// answered EINPROGRESS for (`network/connect-result`): `target`,
     /// `result` (`connected`, `failed` or `pending-at-deadline`) and
@@ -1561,7 +1580,7 @@ fn summary_for(rec: &JournalRecord) -> String {
         "session/start" => "session started".to_owned(),
         "session/stop" => "session stopped".to_owned(),
         "git-change" => git_change_summary(d),
-        "network/connect" => {
+        "network/connect" | "network/implicit" => {
             let target = d.get("target").and_then(|v| v.as_str()).unwrap_or("?");
             let verdict = d.get("verdict").and_then(|v| v.as_str()).unwrap_or("?");
             format!("{} {}", escape_terminal(verdict), escape_terminal(target))

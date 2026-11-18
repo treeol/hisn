@@ -20,24 +20,81 @@ const NATIVE_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const _UNSUPPORTED_ARCH: () = compile_error!("notif needs x86_64 or aarch64");
 
-/// Hand-written BPF: kill foreign arch, USER_NOTIF for connect, ALLOW else.
-/// Jump direction: JEQ jt=1 skips the next instruction on match, jf=0
-/// falls through. Arch JEQ: match -> skip KILL (jt=1). Nr JEQ: match ->
-/// fall through to USER_NOTIF (jt=0, jf=1 skips ALLOW). Getting either
-/// backwards kills every native-arch process or never intercepts.
-/// Verified by notif::tests::filter_jumps.
+/// `SO_NETNS_COOKIE` (Linux 5.14, `socket(7)`): the unique id of the
+/// network namespace a socket lives in; readable without privilege.
+const SO_NETNS_COOKIE: libc::c_int = 71;
+
+/// Offset of `seccomp_data.args[i]` (low 32-bit word on little endian).
+const fn arg_off(i: u32) -> u32 {
+    16 + 8 * i
+}
+
+const BPF_JSET_K: u16 = 0x45;
+
+/// Hand-written classic BPF. Verdicts:
+/// - foreign architecture: `KILL_PROCESS`;
+/// - `connect`, `bind`, `listen`: `USER_NOTIF`;
+/// - `sendto`/`sendmmsg` (flags = arg 3) and `sendmsg` (flags = arg 2)
+///   with `MSG_FASTOPEN`: `USER_NOTIF` (the only implicit connect a
+///   stream socket has; every other send is `ALLOW`, so ordinary
+///   traffic and the helper's own fd passing are never trapped);
+/// - everything else: `ALLOW`.
+///
+/// Jumps only go forward: target = pc + 1 + offset. The program is
+/// checked by interpreting this exact array
+/// (`notif::tests::filter_verdicts_by_interpretation`).
 pub fn connect_filter() -> Vec<libc::sock_filter> {
     let ins = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
-    let connect_nr = libc::SYS_connect as u32;
-    vec![
+    let direct = [
+        libc::SYS_connect as u32,
+        libc::SYS_bind as u32,
+        libc::SYS_listen as u32,
+    ];
+    let s = 4 + direct.len(); // first send-family instruction
+    let allow_pc = s + 7;
+    let notif_pc = s + 8;
+    let to = |from: usize, target: usize| (target - (from + 1)) as u8;
+    let mut v = vec![
         ins(BPF_LD_W_ABS, 0, 0, 4), // arch
         ins(BPF_JEQ_K, 1, 0, NATIVE_ARCH),
         ins(BPF_RET_K, 0, 0, libc::SECCOMP_RET_KILL_PROCESS),
         ins(BPF_LD_W_ABS, 0, 0, 0), // nr
-        ins(BPF_JEQ_K, 0, 1, connect_nr),
-        ins(BPF_RET_K, 0, 0, libc::SECCOMP_RET_USER_NOTIF),
-        ins(BPF_RET_K, 0, 0, libc::SECCOMP_RET_ALLOW),
-    ]
+    ];
+    for (i, &nr) in direct.iter().enumerate() {
+        v.push(ins(BPF_JEQ_K, to(4 + i, notif_pc), 0, nr));
+    }
+    // pc s: sendto -> flags in arg 3 (pc s+3); s+1: sendmmsg -> same;
+    // s+2: sendmsg -> flags in arg 2 (pc s+5), anything else ALLOW.
+    v.push(ins(BPF_JEQ_K, to(s, s + 3), 0, libc::SYS_sendto as u32));
+    v.push(ins(
+        BPF_JEQ_K,
+        to(s + 1, s + 3),
+        0,
+        libc::SYS_sendmmsg as u32,
+    ));
+    v.push(ins(
+        BPF_JEQ_K,
+        to(s + 2, s + 5),
+        to(s + 2, allow_pc),
+        libc::SYS_sendmsg as u32,
+    ));
+    v.push(ins(BPF_LD_W_ABS, 0, 0, arg_off(3))); // s+3
+    v.push(ins(
+        BPF_JSET_K,
+        to(s + 4, notif_pc),
+        to(s + 4, allow_pc),
+        libc::MSG_FASTOPEN as u32,
+    ));
+    v.push(ins(BPF_LD_W_ABS, 0, 0, arg_off(2))); // s+5
+    v.push(ins(
+        BPF_JSET_K,
+        to(s + 6, notif_pc),
+        to(s + 6, allow_pc),
+        libc::MSG_FASTOPEN as u32,
+    ));
+    v.push(ins(BPF_RET_K, 0, 0, libc::SECCOMP_RET_ALLOW)); // s+7
+    v.push(ins(BPF_RET_K, 0, 0, libc::SECCOMP_RET_USER_NOTIF)); // s+8
+    v
 }
 
 /// Install the connect filter, returning the listener fd.
@@ -104,7 +161,8 @@ pub fn probe_features() -> Result<(), String> {
         -1
     };
     let missing = match code {
-        0 => return Ok(()),
+        0 if own_netns_cookie().is_some() => return Ok(()),
+        0 => "SO_NETNS_COOKIE (kernel >= 5.14), which tells a sandbox socket from a host-side one",
         PROBE_NO_LISTENER => "SECCOMP_FILTER_FLAG_NEW_LISTENER (kernel >= 5.0)",
         PROBE_STRUCT_SIZE => "a seccomp_notif layout hisn knows (the kernel's is larger)",
         PROBE_NO_ID_VALID => "SECCOMP_IOCTL_NOTIF_ID_VALID (kernel >= 5.0)",
@@ -454,7 +512,7 @@ pub const MAX_TRACKED: usize = 1024;
 pub type SockaddrReader = fn(u32, u64, usize) -> io::Result<[u8; 128]>;
 
 /// Engine sizing and the sockaddr reader.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct EngineConfig {
     /// Outbound connect deadline in seconds, counted from `NOTIF_RECV`.
     pub deadline_s: u64,
@@ -468,6 +526,11 @@ pub struct EngineConfig {
     /// connects that may wait for a wait thread; one more is refused.
     pub queue: usize,
     pub reader: SockaddrReader,
+    /// The supervisor's network-namespace cookie, resolved once per
+    /// engine in `start_with_seats` when `None`. Sockets with this cookie
+    /// are host-side. Still `None` (unresolvable) means every socket is
+    /// treated as host-side: fail closed.
+    pub supervisor_cookie: Option<NetnsCookie>,
 }
 
 impl EngineConfig {
@@ -478,6 +541,7 @@ impl EngineConfig {
             waiters: WAITERS,
             queue: MAX_PENDING,
             reader: read_sockaddr,
+            supervisor_cookie: None,
         }
     }
 }
@@ -569,12 +633,23 @@ impl NotifEngine {
     }
 
     /// As [`NotifEngine::start_with`], with seat attribution.
+    ///
+    /// The production cookie is the supervisor's own
+    /// netns identity, resolved here (the common sink of all start
+    /// paths). Tests set `cfg.supervisor_cookie` themselves — to a
+    /// namespace that is not the test netns — so their sockets resolve
+    /// as sandbox-side.
     pub fn start_with_seats(
         listener: OwnedFd,
         journal: Option<std::sync::Arc<crate::journal::Journal>>,
-        cfg: EngineConfig,
+        mut cfg: EngineConfig,
         seats: Option<SeatLookup>,
     ) -> Self {
+        if cfg.supervisor_cookie.is_none() {
+            // Fail closed: without a cookie the engine treats every
+            // unresolvable socket as host-side.
+            cfg.supervisor_cookie = own_netns_cookie();
+        }
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sd = shutdown.clone();
         let (done_tx, done) = std::sync::mpsc::channel::<()>();
@@ -971,6 +1046,7 @@ fn engine_loop(
     // established, have failed, or reach the deadline.
     //
     // The receiver only dispatches; a full queue is answered EACCES.
+    let cfg = std::sync::Arc::new(cfg);
     let (tx, rx) = std::sync::mpsc::sync_channel::<(Notif, std::time::Instant)>(cfg.queue.max(1));
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
     let (wait_tx, wait_rx) = std::sync::mpsc::sync_channel::<Waiting>(cfg.queue.max(1));
@@ -982,6 +1058,7 @@ fn engine_loop(
         let tracker = tracker.clone();
         let wait_tx = wait_tx.clone();
         let seats = seats.clone();
+        let cfg = cfg.clone();
         workers.push(std::thread::spawn(move || {
             loop {
                 let msg = {
@@ -1120,6 +1197,43 @@ fn engine_loop(
     drop(listener);
 }
 
+/// `bind`, `listen` and a `MSG_FASTOPEN` send (the implicit connect of a
+/// stream socket) are notified so that they can be answered by where the
+/// socket lives. On a socket in the sandbox's empty namespace they
+/// cannot leave it: CONTINUE. On a socket in the supervisor's namespace
+/// (an injected socket the program kept after a failed connect) an
+/// implicit connect would reach a host address no policy approved, and
+/// `bind`/`listen` would open a port in the supervisor's namespace:
+/// EACCES. A socket whose namespace cannot be determined is refused too.
+/// The arguments are not inspected; the socket (args[0]) decides.
+fn handle_implicit_call(
+    lfd: i32,
+    n: &Notif,
+    cfg: &EngineConfig,
+    journal: &Option<std::sync::Arc<crate::journal::Journal>>,
+) {
+    let sockfd = n.data.args[0] as i32;
+    let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, n.pid as i64, sockfd as i64, 0u64) };
+    let cookie = (dup >= 0)
+        .then(|| unsafe { OwnedFd::from_raw_fd(dup as i32) })
+        .and_then(|d| socket_netns_cookie(d.as_raw_fd()));
+    let (verdict, reason) = match classify_ns(cookie, cfg.supervisor_cookie) {
+        SockNs::Sandbox => ("continue", "implicit-sandbox-socket"),
+        SockNs::Host => ("refuse", "host-socket-implicit"),
+        SockNs::Unknown => ("refuse", "netns-unknown"),
+    };
+    if id_valid(lfd, n.id) {
+        if verdict == "continue" {
+            reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
+        } else {
+            reply(lfd, n.id, -(libc::EACCES), 0, 0);
+        }
+    }
+    if let Some(j) = journal {
+        j.net_implicit_record(n, verdict, reason);
+    }
+}
+
 fn handle_notif(
     lfd: i32,
     n: &mut Notif,
@@ -1134,6 +1248,13 @@ fn handle_notif(
     // for a worker: a notification that is already too old is answered
     // ETIMEDOUT without any work.
     if refuse_if_expired(lfd, n, deadline, journal) {
+        return;
+    }
+    // `bind`, `listen` and MSG_FASTOPEN sends are answered by the
+    // namespace of their socket (see `handle_implicit_call`); only
+    // `connect` carries a sockaddr to parse.
+    if n.data.nr != libc::SYS_connect as i32 {
+        handle_implicit_call(lfd, n, cfg, journal);
         return;
     }
     // A pidfd for the notified task (`n.pid` is a thread id), then
@@ -1258,6 +1379,59 @@ fn handle_notif(
         }
         // dup_fd dropped here (OwnedFd discipline).
     }
+    // Which netns does the notified socket live in? A socket a program
+    // holds is in the sandbox's empty namespace (its own creation, or an
+    // approved connect's injection into... see below) or in the
+    // supervisor's (an injected socket kept after a failed connect). The
+    // loopback/AF_UNIX CONTINUE and the own-socket re-connect are only
+    // safe in the empty namespace; `Host` and `Unknown` get the full
+    // policy and nothing is continued.
+    let sock_ns = {
+        let d2 = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd as i64, sockfd as i64, 0u64) };
+        let cookie = (d2 >= 0)
+            .then(|| unsafe { OwnedFd::from_raw_fd(d2 as i32) })
+            .and_then(|d| socket_netns_cookie(d.as_raw_fd()));
+        classify_ns(cookie, cfg.supervisor_cookie)
+    };
+    if matches!(sock_ns, SockNs::Host | SockNs::Unknown) {
+        // connect() on a host-side or unresolvable socket: the 0.6.0
+        // already-* answers assumed the sandbox netns and are skipped
+        // here (except already-connected, which is a pure kernel fact
+        // with no escape: the connection already exists, and answering
+        // EISCONN grants nothing new).
+        if already_connected {
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -(libc::EISCONN), 0, 0);
+            }
+            if let Some(j) = journal {
+                j.net_record("refuse", "already-connected", n);
+            }
+            return;
+        }
+        if already_pending {
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -(libc::EACCES), 0, 0);
+            }
+            if let Some(j) = journal {
+                j.net_record("refuse", "host-socket-pending", n);
+            }
+            return;
+        }
+        if already_used {
+            // (a): the re-connect re-enters the full policy below — the
+            // host-side socket may serve only the connection it was
+            // approved for, so no host-socket fast path. Fall through
+            // to `decide`.
+        } else {
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -(libc::EACCES), 0, 0);
+            }
+            if let Some(j) = journal {
+                j.net_record("refuse", "host-socket-connect", n);
+            }
+            return;
+        }
+    }
     // 0.6.1: the already-connected / already-pending / already-used
     // answer comes before the private-address verdict, but only for
     // that answer: `connect()` on a socket that is already connected
@@ -1285,42 +1459,64 @@ fn handle_notif(
         return;
     }
     if already_used {
-        // As before, under `Verdict::Allow` only in shape: the
-        // re-connect is made on the program's own socket, and the
-        // kernel's answer is passed on. A private *new* target on a
-        // failed socket still gets the pending error, not EACCES —
-        // the kernel would answer the same without hisn.
-        let rc = match &used_sock {
-            Some(sock) => unsafe {
-                libc::connect(
-                    sock.as_raw_fd(),
-                    buf.as_ptr() as *const libc::sockaddr,
-                    addrlen as libc::socklen_t,
-                )
-            },
-            None => -1,
-        };
-        let errno = if rc == 0 {
-            0
+        if matches!(sock_ns, SockNs::Host | SockNs::Unknown) {
+            // (a): a host-side socket may serve only the connection it
+            // was approved for. No own-socket re-connect fast path:
+            // fall through to the full policy below (fresh socket,
+            // injected on approval — the host socket is replaced).
         } else {
-            io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO)
-        };
-        if id_valid(lfd, n.id) {
-            reply(lfd, n.id, -errno, 0, 0);
-        }
-        if let Some(j) = journal {
-            if errno == 0 || errno == libc::EINPROGRESS {
-                j.net_record("allow", "own-socket", n);
+            // As before, under `Verdict::Allow` only in shape: the
+            // re-connect is made on the program's own socket, and the
+            // kernel's answer is passed on. A private *new* target on a
+            // failed socket still gets the pending error, not EACCES —
+            // the kernel would answer the same without hisn.
+            let rc = match &used_sock {
+                Some(sock) => unsafe {
+                    libc::connect(
+                        sock.as_raw_fd(),
+                        buf.as_ptr() as *const libc::sockaddr,
+                        addrlen as libc::socklen_t,
+                    )
+                },
+                None => -1,
+            };
+            let errno = if rc == 0 {
+                0
             } else {
-                j.net_record("refuse", "earlier-connect-failed", n);
+                io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO)
+            };
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -errno, 0, 0);
             }
+            if let Some(j) = journal {
+                if errno == 0 || errno == libc::EINPROGRESS {
+                    j.net_record("allow", "own-socket", n);
+                } else {
+                    j.net_record("refuse", "earlier-connect-failed", n);
+                }
+            }
+            return;
         }
-        return;
     }
+    // The CONTINUE verdict for loopback and
+    // AF_UNIX assumes the empty sandbox namespace. A host-side socket
+    // (or one whose namespace cannot be resolved) must not CONTINUE a
+    // connect: it would run in the supervisor's namespace, where
+    // loopback reaches host daemons. Apply the full policy instead —
+    // for loopback on a host socket that is a refusal (private).
+    let continue_allowed = matches!(sock_ns, SockNs::Sandbox);
     let is_public = ip.map(|a| is_public_ip(&a)).unwrap_or(false);
     match decide(family, is_loopback, is_stream, is_public) {
+        Verdict::Continue if !continue_allowed => {
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -(libc::EACCES), 0, 0);
+            }
+            if let Some(j) = journal {
+                j.net_record("refuse", "host-socket-loopback-or-unix", n);
+            }
+        }
         Verdict::Continue => {
             if id_valid(lfd, n.id) {
                 reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
@@ -1750,6 +1946,65 @@ fn parse_tgid(status: &str) -> Option<libc::pid_t> {
         .ok()
 }
 
+// ---- open-mode hardening: which namespace a socket lives in ---------------
+
+/// (device, inode) of a namespace — the identity `fstat` gives and
+/// `netns_differs` (supervisor.rs) compares.
+type NetnsCookie = u64;
+
+/// Network-namespace cookie of a socket (`SO_NETNS_COOKIE`). `None` on
+/// any error (old kernel, not a socket, fd gone): callers fail closed.
+/// `SIOCGSKNS` is not used: it needs `CAP_NET_ADMIN` in the namespace's
+/// owning user namespace, which the supervisor does not have.
+fn socket_netns_cookie(fd: i32) -> Option<NetnsCookie> {
+    let mut cookie: u64 = 0;
+    let mut len = std::mem::size_of::<u64>() as libc::socklen_t;
+    // SAFETY: getsockopt with a u64 out-buffer and its length.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_NETNS_COOKIE,
+            &mut cookie as *mut u64 as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && len as usize == std::mem::size_of::<u64>()).then_some(cookie)
+}
+
+/// The cookie of the calling process's own network namespace: that of
+/// a throwaway socket created here.
+fn own_netns_cookie() -> Option<NetnsCookie> {
+    // SAFETY: socket() returns a fresh fd or -1.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fd is fresh and owned here.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    socket_netns_cookie(fd.as_raw_fd())
+}
+
+/// Where a notified socket lives, relative to the supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SockNs {
+    /// Not the supervisor's namespace: the sandbox's empty namespace
+    /// (a program cannot create another one, `CLONE_NEWNET` is denied).
+    Sandbox,
+    /// The supervisor's namespace: an injected socket the program kept.
+    Host,
+    /// Either cookie unknown: treated like `Host`, never `Sandbox`.
+    Unknown,
+}
+
+fn classify_ns(sock: Option<NetnsCookie>, supervisor: Option<NetnsCookie>) -> SockNs {
+    match (sock, supervisor) {
+        (Some(s), Some(h)) if s == h => SockNs::Host,
+        (Some(_), Some(_)) => SockNs::Sandbox,
+        _ => SockNs::Unknown,
+    }
+}
+
 fn copy_sock_opts(addr_fd: i32, pidfd: i32, newfd: i32) -> Option<bool> {
     let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd as i64, addr_fd as i64, 0u64) };
     if dup < 0 {
@@ -2075,6 +2330,16 @@ mod tests {
 
     // ---- engine tests: a real filter, real connect() calls ----------------
 
+    /// Engine config for tests: every test socket lives in the test's own
+    /// network namespace, so a supervisor cookie that matches no
+    /// namespace makes them sandbox-side, as in production.
+    fn sandbox_cfg(deadline_s: u64) -> EngineConfig {
+        EngineConfig {
+            supervisor_cookie: Some(u64::MAX),
+            ..EngineConfig::new(deadline_s)
+        }
+    }
+
     fn connect_once(port: u16) -> i32 {
         // SAFETY: plain socket + connect on a fresh fd; only libc calls,
         // so this is safe to run in a forked child.
@@ -2235,7 +2500,7 @@ mod tests {
         let (_l, port) = loopback_listener();
         let (d, j) = engine_journal();
         let (pid, listener) = connecting_child(1, port);
-        let engine = NotifEngine::start(listener, Some(j.clone()), 5);
+        let engine = NotifEngine::start_with(listener, Some(j.clone()), sandbox_cfg(5));
         assert_eq!(child_exit(pid), 1, "one connect, connected");
         drop(engine);
         assert_eq!(
@@ -2535,7 +2800,7 @@ mod tests {
         // An engine is dropped while it still tracks a socket: the drop
         // returns promptly and the socket is closed (its peer sees EOF).
         let (pid, listener) = connecting_child(0, 1);
-        let engine = NotifEngine::start_with(listener, None, EngineConfig::new(30));
+        let engine = NotifEngine::start_with(listener, None, sandbox_cfg(30));
         let (tracked, peer) = crate::sys::socketpair_seqpacket().unwrap();
         assert!(engine.tracker.slot_seated(tracked, "t:4".into(), None));
         let t = std::time::Instant::now();
@@ -2588,7 +2853,7 @@ mod tests {
         let (pid, listener) = connecting_child(1, port);
         let cfg = EngineConfig {
             reader: failing_reader,
-            ..EngineConfig::new(5)
+            ..sandbox_cfg(5)
         };
         let engine = NotifEngine::start_with(listener, Some(j.clone()), cfg);
         assert_eq!(child_exit(pid), 16, "one connect, refused with EACCES");
@@ -2607,7 +2872,7 @@ mod tests {
     #[test]
     fn dropping_an_idle_engine_is_quick() {
         let (pid, listener) = connecting_child(0, 1);
-        let engine = NotifEngine::start_with(listener, None, EngineConfig::new(30));
+        let engine = NotifEngine::start_with(listener, None, sandbox_cfg(30));
         std::thread::sleep(std::time::Duration::from_millis(100));
         let start = std::time::Instant::now();
         drop(engine);
@@ -2633,7 +2898,7 @@ mod tests {
             workers: 1,
             queue: 4,
             reader: slow_reader,
-            ..EngineConfig::new(1)
+            ..sandbox_cfg(1)
         };
         let engine = NotifEngine::start_with(listener, Some(j.clone()), cfg);
         assert_eq!(child_exit(pid), 102, "two connects, both ETIMEDOUT");
@@ -2661,7 +2926,7 @@ mod tests {
             workers: 1,
             queue: 1,
             reader: slow_reader,
-            ..EngineConfig::new(5)
+            ..sandbox_cfg(5)
         };
         let engine = NotifEngine::start_with(listener, Some(j.clone()), cfg);
         // Well before the worker finishes its first connect, the refused
@@ -2791,30 +3056,338 @@ mod tests {
         assert!(f.iter().any(|i| i.k == libc::SECCOMP_RET_KILL_PROCESS));
     }
 
-    #[test]
-    fn filter_jumps() {
-        // Simulate the filter: arch match must skip KILL; nr match must
-        // land on USER_NOTIF. (Review BLOCKING B1: inverted jumps.)
-        let f = connect_filter();
-        let sim = |arch_ok: bool, nr_ok: bool| -> u32 {
-            let mut pc = 0usize;
-            loop {
-                let ins = &f[pc];
-                match ins.code {
-                    0x20 => pc += 1, // LD
-                    0x15 => {
-                        // JEQ
-                        let take = (pc == 1 && arch_ok) || (pc == 4 && nr_ok);
-                        pc = pc + 1 + if take { ins.jt } else { ins.jf } as usize;
-                    }
-                    0x06 => return ins.k, // RET
-                    _ => panic!("unexpected code {:#x}", ins.code),
-                }
+    /// Evaluate a classic-BPF seccomp program on `(arch, nr, args)`,
+    /// returning its verdict. Supports exactly the opcodes the filter
+    /// may contain and panics on any other, on a jump out of range, and
+    /// on a program that runs off its end.
+    fn run_bpf(prog: &[libc::sock_filter], arch: u32, nr: u32, args: [u64; 6]) -> u32 {
+        let load = |off: u32| -> u32 {
+            match off {
+                0 => nr,
+                4 => arch,
+                16..=63 if off.is_multiple_of(8) => args[((off - 16) / 8) as usize] as u32,
+                _ => panic!("load at unexpected offset {off}"),
             }
         };
-        assert_eq!(sim(true, true), libc::SECCOMP_RET_USER_NOTIF);
-        assert_eq!(sim(true, false), libc::SECCOMP_RET_ALLOW);
-        assert_eq!(sim(false, true), libc::SECCOMP_RET_KILL_PROCESS);
-        assert_eq!(sim(false, false), libc::SECCOMP_RET_KILL_PROCESS);
+        let (mut pc, mut acc) = (0usize, 0u32);
+        for _ in 0..prog.len() + 1 {
+            let i = prog.get(pc).expect("program ran off its end");
+            match i.code {
+                0x20 => {
+                    acc = load(i.k);
+                    pc += 1;
+                }
+                0x15 => pc += 1 + if acc == i.k { i.jt } else { i.jf } as usize,
+                0x45 => pc += 1 + if acc & i.k != 0 { i.jt } else { i.jf } as usize,
+                0x06 => return i.k,
+                c => panic!("unexpected opcode {c:#x} at {pc}"),
+            }
+        }
+        panic!("program loops");
+    }
+
+    #[test]
+    fn filter_verdicts_by_interpretation() {
+        let f = connect_filter();
+        let fast = libc::MSG_FASTOPEN as u64;
+        let v = |nr: i64, args: [u64; 6]| run_bpf(&f, NATIVE_ARCH, nr as u32, args);
+        let none = [0u64; 6];
+        // Intercepted.
+        for nr in [libc::SYS_connect, libc::SYS_bind, libc::SYS_listen] {
+            assert_eq!(v(nr, none), libc::SECCOMP_RET_USER_NOTIF, "nr {nr}");
+        }
+        // sendto(fd, buf, len, flags, ..) and sendmmsg(fd, msgs, vlen, flags):
+        // flags is arg 3; sendmsg(fd, msg, flags): flags is arg 2.
+        let mut a3 = none;
+        a3[3] = fast | libc::MSG_NOSIGNAL as u64;
+        let mut a2 = none;
+        a2[2] = fast;
+        assert_eq!(v(libc::SYS_sendto, a3), libc::SECCOMP_RET_USER_NOTIF);
+        assert_eq!(v(libc::SYS_sendmmsg, a3), libc::SECCOMP_RET_USER_NOTIF);
+        assert_eq!(v(libc::SYS_sendmsg, a2), libc::SECCOMP_RET_USER_NOTIF);
+        // The same calls without MSG_FASTOPEN, and with it in the
+        // wrong argument, are allowed (the helper's fd passing, all
+        // ordinary traffic).
+        let mut other = none;
+        other[2] = libc::MSG_NOSIGNAL as u64;
+        other[3] = libc::MSG_NOSIGNAL as u64;
+        for nr in [libc::SYS_sendto, libc::SYS_sendmmsg, libc::SYS_sendmsg] {
+            assert_eq!(v(nr, other), libc::SECCOMP_RET_ALLOW, "nr {nr}");
+        }
+        assert_eq!(v(libc::SYS_sendmsg, a3), libc::SECCOMP_RET_ALLOW);
+        assert_eq!(v(libc::SYS_sendto, a2), libc::SECCOMP_RET_ALLOW);
+        // Unrelated syscalls, even with a FASTOPEN-looking argument.
+        let mut all = [fast; 6];
+        all[0] = 3;
+        let unrelated = [
+            libc::SYS_read,
+            libc::SYS_write,
+            libc::SYS_mmap,
+            libc::SYS_futex,
+            libc::SYS_clone,
+            libc::SYS_exit_group,
+            libc::SYS_socket,
+            libc::SYS_close,
+            libc::SYS_openat,
+            libc::SYS_recvfrom,
+            libc::SYS_recvmsg,
+            libc::SYS_accept,
+            libc::SYS_getsockopt,
+            libc::SYS_setsockopt,
+            libc::SYS_ioctl,
+            libc::SYS_execve,
+            libc::SYS_brk,
+            libc::SYS_munmap,
+            libc::SYS_rt_sigaction,
+            libc::SYS_epoll_wait,
+            libc::SYS_poll,
+            libc::SYS_pidfd_getfd,
+            libc::SYS_getpid,
+        ];
+        assert!(unrelated.len() >= 20);
+        for nr in unrelated {
+            assert_eq!(v(nr, none), libc::SECCOMP_RET_ALLOW, "nr {nr}");
+            assert_eq!(v(nr, all), libc::SECCOMP_RET_ALLOW, "nr {nr} fastopen args");
+        }
+        // Foreign architecture: killed, whatever the syscall.
+        for foreign in [
+            0u32,
+            0x4000_0003,
+            NATIVE_ARCH ^ 1,
+            0xC000_00B7 ^ NATIVE_ARCH ^ 0xC000_003E,
+        ] {
+            for nr in [libc::SYS_connect, libc::SYS_read, libc::SYS_sendmsg] {
+                assert_eq!(
+                    run_bpf(&f, foreign, nr as u32, a2),
+                    libc::SECCOMP_RET_KILL_PROCESS,
+                    "arch {foreign:#x} nr {nr}"
+                );
+            }
+        }
+        // Every instruction is reachable only through forward jumps in
+        // range (the interpreter would have panicked), and the verdict
+        // set is exactly KILL / USER_NOTIF / ALLOW.
+        for i in f.iter().filter(|i| i.code == 0x06) {
+            assert!(
+                [
+                    libc::SECCOMP_RET_KILL_PROCESS,
+                    libc::SECCOMP_RET_USER_NOTIF,
+                    libc::SECCOMP_RET_ALLOW
+                ]
+                .contains(&i.k)
+            );
+        }
+    }
+
+    #[test]
+    fn socket_netns_cookie_resolves_and_fails_closed() {
+        // Two sockets in this namespace share a cookie; a non-socket and
+        // a bogus fd give None (fail closed).
+        let (a, b) = crate::sys::socketpair_seqpacket().unwrap();
+        let ca = socket_netns_cookie(a.as_raw_fd());
+        assert!(ca.is_some(), "SO_NETNS_COOKIE needs kernel >= 5.14");
+        assert_eq!(ca, socket_netns_cookie(b.as_raw_fd()));
+        assert_eq!(ca, own_netns_cookie());
+        let file = std::fs::File::open("/proc/self/ns/net").unwrap();
+        assert_eq!(socket_netns_cookie(file.as_raw_fd()), None);
+        assert_eq!(socket_netns_cookie(-1), None);
+    }
+
+    #[test]
+    fn classify_ns_fails_closed() {
+        assert_eq!(classify_ns(Some(1), Some(2)), SockNs::Sandbox);
+        assert_eq!(classify_ns(Some(2), Some(2)), SockNs::Host);
+        assert_eq!(classify_ns(None, Some(2)), SockNs::Unknown);
+        assert_eq!(classify_ns(Some(1), None), SockNs::Unknown);
+        assert_eq!(classify_ns(None, None), SockNs::Unknown);
+    }
+
+    #[test]
+    fn engine_refuses_host_side_socket_connects_and_journals() {
+        // (b): a loopback connect on a socket in the supervisor's own
+        // netns must NOT be CONTINUEd (it would reach the host's
+        // loopback). The test simulates the injected-socket case
+        // directly: the child's socket is created in the supervisor's
+        // netns (no netns switch in the test), and the engine's
+        // supervisor cookie is that same namespace, so the child's
+        // socket resolves as "host-side".
+        let (_l, port) = loopback_listener();
+        let (d, j) = engine_journal();
+        // The supervisor cookie is this process's own netns, where the
+        // test's sockets live: they resolve as host-side.
+        let mnt_cookie = own_netns_cookie().expect("SO_NETNS_COOKIE");
+        let (pid, listener) = connecting_child(1, port);
+        let cfg = EngineConfig {
+            supervisor_cookie: Some(mnt_cookie),
+            ..sandbox_cfg(5)
+        };
+        let engine = NotifEngine::start_with(listener, Some(j.clone()), cfg);
+        assert_eq!(child_exit(pid), 16, "one connect, refused with EACCES");
+        drop(engine);
+        let records = connect_records(&d, &j);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].0, "refuse");
+        assert_eq!(records[0].1, "host-socket-connect", "{records:?}");
+    }
+
+    #[test]
+    fn engine_still_continues_sandbox_socket_loopback() {
+        // The same loopback connect, with a supervisor cookie that
+        // matches no namespace (u64::MAX): every test socket resolves
+        // as sandbox-side and the connect is CONTINUEd as in 0.6.0.
+        let (_l, port) = loopback_listener();
+        let (d, j) = engine_journal();
+        let (pid, listener) = connecting_child(1, port);
+        let cfg = EngineConfig {
+            supervisor_cookie: Some(u64::MAX),
+            ..sandbox_cfg(5)
+        };
+        let engine = NotifEngine::start_with(listener, Some(j.clone()), cfg);
+        assert_eq!(child_exit(pid), 1, "one connect, continued");
+        drop(engine);
+        let records = connect_records(&d, &j);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].0, "continue", "{records:?}");
+        assert_eq!(records[0].1, "loopback-or-unix", "{records:?}");
+    }
+
+    /// A child whose socket has already failed one connect (to a closed
+    /// loopback port, before the filter exists): the state of a socket
+    /// the supervisor injected and the program kept. After the filter is
+    /// installed it connects that socket to `port`. Exit code: the
+    /// connect's errno, 0 on success, 2xx on setup failure.
+    fn reconnect_child(port: u16, closed_port: u16) -> (libc::pid_t, OwnedFd) {
+        let (ours, theirs) = crate::sys::socketpair_seqpacket().unwrap();
+        // SAFETY: the child only makes libc calls and _exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            drop(ours);
+            let code = (|| unsafe {
+                let s = libc::socket(
+                    libc::AF_INET,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    0,
+                );
+                if s < 0 {
+                    return 250;
+                }
+                let mk = |p: u16| {
+                    let mut a: libc::sockaddr_in = std::mem::zeroed();
+                    a.sin_family = libc::AF_INET as libc::sa_family_t;
+                    a.sin_addr.s_addr = libc::INADDR_LOOPBACK.to_be();
+                    a.sin_port = p.to_be();
+                    a
+                };
+                let sz = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                let dead = mk(closed_port);
+                libc::connect(s, &dead as *const _ as *const libc::sockaddr, sz);
+                // Wait until the refused connect has ended the socket.
+                let mut pfd = libc::pollfd {
+                    fd: s,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                libc::poll(&mut pfd, 1, 2000);
+                if crate::sys::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0).is_err() {
+                    return 203;
+                }
+                let Ok(listener) = install_connect_filter() else {
+                    return 204;
+                };
+                if crate::sys::send_with_fds(theirs.as_raw_fd(), b"L", &[listener.as_raw_fd()])
+                    .is_err()
+                {
+                    return 205;
+                }
+                let live = mk(port);
+                if libc::connect(s, &live as *const _ as *const libc::sockaddr, sz) == 0 {
+                    0
+                } else {
+                    *libc::__errno_location()
+                }
+            })();
+            unsafe { libc::_exit(code) }
+        }
+        drop(theirs);
+        let mut buf = [0u8; 8];
+        let mut pfd = libc::pollfd {
+            fd: ours.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pfd, 1, 10_000) };
+        let fd = (ready > 0)
+            .then(|| crate::sys::recv_with_fds(ours.as_raw_fd(), &mut buf).ok())
+            .flatten()
+            .and_then(|r| r.fds.into_iter().next());
+        (pid, fd.expect("child installed the filter"))
+    }
+
+    fn closed_loopback_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn host_socket_reconnect_enters_the_full_policy() {
+        // (a): a socket that failed a connect and is kept by the program
+        // is, in production, a supervisor-namespace socket. Its next
+        // connect must not take the own-socket fast path: loopback is
+        // refused (the CONTINUE would run in the supervisor's namespace).
+        let (_l, port) = loopback_listener();
+        let (d, j) = engine_journal();
+        let (pid, listener) = reconnect_child(port, closed_loopback_port());
+        let cfg = EngineConfig {
+            supervisor_cookie: own_netns_cookie(),
+            ..EngineConfig::new(5)
+        };
+        let engine = NotifEngine::start_with(listener, Some(j.clone()), cfg);
+        assert_eq!(child_exit(pid), libc::EACCES);
+        drop(engine);
+        let records = connect_records(&d, &j);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].0, "refuse");
+        assert_eq!(records[0].1, "host-socket-loopback-or-unix", "{records:?}");
+    }
+
+    #[test]
+    fn sandbox_socket_reconnect_keeps_the_own_socket_path() {
+        // Regression guard for 0.6.0: the same failed-then-reconnected
+        // socket in the sandbox namespace is answered on the program's
+        // own socket, not refused.
+        let (_l, port) = loopback_listener();
+        let (d, j) = engine_journal();
+        let (pid, listener) = reconnect_child(port, closed_loopback_port());
+        let engine = NotifEngine::start_with(listener, Some(j.clone()), sandbox_cfg(5));
+        // The kernel hands the earlier failure (ECONNREFUSED) to the
+        // first connect after it, on the program's own socket.
+        assert_eq!(child_exit(pid), libc::ECONNREFUSED);
+        drop(engine);
+        let records = connect_records(&d, &j);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].1, "earlier-connect-failed", "{records:?}");
+    }
+
+    #[test]
+    fn engine_without_cookie_source_refuses_everything() {
+        // Fail closed: with no supervisor cookie resolved, every
+        // socket is treated as host-side (cannot tell sandbox from
+        // host). The loopback connect that 0.6.0 would CONTINUE is
+        // refused.
+        let (_l, port) = loopback_listener();
+        let (d, j) = engine_journal();
+        let (pid, listener) = connecting_child(1, port);
+        let cfg = EngineConfig {
+            supervisor_cookie: None,
+            ..sandbox_cfg(5)
+        };
+        let engine = NotifEngine::start_with(listener, Some(j.clone()), cfg);
+        assert_eq!(child_exit(pid), 16, "refused EACCES");
+        drop(engine);
+        let records = connect_records(&d, &j);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].0, "refuse");
+        assert_eq!(records[0].1, "host-socket-connect", "{records:?}");
     }
 }

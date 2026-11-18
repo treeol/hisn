@@ -185,9 +185,10 @@ pub struct Journal {
     failures: FailureCount,
     rotate_after: u64,
     /// Total size above which the oldest rotated files are deleted after
-    /// a rotation. `None` keeps every file, as before 0.6.0; only the
-    /// writer of the network queue sets it (ADR 0022), so sessions
-    /// without open mode never delete journal files.
+    /// a rotation. `None` keeps every file; every production handle
+    /// carries [`JOURNAL_RETENTION_BYTES`] (0.6.1: retention applies to
+    /// every session, once per workspace, whatever its network mode).
+    /// Only tests that need unbounded growth set `None`.
     retention_bytes: Option<u64>,
     /// Bounded async queue for network records (0.6.0): the verdict path
     /// never waits on a journal write; a full queue drops and counts.
@@ -394,6 +395,19 @@ impl Journal {
             session,
             failures: Arc::new(AtomicU64::new(0)),
             rotate_after,
+            retention_bytes: Some(JOURNAL_RETENTION_BYTES),
+            net_queue: None,
+        }
+    }
+
+    /// Test-only handle with no retention budget (keeps every file).
+    #[cfg(test)]
+    fn without_retention(dir: PathBuf, session: String, rotate_after: u64) -> Self {
+        Self {
+            dir,
+            session,
+            failures: Arc::new(AtomicU64::new(0)),
+            rotate_after,
             retention_bytes: None,
             net_queue: None,
         }
@@ -429,12 +443,10 @@ impl Journal {
         j.net_queue = Some(match &self.net_queue {
             Some(q) => q.clone(),
             None => {
-                // The queue's writer is the one that can be flooded by a
-                // sandboxed program, so it is the one with a size limit.
-                let mut writer = self.plain_clone();
-                writer
-                    .retention_bytes
-                    .get_or_insert(JOURNAL_RETENTION_BYTES);
+                // Every handle now carries the retention budget (0.6.1);
+                // the queue's writer inherits it from `self` via
+                // `plain_clone`, so no per-handle set-up is needed here.
+                let writer = self.plain_clone();
                 NetQueue::new(writer, cap, Arc::new(AtomicU64::new(0)))
             }
         });
@@ -622,6 +634,9 @@ impl Journal {
         };
         let mut seq = next_wseq(&path)?;
         // Rotate before writing when the current file is already oversize.
+        // The pruned record (0.6.1) is written into the *new* current file
+        // below, after `seq` is recovered, so it carries a normal wseq.
+        let mut pruned: Option<(Vec<String>, u64, u64)> = None;
         if let Some(meta) = fs::metadata(&path).ok()
             && meta.len() > self.rotate_after
         {
@@ -629,7 +644,7 @@ impl Journal {
                 message: format!("rotate: {e}"),
             })?;
             if let Some(budget) = self.retention_bytes {
-                prune_journal_files(&self.dir, budget);
+                pruned = prune_journal_files(&self.dir, budget);
             }
             // `wseq` is recovered from the rotated file's tail (the new
             // file is empty, so `last_wseq` falls through to it).
@@ -669,6 +684,32 @@ impl Journal {
         f.write_all(line.as_bytes()).map_err(|e| JournalError {
             message: format!("write: {e}"),
         })?;
+        // 0.6.1: one `journal/pruned` record per deletion batch, written
+        // into the same new current file, right after the record whose
+        // rotation triggered the prune. Under the same flock, so its wseq
+        // follows sequentially. Best-effort: a serialisation failure here
+        // must not fail the record that was already written.
+        if let Some((files, bytes, count)) = pruned {
+            seq = seq.saturating_add(1);
+            let pruned_record = JournalRecord {
+                v: JOURNAL_VERSION,
+                ts: rfc3339_now(),
+                wseq: seq,
+                session: self.session.clone(),
+                kind: "journal/pruned".to_owned(),
+                client: None,
+                data: json!({
+                    "files": files,
+                    "bytes": bytes,
+                    "count": count,
+                    "max_journal_files": MAX_JOURNAL_FILES,
+                    "retention_bytes": JOURNAL_RETENTION_BYTES,
+                }),
+            };
+            if let Ok(pruned_line) = serde_json::to_string(&pruned_record) {
+                let _ = f.write_all(format!("{pruned_line}\n").as_bytes());
+            }
+        }
         Ok(())
     }
 }
@@ -947,22 +988,25 @@ pub fn journal_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// 0.6.0 (ADR 0022): size limit for a journal that receives network
-/// records. After a rotation, while there are more than
-/// [`MAX_JOURNAL_FILES`] files or their total size is above the budget,
-/// the oldest rotated files are deleted, but only once the total exceeds
-/// the budget: a small journal keeps every file however often it
-/// rotated. The active file is never deleted. Called under the journal
-/// lock; best-effort (never fails the append).
+/// Size limit for every journal (0.6.1: all sessions, whatever their
+/// network mode; 0.6.0: only `open`). After a rotation, while there are
+/// more than [`MAX_JOURNAL_FILES`] files or their total size is above
+/// the budget, the oldest rotated files are deleted, but only once the
+/// total exceeds the budget: a small journal keeps every file however
+/// often it rotated. The newest rotated file and the active file are
+/// never deleted. Called under the journal lock; best-effort (never
+/// fails the append). Returns the deleted file names, their total bytes
+/// and their count, for the `journal/pruned` record; `None` when
+/// nothing was deleted.
 pub const MAX_JOURNAL_FILES: usize = 4;
 /// Budget of [`prune_journal_files`] in production: four files of the
 /// rotation size (4 x 64 MiB).
 pub const JOURNAL_RETENTION_BYTES: u64 = 4 * ROTATE_AFTER;
 
-fn prune_journal_files(dir: &Path, budget: u64) {
+fn prune_journal_files(dir: &Path, budget: u64) -> Option<(Vec<String>, u64, u64)> {
     let files = journal_files(dir);
     if files.len() <= MAX_JOURNAL_FILES {
-        return;
+        return None;
     }
     let mut total: u64 = files
         .iter()
@@ -970,23 +1014,44 @@ fn prune_journal_files(dir: &Path, budget: u64) {
         .map(|m| m.len())
         .sum();
     if total <= budget {
-        return;
+        return None;
     }
     // Oldest first (`journal_files` order); the active file is last.
+    // The newest rotated file (second-to-last overall) is never
+    // deleted: the rule keeps the newest rotated file plus the active
+    // one even when the budget is still exceeded afterwards.
     let mut remaining = files.len();
-    for f in &files {
+    let mut deleted: Vec<String> = Vec::new();
+    let mut deleted_bytes: u64 = 0;
+    for (idx, f) in files.iter().enumerate() {
         if remaining <= MAX_JOURNAL_FILES && total <= budget {
             break;
         }
         if f.file_name().and_then(|n| n.to_str()) == Some(JOURNAL_FILE) {
             continue;
         }
+        // Never delete the newest rotated file.
+        if idx + 1 == files.len() - 1 {
+            continue;
+        }
         let len = fs::metadata(f).map(|m| m.len()).unwrap_or(0);
         if fs::remove_file(f).is_ok() {
             total = total.saturating_sub(len);
             remaining -= 1;
+            deleted.push(
+                f.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+            deleted_bytes = deleted_bytes.saturating_add(len);
         }
     }
+    if deleted.is_empty() {
+        return None;
+    }
+    let count = deleted.len() as u64;
+    Some((deleted, deleted_bytes, count))
 }
 
 /// Consume the rest of the current (over-long) line, up to and including
@@ -1895,9 +1960,10 @@ mod tests {
 
     #[test]
     fn only_the_network_writer_deletes_old_journal_files() {
-        // Seven rotations of a tiny journal. A plain handle (every mode
-        // before 0.6.0, and none/host now) keeps all files; a handle
-        // with a retention budget deletes the oldest rotated ones.
+        // Seven rotations of a tiny journal. A plain (default) handle
+        // now also carries the retention budget (0.6.1: every session,
+        // whatever its network mode); only a handle built with
+        // `without_retention` keeps all files.
         let fill = |j: &Journal| {
             for i in 0..8 {
                 j.append("note", None, json!({"text": "x".repeat(300), "i": i}))
@@ -1905,7 +1971,7 @@ mod tests {
             }
         };
         let d = tempfile::tempdir().unwrap();
-        let plain = Journal::with_rotate_after(d.path().join("a"), "s".into(), 200);
+        let plain = Journal::without_retention(d.path().join("a"), "s".into(), 200);
         assert_eq!(plain.retention_bytes, None);
         fill(&plain);
         assert_eq!(journal_files(&d.path().join("a")).len(), 8);
@@ -1913,16 +1979,90 @@ mod tests {
         let mut limited = Journal::with_rotate_after(d.path().join("b"), "s".into(), 200);
         limited.retention_bytes = Some(1000);
         fill(&limited);
+        // Pruning with a tiny budget deletes until the count fits, but
+        // never the newest rotated file; the number of surviving files
+        // is at most MAX+1 and at least the current one plus the newest
+        // rotated one.
         let files = journal_files(&d.path().join("b"));
-        assert_eq!(files.len(), MAX_JOURNAL_FILES);
+        assert!(files.len() <= MAX_JOURNAL_FILES + 1, "files: {files:?}");
+        assert!(files.len() >= 2, "files: {files:?}");
         assert!(files.last().unwrap().ends_with(JOURNAL_FILE));
         // The newest records survive.
         let (records, _) = read_records(&d.path().join("b"));
         assert_eq!(records.last().unwrap().data["i"], 7);
 
-        // The network queue's writer is the handle that has the budget.
+        // The network queue's writer is a handle that has the budget too.
         let engine = plain.clone_for_engine();
         assert_eq!(engine.retention_bytes, None);
+    }
+
+    #[test]
+    fn retention_applies_to_a_plain_handle_and_writes_a_pruned_record() {
+        // 0.6.1: a default handle (no network mode involved) deletes the
+        // oldest rotated files exactly as the network writer did, never
+        // deletes the newest rotated file or the current file, and
+        // writes one `journal/pruned` record per deletion batch.
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("ws");
+        create_test_ws_dir(&dir);
+        let mut j = Journal::with_rotate_after(dir.clone(), "s".into(), 200);
+        // Every production handle (incl. plain ones) carries the budget.
+        assert_eq!(j.retention_bytes, Some(JOURNAL_RETENTION_BYTES));
+        // Shrink it so a handful of rotations exceed it, as in the test
+        // above; the mechanism is identical, only the numbers differ.
+        j.retention_bytes = Some(1000);
+        for i in 0..10 {
+            j.append("note", None, json!({"text": "x".repeat(300), "i": i}))
+                .unwrap();
+        }
+        let files = journal_files(&dir);
+        assert!(files.len() <= MAX_JOURNAL_FILES + 1, "files: {files:?}");
+        assert!(files.len() >= 2, "files: {files:?}");
+        assert!(files.last().unwrap().ends_with(JOURNAL_FILE));
+        // The newest rotated file is present: it is the second-to-last.
+        let newest_rotated = &files[files.len() - 2];
+        assert!(
+            newest_rotated
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap()
+                .starts_with("journal."),
+            "newest rotated file must survive: {newest_rotated:?}"
+        );
+        // The current file holds the newest note (the pruned record
+        // may be the last one the reader sees).
+        let (records, _) = read_records(&dir);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r.kind == "note")
+                .last()
+                .unwrap()
+                .data["i"],
+            9
+        );
+        // At least one pruned record was written, naming deleted files
+        // with a byte total and a count. Deleted names never include the
+        // current or the newest rotated file.
+        let pruned: Vec<_> = records
+            .iter()
+            .filter(|r| r.kind == "journal/pruned")
+            .collect();
+        assert!(
+            !pruned.is_empty(),
+            "a journal/pruned record must be written"
+        );
+        let p = &pruned[0];
+        assert!(p.data["count"].as_u64().unwrap() >= 1);
+        assert!(p.data["bytes"].as_u64().unwrap() > 0);
+        let names: Vec<&str> = p.data["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(names.len() as u64, p.data["count"].as_u64().unwrap());
+        assert!(!names.contains(&JOURNAL_FILE));
     }
 
     #[test]

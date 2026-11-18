@@ -131,9 +131,12 @@ directory write to one journal. `hisn run --workspace NAME` selects a
 workspace by name instead. State lives in
 `$XDG_STATE_HOME/hisn/workspaces/<id>/` (dir `0700`); the journal is
 `journal.jsonl` (0600, one JSON object per line, 64 MiB rotation; rotated
-files are kept and still read). For sessions in `open` (0.6.0), the
-oldest rotated files are deleted once the journal exceeds 256 MiB in
-more than four files; sessions in `none` and `host` keep every file.
+files are kept and still read). Once per workspace, whatever the
+session's network mode, the oldest rotated files are deleted once the
+journal exceeds 256 MiB in more than four files (4 x 64 MiB; the newest
+rotated file and the current file are never deleted). Each deletion
+writes one `journal/pruned` record naming the deleted files, their
+total bytes and their count.
 
 ```sh
 hisn note --session demo "halfway through the migration"   # verbatim, at most 8 KiB

@@ -26,9 +26,12 @@ step() { printf 'release-gate: step %s: %s\n' "$1" "$2"; }
 ok()   { printf 'release-gate: OK %s\n' "$1"; }
 fail() { printf 'release-gate: FAIL %s: %s\n' "$1" "$2" >&2; exit 1; }
 
-# Cross-target clippy: CI builds these non-native targets, and dead-code
-# constants that are fine on one arch fail on another. The gate runs clippy
-# for each installed target and SKIPs (with a rustup hint) the rest.
+# Cross-target clippy: CI builds these non-native targets exactly as
+# `cargo clippy --locked --all-targets --target <t> -- -D warnings`.
+# Dead-code constants fine on one arch fail on another, and
+# target-specific type mismatches (e.g. libc::Ioctl on musl) compile
+# only for their target. The gate runs clippy for each installed target
+# and SKIPs (with a rustup hint) the rest. A non-zero exit fails the gate.
 CROSS_TARGETS="aarch64-unknown-linux-gnu x86_64-unknown-linux-musl"
 
 run_cross_clippy() {
@@ -37,9 +40,9 @@ run_cross_clippy() {
   CROSS_SKIP=""
   for t in $CROSS_TARGETS; do
     if printf '%s\n' "$installed" | grep -qx "$t"; then
-      step 2b "cargo clippy --all-targets --target $t -- -D warnings"
-      cargo clippy --all-targets --target "$t" -- -D warnings \
-        || fail "cross-clippy-$t" "cargo clippy --target $t exited $?"
+      step 2b "cargo clippy --locked --all-targets --target $t -- -D warnings"
+      cargo clippy --locked --all-targets --target "$t" -- -D warnings \
+        || fail "cross-clippy-$t" "cargo clippy --locked --target $t exited $?"
       ok "cross-clippy-$t"
     else
       printf 'release-gate: SKIP cross-clippy-%s: rustup target add %s\n' "$t" "$t"
@@ -85,8 +88,8 @@ step 1 "cargo fmt --check"
 cargo fmt --check || fail "fmt" "cargo fmt --check exited $?"
 ok "fmt"
 
-step 2 "cargo clippy --all-targets -- -D warnings"
-cargo clippy --all-targets -- -D warnings || fail "clippy" "cargo clippy exited $?"
+step 2 "cargo clippy --locked --all-targets -- -D warnings"
+cargo clippy --locked --all-targets -- -D warnings || fail "clippy" "cargo clippy exited $?"
 ok "clippy"
 
 run_cross_clippy

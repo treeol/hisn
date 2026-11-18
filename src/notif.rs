@@ -173,7 +173,7 @@ fn probe_child() -> i32 {
     // proves the operation exists.
     let bogus: u64 = 0xdead_beef;
     // SAFETY: ioctl on our listener with a valid pointer to a u64.
-    let r = unsafe { libc::ioctl(fd, OP_ID_VALID, &bogus as *const u64) };
+    let r = unsafe { libc::ioctl(fd, OP_ID_VALID as libc::Ioctl, &bogus as *const u64) };
     if !(r == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)) {
         return PROBE_NO_ID_VALID;
     }
@@ -188,7 +188,7 @@ fn probe_child() -> i32 {
         newfd_flags: 0,
     };
     // SAFETY: ioctl on our listener with a valid pointer to the struct.
-    let r = unsafe { libc::ioctl(fd, OP_ADDFD, &probe as *const NotifAddFd) };
+    let r = unsafe { libc::ioctl(fd, OP_ADDFD as libc::Ioctl, &probe as *const NotifAddFd) };
     if !(r == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)) {
         return PROBE_NO_ADDFD;
     }
@@ -312,21 +312,21 @@ pub struct NotifAddFd {
 // kernel still accepts. Kernels 5.0-5.16 answer the corrected number with
 // EINVAL, so hisn uses the original one: it is the only encoding every
 // kernel since 5.0 accepts (the floor for open mode is 5.9).
-pub const OP_RECV: libc::c_ulong = 0xC050_2100;
-pub const OP_SEND: libc::c_ulong = 0xC018_2101;
-pub const OP_ID_VALID: libc::c_ulong = 0x8008_2102;
-pub const OP_ADDFD: libc::c_ulong = 0x4018_2103;
+pub const OP_RECV: u32 = 0xC050_2100;
+pub const OP_SEND: u32 = 0xC018_2101;
+pub const OP_ID_VALID: u32 = 0x8008_2102;
+pub const OP_ADDFD: u32 = 0x4018_2103;
 const _: () = assert!(
-    ((OP_RECV >> 16) & 0x1fff) == std::mem::size_of::<RawNotif>() as u64,
+    ((OP_RECV >> 16) & 0x1fff) == std::mem::size_of::<RawNotif>() as u32,
     "OP_RECV size"
 );
 const _: () = assert!(
-    ((OP_SEND >> 16) & 0x1fff) == std::mem::size_of::<NotifResp>() as u64,
+    ((OP_SEND >> 16) & 0x1fff) == std::mem::size_of::<NotifResp>() as u32,
     "OP_SEND size"
 );
 const _: () = assert!(((OP_ID_VALID >> 16) & 0x1fff) == 8, "OP_ID_VALID size");
 const _: () = assert!(
-    ((OP_ADDFD >> 16) & 0x1fff) == std::mem::size_of::<NotifAddFd>() as u64,
+    ((OP_ADDFD >> 16) & 0x1fff) == std::mem::size_of::<NotifAddFd>() as u32,
     "OP_ADDFD size"
 );
 const _: () = assert!(
@@ -373,8 +373,11 @@ pub fn decide(family: u16, is_loopback: bool, is_stream: bool, is_public: bool) 
     Verdict::Allow
 }
 
-fn seccomp_ioctl(fd: i32, op: libc::c_ulong, ptr: *mut libc::c_void) -> io::Result<()> {
-    let r = unsafe { libc::ioctl(fd, op, ptr) };
+fn seccomp_ioctl(fd: i32, op: u32, ptr: *mut libc::c_void) -> io::Result<()> {
+    // libc::Ioctl is c_ulong (glibc, 64-bit) or c_int (musl, 32-bit).
+    // Casting the u32 bit pattern through libc::Ioctl preserves it on both.
+    let request = op as libc::Ioctl;
+    let r = unsafe { libc::ioctl(fd, request, ptr) };
     if r < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -2681,6 +2684,27 @@ mod tests {
         // _IOR('!', 2, __u64): direction 2 (read) in bits 30..31.
         assert_eq!(OP_ID_VALID, 0x8008_2102);
         assert_eq!(OP_ID_VALID >> 30, 2);
+    }
+
+    #[test]
+    fn op_constants_match_the_header_bit_patterns() {
+        // The constants are u32 bit patterns; each must equal the
+        // SECCOMP_IOCTL_NOTIF_* value from linux/seccomp.h.
+        //   RECV = _IOWR('!', 0, 80) = 0xC050_2100
+        //   SEND = _IOWR('!', 1, 24) = 0xC018_2101
+        //   ID_VALID = _IOR  ('!', 2, 8) = 0x8008_2102
+        //   ADDFD = _IOW ('!', 3, 24) = 0x4018_2103
+        assert_eq!(OP_RECV, 0xC050_2100);
+        assert_eq!(OP_SEND, 0xC018_2101);
+        assert_eq!(OP_ID_VALID, 0x8008_2102);
+        assert_eq!(OP_ADDFD, 0x4018_2103);
+        // The bit pattern must survive the cast to libc::Ioctl
+        // (c_ulong on glibc, c_int on musl): casting back to u32
+        // must give the same value.
+        assert_eq!(OP_RECV as libc::Ioctl as u32, OP_RECV);
+        assert_eq!(OP_SEND as libc::Ioctl as u32, OP_SEND);
+        assert_eq!(OP_ID_VALID as libc::Ioctl as u32, OP_ID_VALID);
+        assert_eq!(OP_ADDFD as libc::Ioctl as u32, OP_ADDFD);
     }
 
     #[test]

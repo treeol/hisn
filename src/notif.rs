@@ -240,6 +240,10 @@ pub struct Notif {
     pub parsed_ip: Option<IpAddr>,
     pub parsed_family: u16,
     pub parsed_port: u16,
+    /// 0.6.1: the seat of the exec that caused this notification
+    /// (filled at dispatch by the exec-tree engine); `None` for the
+    /// main command and in-sandbox services.
+    pub seat: Option<String>,
 }
 impl Default for Notif {
     fn default() -> Self {
@@ -256,6 +260,7 @@ impl Default for Notif {
             parsed_ip: None,
             parsed_family: 0,
             parsed_port: 0,
+            seat: None,
         }
     }
 }
@@ -269,6 +274,7 @@ impl From<RawNotif> for Notif {
             parsed_ip: None,
             parsed_family: 0,
             parsed_port: 0,
+            seat: None,
         }
     }
 }
@@ -511,19 +517,41 @@ pub fn read_sockaddr(pid: u32, addr: u64, len: usize) -> io::Result<[u8; 128]> {
     Ok(buf)
 }
 
+/// 0.6.1: seat attribution for an engine's records. The exec-tree
+/// engine is given a lookup `(pid) -> Option<seat>` (the supervisor's
+/// exec pid→seat map); the main-command engine is `None`, so its
+/// records keep `seat: null`. DNS records are never attributed: a DNS
+/// query cannot be tied to one exec tree without guessing (the
+/// responder serves the whole session), so they stay null — documented
+/// here and in ADR 0022.
+pub type SeatLookup = std::sync::Arc<dyn Fn(i32) -> Option<String> + Send + Sync>;
+
 impl NotifEngine {
     /// Start the engine on `listener` with the production configuration.
     /// `journal` is an engine handle of the workspace journal
     /// ([`crate::journal::Journal::clone_for_engine`]): its network records
     /// go through a bounded queue, so a verdict never waits on a journal
-    /// write. Seat attribution is not recorded in 0.6.0. The engine shares
-    /// the queue's tracked-overflow counter with the journal writer.
+    /// write. The engine shares the queue's tracked-overflow counter with
+    /// the journal writer. `seats`, when given, stamps each record with
+    /// the seat of the exec that caused it (0.6.1); the same lookup is
+    /// used for `network/connect` and `network/connect-result`.
     pub fn start(
         listener: OwnedFd,
         journal: Option<std::sync::Arc<crate::journal::Journal>>,
         deadline_s: u64,
     ) -> Self {
-        Self::start_with(listener, journal, EngineConfig::new(deadline_s))
+        Self::start_seated(listener, journal, deadline_s, None)
+    }
+
+    /// As [`NotifEngine::start`], with seat attribution for the records
+    /// caused by an exec'd program.
+    pub fn start_seated(
+        listener: OwnedFd,
+        journal: Option<std::sync::Arc<crate::journal::Journal>>,
+        deadline_s: u64,
+        seats: Option<SeatLookup>,
+    ) -> Self {
+        Self::start_with_seats(listener, journal, EngineConfig::new(deadline_s), seats)
     }
 
     /// Number of non-blocking connects whose completion is tracked now.
@@ -537,6 +565,16 @@ impl NotifEngine {
         journal: Option<std::sync::Arc<crate::journal::Journal>>,
         cfg: EngineConfig,
     ) -> Self {
+        Self::start_with_seats(listener, journal, cfg, None)
+    }
+
+    /// As [`NotifEngine::start_with`], with seat attribution.
+    pub fn start_with_seats(
+        listener: OwnedFd,
+        journal: Option<std::sync::Arc<crate::journal::Journal>>,
+        cfg: EngineConfig,
+        seats: Option<SeatLookup>,
+    ) -> Self {
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sd = shutdown.clone();
         let (done_tx, done) = std::sync::mpsc::channel::<()>();
@@ -548,7 +586,7 @@ impl NotifEngine {
         let tracker = std::sync::Arc::new(tracker);
         let engine_tracker = tracker.clone();
         std::thread::spawn(move || {
-            engine_loop(listener, journal, cfg, &sd, &engine_tracker);
+            engine_loop(listener, journal, cfg, &sd, &engine_tracker, seats);
             let _ = done_tx.send(());
         });
         Self {
@@ -740,6 +778,9 @@ struct TrackedConn {
     /// Closing it does not close the program's descriptor.
     fd: OwnedFd,
     target: String,
+    /// 0.6.1: the seat of the exec that caused the connect, for the
+    /// `network/connect-result` record.
+    seat: Option<String>,
     started: std::time::Instant,
     /// Poll reported an event while the handshake was still in flight.
     /// The entry is then left out of the poll set, so it cannot make the
@@ -784,8 +825,9 @@ impl Tracked {
     }
 
     /// Track `fd`. False (and `fd` closed, overflow counted) when the
-    /// tracker is full.
-    fn slot(&self, fd: OwnedFd, target: String) -> bool {
+    /// tracker is full. `seat` is the seat of the exec that caused
+    /// the connect (0.6.1).
+    fn slot_seated(&self, fd: OwnedFd, target: String, seat: Option<String>) -> bool {
         let mut pend = self.pend.lock().unwrap_or_else(|e| e.into_inner());
         if pend.len() >= self.cap {
             self.overflow
@@ -795,6 +837,7 @@ impl Tracked {
         pend.push(TrackedConn {
             fd,
             target,
+            seat,
             started: std::time::Instant::now(),
             muted: false,
         });
@@ -857,7 +900,7 @@ impl Tracked {
         journal: Option<&crate::journal::Journal>,
     ) -> usize {
         let ready: std::collections::HashSet<i32> = ready.iter().copied().collect();
-        let mut settled: Vec<(String, &'static str, u128)> = Vec::new();
+        let mut settled: Vec<(String, &'static str, u128, Option<String>)> = Vec::new();
         {
             let mut pend = self.pend.lock().unwrap_or_else(|e| e.into_inner());
             pend.retain_mut(|c| {
@@ -880,13 +923,14 @@ impl Tracked {
                     std::mem::take(&mut c.target),
                     result,
                     c.started.elapsed().as_millis(),
+                    c.seat.take(),
                 ));
                 false // dropped: the OwnedFd closes the descriptor
             });
         }
         if let Some(j) = journal {
-            for (target, result, latency_ms) in &settled {
-                j.net_connect_result(target, result, *latency_ms);
+            for (target, result, latency_ms, seat) in &settled {
+                j.net_connect_result_seated(target, result, *latency_ms, seat.as_deref());
             }
         }
         settled.len()
@@ -910,6 +954,7 @@ fn engine_loop(
     cfg: EngineConfig,
     shutdown: &std::sync::atomic::AtomicBool,
     tracker: &std::sync::Arc<Tracked>,
+    seats: Option<SeatLookup>,
 ) {
     // Keep the listener alive until every worker has joined: workers hold
     // only the raw fd number, so dropping it first would be use-after-close.
@@ -936,6 +981,7 @@ fn engine_loop(
         let j = journal.clone();
         let tracker = tracker.clone();
         let wait_tx = wait_tx.clone();
+        let seats = seats.clone();
         workers.push(std::thread::spawn(move || {
             loop {
                 let msg = {
@@ -944,6 +990,9 @@ fn engine_loop(
                 };
                 match msg {
                     Ok((mut n, recv_at)) => {
+                        // 0.6.1: stamp the notification with the seat of
+                        // the exec that caused it, once, at dispatch.
+                        n.seat = seats.as_ref().and_then(|f| f(n.pid as i32));
                         handle_notif(lfd, &mut n, recv_at, &cfg, &j, &tracker, &wait_tx)
                     }
                     Err(_) => return,
@@ -1362,7 +1411,7 @@ fn handle_notif(
                 if let Some(j) = journal {
                     j.net_record("refuse", "connect-failed", n);
                     if client_nonblock {
-                        j.net_connect_result(&target_of(n), "failed", 0);
+                        j.net_connect_result_seated(&target_of(n), "failed", 0, n.seat.as_deref());
                     }
                 }
                 return;
@@ -1605,7 +1654,7 @@ fn inject_inprogress(
     if let Some(j) = journal {
         j.net_record("allow", "injected-inprogress", n);
     }
-    tracker.slot(newfd, target_of(n));
+    tracker.slot_seated(newfd, target_of(n), n.seat.clone());
 }
 
 /// When `deadline` has passed: answer the notification ETIMEDOUT, journal
@@ -2319,7 +2368,7 @@ mod tests {
         let tracker = Tracked::default();
         let dup = program.try_clone().unwrap();
         let dup_fd = dup.as_raw_fd();
-        assert!(tracker.slot(dup, "t:1".into()));
+        assert!(tracker.slot_seated(dup, "t:1".into(), None));
         let settled = tracker.sweep(&[dup_fd], std::time::Duration::from_secs(30), Some(&*j));
         assert_eq!(settled, 1);
         assert!(tracker.is_empty());
@@ -2340,7 +2389,7 @@ mod tests {
         let tracker = Tracked::default();
         let dup = program.try_clone().unwrap();
         let dup_fd = dup.as_raw_fd();
-        assert!(tracker.slot(dup, "t:2".into()));
+        assert!(tracker.slot_seated(dup, "t:2".into(), None));
         tracker.sweep(&[dup_fd], std::time::Duration::from_secs(30), Some(&*j));
         assert!(tracker.is_empty());
         assert_eq!(
@@ -2424,7 +2473,7 @@ mod tests {
         };
         assert_eq!(unsafe { libc::poll(&mut pfd, 1, 0) }, 0);
         let (a, _b) = crate::sys::socketpair_seqpacket().unwrap();
-        assert!(tracker.slot(a, "t".into()));
+        assert!(tracker.slot_seated(a, "t".into(), None));
         assert_eq!(unsafe { libc::poll(&mut pfd, 1, 0) }, 1);
         tracker.drain_wake();
         assert_eq!(unsafe { libc::poll(&mut pfd, 1, 0) }, 0);
@@ -2444,7 +2493,7 @@ mod tests {
         let tracker = Tracked::default();
         let dup = program.try_clone().unwrap();
         let dup_fd = dup.as_raw_fd();
-        assert!(tracker.slot(dup, "t:3".into()));
+        assert!(tracker.slot_seated(dup, "t:3".into(), None));
         let deadline = std::time::Duration::from_millis(300);
         // Before the deadline, without an event: stays tracked.
         assert_eq!(tracker.sweep(&[], deadline, Some(&*j)), 0);
@@ -2473,10 +2522,10 @@ mod tests {
             let (a, _b) = crate::sys::socketpair_seqpacket().unwrap();
             a
         };
-        assert!(tracker.slot(sock(), "a".into()));
-        assert!(tracker.slot(sock(), "b".into()));
-        assert!(!tracker.slot(sock(), "c".into()));
-        assert!(!tracker.slot(sock(), "d".into()));
+        assert!(tracker.slot_seated(sock(), "a".into(), None));
+        assert!(tracker.slot_seated(sock(), "b".into(), None));
+        assert!(!tracker.slot_seated(sock(), "c".into(), None));
+        assert!(!tracker.slot_seated(sock(), "d".into(), None));
         assert_eq!(tracker.len(), 2);
         assert_eq!(overflow.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
@@ -2488,7 +2537,7 @@ mod tests {
         let (pid, listener) = connecting_child(0, 1);
         let engine = NotifEngine::start_with(listener, None, EngineConfig::new(30));
         let (tracked, peer) = crate::sys::socketpair_seqpacket().unwrap();
-        assert!(engine.tracker.slot(tracked, "t:4".into()));
+        assert!(engine.tracker.slot_seated(tracked, "t:4".into(), None));
         let t = std::time::Instant::now();
         drop(engine);
         assert!(

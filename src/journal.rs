@@ -519,7 +519,8 @@ impl Journal {
     /// `verdict` is allow/refuse/continue; `reason` is a short
     /// machine-readable cause; `target` is the `ip:port` (or family) the
     /// supervisor parsed from its own copy of the sockaddr. `seat` is
-    /// always null in 0.6.0.
+    /// the seat of the exec that caused the connect (0.6.1), or null
+    /// for the main command and in-sandbox services.
     ///
     /// On an engine handle ([`Journal::clone_for_engine`]) this only
     /// queues the record (see [`NetQueue`]); the caller never waits on a
@@ -533,7 +534,7 @@ impl Journal {
             "pid": n.pid,
             "verdict": verdict,
             "reason": reason,
-            "seat": Value::Null,
+            "seat": n.seat.as_deref().map(Value::from).unwrap_or(Value::Null),
         });
         self.net_enqueue("network/connect", data);
     }
@@ -546,10 +547,23 @@ impl Journal {
     /// which belongs to the program. Best-effort like every network
     /// record: `net_enqueue` only queues, never blocks.
     pub fn net_connect_result(&self, target: &str, result: &str, latency_ms: u128) {
+        self.net_connect_result_seated(target, result, latency_ms, None)
+    }
+
+    /// As [`Journal::net_connect_result`], with the seat of the exec
+    /// that caused the connect (0.6.1).
+    pub fn net_connect_result_seated(
+        &self,
+        target: &str,
+        result: &str,
+        latency_ms: u128,
+        seat: Option<&str>,
+    ) {
         let data = json!({
             "target": target,
             "result": result,
             "latency_ms": latency_ms,
+            "seat": seat.map(Value::from).unwrap_or(Value::Null),
         });
         self.net_enqueue("network/connect-result", data);
     }
@@ -1802,6 +1816,30 @@ mod tests {
     }
 
     #[test]
+    fn net_record_carries_the_notif_seat() {
+        // 0.6.1: `network/connect` and `network/connect-result` carry
+        // the seat of the exec that caused them (from the notification),
+        // or null when there is none.
+        let (_d, j) = test_journal();
+        let ej = j.clone_for_engine();
+        let mut n = test_notif(443);
+        n.seat = Some("member1".to_owned());
+        ej.net_record("allow", "injected", &n);
+        ej.net_connect_result_seated("192.0.2.1:443", "connected", 0, Some("member1"));
+        let mut plain = test_notif(443);
+        plain.seat = None;
+        ej.net_record("allow", "injected", &plain);
+        assert!(ej.net_flush(std::time::Duration::from_secs(10)));
+        let connects = records_of(&j, "network/connect");
+        assert_eq!(connects.len(), 2);
+        assert_eq!(connects[0].data["seat"], "member1");
+        assert!(connects[1].data["seat"].is_null());
+        let results = records_of(&j, "network/connect-result");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].data["seat"], "member1");
+    }
+
+    #[test]
     fn net_record_does_not_wait_for_a_blocked_journal() {
         // The journal lock is held elsewhere, so every append blocks for
         // its 1 s lock budget. An engine handle must return at once.
@@ -2036,7 +2074,7 @@ mod tests {
             records
                 .iter()
                 .filter(|r| r.kind == "note")
-                .last()
+                .next_back()
                 .unwrap()
                 .data["i"],
             9

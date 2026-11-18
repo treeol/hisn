@@ -318,6 +318,12 @@ pub struct Shared {
     /// 0.5.1 (ADR 0021): the workspace seat set, reloaded from `seats.json`
     /// before each authorization decision when the store's stamp changed.
     seat_cache: Mutex<crate::seats::SeatCache>,
+    /// 0.6.1: exec pid → seat, for the exec-tree connect engine. Filled in
+    /// `do_exec` (and for in-sandbox services, with `None`); read by the
+    /// engine when a notification arrives. Lookups are exact and bounded
+    /// (one entry per live exec plus one per service); a miss means the
+    /// program is not a known exec of this session, so seat stays null.
+    exec_seats: Mutex<std::collections::BTreeMap<i32, Option<String>>>,
 }
 
 /// 0.4.1 R2: the live control connections. The client count and the per-
@@ -1338,6 +1344,11 @@ impl Shared {
                 table.set_status(exec_id, by_id, by_pid);
             }
         });
+        // 0.6.1: record the exec's seat for its network records.
+        self.exec_seats
+            .lock()
+            .expect("exec_seats")
+            .insert(sp.pid, client.seat.clone());
         let mut w = conn;
         let started = writeln!(
             w,
@@ -1365,6 +1376,10 @@ impl Shared {
         };
         let duration_ms = drive_started.elapsed().as_millis();
         self.exec_table.lock().expect("exec_table").remove(exec_id);
+        // 0.6.1: the pid→seat entry lives with the exec; children of
+        // the program share the pid namespace but are not the exec
+        // itself, so the entry is removed with the exec.
+        self.exec_seats.lock().expect("exec_seats").remove(&sp.pid);
         let (res, line) = match outcome {
             exec::Outcome::Exited(exec::Exit::Code(c)) => ("ok", json!({ "exit": { "code": c } })),
             exec::Outcome::Exited(exec::Exit::Signal(n)) => (
@@ -3215,8 +3230,31 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     // joined by their Drop, the responder by `dns_shutdown` below.
     let _net_engine = net_listener
         .map(|l| crate::notif::NotifEngine::start(l, net_journal.clone(), CONNECT_DEADLINE_S));
-    let _exec_engine = exec_net_listener
-        .map(|l| crate::notif::NotifEngine::start(l, net_journal.clone(), CONNECT_DEADLINE_S));
+    // 0.6.1: the exec-tree engine stamps its records with the seat of
+    // the exec that caused them (the map `do_exec` fills); the main
+    // command's engine has no seats, so its records stay null.
+    // The live map is `shared.exec_seats`; the lookup closure captures
+    // a clone of the `Shared` Arc (one extra, bounded, per session).
+    let exec_seats_lookup: crate::notif::SeatLookup = {
+        let shared_ref = std::sync::Arc::clone(&shared);
+        std::sync::Arc::new(move |pid: i32| {
+            shared_ref
+                .exec_seats
+                .lock()
+                .expect("exec_seats")
+                .get(&pid)
+                .cloned()
+                .flatten()
+        })
+    };
+    let _exec_engine = exec_net_listener.map(|l| {
+        crate::notif::NotifEngine::start_seated(
+            l,
+            net_journal.clone(),
+            CONNECT_DEADLINE_S,
+            Some(exec_seats_lookup.clone()),
+        )
+    });
     let dns_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let dns_handle = dns_fds.map(|(udp, tcp)| {
         let sd = dns_shutdown.clone();
@@ -3724,6 +3762,7 @@ fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
             &crate::lifecycle::SystemClock,
         )),
         seat_cache: Mutex::new(crate::seats::SeatCache::new()),
+        exec_seats: Mutex::new(std::collections::BTreeMap::new()),
     });
     // The only way to start `network = "host"` without abstract-socket
     // scoping is the explicit flag; it is audited (DESIGN §7, B1).

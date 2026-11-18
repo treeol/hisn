@@ -288,6 +288,40 @@ check "L103 exec'd program connects out through interception (timeout socket: O_
 journal_is "L102 journal record: session, target ip:port, verdict, reason" "$AWS" 1 \
   kind=network/connect session="$A" target=192.0.2.1:18102 verdict=allow reason=injected-inprogress seat=null
 
+# 0.6.1 seat attribution: network records caused by an exec'd program
+# name the seat of that exec's client (the same value the exec records
+# use); the main command's records stay null. A member seat is created
+# for this workspace, its exec connects out, and the record names it.
+# `hisn journal --seat <name>` selects it.
+SEAT_TOK=$("$HISN" seat --workspace "$AWS" add member1 --role member 2>/dev/null)
+if [ -n "$SEAT_TOK" ]; then
+  OUT=$(HISN_SEAT_TOKEN="$SEAT_TOK" timeout 60 "$HISN" exec --no-tty --session "$A" -- python3 net_helper.py in-connect 18104 </dev/null 2>&1)
+  RC=$?
+  if [ "$RC" -eq 0 ] && printf '%s\n' "$OUT" | grep -q '^CONNECT-OK' && ! printf '%s\n' "$OUT" | grep -q '^FAIL:'; then
+    pass "0.6.1 seat exec connects out through interception (member seat exec)"
+  else
+    fail "0.6.1 seat exec connects out through interception (member seat exec)" "exit $RC: [$OUT]"
+  fi
+  journal_is "0.6.1 journal: exec'd program's network/connect names its seat" "$AWS" 1 \
+    kind=network/connect target=192.0.2.1:18104 verdict=allow reason=injected-inprogress seat=member1
+  if timeout 20 "$HISN" journal --workspace "$AWS" --seat member1 --json </dev/null 2>/dev/null | grep -q '"seat":"member1"'; then
+    pass "0.6.1 journal --seat selects the seat's network record"
+  else
+    fail "0.6.1 journal --seat selects the seat's network record" "no member1 record selected"
+  fi
+  # The main command's connect has seat null (already checked above for
+  # L102's exec; the main command is the init tree).
+  journal_is "0.6.1 journal: main command's network/connect has seat null" "$AWS" 1 \
+    kind=network/connect target=192.0.2.1:18090 verdict=allow seat=null
+  if "$HISN" seat --workspace "$AWS" revoke member1 >/dev/null 2>&1; then
+    pass "0.6.1 seat revoke"
+  else
+    fail "0.6.1 seat revoke" "revoke failed"
+  fi
+else
+  skip "0.6.1 seat attribution" "seat add did not print a credential"
+fi
+
 # The same from a thread other than the program's main thread: the
 # notification then carries a thread id, not a process id.
 check "L103 connect from a second thread is intercepted and allowed" "THREAD-OK" in_session "$A" in-thread 18103

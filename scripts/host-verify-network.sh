@@ -75,7 +75,14 @@ skip()  { SKIP=$((SKIP + 1)); say "SKIP  $1 -- $2"; }
 
 cleanup() {
   local pid
-  if [ -n "$REAL_ID" ]; then
+  for sid in ${REAL_ID:-} ${TIMING_IDS:-}; do
+    [ -n "$sid" ] || continue
+    XDG_RUNTIME_DIR="$TMP/timing/run" XDG_STATE_HOME="$TMP/timing/state" \
+      timeout 20 "$HISN" stop --session "$sid" </dev/null >/dev/null 2>&1
+    XDG_RUNTIME_DIR="$TMP/real/run" XDG_STATE_HOME="$TMP/real/state" \
+      timeout 20 "$HISN" stop --session "$sid" </dev/null >/dev/null 2>&1
+  done
+  if [ -n "${REAL_ID:-}" ]; then
     XDG_RUNTIME_DIR="$TMP/real/run" XDG_STATE_HOME="$TMP/real/state" \
       timeout 20 "$HISN" stop --session "$REAL_ID" </dev/null >/dev/null 2>&1
   fi
@@ -231,6 +238,98 @@ else
   else
     pass "net cases complete: $NP passed, $NF failed, summary line agrees"
   fi
+fi
+
+# 0.6.1 timing probe (INFO only, never a gate, never counted): median of
+# 5 `run --detach` until `ls --json` reports state=running, and the mean
+# of 20 `exec --no-tty -- true`, for network=none, network=open, and a
+# rootfs session when the rootfs is present. Own work directory; every
+# session is stopped on every exit path (TIMING_IDS, stopped by cleanup).
+# Runs before the real-network step so it happens with and without --real.
+timing_probe() {
+  local mode=$1 extra=$2
+  T="$TMP/timing"
+  mkdir -p "$T/run" "$T/state" "$T/cwd"
+  chmod 700 "$T/run"
+  cp "$HELPER" "$T/cwd/net_helper.py"
+  printf 'version = "hisn-policy/v1"\n[session]\ncwd = "%s"\nnetwork = "%s"\n%s\n' \
+    "$T/cwd" "$mode" "$extra" >"$T/policy.toml"
+  th() { XDG_RUNTIME_DIR="$T/run" XDG_STATE_HOME="$T/state" timeout 30 "$HISN" "$@" </dev/null; }
+  local starts=() execs=() sid st ms
+  for _ in 1 2 3 4 5; do
+    sid="$TOKEN-timing-$mode"
+    rm -rf "$T/state"
+    mkdir -p "$T/run" "$T/state"; chmod 700 "$T/run"
+    t0=$(date +%s%N)
+    if th run --detach --policy "$T/policy.toml" --session-id "$sid" >/dev/null 2>&1; then
+      TIMING_IDS="$sid"
+      for _ in $(seq 300); do
+        st=$(XDG_RUNTIME_DIR="$T/run" XDG_STATE_HOME="$T/state" timeout 10 "$HISN" ls --json 2>/dev/null |
+          python3 "$HELPER" ls-get "$sid" state || true)
+        [ "$st" = running ] && break
+        sleep 0.1
+      done
+      t1=$(date +%s%N)
+      if [ "$st" = running ]; then
+        starts+=("$(( (t1 - t0) / 1000000 ))")
+      else
+        note "timing $mode: session did not reach running"
+        starts+=(-1)
+      fi
+      th stop --session "$sid" >/dev/null 2>&1 || true
+      TIMING_IDS=""
+    else
+      starts+=(-1)
+    fi
+    rm -rf "$T/state"
+  done
+  # Median of the successful runs.
+  local sorted median
+  sorted=$(printf '%s\n' "${starts[@]}" | grep -v '^-1$' | sort -n |
+    awk '{a[NR]=$1} END {if (NR>0) print (NR%2 ? a[int(NR/2)+1] : (a[NR/2]+a[NR/2+1])/2); else print "n/a"}')
+  median=$sorted
+  # Mean of 20 exec true on a fresh session.
+  sid="$TOKEN-timing-$mode"
+  rm -rf "$T/state"
+  mkdir -p "$T/run" "$T/state"; chmod 700 "$T/run"
+  if th run --detach --policy "$T/policy.toml" --session-id "$sid" >/dev/null 2>&1; then
+    TIMING_IDS="$sid"
+    for _ in $(seq 300); do
+      st=$(XDG_RUNTIME_DIR="$T/run" XDG_STATE_HOME="$T/state" timeout 10 "$HISN" ls --json 2>/dev/null |
+        python3 "$HELPER" ls-get "$sid" state || true)
+      [ "$st" = running ] && break
+      sleep 0.1
+    done
+    if [ "$st" = running ]; then
+      for _ in $(seq 20); do
+        t0=$(date +%s%N)
+        th exec --no-tty --session "$sid" -- true >/dev/null 2>&1
+        t1=$(date +%s%N)
+        execs+=("$(( (t1 - t0) / 1000000 ))")
+      done
+      local sum=0 n=0 v
+      for v in "${execs[@]}"; do sum=$((sum + v)); n=$((n + 1)); done
+      if [ "$n" -gt 0 ]; then
+        say "INFO timing $mode: run --detach until ready median ${median} ms (5 runs: ${starts[*]}), exec --no-tty true mean $((sum / n)) ms (20 runs)"
+      else
+        say "INFO timing $mode: run --detach until ready median ${median} ms, exec: no samples"
+      fi
+    else
+      say "INFO timing $mode: session did not reach running (exec timing skipped)"
+    fi
+    th stop --session "$sid" >/dev/null 2>&1 || true
+    TIMING_IDS=""
+  else
+    say "INFO timing $mode: session did not start"
+  fi
+  rm -rf "$T/state"
+}
+
+note "timing probe (INFO only, never a gate)"
+timing_probe none ""
+timing_probe open ""
+if [ -n "${ROOTFS:-}" ] && [ -d "${ROOTFS:-/nonexistent}/usr" ]; then
+  timing_probe open "rootfs = \"$ROOTFS\""
 fi
 
 note "step 4: real network"

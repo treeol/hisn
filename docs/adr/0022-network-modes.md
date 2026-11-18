@@ -424,15 +424,19 @@ Connect (allowlist/open), per notification, in this exact order:
    connect with `EACCES` (decision 4). Other families (vsock, …) → `EACCES`.
 5. **Private-address block (Mashūra BLOCKING 4 — applies to `open`
    too).** At connect time, in **both** modes, the supervisor refuses
-   unspecified, multicast, link-local (`169.254.0.0/16`, `fe80::/10`,
-   incl. the metadata address `169.254.169.254`), CGNAT
+   unspecified, multicast, loopback, link-local (`169.254.0.0/16`,
+   `fe80::/10`, incl. the metadata address `169.254.169.254`), CGNAT
    (`100.64.0.0/10`), RFC1918, ULA (`fc00::/7`), `198.18.0.0/15`
-   (benchmarking), site-local `fec0::/10`, and the forms that embed an
-   IPv4 address, classified by that address: IPv4-mapped, IPv4-compatible
-   `::/96`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16` and Teredo `2001::/32`
-   (the client address is stored inverted). The local-use NAT64 prefix
-   `64:ff9b:1::/48` is refused as a whole — **unless** an explicit
-   IP/CIDR rule matches that exact target (0.7.0; 0.6.0 has no rules). Loopback is *not* in this list: loopback always
+   (benchmarking), `0.0.0.0/8`, `240.0.0.0/4` (reserved, incl.
+   `255.255.255.255`), site-local `fec0::/10`, and the forms that
+   embed an IPv4 address, classified by that address: IPv4-mapped,
+   IPv4-compatible `::/96`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`
+   and Teredo `2001::/32` (the client address is stored inverted, and
+   both the server and the client address must be public). The
+   local-use NAT64 prefix `64:ff9b:1::/48` is refused as a whole —
+   **unless** an explicit IP/CIDR rule matches that exact target
+   (0.7.0; 0.6.0 has no rules). Loopback is *not* in this list as a
+   refusal: loopback always
    stays inside the sandbox netns (step 3, never forwarded; host
    services only via `[[host_services]]`/`[[forward]]`). A DNS pin
    alone never authorises a non-public address. This is what stops
@@ -524,12 +528,14 @@ stated here instead of claimed.
 
 ## Control protocol and journal changes
 
-- Protocol revision bumps 3 → 4 (`src/sessionmeta.rs:43`): adds op
-  `net-policy-set {mode, allow[]}` (role `owner`, `src/authz.rs:115`)
-  and op `net-explain {target}` (role `member`, read-only).
-  `client.protocol_version` gating already exists; absent = rev 1,
-  higher declared → `E_VERSION`; older clients are unaffected (they
-  never send the new ops, and the supervisor never requires them).
+- Protocol revision: 0.6.0 shipped at revision 3 (`src/sessionmeta.rs:43`,
+  `PROTOCOL_REVISION = 3`); no new op was added, so there was no bump.
+  The 3 → 4 bump, op `net-policy-set {mode, allow[]}` (role `owner`,
+  `src/authz.rs:115`) and op `net-explain {target}` (role `member`,
+  read-only) are 0.7.0 (allowlist), not 0.6.0. `client.protocol_version`
+  gating already exists; absent = rev 1, higher declared → `E_VERSION`;
+  older clients are unaffected (they never send the new ops, and the
+  supervisor never requires them).
 - `session.json` records `network_mode` beside the existing `network`
   field (the profile value, kept for `ls --json` compatibility —
   same compat rule as the 0.5.x plan: `ls --json` keeps emitting the

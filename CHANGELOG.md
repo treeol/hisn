@@ -78,6 +78,10 @@ Also verified on 192.168.1.213: `pass=100 fail=0 timeout=0 skipped=2`.
   pattern preserved on both glibc `c_ulong` and musl `c_int`). The
   release gate also now runs clippy for each non-native CI target.
   Identical behaviour on x86_64.
+- Test-only: the workspace-dir tests no longer read the process
+  environment (explicit `state_home_with` / `workspace_dir_with` /
+  `is_tmp_state_home_with` forms), so they cannot race with the
+  `/tmp`-fallback tests and fail on CI. No runtime behaviour change.
 
 ## [0.5.1] - 2026-11-15
 

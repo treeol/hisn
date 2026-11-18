@@ -41,15 +41,20 @@ pub struct WorkspaceRef {
 /// [`is_tmp_state_home`] / [`warn_if_tmp_state_home`] report that case
 /// (item 6): the journal lives under a tmp dir and does not survive a
 /// reboot.
-pub fn state_home() -> PathBuf {
-    if let Ok(x) = std::env::var("XDG_STATE_HOME")
+/// Pure resolution of the state home from explicit inputs — the
+/// production [`state_home`] reads the environment once and delegates
+/// here; tests pass explicit values so they never mutate the process
+/// environment (env-mutating tests race with env-reading ones when
+/// `cargo test` runs in parallel).
+pub fn state_home_with(xdg: Option<&str>, home: Option<&str>) -> PathBuf {
+    if let Some(x) = xdg
         && !x.is_empty()
-        && Path::new(&x).is_absolute()
+        && Path::new(x).is_absolute()
     {
         return PathBuf::from(x).join("hisn");
     }
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => PathBuf::from(h).join(".local").join("state").join("hisn"),
+    match home {
+        Some(h) if !h.is_empty() => PathBuf::from(h).join(".local").join("state").join("hisn"),
         _ => {
             let uid = rustix::process::getuid().as_raw();
             PathBuf::from(format!("/tmp/hisn-state-unset-{uid}"))
@@ -57,17 +62,29 @@ pub fn state_home() -> PathBuf {
     }
 }
 
-/// Whether `state_home()` falls back to the per-uid directory under
-/// `/tmp` — i.e. `XDG_STATE_HOME` is missing, empty or relative **and**
-/// `HOME` is missing or empty (item 6).
-pub fn is_tmp_state_home() -> bool {
-    let xdg_ok = std::env::var("XDG_STATE_HOME")
-        .map(|x| !x.is_empty() && Path::new(&x).is_absolute())
-        .unwrap_or(false);
+pub fn state_home() -> PathBuf {
+    state_home_with(
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// Pure predicate over explicit env snapshots (item 6): true iff
+/// `state_home_with` would fall back to the `/tmp` per-uid dir.
+/// [`is_tmp_state_home`] reads the environment and delegates here.
+pub fn is_tmp_state_home_with(xdg: Option<&str>, home: Option<&str>) -> bool {
+    let xdg_ok = xdg.is_some_and(|x| !x.is_empty() && Path::new(x).is_absolute());
     if xdg_ok {
         return false;
     }
-    std::env::var("HOME").map(|h| h.is_empty()).unwrap_or(true)
+    home.is_none_or(|h| h.is_empty())
+}
+
+pub fn is_tmp_state_home() -> bool {
+    is_tmp_state_home_with(
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
 }
 
 /// Print one warning line when the state home is the ephemeral `/tmp`
@@ -181,13 +198,20 @@ pub fn is_valid_workspace_id(s: &str) -> bool {
 /// hashed into the id namespace instead of being joined as a path, so no
 /// caller (including one reading a crafted `session.json`) can make this
 /// escape the workspaces dir with `..` or an absolute path.
-pub fn workspace_dir(id: &str) -> PathBuf {
+/// Explicit-input form of [`workspace_dir`]: the caller supplies the
+/// already-resolved state home, so tests never read the (possibly
+/// concurrently mutated) process environment.
+pub fn workspace_dir_with(state_home: &Path, id: &str) -> PathBuf {
     let safe = if is_valid_workspace_id(id) {
         id.to_owned()
     } else {
         workspace_id_for_name(id)
     };
-    state_home().join("workspaces").join(safe)
+    state_home.join("workspaces").join(safe)
+}
+
+pub fn workspace_dir(id: &str) -> PathBuf {
+    workspace_dir_with(&state_home(), id)
 }
 
 /// Create (or verify) the workspace dir, mode `0700` — the same discipline
@@ -620,7 +644,6 @@ fn find_session_marker_scoped(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     fn marker_tree() -> (tempfile::TempDir, PathBuf) {
         let d = tempfile::tempdir_in("target").unwrap();
@@ -744,8 +767,9 @@ mod tests {
         assert!(find_session_marker_for_uid(&root, "real", owner.wrapping_add(1)).is_none());
     }
 
-    /// Serialises the env-mutating tests in this module.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // State-home resolution is tested via the explicit `*_with`
+    // forms; no test in this module mutates XDG_STATE_HOME/HOME, so
+    // env-reading tests here cannot race with env-mutating ones.
 
     #[test]
     fn workspace_id_is_stable_for_the_same_path() {
@@ -772,9 +796,13 @@ mod tests {
 
     #[test]
     fn workspace_dir_is_under_the_state_home_workspaces() {
-        // A valid id passes through unchanged.
-        let d = workspace_dir("0123456789abcdef");
-        assert!(d.ends_with("hisn/workspaces/0123456789abcdef"));
+        // A valid id passes through unchanged. Explicit state home —
+        // never the process environment (which parallel env-mutating
+        // tests can temporarily empty, sending `state_home()` to the
+        // /tmp fallback that does not end in `hisn/workspaces/`).
+        let home = state_home_with(Some("/real/state"), Some("/home/u"));
+        let d = workspace_dir_with(&home, "0123456789abcdef");
+        assert!(d.ends_with("hisn/workspaces/0123456789abcdef"), "got {d:?}");
     }
 
     #[test]
@@ -791,51 +819,23 @@ mod tests {
     fn tmp_state_home_is_detected_only_when_both_env_vars_fail() {
         // Item 6: the /tmp fallback happens only when XDG_STATE_HOME is
         // missing/empty/relative AND HOME is missing/empty. Tested as a
-        // pure predicate over explicit env snapshots (the real env is
-        // restored immediately).
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let save_xdg = std::env::var("XDG_STATE_HOME").ok();
-        let save_home = std::env::var("HOME").ok();
-        // SAFETY: guarded by ENV_LOCK for the whole restore window.
-        unsafe {
-            let set = |xdg: Option<&str>, home: Option<&str>| {
-                match xdg {
-                    Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                    None => std::env::remove_var("XDG_STATE_HOME"),
-                }
-                match home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            };
-            // Both present and good: not tmp.
-            set(Some("/real/state"), Some("/home/u"));
-            assert!(!is_tmp_state_home());
-            // XDG good, HOME missing: not tmp.
-            set(Some("/real/state"), None);
-            assert!(!is_tmp_state_home());
-            // XDG missing, HOME good: not tmp.
-            set(None, Some("/home/u"));
-            assert!(!is_tmp_state_home());
-            // Both missing: tmp.
-            set(None, None);
-            assert!(is_tmp_state_home());
-            // XDG relative, HOME empty: tmp.
-            set(Some("rel/state"), Some(""));
-            assert!(is_tmp_state_home());
-            // XDG empty, HOME empty: tmp.
-            set(Some(""), Some(""));
-            assert!(is_tmp_state_home());
-            // Restore.
-            match save_xdg {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-            match save_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+        // pure predicate over explicit snapshots — no process-env
+        // mutation, so no race with other tests.
+        // Both present and good: not tmp.
+        assert!(!is_tmp_state_home_with(
+            Some("/real/state"),
+            Some("/home/u")
+        ));
+        // XDG good, HOME missing: not tmp.
+        assert!(!is_tmp_state_home_with(Some("/real/state"), None));
+        // XDG missing, HOME good: not tmp.
+        assert!(!is_tmp_state_home_with(None, Some("/home/u")));
+        // Both missing: tmp.
+        assert!(is_tmp_state_home_with(None, None));
+        // XDG relative, HOME empty: tmp.
+        assert!(is_tmp_state_home_with(Some("rel/state"), Some("")));
+        // XDG empty, HOME empty: tmp.
+        assert!(is_tmp_state_home_with(Some(""), Some("")));
     }
 
     #[test]
@@ -847,13 +847,20 @@ mod tests {
         let b = workspace_for_path(Path::new("/home/valon/Coding/proj"));
         assert_eq!(a.name, b.name);
         assert_ne!(a.id, b.id);
-        assert_ne!(workspace_dir(&a.id), workspace_dir(&b.id));
+        let home = state_home_with(Some("/real/state"), Some("/home/u"));
+        assert_ne!(
+            workspace_dir_with(&home, &a.id),
+            workspace_dir_with(&home, &b.id)
+        );
     }
 
     #[test]
     fn workspace_dir_never_escapes_for_a_crafted_id() {
         // Item 4: workspace_dir is total-safe — anything that is not a
         // 16-hex id is hashed into the namespace, never joined as a path.
+        // Explicit state home (no process-env read; see
+        // `workspace_dir_is_under_the_state_home_workspaces`).
+        let home = state_home_with(Some("/real/state"), Some("/home/u"));
         for crafted in [
             "../../etc",
             "/etc/passwd",
@@ -863,7 +870,7 @@ mod tests {
             "x".repeat(64).as_str(),
             "",
         ] {
-            let d = workspace_dir(crafted);
+            let d = workspace_dir_with(&home, crafted);
             assert!(
                 d.ends_with("hisn/workspaces")
                     || d.parent().is_some_and(|p| p.ends_with("workspaces")),
@@ -874,8 +881,8 @@ mod tests {
             assert!(is_valid_workspace_id(&last), "{crafted:?} -> {d:?}");
         }
         // Valid ids pass through unchanged.
-        let d = workspace_dir("0123456789abcdef");
-        assert!(d.ends_with("hisn/workspaces/0123456789abcdef"));
+        let d = workspace_dir_with(&home, "0123456789abcdef");
+        assert!(d.ends_with("hisn/workspaces/0123456789abcdef"), "got {d:?}");
     }
 
     #[test]

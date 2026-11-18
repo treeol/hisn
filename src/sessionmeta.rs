@@ -701,7 +701,7 @@ mod tests {
         let m = SessionMeta::new("abc", None, owner(), "/w", "none");
         m.write_to(&d).unwrap();
         record_member(&d, 1000, "local", "2026-11-07T12:00:00Z").unwrap();
-        record_member(&d, 1000, "wakil@rubin", "2026-11-07T12:00:01Z").unwrap();
+        record_member(&d, 1000, "wakil@host", "2026-11-07T12:00:01Z").unwrap();
         let back = read(&d).unwrap();
         assert_eq!(
             back.members.len(),
@@ -711,7 +711,7 @@ mod tests {
         assert_eq!(back.members[0].uid, 1000);
         assert_eq!(back.members[0].label, "local");
         assert_eq!(back.members[1].uid, 1000);
-        assert_eq!(back.members[1].label, "wakil@rubin");
+        assert_eq!(back.members[1].label, "wakil@host");
         fs::remove_dir_all(&d).unwrap();
     }
 

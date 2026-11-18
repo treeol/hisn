@@ -2204,7 +2204,7 @@ mod tests {
             "exec/request",
             Some(JournalClient::seat(
                 1000,
-                "rubin".into(),
+                "host1".into(),
                 "member".into(),
                 None,
             )),
@@ -2213,18 +2213,18 @@ mod tests {
         .unwrap();
         let (recs, _) = read_records(&j.dir);
         let c = recs[0].client.as_ref().unwrap();
-        assert_eq!(c.seat.as_deref(), Some("rubin"));
+        assert_eq!(c.seat.as_deref(), Some("host1"));
         assert_eq!(c.role.as_deref(), Some("member"));
-        assert_eq!(c.label, "rubin");
+        assert_eq!(c.label, "host1");
         assert_eq!(c.label_source, "seat");
-        let by_rubin = query(
+        let by_host1 = query(
             &recs,
             &Query {
-                seat: Some("rubin".into()),
+                seat: Some("host1".into()),
                 ..Default::default()
             },
         );
-        assert_eq!(by_rubin.len(), 1);
+        assert_eq!(by_host1.len(), 1);
         // A label-chosen impersonation does not match when a seat is set.
         let mut forged = recs.clone();
         forged[0].client.as_mut().unwrap().label = "wakil".into();
@@ -2268,9 +2268,9 @@ mod tests {
     fn seat_fields_round_trip_and_plain_stays_byte_identical() {
         // The seat fields are additive: a credentialed record carries them,
         // a plain one serializes exactly the 0.5.0 shape.
-        let seat = JournalClient::seat(1000, "rubin".into(), "observer".into(), None);
+        let seat = JournalClient::seat(1000, "host1".into(), "observer".into(), None);
         let json = serde_json::to_value(&seat).unwrap();
-        assert_eq!(json["seat"], "rubin");
+        assert_eq!(json["seat"], "host1");
         assert_eq!(json["role"], "observer");
         assert_eq!(json["label_source"], "seat");
         let plain = JournalClient::plain(1000, "local".into(), "none".into(), None);

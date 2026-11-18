@@ -1433,14 +1433,14 @@ mod tests {
     #[test]
     fn client_field_is_parsed() {
         let r = parse_request(
-            r#"{"op":"exec","argv":["x"],"client":{"label":"wakil@rubin","label_source":"ssh"}}"#,
+            r#"{"op":"exec","argv":["x"],"client":{"label":"wakil@host","label_source":"ssh"}}"#,
         )
         .unwrap();
         match r {
             Request::Exec {
                 client: Some(c), ..
             } => {
-                assert_eq!(c.label.as_deref(), Some("wakil@rubin"));
+                assert_eq!(c.label.as_deref(), Some("wakil@host"));
                 assert_eq!(c.label_source.as_deref(), Some("ssh"));
             }
             _ => panic!("expected Exec with client"),
@@ -1764,7 +1764,7 @@ mod tests {
                     .unwrap_or_else(|e| {
                         panic!("client-field example must parse as ClientField: {block:?}: {e}")
                     });
-                assert_eq!(field.label.as_deref(), Some("wakil@rubin"));
+                assert_eq!(field.label.as_deref(), Some("wakil@host"));
                 assert_eq!(field.label_source.as_deref(), Some("ssh"));
                 assert_eq!(field.req_id.as_deref(), Some("7f3a"));
             }

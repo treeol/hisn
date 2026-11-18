@@ -802,7 +802,7 @@ fn resolve_home_persist_with(
                 return Err(invalid("home.persist", "must not be the real host $HOME"));
             }
             // Refuse if the persist path is an ancestor of the real host
-            // $HOME (e.g. persist="/home" when $HOME="/home/valon"). The
+            // $HOME (e.g. persist="/home" when $HOME="/home/user"). The
             // persist dir would contain the real home, handing the session
             // read/write access to the parent of $HOME.
             if hhc.starts_with(&path) {

@@ -633,14 +633,14 @@ mod tests {
             "--session",
             "s",
             "--client",
-            "rubin-wakil",
+            "host-wakil",
             "--",
             "ls",
         ]);
         let req = build_request_with(&c, Some("TOK"), Some(3)).unwrap();
         assert_eq!(
             req["client"],
-            json!({"label":"rubin-wakil","label_source":"flag","protocol_version":3,"seat_token":"TOK"})
+            json!({"label":"host-wakil","label_source":"flag","protocol_version":3,"seat_token":"TOK"})
         );
         assert!(!req["env"].to_string().contains("TOK"));
     }
@@ -691,14 +691,14 @@ mod tests {
             "--session",
             "s",
             "--client",
-            "rubin-wakil",
+            "host-wakil",
             "--",
             "ls",
         ]);
         assert_eq!(
             build_request(&c).unwrap(),
             json!({"op":"exec","argv":["ls"],"cwd":null,"env":{},"tty":false,
-                   "client":{"label":"rubin-wakil","label_source":"flag"}})
+                   "client":{"label":"host-wakil","label_source":"flag"}})
         );
     }
 

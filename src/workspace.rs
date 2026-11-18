@@ -844,7 +844,7 @@ mod tests {
         // projects with the same folder name in different trees have
         // different workspaces.
         let a = workspace_for_path(Path::new("/work/team/proj"));
-        let b = workspace_for_path(Path::new("/home/valon/Coding/proj"));
+        let b = workspace_for_path(Path::new("/home/user/Coding/proj"));
         assert_eq!(a.name, b.name);
         assert_ne!(a.id, b.id);
         let home = state_home_with(Some("/real/state"), Some("/home/u"));

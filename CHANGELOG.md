@@ -17,12 +17,12 @@ allowlist in this release. `none` (the default) and `host` behave as in
 0.5.1. Details, limitations and what was measured:
 `docs/releases/v0.6.0.md`.
 
-**Evidence (rubin, kernel 7.3.3, at `4ec88bc`):**
+**Evidence (a Fedora 45 host, kernel 7.3.3, at `4ec88bc`):**
 `scripts/host-verify-network.sh --real` ended with
 `RESULT: pass=103 fail=0 timeout=0 skipped=0`; leak suite
 `455 passed, 0 failed, 9 skipped, 2 weak`, with a rootfs and
 `HISN_BIG_TESTS=1` `468 passed, 0 failed, 5 skipped, 2 weak`.
-Also verified on 192.168.1.213: `pass=100 fail=0 timeout=0 skipped=2`.
+Also verified on a second host: `pass=100 fail=0 timeout=0 skipped=2`.
 
 ### Added
 - `session.network = "open"` and `--network open`.
@@ -132,7 +132,7 @@ environmental failures.
 `journal.jsonl` of what its sessions did, and `hisn journal` reads it back in
 one compact line per event.
 
-**Host evidence (rubin):** `make release-gate` green — leak suite `350 passed,
+**Host evidence (a Fedora 45 host, kernel 7.3.3):** `make release-gate` green — leak suite `350 passed,
 0 failed, 9 skipped, 1 weak`; with `HISN_TEST_ROOTFS` and
 `HISN_BIG_TESTS` the leak suite reports `363 passed, 0 failed, 5 skipped,
 1 weak`. A Wakil pinned to hisn 0.4.3 drove a session started by this build:
@@ -194,13 +194,13 @@ adds a release gate, fixes smaller audit findings, and restructures
 session startup so the coming egress proxy, cgroup v2 limits and
 multi-seat work can be added safely.
 
-**Host evidence (rubin):** `make release-gate` all ok (fmt, clippy, make
+**Host evidence (a Fedora host):** `make release-gate` all ok (fmt, clippy, make
 check, make test), leak suite 333 passed, 0 failed, 9 skipped, 1 weak;
 with `HISN_TEST_ROOTFS` and `HISN_BIG_TESTS` the leak suite reports 346
 passed, 0 failed, 5 skipped, 1 weak; `make leaktest` on a terminal also
 reports 333 passed, 0 failed, 9 skipped, 1 weak. The gate's
 pseudo-terminal step was skipped because `script` is not installed; the
-direct terminal run covers it. No unit-test count for rubin is recorded;
+direct terminal run covers it. No unit-test count for the host is recorded;
 no sessions, leak or integration tests were run in the build sandbox.
 
 ### Changed
@@ -247,7 +247,7 @@ of 0.4.1. Profile loading now rejects values that previously panicked or
 hung at run time, readiness probes cannot outlive their timeout, and
 `session.json` updates are race-free.
 
-**Host evidence (rubin):** unit tests 406 passed, 0 failed; leak suite
+**Host evidence (a Fedora host):** unit tests 406 passed, 0 failed; leak suite
 307 passed, 0 failed, 9 skipped, 1 weak; readiness checks pass. In the
 build sandbox `cargo test --lib` is 404 passed, 2 failed (the 2 known
 sandbox failures `scrub_argv_overwrites_cmdline` and
@@ -287,7 +287,7 @@ here; it needs a host to verify (see below).
 
 **Host evidence:** the build sandbox blocks user namespaces, so `cargo test`
 (unit) and the `test_l8.py` self-test run here; the leak suite (L1–L75) and the
-`--detach`/attach host steps are **not run here** and must be run on rubin (see
+`--detach`/attach host steps are **not run here** and must be run on the host (see
 "Host verification"). Two unit tests fail only in this sandbox and pass on a
 host (`scrub_argv_overwrites_cmdline`, `proc_self_mem_is_not_writable_after_apply`).
 
@@ -317,7 +317,7 @@ host (`scrub_argv_overwrites_cmdline`, `proc_self_mem_is_not_writable_after_appl
   stopped it.
 - Leak tests **L73** (`ls --prune --name-prefix`), **L74** (`ls --json`
   clients), **L75** (`run --detach` returns).
-- **Host verification for 0.4.1** (rubin): `cargo test --release`;
+- **Host verification for 0.4.1** (a Fedora host): `cargo test --release`;
   `HISN_TEST_ROOTFS="$(hisn rootfs path wakil-dev)" make leaktest`;
   `hisn run --name t --detach` (returns `<id> t ready`);
   `hisn attach --session t` then `tty` and `tmux new -d -s t && tmux ls`;
@@ -371,8 +371,8 @@ sandbox, one pid namespace, one session env snapshot and one audit log, with
 idle leases, an explicit `hisn stop` that keeps the session directory, and
 archival of the audit on prune.
 
-**Host evidence:** `make leaktest` on rubin: 308 passed, 0 failed, 6 skipped,
-1 weak; remote attach verified on smaragd (Fedora 44, kernel 7.2.13).
+**Host evidence:** `make leaktest` on a Fedora host: 308 passed, 0 failed, 6 skipped,
+1 weak; remote attach verified on a second host (Fedora 44, kernel 7.2.13).
 
 **Security:** equal access per uid in 0.4.0; the client record, the single
 `authorize()` seam and the per-client audit ship now, so roles are a policy
@@ -586,7 +586,7 @@ Hardening before the tag (same version):
   daemon socket with label `root-equivalent` and required `risk_ack =
   "root-equivalent"`. `tier = "proxy"` and `nested_userns = true` are rejected
   with `E_NOT_SUPPORTED` (0.4). Shipped: `profiles/docker-socket.toml`,
-  `profiles/deploy-smaragd-example.toml`. The socket dies with the session;
+  `profiles/deploy-example.toml`. The socket dies with the session;
   containers the daemon started do not.
 - **In-sandbox services** (`[[services]]`): start a long-lived process inside
   the sandbox through the exec helper chain (same confinement as the main

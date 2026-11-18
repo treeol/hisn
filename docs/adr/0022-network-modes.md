@@ -83,8 +83,8 @@ ADR 0018 (draft, not in the tree) proposed an allowlist proxy for the
 `host` mode; it was never built. The question this ADR answers: can the
 supervisor decide each outbound `connect()` from inside the empty netns,
 transparently, for any agent, with no manual work — and is that safer
-than sharing the host netns? The probe series ran on rubin (Fedora 45,
-kernel 7.3.3-300.fc45.x86_64); every probe compiles with
+than sharing the host netns? The probe series ran on a Fedora 45 host
+(kernel 7.3.3-300.fc45.x86_64); every probe compiles with
 `gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2`.
 
 One table: fact → probe case → host result. Host results are only from
@@ -614,7 +614,7 @@ mode, asserts L90–L111 against loopback/`192.0.2.0/24` listeners the
 script starts itself. **No traffic leaves the host.** L94 (DNS) is a
 **pre-merge host gate**, not a post-merge leak test: the script runs
 the real nsswitch hisn ships inside the sandbox, on a host whose own
-nsswitch is the rubin `resolve`-first one — so a pass proves the
+nsswitch is the host's `resolve`-first one — so a pass proves the
 sandbox-local files, not the host's, do the work. The same gate covers
 H2 (second listener `EBUSY` measured cleanly) and the "supervisor polls
 a listener created in another thread group" case, both still pending

@@ -20,6 +20,40 @@
 # start: every step is a read-only check or a self-contained test run.
 set -u
 
+# Private-details check (0.6.1 item 2d): shipped text must not name the
+# author's machines or their LAN addresses. Shipped files are everything
+# tracked except tests, fixtures and the gate's own allowlist; test-only
+# files may keep fixture addresses. The pattern matches the author's
+# host names, home path and user, and any address in 192.168.1.0/24 or
+# 192.168.88.0/24. Matches are filtered through
+# scripts/release-gate-allowlist.txt (one fixed substring per line); a
+# surviving match fails the gate.
+run_private_details() {
+  step 0 "private-details check (shipped files)"
+  local allow="scripts/release-gate-allowlist.txt" pat='rubin|smaragd|firecracker|pihole|/home/valon|valon@|192\.168\.(1|88)\.[0-9]+\.[0-9]+' # gate pattern (allowlisted below)
+  local hits
+  hits=$(git ls-files -- '*.md' '*.toml' '*.txt' '*.sh' '*.rs' '*.py' \
+    ':!tests/*' ':!scripts/release-gate-allowlist.txt' | while IFS= read -r f; do
+      grep -nE "$pat" -- "$f" 2>/dev/null | sed "s|^|$f:|"
+    done)
+  if [ -n "$hits" ]; then
+    local bad=""
+    while IFS= read -r line; do
+      local ok=0 a
+      [ -f "$allow" ] && while IFS= read -r a; do
+        case "$a" in ''|'#'*) continue ;; esac
+        case "$line" in *"$a"*) ok=1; break ;; esac
+      done <"$allow"
+      [ "$ok" -eq 0 ] && bad="${bad}
+$line"
+    done <<<"$hits"
+    if [ -n "$bad" ]; then
+      fail "private-details" "shipped files contain private host names/addresses:$bad"
+    fi
+  fi
+  ok "private-details"
+}
+
 cd "$(dirname "$0")/.." || exit 1
 
 step() { printf 'release-gate: step %s: %s\n' "$1" "$2"; }
@@ -83,6 +117,8 @@ fi
 # Pass the optional gates through when set (never invent values for them).
 if [ -n "${HISN_TEST_ROOTFS:-}" ]; then export HISN_TEST_ROOTFS; fi
 if [ -n "${HISN_BIG_TESTS:-}" ]; then export HISN_BIG_TESTS; fi
+
+run_private_details
 
 step 1 "cargo fmt --check"
 cargo fmt --check || fail "fmt" "cargo fmt --check exited $?"

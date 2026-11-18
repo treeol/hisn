@@ -49,7 +49,7 @@ the 0.4.1 regressions that reached a host (a start failure exiting 1 instead of
 125, and a control connection counted but never removed, which kept the session
 from going idle) passed `cargo test` and were caught only by `make leaktest`.
 
-Run the suite on the host (rubin) against the commit under review, and attach the
+Run the suite on the host (a Fedora host) against the commit under review, and attach the
 log as above:
 
 ```sh

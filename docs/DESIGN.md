@@ -967,7 +967,7 @@ agent = true               # filtering proxy (T1: sign but never add/remove/extr
 keys = ["SHA256:…"]       # fingerprint allowlist (absent = all keys)
 
 [net]
-nameservers = ["192.168.1.111"]   # DNS resolvers for network = "host"
+nameservers = ["192.0.2.1"]   # DNS resolvers for network = "host"
 ```
 
 `hisn run --home-persist PATH` and `--rootfs-path DIR` override `[home] persist`
@@ -1361,7 +1361,7 @@ A unix socket forward (§17) works cross-network-namespace: the socket is
 reached by inode via a mount, not by network. `network = "none"` is
 sufficient for `docker ps` and `docker run`. The shipped
 `profiles/docker-socket.toml` uses `network = "host"` because the deploy
-use case (smaragd) needs host networking for compose services, not for
+use case (a second host) needs host networking for compose services, not for
 reaching the daemon socket. A profile that only needs `docker run` (no
 container networking) may use `network = "none"`.
 
@@ -1370,7 +1370,7 @@ container networking) may use `network = "none"`.
 - `profiles/docker-socket.toml` — T2 with `risk_ack = "root-equivalent"`,
   `network = "host"` (for compose services), and a `[[forward]]` of
   `/var/run/docker.sock`.
-- `profiles/deploy-smaragd-example.toml` — a deploy example: `network =
+- `profiles/deploy-example.toml` — a deploy example: `network =
   "host"`, `cwd` rw, `mounts.grantable_rw` for deploy outputs, docker
   socket T2 with `risk_ack`.
 

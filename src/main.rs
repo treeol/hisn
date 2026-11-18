@@ -1253,13 +1253,13 @@ mod ls_tests {
         meta.rootfs = Some("wakil-dev".into());
         meta.members = vec![Member {
             uid: 1000,
-            label: "rubin-wakil".into(),
+            label: "host-wakil".into(),
             first_seen: "2026-11-07T12:00:00Z".into(),
             last_seen: "2026-11-07T12:01:00Z".into(),
             extra: std::collections::BTreeMap::new(),
         }];
         let clients = vec![json!({
-            "uid": 1000, "pid": 42, "label": "rubin-wakil",
+            "uid": 1000, "pid": 42, "label": "host-wakil",
             "label_source": "flag", "connected_since": "2026-11-07T12:00:00Z"
         })];
         let execs = vec![json!({

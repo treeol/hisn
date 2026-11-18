@@ -185,7 +185,7 @@ still blocks it). The `kernel-surface` risk label is defined now so profiles
 can reference it; the "most secure for building" and "nested rootless works"
 claims are removed pending 0.4 evidence.
 
-## Valon's concrete case (smaragd deploy)
+## Valon's concrete case (a second-host deploy)
 
 **In 0.3: Tier T2** (`docker = "socket"`, `risk_ack = "root-equivalent"`):
 run `docker compose` against the host daemon. T1 is deferred to 0.4 (round-2
@@ -206,7 +206,7 @@ risk_ack = "root-equivalent"
 `session.network = "host"` is so the compose *services* can reach the host
 network; it is not needed to reach the daemon socket (a unix socket under
 `/run` is reachable with `session.network = "none"` — round-2 finding). The
-current smaragd case uses `host` because the compose services themselves need
+current case uses `host` because the compose services themselves need
 host networking; that is a 0.2 capability with risk label `data`.
 
 ## Invariants

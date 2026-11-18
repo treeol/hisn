@@ -1,6 +1,6 @@
 version = "hisn-profile/v1"
 
-# Deploy example for smaragd: network host (compose needs the daemon socket),
+# Deploy example: network host (compose needs the daemon socket),
 # cwd rw (the deploy repo), grantable_rw for deploy outputs, docker socket T2.
 [policy]
 version = "hisn-policy/v1"

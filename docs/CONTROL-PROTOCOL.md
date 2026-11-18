@@ -40,7 +40,7 @@ code disagree, the code wins and this file is wrong.</p>
 Every request may carry a `client` object with four optional fields:
 
 ```json
-{"label": "wakil@rubin", "label_source": "ssh", "req_id": "7f3a", "protocol_version": 3}
+{"label": "wakil@host", "label_source": "ssh", "req_id": "7f3a", "protocol_version": 3}
 ```
 
 - `label` — a human label from `--client LABEL` (or derived from the SSH

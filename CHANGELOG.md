@@ -17,11 +17,12 @@ allowlist in this release. `none` (the default) and `host` behave as in
 0.5.1. Details, limitations and what was measured:
 `docs/releases/v0.6.0.md`.
 
-**Evidence (test machine, kernel 7.3.3, at `44e3c90`):**
+**Evidence (rubin, kernel 7.3.3, at `4ec88bc`):**
 `scripts/host-verify-network.sh --real` ended with
-`RESULT: pass=70 fail=0 timeout=0 skipped=1`; leak suite
-`421 passed, 0 failed, 10 skipped, 4 weak`, with a rootfs and
-`HISN_BIG_TESTS=1` `434 passed, 0 failed, 6 skipped, 4 weak`.
+`RESULT: pass=103 fail=0 timeout=0 skipped=0`; leak suite
+`455 passed, 0 failed, 9 skipped, 2 weak`, with a rootfs and
+`HISN_BIG_TESTS=1` `468 passed, 0 failed, 5 skipped, 2 weak`.
+Also verified on 192.168.1.213: `pass=100 fail=0 timeout=0 skipped=2`.
 
 ### Added
 - `session.network = "open"` and `--network open`.
@@ -725,7 +726,9 @@ First release.
 - `hisn exec` verifies fail-closed, before running anything, that the root it
   entered is the sandbox root (DESIGN D25).
 
-[Unreleased]: https://github.com/treeol/hisn/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/treeol/hisn/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/treeol/hisn/releases/tag/v0.6.0
+[0.5.1]: https://github.com/treeol/hisn/releases/tag/v0.5.1
 [0.5.0]: https://github.com/treeol/hisn/releases/tag/v0.5.0
 [0.4.3]: https://github.com/treeol/hisn/releases/tag/v0.4.3
 [0.4.2]: https://github.com/treeol/hisn/releases/tag/v0.4.2

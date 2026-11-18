@@ -727,11 +727,11 @@ does where it differs from or sharpens the text above:
   name and keeps no pins (that is the allowlist's part).
 
 Measured on kernel 7.3.3-300.fc45.x86_64 (Fedora 45, Yama
-`ptrace_scope = 1`), commit `44e3c90`:
+`ptrace_scope = 1`), commit `4ec88bc`:
 `scripts/host-verify-network.sh --real` ended with
-`RESULT: pass=70 fail=0 timeout=0 skipped=1`. 100 connects cost
-about 100 µs each through interception (medians 103.2, 99.0,
-109.6 µs) against about 22 µs direct (21.6, 24.4, 21.9 µs); the probe
+`RESULT: pass=103 fail=0 timeout=0 skipped=0`. 100 connects cost
+about 97 µs each through interception (medians 112.6, 97.4,
+97.4 µs) against about 21 µs direct (21.4, 20.6, 19.4 µs); the probe
 had measured 20–25 µs extra with a single-threaded C supervisor. The
 `kcmp` fallback for kernels before 6.9 has unit coverage only.
 

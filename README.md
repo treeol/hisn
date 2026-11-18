@@ -131,7 +131,9 @@ directory write to one journal. `hisn run --workspace NAME` selects a
 workspace by name instead. State lives in
 `$XDG_STATE_HOME/hisn/workspaces/<id>/` (dir `0700`); the journal is
 `journal.jsonl` (0600, one JSON object per line, 64 MiB rotation; rotated
-files are kept and still read).
+files are kept and still read). For sessions in `open` (0.6.0), the
+oldest rotated files are deleted once the journal exceeds 256 MiB in
+more than four files; sessions in `none` and `host` keep every file.
 
 ```sh
 hisn note --session demo "halfway through the migration"   # verbatim, at most 8 KiB
@@ -166,9 +168,10 @@ needs Landlock abstract-socket scoping or an explicit flag. `open` (0.6.0)
 keeps the empty network namespace and intercepts every `connect()` with
 seccomp user notification: the supervisor makes outbound TCP connections
 to public addresses on the session's behalf and records each decision in
-the journal. Private and link-local targets, UDP other than DNS, and
-other address families are refused; names resolve through a DNS responder
-in the supervisor. Limitations are listed in the
+the journal (at most 50 network records per second one by one; the rest
+are counted in a summary). Private and link-local targets, UDP other
+than DNS, and other address families are refused; names resolve through
+a DNS responder in the supervisor. Limitations are listed in the
 [0.6.0 release notes](docs/releases/v0.6.0.md).
 
 **Authorized.** The control socket is mode 0600 and refuses any peer inside the
@@ -239,8 +242,8 @@ In short:
 
 ## Status
 
-The current release is hisn 0.5.1. Release notes, including compatibility and
-known limitations, are in [docs/releases/v0.5.1.md](docs/releases/v0.5.1.md);
+The current release is hisn 0.6.0. Release notes, including compatibility and
+known limitations, are in [docs/releases/v0.6.0.md](docs/releases/v0.6.0.md);
 earlier releases are in the [CHANGELOG](CHANGELOG.md).
 
 CI runs the leak suite on Ubuntu 22.04 and 24.04 (x86_64). aarch64 and musl

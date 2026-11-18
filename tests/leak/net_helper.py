@@ -874,16 +874,19 @@ def in_vsock():
 
 def in_reconnect():
     """connect() on a socket that is already connected fails EISCONN and
-    leaves the connection alone."""
+    leaves the connection alone — for a public target and for a private
+    one alike (0.6.1: the already-connected answer comes before the
+    private-address verdict)."""
     sock = socket.socket()
     sock.settimeout(10)
     sock.connect((LISTEN_IP, 18080))
-    try:
-        sock.connect((LISTEN_IP, 18080))
-        fail('a second connect() on a connected socket succeeded')
-    except OSError as e:
-        if e.errno != 106:  # EISCONN
-            fail(f'second connect(): errno {e.errno} (want EISCONN)')
+    for target in (LISTEN_IP, '192.168.1.1'):
+        try:
+            sock.connect((target, 18080))
+            fail(f'second connect() to {target} on a connected socket succeeded')
+        except OSError as e:
+            if e.errno != 106:  # EISCONN
+                fail(f'second connect() to {target}: errno {e.errno} (want EISCONN)')
     if sock.recv(100) != GREETING:
         fail('the first connection was replaced or lost')
     print('RECONNECT-OK')

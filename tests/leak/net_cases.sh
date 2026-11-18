@@ -454,6 +454,8 @@ journal_is "L122 journal: tracked non-blocking connect ends as pending-at-deadli
 
 check "L99 close-on-exec flag of the socket survives the connect" "CLOEXEC-OK" in_session "$A" in-cloexec
 check "L99 connect() on a connected socket fails EISCONN, connection kept" "RECONNECT-OK" in_session "$A" in-reconnect
+journal_is "L99 journal: second connect() on a connected socket to a private target is refuse/already-connected (0.6.1)" "$AWS" 1 \
+  kind=network/connect target=192.168.1.1:18080 verdict=refuse reason=already-connected
 check "L104 connect() on a datagram socket is refused EACCES" "L104-OK" in_session "$A" in-dgram
 journal_is "L104 journal: refuse non-stream" "$AWS" 1 kind=network/connect target=192.0.2.1:18080 verdict=refuse reason=non-stream
 check "L105 bind before connect: connected, source port not kept" "L105-OK" in_session "$A" in-bind

@@ -1209,6 +1209,67 @@ fn handle_notif(
         }
         // dup_fd dropped here (OwnedFd discipline).
     }
+    // 0.6.1: the already-connected / already-pending / already-used
+    // answer comes before the private-address verdict, but only for
+    // that answer: `connect()` on a socket that is already connected
+    // (or pending, or failed) is answered exactly as the kernel would
+    // (EISCONN / EALREADY / the pending error), whatever its *new*
+    // target — including a private one. A fresh socket to a private
+    // address is still refused EACCES below. Nothing is injected on
+    // any of these paths.
+    if already_connected {
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, -(libc::EISCONN), 0, 0);
+        }
+        if let Some(j) = journal {
+            j.net_record("refuse", "already-connected", n);
+        }
+        return;
+    }
+    if already_pending {
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, -(libc::EALREADY), 0, 0);
+        }
+        if let Some(j) = journal {
+            j.net_record("refuse", "already-pending", n);
+        }
+        return;
+    }
+    if already_used {
+        // As before, under `Verdict::Allow` only in shape: the
+        // re-connect is made on the program's own socket, and the
+        // kernel's answer is passed on. A private *new* target on a
+        // failed socket still gets the pending error, not EACCES —
+        // the kernel would answer the same without hisn.
+        let rc = match &used_sock {
+            Some(sock) => unsafe {
+                libc::connect(
+                    sock.as_raw_fd(),
+                    buf.as_ptr() as *const libc::sockaddr,
+                    addrlen as libc::socklen_t,
+                )
+            },
+            None => -1,
+        };
+        let errno = if rc == 0 {
+            0
+        } else {
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        };
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, -errno, 0, 0);
+        }
+        if let Some(j) = journal {
+            if errno == 0 || errno == libc::EINPROGRESS {
+                j.net_record("allow", "own-socket", n);
+            } else {
+                j.net_record("refuse", "earlier-connect-failed", n);
+            }
+        }
+        return;
+    }
     let is_public = ip.map(|a| is_public_ip(&a)).unwrap_or(false);
     match decide(family, is_loopback, is_stream, is_public) {
         Verdict::Continue => {
@@ -1235,72 +1296,6 @@ fn handle_notif(
             }
             if let Some(j) = journal {
                 j.net_record("refuse", reason, n);
-            }
-        }
-        Verdict::Allow if already_connected => {
-            // connect() on a socket that is already connected: the kernel
-            // answers EISCONN. Replacing the socket here would silently
-            // drop the established connection.
-            if id_valid(lfd, n.id) {
-                reply(lfd, n.id, -(libc::EISCONN), 0, 0);
-            }
-            if let Some(j) = journal {
-                j.net_record("refuse", "already-connected", n);
-            }
-        }
-        Verdict::Allow if already_pending => {
-            // connect() on a socket whose connect is still in flight (the
-            // socket an earlier non-blocking connect injected): the kernel
-            // answers EALREADY. Replacing the socket here would abandon
-            // the pending connection.
-            if id_valid(lfd, n.id) {
-                reply(lfd, n.id, -(libc::EALREADY), 0, 0);
-            }
-            if let Some(j) = journal {
-                j.net_record("refuse", "already-pending", n);
-            }
-        }
-        Verdict::Allow if already_used => {
-            // connect() again on a socket whose earlier connect failed.
-            // Some programs learn the outcome of a non-blocking connect
-            // this way instead of reading SO_ERROR. The kernel's answer
-            // is the pending error (ECONNREFUSED, ...), or ECONNABORTED
-            // once the error has been read, and the socket is fresh
-            // again afterwards. Replacing the socket here would hide the
-            // failure and start a second connection instead.
-            //
-            // The supervisor makes this very connect() on the program's
-            // own socket and passes on the result: the error is taken by
-            // the call the program made, as it would be without hisn.
-            // The target has passed every check above.
-            let rc = match &used_sock {
-                Some(sock) => unsafe {
-                    libc::connect(
-                        sock.as_raw_fd(),
-                        buf.as_ptr() as *const libc::sockaddr,
-                        addrlen as libc::socklen_t,
-                    )
-                },
-                None => -1,
-            };
-            let errno = if rc == 0 {
-                0
-            } else {
-                io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO)
-            };
-            if id_valid(lfd, n.id) {
-                reply(lfd, n.id, -errno, 0, 0);
-            }
-            if let Some(j) = journal {
-                if errno == 0 || errno == libc::EINPROGRESS {
-                    // The socket was reset in between and this call
-                    // started a connect on it.
-                    j.net_record("allow", "own-socket", n);
-                } else {
-                    j.net_record("refuse", "earlier-connect-failed", n);
-                }
             }
         }
         Verdict::Allow => {

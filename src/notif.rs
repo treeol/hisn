@@ -582,13 +582,106 @@ pub fn read_sockaddr(pid: u32, addr: u64, len: usize) -> io::Result<[u8; 128]> {
 }
 
 /// 0.6.1: seat attribution for an engine's records. The exec-tree
-/// engine is given a lookup `(pid) -> Option<seat>` (the supervisor's
-/// exec pid→seat map); the main-command engine is `None`, so its
-/// records keep `seat: null`. DNS records are never attributed: a DNS
-/// query cannot be tied to one exec tree without guessing (the
+/// engine is given a lookup `(sandbox pid) -> Option<Option<seat>>`
+/// over the supervisor's exec table: `None` = not an exec's top pid,
+/// `Some(seat)` = that exec's client seat (itself `None` for a client
+/// without a seat). The notified task is mapped to an exec by process
+/// ancestry ([`resolve_seat`]); the main-command engine has no lookup,
+/// so its records keep `seat: null`. DNS records are never attributed:
+/// a DNS query cannot be tied to a calling task without guessing (the
 /// responder serves the whole session), so they stay null — documented
 /// here and in ADR 0022.
-pub type SeatLookup = std::sync::Arc<dyn Fn(i32) -> Option<String> + Send + Sync>;
+pub type SeatLookup = std::sync::Arc<dyn Fn(i32) -> Option<Option<String>> + Send + Sync>;
+
+/// What the ancestry walk needs from `/proc/<tid>/status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcStatus {
+    pub tgid: i32,
+    pub ppid: i32,
+    /// `NSpid:` entries, outermost namespace first; the last one is the
+    /// pid in the task's own (innermost) pid namespace.
+    pub nspid: Vec<i32>,
+}
+
+/// Reader of task status; the production one reads `/proc`, tests use a
+/// fake.
+pub trait ProcReader {
+    fn status(&self, tid: i32) -> Option<ProcStatus>;
+}
+
+pub struct RealProc;
+
+/// Parse the text of `/proc/<tid>/status`.
+pub fn parse_proc_status(text: &str) -> Option<ProcStatus> {
+    let (mut tgid, mut ppid, mut nspid) = (None, None, None);
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("Tgid:") {
+            tgid = v.trim().parse::<i32>().ok();
+        } else if let Some(v) = line.strip_prefix("PPid:") {
+            ppid = v.trim().parse::<i32>().ok();
+        } else if let Some(v) = line.strip_prefix("NSpid:") {
+            nspid = v
+                .split_whitespace()
+                .map(|x| x.parse::<i32>().ok())
+                .collect::<Option<Vec<_>>>();
+        }
+    }
+    Some(ProcStatus {
+        tgid: tgid?,
+        ppid: ppid?,
+        nspid: nspid.filter(|v| !v.is_empty())?,
+    })
+}
+
+impl ProcReader for RealProc {
+    fn status(&self, tid: i32) -> Option<ProcStatus> {
+        let t = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+        parse_proc_status(&t)
+    }
+}
+
+/// Maximum ancestry steps of the seat walk.
+const SEAT_WALK_MAX: usize = 64;
+
+/// Walk from the notifying thread `tid` up through `PPid` until a task
+/// whose pid in the sandbox pid namespace is an exec's top pid
+/// (`lookup`) is found. `level` is the `NSpid` depth of tasks of the
+/// sandbox pid namespace (the supervisor's own depth + 1); only tasks
+/// at that depth are matched, so a pid namespace the program made for
+/// itself cannot be mistaken for an exec. Stops without a match at the
+/// sandbox init (pid 1 at `level`), at a task above `level` (left the
+/// sandbox), at pid 0, after [`SEAT_WALK_MAX`] steps, on a cycle, or on
+/// an unreadable status. Never cached: a pid can be reused.
+pub fn resolve_seat(
+    proc_: &dyn ProcReader,
+    tid: i32,
+    level: usize,
+    lookup: &dyn Fn(i32) -> Option<Option<String>>,
+) -> Option<String> {
+    let mut pid = proc_.status(tid)?.tgid;
+    let mut seen: Vec<i32> = Vec::new();
+    for _ in 0..SEAT_WALK_MAX {
+        if pid <= 0 || seen.contains(&pid) {
+            return None;
+        }
+        seen.push(pid);
+        let st = proc_.status(pid)?;
+        let inner = *st.nspid.last()?;
+        if st.nspid.len() < level {
+            return None;
+        }
+        if st.nspid.len() == level {
+            if let Some(found) = lookup(inner) {
+                return found;
+            }
+            if inner == 1 {
+                return None;
+            }
+        }
+        pid = st.ppid;
+    }
+    None
+}
 
 impl NotifEngine {
     /// Start the engine on `listener` with the production configuration.
@@ -1035,6 +1128,11 @@ fn engine_loop(
     // only the raw fd number, so dropping it first would be use-after-close.
     let listener = std::sync::Arc::new(listener);
     let lfd = listener.as_raw_fd();
+    // NSpid depth of the sandbox pid namespace: ours + 1.
+    let seat_level = RealProc
+        .status(unsafe { libc::getpid() })
+        .map(|s| s.nspid.len() + 1)
+        .unwrap_or(2);
     // Two pools, each behind a bounded queue.
     //
     // Dispatch pool: reads and decides every notification and makes the
@@ -1069,7 +1167,12 @@ fn engine_loop(
                     Ok((mut n, recv_at)) => {
                         // 0.6.1: stamp the notification with the seat of
                         // the exec that caused it, once, at dispatch.
-                        n.seat = seats.as_ref().and_then(|f| f(n.pid as i32));
+                        // The walk is followed by NOTIF_ID_VALID: if the
+                        // task is not known to be the same one, null.
+                        n.seat = seats
+                            .as_ref()
+                            .and_then(|f| resolve_seat(&RealProc, n.pid as i32, seat_level, &**f))
+                            .filter(|_| id_valid(lfd, n.id));
                         handle_notif(lfd, &mut n, recv_at, &cfg, &j, &tracker, &wait_tx)
                     }
                     Err(_) => return,
@@ -2233,6 +2336,138 @@ fn is_public_v4(v4: &Ipv4Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // ---- 0.6.1 seat ancestry walk (fake /proc) ----
+    struct FakeProc(std::collections::HashMap<i32, ProcStatus>);
+    impl ProcReader for FakeProc {
+        fn status(&self, tid: i32) -> Option<ProcStatus> {
+            self.0.get(&tid).cloned()
+        }
+    }
+    /// task: (key id as seen by supervisor, tgid, ppid, nspid)
+    fn fake(tasks: &[(i32, i32, i32, &[i32])]) -> FakeProc {
+        FakeProc(
+            tasks
+                .iter()
+                .map(|(id, tgid, ppid, ns)| {
+                    (
+                        *id,
+                        ProcStatus {
+                            tgid: *tgid,
+                            ppid: *ppid,
+                            nspid: ns.to_vec(),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+    fn exec_table(top: i32) -> impl Fn(i32) -> Option<Option<String>> {
+        move |p| (p == top).then(|| Some("member1".to_string()))
+    }
+    // supervisor ns depth 1, sandbox level 2. Host ids 100.. map to
+    // sandbox pids: init 100->1, exec top 150->7.
+    const INIT: (i32, i32, i32, &[i32]) = (100, 100, 90, &[100, 1]);
+
+    #[test]
+    fn seat_walk_direct_exec_pid_thread_child_grandchild() {
+        let p = fake(&[
+            INIT,
+            (150, 150, 100, &[150, 7]),
+            (151, 150, 100, &[151, 8]),  // second thread of the exec
+            (160, 160, 150, &[160, 9]),  // child
+            (170, 170, 160, &[170, 10]), // grandchild
+        ]);
+        let l = exec_table(7);
+        for tid in [150, 151, 160, 170] {
+            assert_eq!(
+                resolve_seat(&p, tid, 2, &l).as_deref(),
+                Some("member1"),
+                "{tid}"
+            );
+        }
+    }
+
+    #[test]
+    fn seat_walk_main_command_and_reparented_are_null() {
+        let p = fake(&[
+            INIT,
+            (120, 120, 100, &[120, 3]), // main command tree
+            (150, 150, 100, &[150, 7]),
+            (180, 180, 100, &[180, 11]), // detached: reparented to init
+        ]);
+        let l = exec_table(7);
+        assert_eq!(resolve_seat(&p, 120, 2, &l), None);
+        assert_eq!(resolve_seat(&p, 180, 2, &l), None);
+        assert_eq!(resolve_seat(&p, 100, 2, &l), None);
+    }
+
+    #[test]
+    fn seat_walk_loop_too_deep_and_unreadable_are_null() {
+        let l = exec_table(7);
+        // cycle between two tasks
+        let p = fake(&[(200, 200, 201, &[200, 20]), (201, 201, 200, &[201, 21])]);
+        assert_eq!(resolve_seat(&p, 200, 2, &l), None);
+        // too deep: a chain of 70 tasks, exec top above the limit
+        let mut v: Vec<(i32, i32, i32, Vec<i32>)> = Vec::new();
+        for i in 0..70 {
+            v.push((300 + i, 300 + i, 301 + i, vec![300 + i, 20 + i]));
+        }
+        v.push((370, 370, 100, vec![370, 7]));
+        let m = FakeProc(
+            v.into_iter()
+                .map(|(a, b, c, d)| {
+                    (
+                        a,
+                        ProcStatus {
+                            tgid: b,
+                            ppid: c,
+                            nspid: d,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(resolve_seat(&m, 300, 2, &l), None);
+        // unreadable status of the task and of an ancestor
+        let p = fake(&[(150, 150, 160, &[150, 7])]);
+        assert_eq!(resolve_seat(&p, 999, 2, &l), None);
+        assert_eq!(resolve_seat(&p, 150, 2, &exec_table(8)), None);
+    }
+
+    #[test]
+    fn seat_walk_ignores_nested_pid_namespaces_and_exited_exec_entry() {
+        // A task in a pid ns the program made (depth 3) whose inner pid
+        // equals the exec top pid is not the exec.
+        let p = fake(&[
+            INIT,
+            (150, 150, 100, &[150, 5]),
+            (160, 160, 150, &[160, 7, 1]),
+        ]);
+        assert_eq!(resolve_seat(&p, 160, 2, &exec_table(7)), None);
+        // exec entry removed (lookup returns None): null.
+        assert_eq!(resolve_seat(&p, 150, 2, &|_| None), None);
+        // an exec whose client has no seat stays null
+        let q = fake(&[INIT, (150, 150, 100, &[150, 7])]);
+        assert_eq!(
+            resolve_seat(&q, 150, 2, &|p| (p == 7).then_some(None)),
+            None
+        );
+    }
+
+    #[test]
+    fn proc_status_parses_the_fields_the_walk_needs() {
+        let t = "Name:\tx\nTgid:\t12\nPid:\t13\nPPid:\t4\nNSpid:\t13\t5\n";
+        assert_eq!(
+            parse_proc_status(t),
+            Some(ProcStatus {
+                tgid: 12,
+                ppid: 4,
+                nspid: vec![13, 5]
+            })
+        );
+        assert_eq!(parse_proc_status("Tgid:\t1\n"), None);
+    }
+
     use super::*;
     use std::str::FromStr;
 

@@ -305,6 +305,18 @@ if [ -n "$SEAT_TOK" ]; then
   fi
   journal_is "0.6.1 journal: exec'd program's network/connect names its seat" "$AWS" 1 \
     kind=network/connect target=192.0.2.1:18104 verdict=allow reason=injected-inprogress seat=member1
+  # 0.6.1: the same seat, from a child process and from a second thread
+  # of the exec (attribution is by process ancestry, not the exec's pid).
+  OUT=$(HISN_SEAT_TOKEN="$SEAT_TOK" timeout 60 "$HISN" exec --no-tty --session "$A" -- python3 net_helper.py in-child 18105 </dev/null 2>&1)
+  if printf '%s\n' "$OUT" | grep -q '^CHILD-OK'; then pass "0.6.1 seat exec: connect from a child process"; else fail "0.6.1 seat exec: connect from a child process" "[$OUT]"; fi
+  OUT=$(HISN_SEAT_TOKEN="$SEAT_TOK" timeout 60 "$HISN" exec --no-tty --session "$A" -- python3 net_helper.py in-thread 18106 </dev/null 2>&1)
+  if printf '%s\n' "$OUT" | grep -q '^THREAD-OK'; then pass "0.6.1 seat exec: connect from a second thread"; else fail "0.6.1 seat exec: connect from a second thread" "[$OUT]"; fi
+  journal_is "0.6.1 journal: child process connect names its seat" "$AWS" 1 \
+    kind=network/connect target=192.0.2.1:18105 verdict=allow seat=member1
+  journal_is "0.6.1 journal: second-thread connect names its seat" "$AWS" 1 \
+    kind=network/connect target=192.0.2.1:18106 verdict=allow seat=member1
+  SEATN=$(timeout 20 "$HISN" journal --workspace "$AWS" --seat member1 --kind network/connect --json </dev/null 2>/dev/null | grep -c '"seat":"member1"')
+  if [ "$SEATN" = 3 ]; then pass "0.6.1 journal --seat selects exactly the three connects"; else fail "0.6.1 journal --seat selects exactly the three connects" "selected $SEATN"; fi
   # `journal --seat` must return the network/connect record itself (not
   # only the exec/* records the exec wrote): filter on the kind as
   # well.

@@ -32,7 +32,7 @@ import time
 LISTEN_IP = '192.0.2.1'
 DNS_IP = '192.0.2.2'
 BLACKHOLE = ('192.0.2.98', 18181)
-TCP_PORTS = (18080, 18081, 18090, 18102, 18103, 18104, 18110, 18120, 18130, 18131)
+TCP_PORTS = (18080, 18081, 18090, 18102, 18103, 18104, 18105, 18106, 18110, 18120, 18130, 18131)
 HTTP_PORT = 18140
 CLOSED_PORT = 18444
 # Further ports on the blackhole address, so that a case can count its
@@ -338,6 +338,21 @@ def in_connect(port, mode='timeout'):
     if data != GREETING:
         fail(f'connected, but read {data!r}')
     print(f'CONNECT-OK nonblock={flag[0]}')
+
+
+def in_child(port):
+    """Connect from a forked child process (a descendant of the exec)."""
+    pid = os.fork()
+    if pid == 0:
+        try:
+            data = _greeting_from(port)
+            os._exit(0 if data == GREETING else 3)
+        except BaseException:
+            os._exit(4)
+    _, st = os.waitpid(pid, 0)
+    if st != 0:
+        fail(f'child connect failed, wait status {st}')
+    print('CHILD-OK')
 
 
 def in_main(port, out_path, mode='timeout'):
@@ -1041,6 +1056,7 @@ def main(argv):
         'pending-count': lambda: pending_count(*map(int, args[:1])),
         'journal-dump': journal_dump,
         'in-connect': lambda: in_connect(int(args[0]), *args[1:2]),
+        'in-child': lambda: in_child(int(args[0])),
         'in-main': lambda: in_main(int(args[0]), args[1], *args[2:3]),
         'in-dns': in_dns,
         'in-dns-raw': lambda: in_dns_raw(args[0], args[1]),

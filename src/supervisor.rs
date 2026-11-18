@@ -3244,7 +3244,6 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
                 .expect("exec_seats")
                 .get(&pid)
                 .cloned()
-                .flatten()
         })
     };
     let _exec_engine = exec_net_listener.map(|l| {

@@ -32,7 +32,7 @@ import time
 LISTEN_IP = '192.0.2.1'
 DNS_IP = '192.0.2.2'
 BLACKHOLE = ('192.0.2.98', 18181)
-TCP_PORTS = (18080, 18081, 18090, 18102, 18103, 18110, 18120, 18130, 18131)
+TCP_PORTS = (18080, 18081, 18090, 18102, 18103, 18104, 18110, 18120, 18130, 18131)
 HTTP_PORT = 18140
 CLOSED_PORT = 18444
 # Further ports on the blackhole address, so that a case can count its
@@ -643,6 +643,41 @@ def in_reconnect_failed(port, port_read):
     print('REFAILED-OK unread=ECONNREFUSED read=ECONNABORTED')
 
 
+def in_hostsocket(port):
+    """A socket whose supervisor-side connect failed is kept by the
+    program (open mode injects the supervisor's socket before the
+    connect completes). It must not reach anything the policy did not
+    approve: loopback connect, bind, listen and a fast-open send all
+    fail EACCES, and nothing is opened or reached on the host."""
+    import select
+    sock = socket.socket()
+    sock.setblocking(False)
+    rc = sock.connect_ex((LISTEN_IP, port))
+    if rc != EINPROGRESS:
+        fail(f'connect to the closed port: errno {rc}, want EINPROGRESS')
+    if not select.select([], [sock], [], 10)[1]:
+        fail('socket never became writable')
+    host = ('127.0.0.1', HOST_LOOPBACK_PORT)
+    rc = sock.connect_ex(host)
+    if rc != EACCES:
+        fail(f'loopback connect on the kept socket: errno {rc}, want EACCES')
+    for name, call in (
+        ('bind', lambda: sock.bind(('127.0.0.1', 19060))),
+        ('listen', lambda: sock.listen(1)),
+        ('fast-open sendto', lambda: sock.sendto(
+            b'x', socket.MSG_FASTOPEN, host)),
+    ):
+        try:
+            call()
+            fail(f'{name} on the kept socket succeeded')
+        except OSError as e:
+            if e.errno != EACCES:
+                fail(f'{name} on the kept socket: errno {e.errno}, '
+                     'want EACCES')
+    print('HOSTSOCKET-OK connect=EACCES bind=EACCES listen=EACCES '
+          'fastopen=EACCES')
+
+
 def in_pool(go_path, count):
     """`count` blocking connects to the blackhole stay pending; once
     `go_path` exists (the test creates it after it has seen them in the
@@ -1038,6 +1073,7 @@ def main(argv):
         'in-reconnect-pending': in_reconnect_pending,
         'in-reconnect-failed': lambda: in_reconnect_failed(
             int(args[0]), int(args[1])),
+        'in-hostsocket': lambda: in_hostsocket(int(args[0])),
         'in-pool': lambda: in_pool(args[0], int(args[1])),
         'in-blocking-refused': lambda: in_blocking_refused(int(args[0])),
         'in-deadline': in_deadline,

@@ -1213,9 +1213,22 @@ fn handle_implicit_call(
     journal: &Option<std::sync::Arc<crate::journal::Journal>>,
 ) {
     let sockfd = n.data.args[0] as i32;
-    let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, n.pid as i64, sockfd as i64, 0u64) };
-    let cookie = (dup >= 0)
-        .then(|| unsafe { OwnedFd::from_raw_fd(dup as i32) })
+    // pidfd_getfd takes a pidfd (not a thread id); ID_VALID confirms the
+    // pidfd still names the task suspended in this call.
+    let cookie = open_task_pidfd(n.pid as libc::pid_t, true)
+        .ok()
+        .filter(|_| id_valid(lfd, n.id))
+        .and_then(|pidfd| {
+            let dup = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_getfd,
+                    pidfd.as_raw_fd() as i64,
+                    sockfd as i64,
+                    0u64,
+                )
+            };
+            (dup >= 0).then(|| unsafe { OwnedFd::from_raw_fd(dup as i32) })
+        })
         .and_then(|d| socket_netns_cookie(d.as_raw_fd()));
     let (verdict, reason) = match classify_ns(cookie, cfg.supervisor_cookie) {
         SockNs::Sandbox => ("continue", "implicit-sandbox-socket"),
@@ -1229,7 +1242,9 @@ fn handle_implicit_call(
             reply(lfd, n.id, -(libc::EACCES), 0, 0);
         }
     }
-    if let Some(j) = journal {
+    // Only refusals are journaled: a continued bind/listen on a sandbox
+    // socket is routine and would fill the journal.
+    if let (Some(j), "refuse") = (journal, verdict) {
         j.net_implicit_record(n, verdict, reason);
     }
 }
@@ -1358,7 +1373,10 @@ fn handle_notif(
                 &mut peer as *mut libc::sockaddr_storage as *mut libc::sockaddr,
                 &mut peer_len,
             )
-        } == 0;
+        } == 0
+            // Only stream sockets: getpeername succeeds on an unconnected
+            // netlink socket, which must reach the policy (L109).
+            && is_stream;
         // A stream socket whose connect is still in flight: the one an
         // earlier non-blocking connect() put there.
         already_pending = is_stream
@@ -1393,45 +1411,6 @@ fn handle_notif(
             .and_then(|d| socket_netns_cookie(d.as_raw_fd()));
         classify_ns(cookie, cfg.supervisor_cookie)
     };
-    if matches!(sock_ns, SockNs::Host | SockNs::Unknown) {
-        // connect() on a host-side or unresolvable socket: the 0.6.0
-        // already-* answers assumed the sandbox netns and are skipped
-        // here (except already-connected, which is a pure kernel fact
-        // with no escape: the connection already exists, and answering
-        // EISCONN grants nothing new).
-        if already_connected {
-            if id_valid(lfd, n.id) {
-                reply(lfd, n.id, -(libc::EISCONN), 0, 0);
-            }
-            if let Some(j) = journal {
-                j.net_record("refuse", "already-connected", n);
-            }
-            return;
-        }
-        if already_pending {
-            if id_valid(lfd, n.id) {
-                reply(lfd, n.id, -(libc::EACCES), 0, 0);
-            }
-            if let Some(j) = journal {
-                j.net_record("refuse", "host-socket-pending", n);
-            }
-            return;
-        }
-        if already_used {
-            // (a): the re-connect re-enters the full policy below — the
-            // host-side socket may serve only the connection it was
-            // approved for, so no host-socket fast path. Fall through
-            // to `decide`.
-        } else {
-            if id_valid(lfd, n.id) {
-                reply(lfd, n.id, -(libc::EACCES), 0, 0);
-            }
-            if let Some(j) = journal {
-                j.net_record("refuse", "host-socket-connect", n);
-            }
-            return;
-        }
-    }
     // 0.6.1: the already-connected / already-pending / already-used
     // answer comes before the private-address verdict, but only for
     // that answer: `connect()` on a socket that is already connected
@@ -1458,18 +1437,44 @@ fn handle_notif(
         }
         return;
     }
+    let off_sandbox = matches!(sock_ns, SockNs::Host | SockNs::Unknown);
+    if off_sandbox && !already_used {
+        // A socket outside the sandbox namespace that is neither
+        // connected, pending nor failed has no approved connection: it
+        // serves nothing (invariant a).
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, -(libc::EACCES), 0, 0);
+        }
+        if let Some(j) = journal {
+            j.net_record("refuse", "host-socket-connect", n);
+        }
+        return;
+    }
     if already_used {
-        if matches!(sock_ns, SockNs::Host | SockNs::Unknown) {
-            // (a): a host-side socket may serve only the connection it
-            // was approved for. No own-socket re-connect fast path:
-            // fall through to the full policy below (fresh socket,
-            // injected on approval — the host socket is replaced).
-        } else {
-            // As before, under `Verdict::Allow` only in shape: the
-            // re-connect is made on the program's own socket, and the
-            // kernel's answer is passed on. A private *new* target on a
-            // failed socket still gets the pending error, not EACCES —
-            // the kernel would answer the same without hisn.
+        // (a) A supervisor-side socket that failed is answered on the
+        // program's own socket as in 0.6.0, but only for a target the
+        // full policy approves: the re-connect is made by the
+        // supervisor in its own namespace, so loopback, private and
+        // unlisted targets are refused here.
+        if off_sandbox {
+            let public = ip.map(|a| is_public_ip(&a)).unwrap_or(false);
+            let verdict = decide(family, is_loopback, is_stream, public);
+            if !matches!(verdict, Verdict::Allow) {
+                let reason = if matches!(verdict, Verdict::Continue) {
+                    "host-socket-loopback-or-unix"
+                } else {
+                    "private-or-unlisted"
+                };
+                if id_valid(lfd, n.id) {
+                    reply(lfd, n.id, -(libc::EACCES), 0, 0);
+                }
+                if let Some(j) = journal {
+                    j.net_record("refuse", reason, n);
+                }
+                return;
+            }
+        }
+        {
             let rc = match &used_sock {
                 Some(sock) => unsafe {
                     libc::connect(

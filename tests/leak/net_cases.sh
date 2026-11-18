@@ -6,7 +6,8 @@
 # blocking sockets (L119), connect() on a pending socket (L120),
 # non-blocking behind blocking connects (L121), the connect deadline
 # (L122), session stop with a tracked connect (L123) and connect() on a
-# socket whose connect failed (L124).
+# socket whose connect failed (L124) and a kept supervisor-side socket
+# (L125).
 #
 # Usage (always through unshare; this script refuses to run otherwise):
 #   unshare -Urn bash tests/leak/net_cases.sh HISN WORKDIR TOKEN
@@ -454,6 +455,21 @@ journal_is "L124 journal: one injected connect to the second closed port, no sec
   kind=network/connect target=192.0.2.1:18447 verdict=allow
 journal_is "L124 journal: the second connect is refuse/earlier-connect-failed" "$AWS" 1 \
   kind=network/connect target=192.0.2.1:18446 verdict=refuse reason=earlier-connect-failed
+
+# L125: a socket whose connect the supervisor made and which failed stays
+# with the program, in the supervisor's namespace. It may not reach a
+# host loopback daemon (18070 is one), bind or listen there, or send with
+# fast-open. Nothing may be opened or reached on the host side.
+check "L125 a kept supervisor-side socket: loopback connect, bind, listen and fast-open sendto all fail EACCES" "HOSTSOCKET-OK connect=EACCES bind=EACCES listen=EACCES fastopen=EACCES" in_session "$A" in-hostsocket 18448
+journal_is "L125 journal: the loopback connect is refuse/host-socket-loopback-or-unix" "$AWS" 1 \
+  kind=network/connect target=127.0.0.1:18070 verdict=refuse reason=host-socket-loopback-or-unix
+journal_is "L125 journal: bind, listen and fast-open are refuse/host-socket-implicit" "$AWS" 3 \
+  kind=network/implicit verdict=refuse reason=host-socket-implicit
+if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',19060))==0 else 1)"; then
+  fail "L125 host side: port 19060 is not open in the supervisor's namespace" "something listens on 127.0.0.1:19060"
+else
+  pass "L125 host side: port 19060 is not open in the supervisor's namespace"
+fi
 
 # L121: 64 blocking connects to the blackhole are pending in the
 # supervisor (counted in /proc/net/tcp); a non-blocking connect is still

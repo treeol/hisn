@@ -3,7 +3,9 @@
 #
 # Steps, in order:
 #   1. cargo fmt --check
-#   2. cargo clippy --all-targets -- -D warnings
+#   2. cargo clippy --all-targets -- -D warnings (native target)
+#   2b. cargo clippy --all-targets --target <t> -- -D warnings for each
+#       non-native CI target that is installed (SKIP with a rustup hint when not)
 #   3. make check (hisn check: host-capability report; exit 2 if a required
 #      capability is missing)
 #   4. make test
@@ -23,6 +25,28 @@ cd "$(dirname "$0")/.." || exit 1
 step() { printf 'release-gate: step %s: %s\n' "$1" "$2"; }
 ok()   { printf 'release-gate: OK %s\n' "$1"; }
 fail() { printf 'release-gate: FAIL %s: %s\n' "$1" "$2" >&2; exit 1; }
+
+# Cross-target clippy: CI builds these non-native targets, and dead-code
+# constants that are fine on one arch fail on another. The gate runs clippy
+# for each installed target and SKIPs (with a rustup hint) the rest.
+CROSS_TARGETS="aarch64-unknown-linux-gnu x86_64-unknown-linux-musl"
+
+run_cross_clippy() {
+  local installed
+  installed="$(rustup target list --installed 2>/dev/null)"
+  CROSS_SKIP=""
+  for t in $CROSS_TARGETS; do
+    if printf '%s\n' "$installed" | grep -qx "$t"; then
+      step 2b "cargo clippy --all-targets --target $t -- -D warnings"
+      cargo clippy --all-targets --target "$t" -- -D warnings \
+        || fail "cross-clippy-$t" "cargo clippy --target $t exited $?"
+      ok "cross-clippy-$t"
+    else
+      printf 'release-gate: SKIP cross-clippy-%s: rustup target add %s\n' "$t" "$t"
+      CROSS_SKIP="${CROSS_SKIP} $t"
+    fi
+  done
+}
 
 run_leak_pipe() {
   step 5 "leak suite through a pipe"
@@ -65,6 +89,8 @@ step 2 "cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings || fail "clippy" "cargo clippy exited $?"
 ok "clippy"
 
+run_cross_clippy
+
 step 3 "make check"
 make check || fail "make-check" "make check exited $?"
 ok "make-check"
@@ -76,4 +102,5 @@ ok "make-test"
 run_leak_pipe
 run_leak_pty
 
-printf 'release-gate: summary fmt=ok clippy=ok make-check=ok make-test=ok leak-suite-pipe=ok leak-suite-pty=%s\n' "${LEAK_PTY:-skipped}"
+printf 'release-gate: summary fmt=ok clippy=ok cross-clippy=%s make-check=ok make-test=ok leak-suite-pipe=ok leak-suite-pty=%s\n' \
+  "${CROSS_SKIP:-all-ok}" "${LEAK_PTY:-skipped}"

@@ -10,16 +10,15 @@ const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JEQ_K: u16 = 0x15;
 const BPF_RET_K: u16 = 0x06;
 
-const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
-#[allow(dead_code)]
-const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
-
+/// Native architecture constant for the seccomp filter. Each target
+/// compiles only its own value; an unsupported target is a compile
+/// error so a wrong arch value never reaches a seccomp filter.
 #[cfg(target_arch = "x86_64")]
-const NATIVE_ARCH: u32 = AUDIT_ARCH_X86_64;
+const NATIVE_ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
 #[cfg(target_arch = "aarch64")]
-const NATIVE_ARCH: u32 = AUDIT_ARCH_AARCH64;
+const NATIVE_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-const NATIVE_ARCH: u32 = 0;
+const _UNSUPPORTED_ARCH: () = compile_error!("notif needs x86_64 or aarch64");
 
 /// Hand-written BPF: kill foreign arch, USER_NOTIF for connect, ALLOW else.
 /// Jump direction: JEQ jt=1 skips the next instruction on match, jf=0

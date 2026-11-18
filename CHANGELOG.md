@@ -67,6 +67,11 @@ Also verified on 192.168.1.213: `pass=100 fail=0 timeout=0 skipped=2`.
 - The 512 MB import test measured the memory of the whole test process
   and could fail because of other tests running in parallel; it now
   measures in its own process.
+- The release build from `4ec88bc` failed CI on non-x86_64 targets:
+  `AUDIT_ARCH_X86_64` was dead code on aarch64. Each target now compiles
+  only its own `NATIVE_ARCH` constant (`src/notif.rs`), with a
+  `compile_error!` for unsupported architectures. Identical behaviour
+  on x86_64.
 
 ## [0.5.1] - 2026-11-15
 

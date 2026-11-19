@@ -139,7 +139,9 @@ run_step() {
     return 0
   fi
   say "--- last 30 lines of $log"
-  tail -n 30 "$log" | tee -a "$SUMMARY"
+  # Quoted log lines are indented: a nested PASS/FAIL line must not be
+  # counted by the tally in finish().
+  tail -n 30 "$log" | sed 's/^/    | /' | tee -a "$SUMMARY"
   say "--- end"
   return 1
 }

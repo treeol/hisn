@@ -3416,8 +3416,8 @@ mod tests {
             libc::SYS_brk,
             libc::SYS_munmap,
             libc::SYS_rt_sigaction,
-            libc::SYS_epoll_wait,
-            libc::SYS_poll,
+            libc::SYS_epoll_pwait,
+            libc::SYS_ppoll,
             libc::SYS_pidfd_getfd,
             libc::SYS_getpid,
         ];

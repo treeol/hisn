@@ -251,7 +251,7 @@ fi
 timing_probe() {
   local mode=$1 extra=$2 label=${3:-$1}
   local RFLAG=()
-  [ "$label" = open+rootfs ] && RFLAG=(--rootfs-path "$ROOTFS")
+  [ "$label" = open-rootfs ] && RFLAG=(--rootfs-path "$ROOTFS")
   T="$TMP/timing"
   mkdir -p "$T/run" "$T/state" "$T/cwd"
   chmod 700 "$T/run"
@@ -335,9 +335,9 @@ note "timing probe (INFO only, never a gate)"
 timing_probe none ""
 timing_probe open ""
 if [ -n "${ROOTFS:-}" ] && [ -d "${ROOTFS:-/nonexistent}/usr" ]; then
-  timing_probe open "" open+rootfs
+  timing_probe open "" open-rootfs
 else
-  skip "timing open+rootfs" "no rootfs: set HISN_TEST_ROOTFS, or import one as wakil-dev"
+  skip "timing open-rootfs" "no rootfs: set HISN_TEST_ROOTFS, or import one as wakil-dev"
 fi
 
 note "step 4: real network"

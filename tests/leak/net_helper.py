@@ -693,6 +693,34 @@ def in_hostsocket(port):
           'fastopen=EACCES')
 
 
+def in_hostsocket_report(port):
+    """Like in_hostsocket, but never fails: one `SUBCHECK name held` or
+    `SUBCHECK name did-not-hold` line per sub-check (used to compare a
+    build with the 0.6.1 hardening). Held means the call failed EACCES."""
+    import select
+    sock = socket.socket()
+    sock.setblocking(False)
+    rc = sock.connect_ex((LISTEN_IP, port))
+    if rc != EINPROGRESS or not select.select([], [sock], [], 10)[1]:
+        print(f'SUBCHECK precondition did-not-hold errno={rc}')
+        return
+    host = ('127.0.0.1', HOST_LOOPBACK_PORT)
+    checks = (
+        ('loopback-connect', lambda: sock.connect_ex(host)),
+        ('bind', lambda: sock.bind(('127.0.0.1', 19060))),
+        ('listen', lambda: sock.listen(1)),
+        ('fast-open-sendto', lambda: sock.sendto(
+            b'x', socket.MSG_FASTOPEN, host)),
+    )
+    for name, call in checks:
+        try:
+            rc = call()
+            errno_ = rc if isinstance(rc, int) and rc else 0
+        except OSError as e:
+            errno_ = e.errno
+        print(f'SUBCHECK {name} {"held" if errno_ == EACCES else "did-not-hold"}')
+
+
 def in_pool(go_path, count):
     """`count` blocking connects to the blackhole stay pending; once
     `go_path` exists (the test creates it after it has seen them in the
@@ -1089,6 +1117,7 @@ def main(argv):
         'in-reconnect-pending': in_reconnect_pending,
         'in-reconnect-failed': lambda: in_reconnect_failed(
             int(args[0]), int(args[1])),
+        'in-hostsocket-report': lambda: in_hostsocket_report(int(args[0])),
         'in-hostsocket': lambda: in_hostsocket(int(args[0])),
         'in-pool': lambda: in_pool(args[0], int(args[1])),
         'in-blocking-refused': lambda: in_blocking_refused(int(args[0])),

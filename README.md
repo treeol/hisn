@@ -260,7 +260,7 @@ In short:
 
 ## Status
 
-The current release is hisn 0.6.0. Release notes, including compatibility and
+The current release is hisn 0.6.1. Release notes, including compatibility and
 known limitations, are in [docs/releases/v0.6.0.md](docs/releases/v0.6.0.md);
 earlier releases are in the [CHANGELOG](CHANGELOG.md).
 

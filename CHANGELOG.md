@@ -7,6 +7,18 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-19
+
+### Security
+- `network = "open"` is meant to let a program reach only targets the
+  connect policy approved. In 0.6.0 a socket the supervisor had handed
+  to a program before its connect, and that connect then failed, could
+  still be used for a loopback connect, `bind`, `listen` or a fast-open
+  send in the supervisor's network namespace. 0.6.1 refuses all of
+  these on such a socket. Upgrade before using `open` with untrusted
+  code. One time-of-check gap remains and is documented in ADR 0022
+  ("0.6.1 hardening", known gap).
+
 ### Fixed
 - Journal retention now applies to every session, whatever its network
   mode (once per workspace, 64 MiB), with a `journal/pruned` record
@@ -28,6 +40,11 @@ All notable changes to hisn are recorded here. The format follows
   `journal/pruned` (files deleted by retention).
 
 ### Changed
+- `network = "open"` needs kernel 5.14 (`SO_NETNS_COOKIE`); 0.6.0
+  accepted 5.9.
+- Intercepted connect: about 151 µs against 97 µs in 0.6.0 on the same
+  host (the filter now also notifies `bind`, `listen` and fast-open
+  sends, and each connect resolves its seat and socket namespace).
 - Shipped text no longer names private hosts or addresses; the release
   gate now fails if those names or a private LAN address reappear.
 
@@ -765,7 +782,8 @@ First release.
 - `hisn exec` verifies fail-closed, before running anything, that the root it
   entered is the sandbox root (DESIGN D25).
 
-[Unreleased]: https://github.com/treeol/hisn/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/treeol/hisn/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/treeol/hisn/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/treeol/hisn/releases/tag/v0.6.0
 [0.5.1]: https://github.com/treeol/hisn/releases/tag/v0.5.1
 [0.5.0]: https://github.com/treeol/hisn/releases/tag/v0.5.0

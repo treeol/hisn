@@ -30,11 +30,11 @@ set -u
 # surviving match fails the gate.
 run_private_details() {
   step 0 "private-details check (shipped files)"
-  local allow="scripts/release-gate-allowlist.txt" pat='rubin|smaragd|firecracker|pihole|/home/valon|valon@|192\.168\.(1|88)\.[0-9]+\.[0-9]+' # gate pattern (allowlisted below)
+  local allow="scripts/release-gate-allowlist.txt" pat='rubin|smaragd|firecracker|pihole|/home/valon|valon@|192\.168\.(1|88)\.[0-9]+' # gate pattern (case-insensitive) (allowlisted below)
   local hits
   hits=$(git ls-files -- '*.md' '*.toml' '*.txt' '*.sh' '*.rs' '*.py' \
     ':!tests/*' ':!scripts/release-gate-allowlist.txt' | while IFS= read -r f; do
-      grep -nE "$pat" -- "$f" 2>/dev/null | sed "s|^|$f:|"
+      grep -niE "$pat" -- "$f" 2>/dev/null | sed "s|^|$f:|"
     done)
   if [ -n "$hits" ]; then
     local bad=""

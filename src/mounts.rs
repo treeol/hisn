@@ -1156,12 +1156,12 @@ mod tests {
     }
 
     const STUB_HOST: &str = "# systemd stub\nnameserver 127.0.0.53\nsearch home\n";
-    const UPSTREAMS: &str = "# real\nnameserver 192.168.1.111\nnameserver 2001:db8::1\nsearch corp.example\noptions edns0\n";
+    const UPSTREAMS: &str = "# real\nnameserver 192.0.2.53\nnameserver 2001:db8::1\nsearch corp.example\noptions edns0\n";
 
     #[test]
     fn stub_only_host_uses_the_resolver_file_upstreams() {
         let out = build_resolv_conf(Some(STUB_HOST), Some(UPSTREAMS), None).unwrap();
-        assert!(out.contains("nameserver 192.168.1.111\n"), "{out}");
+        assert!(out.contains("nameserver 192.0.2.53\n"), "{out}");
         assert!(out.contains("nameserver 2001:db8::1\n"), "{out}");
         assert!(!out.contains("127.0.0.53"), "loopback passed: {out}");
         // the host had a search line, so it wins over the upstream file's
@@ -1242,7 +1242,7 @@ mod tests {
         let out =
             build_resolv_conf_ordered(Some(IMAGE_EMPTY), Some(STUB_HOST), Some(UPSTREAMS), None)
                 .unwrap();
-        assert!(out.contains("nameserver 192.168.1.111\n"), "{out}");
+        assert!(out.contains("nameserver 192.0.2.53\n"), "{out}");
         assert!(
             !out.contains("9.9.9.9") && !out.contains("127.0.0.53"),
             "{out}"
@@ -1270,7 +1270,7 @@ mod tests {
         let out =
             build_resolv_conf_ordered(Some(IMAGE_REAL), Some(STUB_HOST), Some(UPSTREAMS), None)
                 .unwrap();
-        assert!(out.contains("nameserver 192.168.1.111\n"), "{out}");
+        assert!(out.contains("nameserver 192.0.2.53\n"), "{out}");
         assert!(!out.contains("9.9.9.9"), "{out}");
     }
 

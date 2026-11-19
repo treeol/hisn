@@ -718,7 +718,9 @@ def in_hostsocket_report(port):
             errno_ = rc if isinstance(rc, int) and rc else 0
         except OSError as e:
             errno_ = e.errno
-        print(f'SUBCHECK {name} {"held" if errno_ == EACCES else "did-not-hold"}')
+        import errno as _errno
+        label = _errno.errorcode.get(errno_, str(errno_)) if errno_ else 'success'
+        print(f'SUBCHECK {name} {"held" if errno_ == EACCES else "did-not-hold"} result={label}')
 
 
 def in_pool(go_path, count):

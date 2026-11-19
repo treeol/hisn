@@ -15,9 +15,27 @@ All notable changes to hisn are recorded here. The format follows
   to a program before its connect, and that connect then failed, could
   still be used for a loopback connect, `bind`, `listen` or a fast-open
   send in the supervisor's network namespace. 0.6.1 refuses all of
-  these on such a socket. Upgrade before using `open` with untrusted
-  code. One time-of-check gap remains and is documented in ADR 0022
-  ("0.6.1 hardening", known gap).
+  these on such a socket, and leaves a call to the kernel only for a
+  socket that verifiably lives in the sandbox namespace. Upgrade before
+  using `open` with untrusted code.
+- **Remaining limitation.** For calls the supervisor leaves to the
+  kernel, the check and the kernel's execution are two moments; a
+  program written to exploit that timing may get a call through that
+  the policy would have refused. Ordinary programs are not affected.
+  Use `open` only for code you trust until 0.6.2, in which the
+  supervisor performs these calls itself on its own copy of the socket,
+  with a kernel-enforced backstop alongside. `network = "none"` is not
+  affected. See ADR 0022, "0.6.1 hardening", "Known gap".
+
+**Evidence (a Fedora 45 host, kernel 7.3.3, at `8f2d0a1`):**
+`bash .wakil/host-run-061.sh full` ended `RESULT stage=full exit=0`
+(unit tests `590 passed; 0 failed`; leak suite `473 passed, 0 failed,
+9 skipped, 2 weak` and with a rootfs `486 passed, 0 failed, 5 skipped,
+2 weak`; host script `RESULT: pass=110 fail=0 timeout=0 skipped=1`);
+`scripts/host-verify-network.sh --real` ended
+`RESULT: pass=121 fail=0 timeout=0 skipped=0`. Secondary, a second test
+machine at `3d417ae`: `pass=111 fail=0 timeout=0 skipped=2`. Details:
+`docs/releases/v0.6.1.md`.
 
 ### Fixed
 - Journal retention now applies to every session, whatever its network

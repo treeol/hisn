@@ -100,7 +100,7 @@ host output pasted after each pass; pass-6 host results are pending.
 | Supervisor (ancestor in the owning userns) reads the `sockaddr` of the exec'd program via `process_vm_readv` **and** `/proc/<pid>/mem`; execve resets dumpable to 1 even with NNP so the program is readable; `NOTIF_ID_VALID=0` after the read | B2 | PASS |
 | A non-dumpable process that never exec'd cannot be read (EPERM). This does not carry over to a program inside a hisn sandbox, see the correction under connect-flow step 2. | B1 | INFO (as expected) |
 | Loopback, unix-path and abstract-unix connects continue via `CONTINUE` | C1–C3 | PASS |
-| `CONTINUE` is subject to a TOCTOU race (child rewrites the buffer): 22 of 2000 rewrites won (`continued=1975, refused=25`); harmless only because the netns is empty. Pass 6 measured `enetunreach=47, refused=25, continued=1975, attempts=2000, toctou_wins=22`. | C4 pass 6 | INFO (race measured) |
+| `CONTINUE` is subject to a TOCTOU race (child rewrites the buffer): 22 of 2000 rewrites won (`continued=1975, refused=25`); harmless only while every socket lives in the empty netns (not so for a kept supervisor-side socket, see "0.6.1 hardening"). Pass 6 measured `enetunreach=47, refused=25, continued=1975, attempts=2000, toctou_wins=22`. | C4 pass 6 | INFO (race measured) |
 | `sendto`/`sendmsg`/`sendmmsg`/`MSG_FASTOPEN` to outside addresses fail `ENETUNREACH` in the empty netns; control from host namespace reaches | E1–E4, E-control | PASS |
 | Socket options survive the swap when copied via `pidfd_getfd`; `SO_RCVBUF`/`SO_SNDBUF` read back 2× the requested value, so the supervisor requests half | F | PASS |
 | A program's own nested filter with ALLOW for `connect` does not break interception; its own ERRNO filter wins over the outer `USER_NOTIF` (only for that program) | H1, H3 | PASS |
@@ -509,9 +509,11 @@ allowlisted git host can read what the agent pushes — that is what
 allowlisting means); tunneling through allowed domains (DNS pinning
 pins the *address*, not the content — a connection to an allowed IP is
 a connection to that IP for any protocol); the `CONTINUE` TOCTOU race
-(C4: 22/2000 rewrites won) — harmless here because every rewritten
-address still resolves inside the empty netns (loopback, or a TEST-NET
-range with no route, or a path with no listener); the shared-Unix-user
+(C4: 22/2000 rewrites won) — harmless only while every socket lives in
+the empty netns, because then every rewritten address still resolves
+inside it (loopback, or a TEST-NET range with no route, or a path with
+no listener); for a socket kept in the supervisor's namespace after a
+failed connect that does not hold, see "0.6.1 hardening", "Known gap"; the shared-Unix-user
 caveat (ADR 0021 decision A: a same-uid process can omit the
 credential, read the user's files, and race the supervisor's
 `process_vm_readv` — seats are attribution, not a boundary, and the
@@ -827,14 +829,21 @@ against a v0.6.0 build): see the 0.6.1 release notes for the result.
 The `host-socket-loopback-or-unix` and `host-socket-implicit` records are
 new in 0.6.1.
 
-**Known gap (open point, not fixed in 0.6.1).** `CONTINUE` lets the
-kernel run the original call, and the supervisor's check was made on a
-duplicate of the descriptor. A second thread of the program that
-replaces the descriptor number between the check and the call can make
-the kernel run it on another socket. This is the same time-of-check gap
-as decision 7's descriptor-reuse race and the `CONTINUE` buffer race
-measured in the probes; it was open in 0.6.0 as well. It matters only
-for a program that holds a supervisor-side socket (kept after a failed
-connect) and a second thread, and it needs a design change to close
-(the supervisor performing the call itself on the verified socket
-instead of continuing it). No test in this release shows it closed.
+**Known gap (a real limitation of 0.6.1; fix planned for 0.6.2).**
+0.6.1 enforces that a socket the supervisor handed in is refused for new
+connects, `bind`, `listen` and fast-open sends, and that a call is left
+to the kernel (`CONTINUE`) only for a socket that verifiably lives in the
+sandbox namespace. What remains: for the calls the supervisor leaves to
+the kernel, the check (made on a duplicate of the descriptor) and the
+kernel's execution of the original call are two moments. A program
+written to exploit that timing may get a call through that the policy
+would have refused. It takes code written for that purpose; ordinary
+programs are not affected. This is not equivalent to the address race of
+decision 3 and the probes ("`CONTINUE` TOCTOU", 22 of 2000): that one
+was harmless only while every socket lived in the empty namespace. With
+a supervisor-side socket kept after a failed connect, that assumption
+no longer holds. Consequence: `open` is for code you trust until this is
+closed; `network = "none"` is not affected. Plan for 0.6.2: the
+supervisor performs these calls itself on its own copy of the socket,
+with a kernel-enforced backstop evaluated alongside. No test in this
+release shows the gap closed.

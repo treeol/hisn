@@ -16,10 +16,16 @@ All notable changes to hisn are recorded here. The format follows
 - `tcp_info` fields are read by definition, not by hardcoded offset.
 
 ### Added
-- `network/connect` and `network/connect-result` records name the seat of
-  the exec that caused them; the main command and in-sandbox services
+- `network/connect`, `network/connect-result` and `network/implicit`
+  records name the seat of the exec that caused them, found by process
+  ancestry of the calling task (children and threads included); the main
+  command, in-sandbox services and processes detached from their exec
   stay `seat: null`. DNS records stay unattributed (a query cannot be
-  tied to one exec tree without guessing).
+  tied to one caller without guessing).
+- `network/connect` records carry `notif_id` and `pid`.
+- New record kinds: `network/implicit` (bind, listen or fast-open send
+  seen by the open-mode engine; the target names the syscall) and
+  `journal/pruned` (files deleted by retention).
 
 ### Changed
 - Shipped text no longer names private hosts or addresses; the release

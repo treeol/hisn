@@ -136,7 +136,19 @@ session's network mode, the oldest rotated files are deleted once the
 journal exceeds 256 MiB in more than four files (4 x 64 MiB; the newest
 rotated file and the current file are never deleted). Each deletion
 writes one `journal/pruned` record naming the deleted files, their
-total bytes and their count.
+total bytes and their count; `hisn journal` shows it as a readable line.
+
+Network records (`open` sessions) are `network/connect` (with `notif_id`
+and `pid`), `network/connect-result`, `network/implicit` (a `bind`,
+`listen` or fast-open send the engine saw; the target names the syscall),
+`network/dns` and `network/summary`. The `seat` of a network record is
+found from the process ancestry of the calling task: the walk follows
+parent pids from the caller up to an exec started by `hisn exec`, and
+the record names that exec's seat. The main command, in-sandbox
+services, and a process that detached from its exec (reparented) record
+`seat: null`; so does any record whose walk fails. DNS records carry no
+seat (a query cannot be tied to one caller without guessing).
+`hisn journal --seat NAME` selects the records of one seat.
 
 ```sh
 hisn note --session demo "halfway through the migration"   # verbatim, at most 8 KiB

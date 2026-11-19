@@ -716,8 +716,16 @@ does where it differs from or sharpens the text above:
   session (4096 entries; full: the record is dropped and counted). At
   most 50 per second are written one by one, the rest are counted in
   `network/summary` (with `result_connected`, `result_other` and
-  `tracked_overflow`). `network/connect` has no `latency_ms`,
-  `resolved_name` or seat attribution yet (`seat` is `null`).
+  `tracked_overflow`). `network/connect` has no `latency_ms` or
+  `resolved_name`. Since 0.6.1 it carries `notif_id` and `pid` (the
+  notified thread id in the supervisor's pid namespace) and `seat`
+  (found by process ancestry, see "Seat attribution" below).
+  `network/implicit` (0.6.1) records a `bind`, `listen` or fast-open
+  `sendto`/`sendmsg`/`sendmmsg` the engine saw: `target` is
+  `<syscall> <reason>`, `verdict` `continue` or `refuse`, `reason`
+  `implicit-sandbox-socket`, `host-socket-implicit` or `netns-unknown`,
+  plus `notif_id`, `pid`, `seat`. `journal/pruned` (0.6.1) names the
+  rotated files a retention pass deleted.
   `network/connect-result` (`target`, `result`, `latency_ms`, no
   errno) is how a non-blocking connect ended that was answered
   `EINPROGRESS`, or `failed` with latency 0 when it failed at once.

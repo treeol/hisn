@@ -163,7 +163,7 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
     let net_listener = if cfg.policy.network == Network::Open {
         Some(
             crate::notif::install_connect_filter()
-                .context("installing connect filter (kernel >= 5.9 required)")?,
+                .context("installing connect filter (kernel >= 5.14 required)")?,
         )
     } else {
         None

@@ -371,11 +371,13 @@ pub struct NotifAddFd {
 //   ADDFD    = _IOW ('!', 3, 24) = 0x4018_2103
 //
 // ID_VALID: Linux 5.0 defined it with the wrong direction (_IOR,
-// 0x8008_2102). 5.17 corrected the header to _IOW (0x4008_2102) and kept
-// the original number as SECCOMP_IOCTL_NOTIF_ID_VALID_WRONG_DIR, which the
-// kernel still accepts. Kernels 5.0-5.16 answer the corrected number with
-// EINVAL, so hisn uses the original one: it is the only encoding every
-// kernel since 5.0 accepts (the floor for open mode is 5.9).
+// 0x8008_2102). The header was corrected to _IOW (0x4008_2102) and the
+// original number kept as SECCOMP_IOCTL_NOTIF_ID_VALID_WRONG_DIR, which
+// the kernel still accepts (kernel/seccomp.c of v5.14, v5.16, v5.17,
+// v6.1 and v6.8 has `case ..._WRONG_DIR:` next to the corrected case; a
+// kernel before the correction knows only the original number). So the
+// original number is accepted on every kernel since 5.0, and the floor
+// for open mode is 5.14 (SO_NETNS_COOKIE).
 pub const OP_RECV: u32 = 0xC050_2100;
 pub const OP_SEND: u32 = 0xC018_2101;
 pub const OP_ID_VALID: u32 = 0x8008_2102;

@@ -308,12 +308,17 @@ unchanged from the task; the rest are stated with their refinement.
     `SECCOMP_IOCTL_NOTIF_RECV`/`SEND`/`ID_VALID` (5.0),
     `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (5.5),
     `SECCOMP_IOCTL_NOTIF_ADDFD` incl. `SETFD` (5.9),
-    `SECCOMP_ADDFD_FLAG_SEND` (5.14). If a hard-floor feature is missing,
+    `SECCOMP_ADDFD_FLAG_SEND` (5.14), `SO_NETNS_COOKIE` (5.14, 0.6.1;
+    hard floor). If a hard-floor feature is missing,
     startup fails with a clear error naming the feature and the minimum
     kernel. `none` never touches these and keeps working.
-    Minimum kernels: **floor 5.9** (`SETFD` injection; 5.9–5.13 installs
-    use `SETFD` + a separate `NOTIF_SEND`, 5.14+ may use `FLAG_SEND`
-    one-step — same result, one extra syscall per connect on 5.9–5.13).
+    Minimum kernels: **floor 5.14** (0.6.1: `SO_NETNS_COOKIE`, needed to
+    tell a socket in the sandbox's namespace from one in the
+    supervisor's; with it `FLAG_SEND` one-step injection is always
+    available). 0.6.0 had floor 5.9 (`SETFD` + a separate `NOTIF_SEND`
+    on 5.9–5.13); the code still injects in two steps on every kernel
+    (see "Implementation (0.6.0)"), which is not reachable as a
+    5.9–5.13 path any more because those kernels refuse to start.
     Sources: `seccomp_unotify(2)`, `seccomp(2)`, `pidfd_open(2)`,
     `pidfd_getfd(2)` (Linux man pages).
 11. **Separate hand-written BPF filter.** The interception filter
@@ -569,15 +574,16 @@ stated here instead of claimed.
 | `SECCOMP_USER_NOTIF_FLAG_CONTINUE` | 5.5 | refuse to start |
 | `SECCOMP_IOCTL_NOTIF_ADDFD` (incl. `SETFD`) | 5.9 | refuse to start (no correct injection below 5.9) |
 | `SECCOMP_ADDFD_FLAG_SEND` | 5.14 | two-step inject (`SETFD` + separate `NOTIF_SEND`), slower, same result |
+| `SO_NETNS_COOKIE` (0.6.1) | 5.14 | refuse to start |
 | `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` | 5.19 | not required (deadline + workers cover the hang) |
 | `pidfd_open` | 5.3 | refuse to start |
 | `pidfd_getfd` | 5.6 | refuse to start |
 
 Feature detection is by **attempting the ioctl/filter install** at
 startup and logging what was found — not by parsing `uname -r` (distro
-backports make the version string lie). Floor is **5.9** (`SETFD`
-injection is the hard floor — below it there is no correct injection at
-all). The startup error names the first missing feature and its
+backports make the version string lie). Floor is **5.14** since 0.6.1
+(`SO_NETNS_COOKIE`; before that 5.9, where `SETFD` injection was the
+hard floor). The startup error names the first missing feature and its
 minimum kernel. Sources: `seccomp_unotify(2)`, `seccomp(2)`,
 `pidfd_open(2)`, `pidfd_getfd(2)` (Linux man pages).
 
@@ -670,7 +676,11 @@ does where it differs from or sharpens the text above:
 
 - **Injection** is always two steps, `ADDFD` with `SETFD` and then
   `NOTIF_SEND` with value 0, on every kernel. `SECCOMP_ADDFD_FLAG_SEND`
-  is not used, so the path described for 5.9–5.13 is the only path.
+  is not used (injection around `src/notif.rs:1897`; the
+  constant `FLAG_SEND` is defined and unused). Since 0.6.1 the floor is
+  5.14, so the 5.9–5.13 path of 0.6.0 is unreachable; the code is
+  unchanged and its removal or a switch to `FLAG_SEND` is a later
+  change.
   The descriptor's close-on-exec flag is carried over.
 - **`NOTIF_ID_VALID`** uses the number `0x80082102`, which every
   kernel since 5.0 accepts. The start-up probe counts an operation as

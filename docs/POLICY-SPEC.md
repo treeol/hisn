@@ -46,7 +46,7 @@ nproc  = 4096
 | `version` | string | — (required) | must equal `hisn-policy/v1` |
 | `session.cwd` | path | `.` | canonicalised; must exist, be a directory, and satisfy §4 rules; mounted **rw at the identical path** |
 | `session.home` | `"tmpfs"` \| abs path | `"tmpfs"` | a path must exist, be owned by the caller, and not overlap runtime dir |
-| `session.network` | enum | `"none"` | `"host"` additionally requires Landlock scope support (DESIGN §7) or CLI `--allow-host-abstract-sockets`. `"open"` (0.6.0) needs kernel 5.9 or newer and Yama `ptrace_scope` 0 or 1, and rejects `seccomp.extra_deny` entries `connect` and `socket` |
+| `session.network` | enum | `"none"` | `"host"` additionally requires Landlock scope support (DESIGN §7) or CLI `--allow-host-abstract-sockets`. `"open"` (0.6.0) needs kernel 5.14 or newer and Yama `ptrace_scope` 0 or 1, and rejects `seccomp.extra_deny` entries `connect` and `socket` |
 | `session.hostname` | string | `"hisn"` | |
 | `session.shm` | bool | `false` | mount `/dev/shm` (tmpfs); 0.2.1. Default off = no `/dev/shm` (0.2 behavior) |
 | `session.shm_size` | u64 (MiB) | `64` | `/dev/shm` size; range `1..=65536`; 0.2.1 |

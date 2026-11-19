@@ -122,6 +122,9 @@ status. Add `-v` for logs on stderr.
 
 hisn needs kernel 5.12 or newer with unprivileged user namespaces, Landlock and
 seccomp. `hisn check` reports what is missing (exit 2; `--json` for a report).
+`network = "open"` needs kernel 5.14 or newer (`SO_NETNS_COOKIE`, which tells
+a socket in the sandbox's namespace from one in the supervisor's); on an older
+kernel the session refuses to start and names the missing feature.
 
 ## Workspace journal
 

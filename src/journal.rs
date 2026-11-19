@@ -546,7 +546,7 @@ impl Journal {
     /// `reason` names the case. Same queue discipline as
     /// [`Journal::net_record`].
     pub fn net_implicit_record(&self, n: &crate::notif::Notif, verdict: &str, reason: &str) {
-        let target = format!("nr:{} {}", n.data.nr, reason);
+        let target = format!("{} {}", crate::notif::syscall_name(n.data.nr), reason);
         let data = json!({
             "target": target,
             "notif_id": n.id,

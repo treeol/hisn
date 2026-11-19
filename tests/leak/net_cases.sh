@@ -477,6 +477,12 @@ journal_is "L125 journal: the loopback connect is refuse/host-socket-loopback-or
   kind=network/connect target=127.0.0.1:18070 verdict=refuse reason=host-socket-loopback-or-unix
 journal_is "L125 journal: bind, listen and fast-open are refuse/host-socket-implicit" "$AWS" 3 \
   kind=network/implicit verdict=refuse reason=host-socket-implicit
+journal_is "L125 journal: the implicit records name bind, listen and sendto" "$AWS" 1 \
+  kind=network/implicit "target=bind host-socket-implicit"
+journal_is "L125 journal: the listen record names listen" "$AWS" 1 \
+  kind=network/implicit "target=listen host-socket-implicit"
+journal_is "L125 journal: the fast-open record names sendto" "$AWS" 1 \
+  kind=network/implicit "target=sendto host-socket-implicit"
 if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',19060))==0 else 1)"; then
   fail "L125 host side: port 19060 is not open in the supervisor's namespace" "something listens on 127.0.0.1:19060"
 else

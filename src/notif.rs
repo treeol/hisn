@@ -2217,6 +2217,28 @@ fn copy_sock_opts(addr_fd: i32, pidfd: i32, newfd: i32) -> Option<bool> {
 /// Format the connect address read from the notification for the journal:
 /// `ip:port` for INET, or the raw family for other families (`family:2`).
 /// This is the only target form — never a pid/nr (see ADR 0022 L102).
+/// Name of an intercepted syscall for the journal (`network/implicit`
+/// target); anything else keeps the `nr:<n>` form.
+pub fn syscall_name(nr: i32) -> String {
+    let n = nr as libc::c_long;
+    let name = if n == libc::SYS_connect {
+        "connect"
+    } else if n == libc::SYS_bind {
+        "bind"
+    } else if n == libc::SYS_listen {
+        "listen"
+    } else if n == libc::SYS_sendto {
+        "sendto"
+    } else if n == libc::SYS_sendmsg {
+        "sendmsg"
+    } else if n == libc::SYS_sendmmsg {
+        "sendmmsg"
+    } else {
+        return format!("nr:{nr}");
+    };
+    name.to_string()
+}
+
 pub fn notif_target(ip: Option<&IpAddr>, family: u16, port: u16) -> String {
     match ip {
         Some(a) => format!("{a}:{port}"),
@@ -2336,6 +2358,19 @@ fn is_public_v4(v4: &Ipv4Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn syscall_names_for_implicit_records() {
+        use super::syscall_name;
+        assert_eq!(syscall_name(libc::SYS_bind as i32), "bind");
+        assert_eq!(syscall_name(libc::SYS_listen as i32), "listen");
+        assert_eq!(syscall_name(libc::SYS_sendto as i32), "sendto");
+        assert_eq!(syscall_name(libc::SYS_sendmsg as i32), "sendmsg");
+        assert_eq!(syscall_name(libc::SYS_sendmmsg as i32), "sendmmsg");
+        assert_eq!(
+            syscall_name(libc::SYS_read as i32),
+            format!("nr:{}", libc::SYS_read)
+        );
+    }
     // ---- 0.6.1 seat ancestry walk (fake /proc) ----
     struct FakeProc(std::collections::HashMap<i32, ProcStatus>);
     impl ProcReader for FakeProc {

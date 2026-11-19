@@ -247,21 +247,23 @@ fi
 # session is stopped on every exit path (TIMING_IDS, stopped by cleanup).
 # Runs before the real-network step so it happens with and without --real.
 timing_probe() {
-  local mode=$1 extra=$2
+  local mode=$1 extra=$2 label=${3:-$1}
   T="$TMP/timing"
   mkdir -p "$T/run" "$T/state" "$T/cwd"
   chmod 700 "$T/run"
   cp "$HELPER" "$T/cwd/net_helper.py"
-  printf 'version = "hisn-policy/v1"\n[session]\ncwd = "%s"\nnetwork = "%s"\n%s\n' \
+  printf 'version = "hisn-policy/v1"\n[session]\ncwd = "%s"\nnetwork = "%s"\n%b\n' \
     "$T/cwd" "$mode" "$extra" >"$T/policy.toml"
   th() { XDG_RUNTIME_DIR="$T/run" XDG_STATE_HOME="$T/state" timeout 30 "$HISN" "$@" </dev/null; }
-  local starts=() execs=() sid st ms
+  local starts=() execs=() detach_ms=() sid st ms
   for _ in 1 2 3 4 5; do
-    sid="$TOKEN-timing-$mode"
+    sid="$TOKEN-timing-$label"
     rm -rf "$T/state"
     mkdir -p "$T/run" "$T/state"; chmod 700 "$T/run"
     t0=$(date +%s%N)
     if th run --detach --policy "$T/policy.toml" --session-id "$sid" >/dev/null 2>&1; then
+      tr=$(date +%s%N)
+      detach_ms+=("$(( (tr - t0) / 1000000 ))")
       TIMING_IDS="$sid"
       for _ in $(seq 300); do
         st=$(XDG_RUNTIME_DIR="$T/run" XDG_STATE_HOME="$T/state" timeout 10 "$HISN" ls --json 2>/dev/null |
@@ -273,7 +275,7 @@ timing_probe() {
       if [ "$st" = running ]; then
         starts+=("$(( (t1 - t0) / 1000000 ))")
       else
-        note "timing $mode: session did not reach running"
+        note "timing $label: session did not reach running"
         starts+=(-1)
       fi
       th stop --session "$sid" >/dev/null 2>&1 || true
@@ -289,7 +291,7 @@ timing_probe() {
     awk '{a[NR]=$1} END {if (NR>0) print (NR%2 ? a[int(NR/2)+1] : (a[NR/2]+a[NR/2+1])/2); else print "n/a"}')
   median=$sorted
   # Mean of 20 exec true on a fresh session.
-  sid="$TOKEN-timing-$mode"
+  sid="$TOKEN-timing-$label"
   rm -rf "$T/state"
   mkdir -p "$T/run" "$T/state"; chmod 700 "$T/run"
   if th run --detach --policy "$T/policy.toml" --session-id "$sid" >/dev/null 2>&1; then
@@ -310,17 +312,17 @@ timing_probe() {
       local sum=0 n=0 v
       for v in "${execs[@]}"; do sum=$((sum + v)); n=$((n + 1)); done
       if [ "$n" -gt 0 ]; then
-        say "INFO timing $mode: run --detach until ready median ${median} ms (5 runs: ${starts[*]}), exec --no-tty true mean $((sum / n)) ms (20 runs)"
+        say "INFO timing $label: run --detach until ready median ${median} ms (5 runs: ${starts[*]}; run --detach command alone: ${detach_ms[*]} ms; the poll loop adds one hisn ls + python start per 100 ms step), exec --no-tty true mean $((sum / n)) ms (20 runs)"
       else
-        say "INFO timing $mode: run --detach until ready median ${median} ms, exec: no samples"
+        say "INFO timing $label: run --detach until ready median ${median} ms, exec: no samples"
       fi
     else
-      say "INFO timing $mode: session did not reach running (exec timing skipped)"
+      say "INFO timing $label: session did not reach running (exec timing skipped)"
     fi
     th stop --session "$sid" >/dev/null 2>&1 || true
     TIMING_IDS=""
   else
-    say "INFO timing $mode: session did not start"
+    say "INFO timing $label: session did not start"
   fi
   rm -rf "$T/state"
 }
@@ -329,7 +331,9 @@ note "timing probe (INFO only, never a gate)"
 timing_probe none ""
 timing_probe open ""
 if [ -n "${ROOTFS:-}" ] && [ -d "${ROOTFS:-/nonexistent}/usr" ]; then
-  timing_probe open "rootfs = \"$ROOTFS\""
+  timing_probe open "[rootfs]\npath = \"$ROOTFS\"" open+rootfs
+else
+  skip "timing open+rootfs" "no rootfs: set HISN_TEST_ROOTFS, or import one as wakil-dev"
 fi
 
 note "step 4: real network"

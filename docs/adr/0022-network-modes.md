@@ -111,7 +111,7 @@ host output pasted after each pass; pass-6 host results are pending.
 **DNS was not proven.** Pass 6's draft claim — "host `/etc/nsswitch.conf`
 is `hosts: files dns`, nss-resolve hypothesis refuted" — was read from
 inside a hisn session, which sees the session's own `/etc/nsswitch.conf`.
-Rubin's real host file (from pasted host output) is
+A real host's file (from pasted host output) is
 `hosts: files myhostname mdns4_minimal [NOTFOUND=return] resolve
 [!UNAVAIL=return] dns`. `nss-resolve` therefore runs before `dns` and
 answers or stops the chain, and the probe reached `Temporary failure in
@@ -793,3 +793,34 @@ open points:
 - `hisn net explain`/`net status` are host-side commands (in-sandbox
   peers are refused by `authorize_peer`); in-sandbox agents see only
   `EACCES`/`NXDOMAIN` and the journal is the explanation path.
+
+## 0.6.1 hardening
+
+**Property.** In `open`, a program in the sandbox can only hold two kinds
+of socket: one in the sandbox's empty network namespace, which reaches
+nothing but the sandbox's own loopback, and one in the supervisor's
+namespace that the supervisor injected for a connection the policy
+approved. Since 0.6.0 the injection happens before the connect has
+completed, so a program can keep an injected socket after that connect
+failed. The second kind must therefore serve only the connection it was
+approved for. Every call by which a socket of that kind could start
+another connection or open a port (`connect`, `bind`, `listen`, a
+`MSG_FASTOPEN` send) is notified to the supervisor and answered by the
+namespace of the socket, or refused; every other syscall is `ALLOW`ed by
+the filter. The supervisor makes the answer on the socket itself (a
+`pidfd_getfd` duplicate and `SO_NETNS_COOKIE`), after `NOTIF_ID_VALID`,
+never on the address argument. If the namespace cannot be determined the
+call is refused.
+
+| # | Invariant | Code (`src/notif.rs`) | Test |
+|---|---|---|---|
+| a | An injected socket serves only its approved connection; a further `connect` goes through the full policy | `off_sandbox && !already_used` refuses `host-socket-connect` (1545); a failed host-side socket is re-connected only on `Allow` (1558) | unit `engine_refuses_host_side_socket_connects_and_journals`, `host_socket_reconnect_enters_the_full_policy`; leak `L125` |
+| b | `CONTINUE` only for a socket with a known namespace cookie that is not the supervisor's; otherwise the full policy | `classify_ns` (2110), `continue_allowed` (1619); unknown cookie is `Unknown`, treated as `Host` | unit `classify_ns_fails_closed`, `engine_still_continues_sandbox_socket_loopback`, `engine_without_cookie_source_refuses_everything`, `socket_netns_cookie_resolves_and_fails_closed`; leak `L96` (sandbox loopback still works), `L125` |
+| c | Fast-open sends cannot leave on a supervisor-side socket | `connect_filter` (46) notifies `sendto`/`sendmmsg`/`sendmsg` with `MSG_FASTOPEN`; `handle_implicit_call` (1314) answers by namespace | unit `filter_verdicts_by_interpretation` (runs the installed array); leak `L125` (fast-open sendto EACCES), `L98` |
+| d | `bind`/`listen` on a supervisor-side socket cannot open a port in the supervisor's namespace | same filter entries; `handle_implicit_call` refuses `host-socket-implicit` | leak `L125` (bind and listen EACCES; the journal has one `network/implicit` record each) |
+| e | The filter cannot kill or block an unrelated program | unknown architecture is the only kill path; `ALLOW` is the default | unit `filter_verdicts_by_interpretation` (23 unrelated syscalls, foreign architecture) |
+
+**Comparison with 0.6.0** (`.wakil/host-run-061.sh v060`, L125 sub-checks
+against a v0.6.0 build): see the 0.6.1 release notes for the result.
+The `host-socket-loopback-or-unix` and `host-socket-implicit` records are
+new in 0.6.1.

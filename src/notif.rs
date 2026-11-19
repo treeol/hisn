@@ -3648,10 +3648,12 @@ mod tests {
 
     #[test]
     fn engine_without_cookie_source_refuses_everything() {
-        // Fail closed: with no supervisor cookie resolved, every
-        // socket is treated as host-side (cannot tell sandbox from
-        // host). The loopback connect that 0.6.0 would CONTINUE is
-        // refused.
+        // `start_with_seats` fills in the engine's own namespace cookie
+        // when none is given, and this test child runs in that same
+        // namespace, so the socket is classified `Host` and the
+        // loopback connect that 0.6.0 would CONTINUE is refused. The
+        // case "cookie unknown" (`Unknown`, treated like `Host`) is
+        // covered by `classify_ns_fails_closed`, not by this test.
         let (_l, port) = loopback_listener();
         let (d, j) = engine_journal();
         let (pid, listener) = connecting_child(1, port);

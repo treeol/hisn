@@ -742,8 +742,10 @@ does where it differs from or sharpens the text above:
   `network/dns` carries
   `name`, `qtype`, `proto`, `upstream`, `rcode` and `verdict`
   `ok` / `failed` / `error`. The size limit (oldest rotated files
-  deleted beyond 256 MiB in more than four files) applies only to
-  journals of sessions in `open`.
+  deleted beyond 256 MiB in more than four files) applied only to
+  journals of sessions in `open` in 0.6.0; since 0.6.1 it applies to
+  every session, whatever its network mode, and each deletion writes a
+  `journal/pruned` record.
 - **`nsswitch.conf`** is generated only in `open`; `none` and `host`
   keep the host's file.
 - **No `[net] allow` exceptions**: private targets are always refused.
@@ -814,13 +816,25 @@ call is refused.
 
 | # | Invariant | Code (`src/notif.rs`) | Test |
 |---|---|---|---|
-| a | An injected socket serves only its approved connection; a further `connect` goes through the full policy | `off_sandbox && !already_used` refuses `host-socket-connect` (1545); a failed host-side socket is re-connected only on `Allow` (1558) | unit `engine_refuses_host_side_socket_connects_and_journals`, `host_socket_reconnect_enters_the_full_policy`; leak `L125` |
-| b | `CONTINUE` only for a socket with a known namespace cookie that is not the supervisor's; otherwise the full policy | `classify_ns` (2110), `continue_allowed` (1619); unknown cookie is `Unknown`, treated as `Host` | unit `classify_ns_fails_closed`, `engine_still_continues_sandbox_socket_loopback`, `engine_without_cookie_source_refuses_everything`, `socket_netns_cookie_resolves_and_fails_closed`; leak `L96` (sandbox loopback still works), `L125` |
+| a | An injected socket serves only its approved connection; a further `connect` to another target goes through the full policy (a socket already connected or pending only gets `EISCONN`/`EALREADY`, no new connection) | `off_sandbox && !already_used` refuses `host-socket-connect` (1545); a failed host-side socket is re-connected only on `Allow` (1558) | unit `engine_refuses_host_side_socket_connects_and_journals`, `host_socket_reconnect_enters_the_full_policy`; leak `L125` |
+| b | `CONTINUE` only for a socket with a known namespace cookie that is not the supervisor's; otherwise the full policy | `classify_ns` (2110), `continue_allowed` (1619); unknown cookie is `Unknown`, treated as `Host` | unit `classify_ns_fails_closed`, `engine_still_continues_sandbox_socket_loopback`, `socket_netns_cookie_resolves_and_fails_closed` (`engine_without_cookie_source_refuses_everything` shows a same-namespace socket is classified `Host`, not the unknown-cookie case); leak `L96` (sandbox loopback still works), `L125` |
 | c | Fast-open sends cannot leave on a supervisor-side socket | `connect_filter` (46) notifies `sendto`/`sendmmsg`/`sendmsg` with `MSG_FASTOPEN`; `handle_implicit_call` (1314) answers by namespace | unit `filter_verdicts_by_interpretation` (runs the installed array); leak `L125` (fast-open sendto EACCES), `L98` |
 | d | `bind`/`listen` on a supervisor-side socket cannot open a port in the supervisor's namespace | same filter entries; `handle_implicit_call` refuses `host-socket-implicit` | leak `L125` (bind and listen EACCES; the journal has one `network/implicit` record each) |
-| e | The filter cannot kill or block an unrelated program | unknown architecture is the only kill path; `ALLOW` is the default | unit `filter_verdicts_by_interpretation` (23 unrelated syscalls, foreign architecture) |
+| e | The only verdict the filter gives other than `ALLOW` for an unrelated syscall is the kill of a foreign architecture | `ALLOW` is the default | unit `filter_verdicts_by_interpretation` interprets the installed array (23 unrelated syscalls, foreign architecture). It shows the filter's verdicts, not that no program is delayed: every `bind`/`listen` now round-trips the supervisor and is refused `EACCES` when the notification queue is full |
 
 **Comparison with 0.6.0** (`.wakil/host-run-061.sh v060`, L125 sub-checks
 against a v0.6.0 build): see the 0.6.1 release notes for the result.
 The `host-socket-loopback-or-unix` and `host-socket-implicit` records are
 new in 0.6.1.
+
+**Known gap (open point, not fixed in 0.6.1).** `CONTINUE` lets the
+kernel run the original call, and the supervisor's check was made on a
+duplicate of the descriptor. A second thread of the program that
+replaces the descriptor number between the check and the call can make
+the kernel run it on another socket. This is the same time-of-check gap
+as decision 7's descriptor-reuse race and the `CONTINUE` buffer race
+measured in the probes; it was open in 0.6.0 as well. It matters only
+for a program that holds a supervisor-side socket (kept after a failed
+connect) and a second thread, and it needs a design change to close
+(the supervisor performing the call itself on the verified socket
+instead of continuing it). No test in this release shows it closed.

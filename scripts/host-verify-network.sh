@@ -298,7 +298,7 @@ timing_probe() {
   sid="$TOKEN-timing-$label"
   rm -rf "$T/state"
   mkdir -p "$T/run" "$T/state"; chmod 700 "$T/run"
-  if th run --detach --policy "$T/policy.toml" ${RFLAG[@]+"${RFLAG[@]}"} --session-id "$sid" >/dev/null 2>&1; then
+  if th run --detach --policy "$T/policy.toml" ${RFLAG[@]+"${RFLAG[@]}"} --session-id "$sid" >"$LOGDIR/timing-$label.start.log" 2>&1; then
     TIMING_IDS="$sid"
     for _ in $(seq 300); do
       st=$(XDG_RUNTIME_DIR="$T/run" XDG_STATE_HOME="$T/state" timeout 10 "$HISN" ls --json 2>/dev/null |
@@ -326,7 +326,7 @@ timing_probe() {
     th stop --session "$sid" >/dev/null 2>&1 || true
     TIMING_IDS=""
   else
-    say "INFO timing $label: session did not start"
+    say "INFO timing $label: session did not start: $(tr '\n' ' ' <"$LOGDIR/timing-$label.start.log" | head -c 300)"
   fi
   rm -rf "$T/state"
 }

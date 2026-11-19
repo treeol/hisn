@@ -250,6 +250,8 @@ fi
 # Runs before the real-network step so it happens with and without --real.
 timing_probe() {
   local mode=$1 extra=$2 label=${3:-$1}
+  local RFLAG=()
+  [ "$label" = open+rootfs ] && RFLAG=(--rootfs-path "$ROOTFS")
   T="$TMP/timing"
   mkdir -p "$T/run" "$T/state" "$T/cwd"
   chmod 700 "$T/run"
@@ -263,7 +265,7 @@ timing_probe() {
     rm -rf "$T/state"
     mkdir -p "$T/run" "$T/state"; chmod 700 "$T/run"
     t0=$(date +%s%N)
-    if th run --detach --policy "$T/policy.toml" --session-id "$sid" >/dev/null 2>&1; then
+    if th run --detach --policy "$T/policy.toml" ${RFLAG[@]+"${RFLAG[@]}"} --session-id "$sid" >/dev/null 2>&1; then
       tr=$(date +%s%N)
       detach_ms+=("$(( (tr - t0) / 1000000 ))")
       TIMING_IDS="$sid"
@@ -296,7 +298,7 @@ timing_probe() {
   sid="$TOKEN-timing-$label"
   rm -rf "$T/state"
   mkdir -p "$T/run" "$T/state"; chmod 700 "$T/run"
-  if th run --detach --policy "$T/policy.toml" --session-id "$sid" >/dev/null 2>&1; then
+  if th run --detach --policy "$T/policy.toml" ${RFLAG[@]+"${RFLAG[@]}"} --session-id "$sid" >/dev/null 2>&1; then
     TIMING_IDS="$sid"
     for _ in $(seq 300); do
       st=$(XDG_RUNTIME_DIR="$T/run" XDG_STATE_HOME="$T/state" timeout 10 "$HISN" ls --json 2>/dev/null |
@@ -333,7 +335,7 @@ note "timing probe (INFO only, never a gate)"
 timing_probe none ""
 timing_probe open ""
 if [ -n "${ROOTFS:-}" ] && [ -d "${ROOTFS:-/nonexistent}/usr" ]; then
-  timing_probe open "[rootfs]\npath = \"$ROOTFS\"" open+rootfs
+  timing_probe open "" open+rootfs
 else
   skip "timing open+rootfs" "no rootfs: set HISN_TEST_ROOTFS, or import one as wakil-dev"
 fi

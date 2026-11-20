@@ -364,7 +364,7 @@ journal_is "L113 journal: no failed lookup recorded as ok" "$AWS" 0 kind=network
 journal_is "L113 journal: no timed-out lookup recorded as ok" "$AWS" 0 kind=network/dns name=drop.hermetic.test verdict=ok
 
 check "L96 loopback listener inside the sandbox is reached" "L96-OK" in_session "$A" in-loopback
-journal_is "L96 journal: continue 127.0.0.1:19001" "$AWS" 1 kind=network/connect target=127.0.0.1:19001 verdict=continue
+journal_is "L96 journal: loopback connect is supervisor-executed" "$AWS" 1 kind=network/connect target=127.0.0.1:19001 verdict=allow reason=supervisor-executed
 check "L97 host unix socket is not visible (ENOENT)" "L97-OK" in_session "$A" in-unix "$T/host.sock"
 check "L98 sendto and fast-open to an outside address fail ENETUNREACH" "L98-OK" in_session "$A" in-sendto
 check "L99 non-blocking connect completes and keeps O_NONBLOCK" "L99-OK" in_session "$A" in-nonblock
@@ -581,6 +581,14 @@ for line in sys.stdin:
     if key not in seen:
         seen.add(key); print("INFO    " + line.strip())'
 
+# ============================================ 0.6.2 I3 parity + concurrency
+# Ordinary-program behaviour is unchanged: loopback server/client,
+# AF_UNIX path and abstract, non-blocking and IPv6 all work inside an
+# open session, and many threads doing socket work at once get the
+# native answers.
+check "0.6.2 I3 parity: loopback v4/v6, non-blocking, AF_UNIX path/abstract" "PARITY-OK" in_session "$A" in-parity
+check "0.6.2 concurrency: 16 threads of ordinary socket work" "CONCURRENCY-OK" in_session "$A" in-concurrency 16
+
 check "net harness: open session stops cleanly" "" timeout 30 "$HISN" stop --session "$A" </dev/null
 for _ in $(seq 50); do [ "$(session_field "$A" state)" != running ] && break; sleep 0.1; done
 check "net harness: open session is no longer running" "stopped" session_field "$A" state
@@ -760,13 +768,5 @@ else
 fi
 write_policy "$T/d-none.toml" "$T/d-cwd" none connect
 check "L116 extra_deny connect is accepted under none" "" timeout 30 "$HISN" run --policy "$T/d-none.toml" --session-id "$TOKEN-deny-none" -- true </dev/null
-
-# ============================================ 0.6.2 I3 parity + concurrency
-# Ordinary-program behaviour is unchanged: loopback server/client,
-# AF_UNIX path and abstract, non-blocking and IPv6 all work inside an
-# open session, and many threads doing socket work at once get the
-# native answers.
-check "0.6.2 I3 parity: loopback v4/v6, non-blocking, AF_UNIX path/abstract" "PARITY-OK" in_session "$A" in-parity
-check "0.6.2 concurrency: 16 threads of ordinary socket work" "CONCURRENCY-OK" in_session "$A" in-concurrency 16
 
 finish

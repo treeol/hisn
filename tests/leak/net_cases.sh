@@ -364,7 +364,7 @@ journal_is "L113 journal: no failed lookup recorded as ok" "$AWS" 0 kind=network
 journal_is "L113 journal: no timed-out lookup recorded as ok" "$AWS" 0 kind=network/dns name=drop.hermetic.test verdict=ok
 
 check "L96 loopback listener inside the sandbox is reached" "L96-OK" in_session "$A" in-loopback
-journal_is "L96 journal: loopback connect is supervisor-executed" "$AWS" 1 kind=network/connect target=127.0.0.1:19001 verdict=allow reason=supervisor-executed
+journal_is "L96 journal: loopback connect is supervisor-executed" "$AWS" 1 kind=network/connect target=127.0.0.1:19001 verdict=allow reason=supervisor-executed-inprogress
 check "L97 host unix socket is not visible (ENOENT)" "L97-OK" in_session "$A" in-unix "$T/host.sock"
 check "L98 sendto and fast-open to an outside address fail ENETUNREACH" "L98-OK" in_session "$A" in-sendto
 check "L99 non-blocking connect completes and keeps O_NONBLOCK" "L99-OK" in_session "$A" in-nonblock

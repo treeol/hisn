@@ -1088,7 +1088,11 @@ def in_concurrency_burst(n_threads):
             if i % 3 == 0:
                 s = socket.socket()
                 s.settimeout(10)
-                s.connect(('127.0.0.1', 19101))
+                try:
+                    s.connect(('127.0.0.1', 19101))
+                except OSError as e:
+                    if e.errno != 111:  # ECONNREFUSED is the native answer
+                        return f'connect errno {e.errno}'
                 s.close()
                 return 'ok'
             if i % 3 == 1:

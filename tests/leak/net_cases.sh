@@ -472,7 +472,7 @@ journal_is "L124 journal: the second connect is refuse/earlier-connect-failed" "
 # with the program, in the supervisor's namespace. It may not reach a
 # host loopback daemon (18070 is one), bind or listen there, or send with
 # fast-open. Nothing may be opened or reached on the host side.
-check "L125 a kept supervisor-side socket: loopback connect and bind fail EACCES, listen succeeds (supervisor-executed), fast-open fails EOPNOTSUPP" "HOSTSOCKET-OK connect=EACCES bind=EACCES listen=ok fastopen=EOPNOTSUPP" in_session "$A" in-hostsocket 18448
+check "L125 a kept supervisor-side socket: loopback connect and bind fail EACCES, listen refused EACCES, fast-open fails EOPNOTSUPP" "HOSTSOCKET-OK connect=EACCES bind=EACCES listen=EACCES fastopen=EOPNOTSUPP" in_session "$A" in-hostsocket 18448
 journal_is "L125 journal: the loopback connect is refuse/host-socket-loopback-or-unix" "$AWS" 1 \
   kind=network/connect target=127.0.0.1:18070 verdict=refuse reason=host-socket-loopback-or-unix
 journal_is "L125 journal: the bind is refuse/host-socket-bind" "$AWS" 1 \

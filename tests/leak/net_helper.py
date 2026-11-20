@@ -664,11 +664,11 @@ def in_hostsocket(port):
     """A socket whose supervisor-side connect failed is kept by the
     program (open mode injects the supervisor's socket before the
     connect completes). It must not reach anything the policy did not
-    approve: loopback connect and bind fail EACCES, `listen` is
-    supervisor-executed and answers 0 without opening a host port
-    (design A: the socket's namespace is the supervisor's, and listen
-    has no address), and a fast-open send fails EOPNOTSUPP from the
-    BPF filter (design C). Nothing is opened or reached on the host."""
+    approve: loopback connect and bind fail EACCES, `listen` is refused
+    EACCES (the socket lives in the supervisor's namespace; listening
+    on it would auto-bind a port there), and a fast-open send fails
+    EOPNOTSUPP from the BPF filter (design C). Nothing is opened or
+    reached on the host."""
     import select
     sock = socket.socket()
     sock.setblocking(False)
@@ -687,20 +687,22 @@ def in_hostsocket(port):
     except OSError as e:
         if e.errno != EACCES:
             fail(f'bind on the kept socket: errno {e.errno}, want EACCES')
-    # listen: supervisor-executed on its own reference; the socket
-    # lives in the supervisor's namespace, so this opens no host port
-    # the caller cares about, and must not fail.
+    # listen: the socket lives in the supervisor's namespace, so
+    # listening on it would auto-bind a port there. The supervisor
+    # refuses it (EACCES).
     try:
         sock.listen(1)
+        fail('listen on the kept socket succeeded')
     except OSError as e:
-        fail(f'listen on the kept socket: errno {e.errno}, want success')
+        if e.errno != EACCES:
+            fail(f'listen on the kept socket: errno {e.errno}, want EACCES')
     try:
         sock.sendto(b'x', socket.MSG_FASTOPEN, host)
         fail('fast-open sendto on the kept socket succeeded')
     except OSError as e:
         if e.errno != 95:  # EOPNOTSUPP, from the BPF filter (C)
             fail(f'fast-open sendto: errno {e.errno}, want EOPNOTSUPP')
-    print('HOSTSOCKET-OK connect=EACCES bind=EACCES listen=ok '
+    print('HOSTSOCKET-OK connect=EACCES bind=EACCES listen=EACCES '
           'fastopen=EOPNOTSUPP')
 
 
@@ -1118,9 +1120,6 @@ def in_concurrency_burst(n_threads):
     if bad:
         fail(f'{len(bad)}/{len(results)} threads wrong: {bad[:5]}')
     print('CONCURRENCY-OK')
-
-
-def in_reconnect():
 
 
 def in_dumpable(port):

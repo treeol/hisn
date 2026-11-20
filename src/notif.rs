@@ -1423,38 +1423,23 @@ fn handle_implicit_call(
     // unbound socket auto-binds an ephemeral port on the wildcard
     // address in the socket's namespace, so a supervisor-side socket
     // must be refused before listening (I2) — listen on a host socket
-    // would open a host port. AF_UNIX listen records the caller's
-    // credentials (SO_PEERCRED), so for non-INET sandbox sockets the
-    // call is continued (kernel credentials), not supervisor-executed.
+    // would open a host port. The supervisor executes `listen` on its
+    // own reference for every address family after namespace
+    // classification; the kernel never executes a continued `listen`
+    // from a sandboxed task.
     if is_listen {
         let Some(d) = dup else {
             refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal);
             return;
         };
-        if d_is_inet(d.as_raw_fd()) {
-            match classify_ns(socket_netns_cookie(d.as_raw_fd()), cfg.supervisor_cookie) {
-                SockNs::Sandbox => {
-                    let backlog = n.data.args[1] as i32;
-                    let rc = unsafe { libc::listen(d.as_raw_fd(), backlog) };
-                    answer_result(lfd, n, rc, "listen", journal);
-                }
-                SockNs::Host => {
-                    refuse_implicit(lfd, n, libc::EACCES, "host-socket-listen", journal)
-                }
-                SockNs::Unknown => refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal),
+        match classify_ns(socket_netns_cookie(d.as_raw_fd()), cfg.supervisor_cookie) {
+            SockNs::Sandbox => {
+                let backlog = n.data.args[1] as i32;
+                let rc = unsafe { libc::listen(d.as_raw_fd(), backlog) };
+                answer_result(lfd, n, rc, "listen", journal);
             }
-        } else {
-            match classify_ns(socket_netns_cookie(d.as_raw_fd()), cfg.supervisor_cookie) {
-                SockNs::Sandbox => {
-                    if id_valid(lfd, n.id) {
-                        reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
-                    }
-                }
-                SockNs::Host => {
-                    refuse_implicit(lfd, n, libc::EACCES, "host-socket-listen", journal)
-                }
-                SockNs::Unknown => refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal),
-            }
+            SockNs::Host => refuse_implicit(lfd, n, libc::EACCES, "host-socket-listen", journal),
+            SockNs::Unknown => refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal),
         }
         return;
     }
@@ -1558,26 +1543,6 @@ fn low_port_bind_is_privileged(buf: &[u8; 128], family: u16) -> bool {
     // sandbox value (1024) directly.
     let _ = family;
     port < 1024
-}
-
-fn d_is_inet(fd: i32) -> bool {
-    // SO_DOMAIN (asm-generic/socket.h, since Linux 2.6.32) via
-    // getsockopt. `libc::SO_DOMAIN` is 39 on x86_64/aarch64 (34 is
-    // SO_PASSSEC). Fallback when unknown: treat as non-INET
-    // (continued, never supervisor-executed), the safe side for
-    // credentials.
-    let mut domain: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_DOMAIN,
-            &mut domain as *mut libc::c_int as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    rc == 0 && (domain == libc::AF_INET || domain == libc::AF_INET6)
 }
 
 fn answer_result(
@@ -2759,7 +2724,7 @@ pub fn verdict_table() -> &'static [(CallClass, Answer, &'static str)] {
         (
             Listen,
             SupervisorExecuted,
-            "INET listen is supervisor-executed on its own reference (A) after namespace classification (Host/Unknown refused); AF_UNIX listen is KernelContinued (SO_PEERCRED parity). Open point: a continued AF_UNIX listen re-resolves the fd at execution time; Landlock covers TCP connect/bind, listen auto-bind is the remaining gap (host listen would bind an ephemeral port in the supervisor namespace). See release notes.",
+            "supervisor executes listen on its own reference for every address family after namespace classification (Host/Unknown refused). Landlock covers TCP connect/bind; listen auto-bind is the remaining gap (host listen would bind an ephemeral port in the supervisor namespace). See release notes.",
         ),
         (
             FastopenSend,
@@ -4352,5 +4317,102 @@ mod tests {
         assert_eq!(records.len(), 1, "{records:?}");
         assert_eq!(records[0].0, "refuse");
         assert_eq!(records[0].1, "host-socket-connect", "{records:?}");
+    }
+
+    /// Fork a child that installs the seccomp filter, creates an AF_UNIX
+    /// SOCK_STREAM socket, binds it to a unique path, and calls `listen()`.
+    /// The filter intercepts `listen` and the engine supervisor-executes
+    /// it. Exit code: 0 on success, errno on failure, 2xx on setup error.
+    fn unix_listen_child() -> (libc::pid_t, OwnedFd) {
+        let (ours, theirs) = crate::sys::socketpair_seqpacket().unwrap();
+        let path = format!("/tmp/hisn-test-listen-{}.sock", std::process::id());
+        // SAFETY: the child only makes libc calls and _exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            drop(ours);
+            let code = (|| unsafe {
+                if crate::sys::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0).is_err() {
+                    return 203;
+                }
+                let Ok(listener) = install_connect_filter() else {
+                    return 204;
+                };
+                if crate::sys::send_with_fds(theirs.as_raw_fd(), b"L", &[listener.as_raw_fd()])
+                    .is_err()
+                {
+                    return 205;
+                }
+                drop(listener);
+                let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+                if s < 0 {
+                    return 250;
+                }
+                let mut addr: libc::sockaddr_un = std::mem::zeroed();
+                addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+                let p = format!("{}\0", path);
+                let bytes = p.as_bytes();
+                let n = bytes.len().min(addr.sun_path.len());
+                addr.sun_path[..n]
+                    .copy_from_slice(std::mem::transmute::<&[u8], &[libc::c_char]>(&bytes[..n]));
+                if libc::bind(
+                    s,
+                    &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                ) < 0
+                {
+                    return 251;
+                }
+                let rc = libc::listen(s, 1);
+                if rc == 0 {
+                    0
+                } else {
+                    *libc::__errno_location()
+                }
+            })();
+            let _ = std::fs::remove_file(&path);
+            unsafe { libc::_exit(code) }
+        }
+        drop(theirs);
+        let mut buf = [0u8; 8];
+        let mut pfd = libc::pollfd {
+            fd: ours.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pfd, 1, 10_000) };
+        let fd = (ready > 0)
+            .then(|| crate::sys::recv_with_fds(ours.as_raw_fd(), &mut buf).ok())
+            .flatten()
+            .and_then(|r| r.fds.into_iter().next());
+        match fd {
+            Some(fd) => (pid, fd),
+            None => {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                let mut st = 0;
+                unsafe { libc::waitpid(pid, &mut st, 0) };
+                panic!("test child could not install the seccomp filter");
+            }
+        }
+    }
+
+    #[test]
+    fn af_unix_listen_is_supervisor_executed() {
+        // After Block 3a, every listen on a sandbox socket is
+        // supervisor-executed, regardless of address family. The kernel
+        // never executes a continued listen from a sandboxed task.
+        // This test verifies an AF_UNIX (non-INET) listen succeeds via
+        // supervisor execution. The seccomp filter intercepts the
+        // listen syscall; the engine supervisor-executes it on the
+        // dup reference; the child sees errno=0 (exit 0).
+        let (_d, _j) = engine_journal();
+        let (pid, listener) = unix_listen_child();
+        let engine = NotifEngine::start_with(listener, None, sandbox_cfg(5));
+        assert_eq!(
+            child_exit(pid),
+            0,
+            "AF_UNIX listen should succeed (supervisor-executed)"
+        );
+        drop(engine);
     }
 }

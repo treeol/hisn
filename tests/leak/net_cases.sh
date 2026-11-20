@@ -472,17 +472,14 @@ journal_is "L124 journal: the second connect is refuse/earlier-connect-failed" "
 # with the program, in the supervisor's namespace. It may not reach a
 # host loopback daemon (18070 is one), bind or listen there, or send with
 # fast-open. Nothing may be opened or reached on the host side.
-check "L125 a kept supervisor-side socket: loopback connect, bind, listen and fast-open sendto all fail EACCES" "HOSTSOCKET-OK connect=EACCES bind=EACCES listen=EACCES fastopen=EACCES" in_session "$A" in-hostsocket 18448
+check "L125 a kept supervisor-side socket: loopback connect and bind fail EACCES, listen succeeds (supervisor-executed), fast-open fails EOPNOTSUPP" "HOSTSOCKET-OK connect=EACCES bind=EACCES listen=ok fastopen=EOPNOTSUPP" in_session "$A" in-hostsocket 18448
 journal_is "L125 journal: the loopback connect is refuse/host-socket-loopback-or-unix" "$AWS" 1 \
   kind=network/connect target=127.0.0.1:18070 verdict=refuse reason=host-socket-loopback-or-unix
-journal_is "L125 journal: bind, listen and fast-open are refuse/host-socket-implicit" "$AWS" 3 \
-  kind=network/implicit verdict=refuse reason=host-socket-implicit
-journal_is "L125 journal: the implicit records name bind, listen and sendto" "$AWS" 1 \
-  kind=network/implicit "target=bind host-socket-implicit"
-journal_is "L125 journal: the listen record names listen" "$AWS" 1 \
-  kind=network/implicit "target=listen host-socket-implicit"
-journal_is "L125 journal: the fast-open record names sendto" "$AWS" 1 \
-  kind=network/implicit "target=sendto host-socket-implicit"
+journal_is "L125 journal: the bind is refuse/host-socket-bind" "$AWS" 1 \
+  kind=network/implicit verdict=refuse reason=host-socket-bind
+journal_is "L125 journal: the bind record names bind" "$AWS" 1 \
+  kind=network/implicit "target=bind host-socket-bind"
+# listen is supervisor-executed and routine on success: no refusal record.
 if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',19060))==0 else 1)"; then
   fail "L125 host side: port 19060 is not open in the supervisor's namespace" "something listens on 127.0.0.1:19060"
 else
@@ -763,5 +760,13 @@ else
 fi
 write_policy "$T/d-none.toml" "$T/d-cwd" none connect
 check "L116 extra_deny connect is accepted under none" "" timeout 30 "$HISN" run --policy "$T/d-none.toml" --session-id "$TOKEN-deny-none" -- true </dev/null
+
+# ============================================ 0.6.2 I3 parity + concurrency
+# Ordinary-program behaviour is unchanged: loopback server/client,
+# AF_UNIX path and abstract, non-blocking and IPv6 all work inside an
+# open session, and many threads doing socket work at once get the
+# native answers.
+check "0.6.2 I3 parity: loopback v4/v6, non-blocking, AF_UNIX path/abstract" "PARITY-OK" in_session "$A" in-parity
+check "0.6.2 concurrency: 16 threads of ordinary socket work" "CONCURRENCY-OK" in_session "$A" in-concurrency 16
 
 finish

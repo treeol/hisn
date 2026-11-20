@@ -469,8 +469,10 @@ def in_sendto():
         tcp.sendto(b'x', socket.MSG_FASTOPEN, (LISTEN_IP, 18080))
         fail('TCP fast-open sendto to an outside address was sent')
     except OSError as e:
-        if e.errno != ENETUNREACH:
-            fail(f'fast-open sendto: errno {e.errno} (want ENETUNREACH)')
+        # 0.6.2 (C): the BPF filter answers EOPNOTSUPP itself, before
+        # any address is looked at. Programs fall back to connect.
+        if e.errno != 95:  # EOPNOTSUPP
+            fail(f'fast-open sendto: errno {e.errno} (want EOPNOTSUPP)')
     print('L98-OK')
 
 
@@ -662,8 +664,11 @@ def in_hostsocket(port):
     """A socket whose supervisor-side connect failed is kept by the
     program (open mode injects the supervisor's socket before the
     connect completes). It must not reach anything the policy did not
-    approve: loopback connect, bind, listen and a fast-open send all
-    fail EACCES, and nothing is opened or reached on the host."""
+    approve: loopback connect and bind fail EACCES, `listen` is
+    supervisor-executed and answers 0 without opening a host port
+    (design A: the socket's namespace is the supervisor's, and listen
+    has no address), and a fast-open send fails EOPNOTSUPP from the
+    BPF filter (design C). Nothing is opened or reached on the host."""
     import select
     sock = socket.socket()
     sock.setblocking(False)
@@ -676,21 +681,27 @@ def in_hostsocket(port):
     rc = sock.connect_ex(host)
     if rc != EACCES:
         fail(f'loopback connect on the kept socket: errno {rc}, want EACCES')
-    for name, call in (
-        ('bind', lambda: sock.bind(('127.0.0.1', 19060))),
-        ('listen', lambda: sock.listen(1)),
-        ('fast-open sendto', lambda: sock.sendto(
-            b'x', socket.MSG_FASTOPEN, host)),
-    ):
-        try:
-            call()
-            fail(f'{name} on the kept socket succeeded')
-        except OSError as e:
-            if e.errno != EACCES:
-                fail(f'{name} on the kept socket: errno {e.errno}, '
-                     'want EACCES')
-    print('HOSTSOCKET-OK connect=EACCES bind=EACCES listen=EACCES '
-          'fastopen=EACCES')
+    try:
+        sock.bind(('127.0.0.1', 19060))
+        fail('bind on the kept socket succeeded')
+    except OSError as e:
+        if e.errno != EACCES:
+            fail(f'bind on the kept socket: errno {e.errno}, want EACCES')
+    # listen: supervisor-executed on its own reference; the socket
+    # lives in the supervisor's namespace, so this opens no host port
+    # the caller cares about, and must not fail.
+    try:
+        sock.listen(1)
+    except OSError as e:
+        fail(f'listen on the kept socket: errno {e.errno}, want success')
+    try:
+        sock.sendto(b'x', socket.MSG_FASTOPEN, host)
+        fail('fast-open sendto on the kept socket succeeded')
+    except OSError as e:
+        if e.errno != 95:  # EOPNOTSUPP, from the BPF filter (C)
+            fail(f'fast-open sendto: errno {e.errno}, want EOPNOTSUPP')
+    print('HOSTSOCKET-OK connect=EACCES bind=EACCES listen=ok '
+          'fastopen=EOPNOTSUPP')
 
 
 def in_hostsocket_report(port):
@@ -972,6 +983,146 @@ def in_reconnect():
     print('RECONNECT-OK')
 
 
+def in_parity_loopback():
+    """I3 parity: loopback server+client, blocking and non-blocking,
+    IPv4 and IPv6, AF_UNIX path and abstract — all inside the session.
+    Results, not just success: data round-trips and errno values are
+    the native ones."""
+    # IPv4 blocking
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('127.0.0.1', 19101))
+    srv.listen(1)
+    cli = socket.socket()
+    cli.settimeout(10)
+    cli.connect(('127.0.0.1', 19101))
+    acc, _ = srv.accept()
+    cli.sendall(b'v4')
+    if acc.recv(2) != b'v4':
+        fail('IPv4 loopback data')
+    cli.close(); srv.close(); acc.close()
+    # IPv6 blocking
+    srv = socket.socket(socket.AF_INET6)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('::1', 19102))
+    srv.listen(1)
+    cli = socket.socket(socket.AF_INET6)
+    cli.settimeout(10)
+    cli.connect(('::1', 19102))
+    acc, _ = srv.accept()
+    cli.sendall(b'v6')
+    if acc.recv(2) != b'v6':
+        fail('IPv6 loopback data')
+    cli.close(); srv.close(); acc.close()
+    # IPv4 non-blocking
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('127.0.0.1', 19103))
+    srv.listen(1)
+    cli = socket.socket()
+    cli.setblocking(False)
+    rc = cli.connect_ex(('127.0.0.1', 19103))
+    if rc not in (0, 115):  # success or EINPROGRESS
+        fail(f'non-blocking loopback connect errno {rc}')
+    if rc == 115:
+        import select
+        r, w, _ = select.select([], [cli], [], 5)
+        if not w:
+            fail('non-blocking connect never became writable')
+        if cli.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) != 0:
+            fail('non-blocking connect SO_ERROR != 0')
+    acc, _ = srv.accept()
+    cli.setblocking(True)
+    cli.sendall(b'nb')
+    if acc.recv(2) != b'nb':
+        fail('non-blocking loopback data')
+    cli.close(); srv.close(); acc.close()
+    # AF_UNIX path
+    path = '/tmp/parity-062.sock'
+    import os
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    usrv = socket.socket(socket.AF_UNIX)
+    usrv.bind(path)
+    usrv.listen(1)
+    ucli = socket.socket(socket.AF_UNIX)
+    ucli.settimeout(10)
+    ucli.connect(path)
+    uacc, _ = usrv.accept()
+    ucli.sendall(b'un')
+    if uacc.recv(2) != b'un':
+        fail('AF_UNIX path data')
+    ucli.close(); usrv.close(); uacc.close()
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    # AF_UNIX abstract
+    asrv = socket.socket(socket.AF_UNIX)
+    asrv.bind('\0parity-062-abstract')
+    asrv.listen(1)
+    acli = socket.socket(socket.AF_UNIX)
+    acli.settimeout(10)
+    acli.connect('\0parity-062-abstract')
+    aacc, _ = asrv.accept()
+    acli.sendall(b'ab')
+    if aacc.recv(2) != b'ab':
+        fail('AF_UNIX abstract data')
+    acli.close(); asrv.close(); aacc.close()
+    print('PARITY-OK')
+
+
+def in_concurrency_burst(n_threads):
+    """Many threads doing ordinary socket work at once: loopback
+    connects, AF_UNIX connects and refuses of private targets. Every
+    thread must get the native answer."""
+    import concurrent.futures
+    results = []
+
+    def work(i):
+        try:
+            if i % 3 == 0:
+                s = socket.socket()
+                s.settimeout(10)
+                s.connect(('127.0.0.1', 19101))
+                s.close()
+                return 'ok'
+            if i % 3 == 1:
+                s = socket.socket()
+                try:
+                    s.settimeout(2)
+                    s.connect(('10.0.0.1', 12345))
+                    return 'bad-private-ok'
+                except OSError as e:
+                    return 'ok' if e.errno in (13, 111, 113) else f'errno {e.errno}'
+                finally:
+                    s.close()
+            s2 = socket.socket(socket.AF_UNIX)
+            try:
+                s2.settimeout(2)
+                s2.connect('/tmp/parity-062.sock')
+                return 'bad-unix-ok'
+            except OSError as e:
+                return 'ok' if e.errno == 2 else f'errno {e.errno}'
+            finally:
+                s2.close()
+        except Exception as e:
+            return f'exc {e}'
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as ex:
+        for r in ex.map(work, range(n_threads * 3)):
+            results.append(r)
+    bad = [r for r in results if r != 'ok']
+    if bad:
+        fail(f'{len(bad)}/{len(results)} threads wrong: {bad[:5]}')
+    print('CONCURRENCY-OK')
+
+
+def in_reconnect():
+
+
 def in_dumpable(port):
     import ctypes
     libc = ctypes.CDLL(None, use_errno=True)
@@ -1125,6 +1276,8 @@ def main(argv):
         'in-blocking-refused': lambda: in_blocking_refused(int(args[0])),
         'in-deadline': in_deadline,
         'in-leave-tracked': in_leave_tracked,
+        'in-parity': in_parity_loopback,
+        'in-concurrency': lambda: in_concurrency_burst(int(args[0])),
     }
     if cmd not in commands:
         fail(f'unknown subcommand {cmd}')

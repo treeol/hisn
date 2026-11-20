@@ -10,8 +10,8 @@
 use std::path::PathBuf;
 
 use landlock::{
-    ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, Scope,
+    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
+    RulesetAttr, RulesetCreatedAttr, Scope,
 };
 
 use crate::mounts::SANDBOX_HOME;
@@ -19,6 +19,12 @@ use crate::policy::{LandlockScope, Network, ResolvedPolicy};
 
 /// Newest ABI hisn knows how to use. Older kernels degrade (best-effort).
 pub const TARGET_ABI: ABI = ABI::V6;
+
+/// Lowest Landlock ABI that carries network rules (`AccessNet::BindTcp` /
+/// `ConnectTcp`, Landlock ABI v4 = Linux 6.7). Open mode requires it: the
+/// kernel-side refusal of TCP bind/connect by sandboxed tasks is what makes
+/// a continued interception safe (0.6.2, design B).
+pub const MIN_NET_ABI: ABI = ABI::V4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LandlockError {
@@ -29,6 +35,12 @@ pub enum LandlockError {
          less; pass --allow-host-abstract-sockets to accept the risk"
     )]
     ScopeUnavailable,
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[error(
+        "network = \"open\" needs Landlock ABI >= 4 (TCP bind/connect network rules, Linux 6.7), \
+         kernel offers less"
+    )]
+    NetRulesUnavailable,
 }
 
 /// What the ruleset will contain, independent of kernel support.
@@ -44,6 +56,10 @@ pub struct LandlockPlan {
     /// Apply `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` (ABI >= 6). Default false
     /// (P17), but `network = "host"` requires it (`scope_required`).
     pub scope_abstract: bool,
+    /// 0.6.2 open mode: handle `AccessNet` (BindTcp | ConnectTcp) with no
+    /// allow rules, so the kernel refuses TCP bind/connect by any task in
+    /// the domain at execution time. Set iff `policy.network == Open`.
+    pub deny_tcp: bool,
 }
 
 /// Compute the ruleset from the resolved policy. `initial_rw_grants` are the
@@ -71,6 +87,7 @@ pub fn plan(policy: &ResolvedPolicy, initial_rw_grants: &[PathBuf]) -> LandlockP
         write_roots: write,
         scope_signal,
         scope_abstract,
+        deny_tcp: policy.network == Network::Open,
     }
 }
 
@@ -78,6 +95,13 @@ pub fn plan(policy: &ResolvedPolicy, initial_rw_grants: &[PathBuf]) -> LandlockP
 /// the caller explicitly opted out.
 pub fn scope_required(policy: &ResolvedPolicy, allow_host_abstract: bool) -> bool {
     policy.network == Network::Host && !allow_host_abstract
+}
+
+/// `network = "open"` must not start when the kernel cannot provide the
+/// TCP network rules (ABI >= 4). Never degrades silently: without the
+/// rules, a continued interception would again be a check-time decision.
+pub fn net_rules_required(policy: &ResolvedPolicy) -> bool {
+    policy.network == Network::Open
 }
 
 /// Apply the plan to the calling thread (and its future children).
@@ -100,6 +124,15 @@ pub fn apply(plan: &LandlockPlan, require_scope: bool) -> Result<(bool, bool), L
     }
     if scope_abstract {
         rs = rs.scope(Scope::AbstractUnixSocket).map_err(|e| err(&e))?;
+    }
+    // 0.6.2 open mode: handle TCP bind/connect with no allow rules. The
+    // kernel then refuses those calls at execution time for any task in
+    // this domain. BestEffort would drop this silently on an old kernel,
+    // so the effective ABI is checked below like the scopes.
+    if plan.deny_tcp {
+        rs = rs
+            .handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp)
+            .map_err(|e| err(&e))?;
     }
     let mut created = rs.create().map_err(|e| err(&e))?;
     for root in &plan.read_roots {
@@ -128,6 +161,13 @@ pub fn apply(plan: &LandlockPlan, require_scope: bool) -> Result<(bool, bool), L
     let abstract_applied = scope_abstract && abi_ok;
     if require_scope && !abstract_applied {
         return Err(LandlockError::ScopeUnavailable);
+    }
+    if plan.deny_tcp {
+        let net_ok = enforced
+            && matches!(status.landlock, landlock::LandlockStatus::Available { effective_abi, .. } if effective_abi >= MIN_NET_ABI);
+        if !net_ok {
+            return Err(LandlockError::NetRulesUnavailable);
+        }
     }
     Ok((enforced, scoped))
 }

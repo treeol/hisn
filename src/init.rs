@@ -141,18 +141,23 @@ fn run_init(cfg: &InitConfig, chan: &OwnedFd) -> Result<i32> {
 
     // 10. Limits, Landlock.
     set_rlimits(&cfg.policy).context("setrlimit")?;
-    landlock::apply(&cfg.landlock, cfg.require_scope).context("landlock")?;
-
-    // 11. No privileges, ever. NOTE: the DNS bind must happen BEFORE
-    // drop_all_caps() (port 53 needs CAP_NET_BIND_SERVICE on default
-    // hosts); the connect-filter install must happen AFTER NNP (so it
-    // needs no CAP_SYS_ADMIN) and BEFORE PR_SET_DUMPABLE=0 (step 12b).
+    // 0.6.2: in open mode the DNS responder sockets are bound BEFORE
+    // Landlock is applied, because Landlock's TCP rules (design B)
+    // refuse every later TCP bind by a task in the domain — including
+    // init's own DNS bind on port 53. UDP is not covered by those
+    // rules, but both sockets are bound here for one ordering.
     let (dns_udp, dns_tcp) = if cfg.policy.network == Network::Open {
         let (u, t) = crate::dns::bind_dns().context("binding DNS responder sockets")?;
         (Some(u), Some(t))
     } else {
         (None, None)
     };
+    landlock::apply(&cfg.landlock, cfg.require_scope).context("landlock")?;
+
+    // 11. No privileges, ever. NOTE: the DNS bind must happen BEFORE
+    // drop_all_caps() (port 53 needs CAP_NET_BIND_SERVICE on default
+    // hosts); the connect-filter install must happen AFTER NNP (so it
+    // needs no CAP_SYS_ADMIN) and BEFORE PR_SET_DUMPABLE=0 (step 12b).
     sys::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0).context("no_new_privs")?;
     drop_all_caps().context("dropping capabilities")?;
     // 11b. ADR 0022 open mode: install the connect filter with a

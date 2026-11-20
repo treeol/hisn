@@ -296,6 +296,49 @@ fn check_landlock() -> Item {
     }
 }
 
+/// 0.6.2: open mode needs Landlock TCP network rules (ABI >= 4, Linux
+/// 6.7). The kernel refuses TCP bind/connect by sandboxed tasks at
+/// execution time; without it a continued interception would again be a
+/// check-time decision. `required` is false (Warn when ABI < 4) so
+/// `hisn check` does not fail none/host sessions on old kernels —
+/// open-mode startup separately enforces the requirement with a clear
+/// error (`check_landlock_net_abi`).
+fn check_landlock_net() -> Item {
+    let r = unsafe {
+        libc::syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            std::ptr::null::<u8>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if r >= 4 {
+        item(
+            "landlock net rules (open mode)",
+            false,
+            Status::Ok,
+            format!("ABI v{r} (>= v4, Linux 6.7)"),
+        )
+    } else if r >= 1 {
+        item(
+            "landlock net rules (open mode)",
+            false,
+            Status::Warn,
+            format!(
+                "ABI v{r} < v4: network = \"open\" cannot start on this kernel (none/host unaffected)"
+            ),
+        )
+    } else {
+        let e = errno();
+        item(
+            "landlock net rules (open mode)",
+            false,
+            Status::Warn,
+            format!("unavailable: {}", errno_name(e)),
+        )
+    }
+}
+
 fn check_seccomp() -> Item {
     let mut action = SECCOMP_RET_KILL_PROCESS;
     // SAFETY: action is a valid u32 pointer for SECCOMP_GET_ACTION_AVAIL.
@@ -584,6 +627,11 @@ pub fn run_checks() -> Report {
     let mut items = vec![check_kernel()];
     items.extend(check_userns());
     items.push(check_landlock());
+    // `landlock net rules (open mode)` is optional (Warn on old
+    // kernels) so the report does not fail none/host sessions; open
+    // mode startup enforces it separately in
+    // `check_landlock_net_abi`.
+    items.push(check_landlock_net());
     items.push(check_seccomp());
     items.extend(check_mount_api());
     items.push(check_subids());

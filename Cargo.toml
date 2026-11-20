@@ -1,6 +1,6 @@
 [package]
 name = "hisn"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 description = "Daemonless, rootless, single-binary Linux sandbox for AI coding agents: namespaces, pivot_root, seccomp, Landlock, no root"
 license = "Apache-2.0"
@@ -32,6 +32,12 @@ thiserror = "2.0.21"
 toml = "1.1.8"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+
+[features]
+# Test-only: answer CONTINUE for every intercepted call, to prove the
+# kernel-side (Landlock) enforcement independently. Never enabled in
+# release builds; scripts/release-gate.sh fails if it is.
+force-continue = []
 
 [dev-dependencies]
 tempfile = "3.27.0"

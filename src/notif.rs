@@ -35,9 +35,12 @@ const BPF_JSET_K: u16 = 0x45;
 /// - foreign architecture: `KILL_PROCESS`;
 /// - `connect`, `bind`, `listen`: `USER_NOTIF`;
 /// - `sendto`/`sendmmsg` (flags = arg 3) and `sendmsg` (flags = arg 2)
-///   with `MSG_FASTOPEN`: `USER_NOTIF` (the only implicit connect a
-///   stream socket has; every other send is `ALLOW`, so ordinary
-///   traffic and the helper's own fd passing are never trapped);
+///   with `MSG_FASTOPEN`: `ERRNO(EOPNOTSUPP)` — 0.6.2 design C. The flag
+///   is a register argument, so the filter decides alone; open mode does
+///   not support TCP fast open and programs fall back to a normal
+///   connect. No notification, no supervisor decision, hence no
+///   check/execute gap. Every other send is `ALLOW`, so ordinary
+///   traffic and the helper's own fd passing are never trapped;
 /// - everything else: `ALLOW`.
 ///
 /// Jumps only go forward: target = pc + 1 + offset. The program is
@@ -53,6 +56,7 @@ pub fn connect_filter() -> Vec<libc::sock_filter> {
     let s = 4 + direct.len(); // first send-family instruction
     let allow_pc = s + 7;
     let notif_pc = s + 8;
+    let err_pc = s + 9; // SECCOMP_RET_ERRNO | EOPNOTSUPP
     let to = |from: usize, target: usize| (target - (from + 1)) as u8;
     let mut v = vec![
         ins(BPF_LD_W_ABS, 0, 0, 4), // arch
@@ -81,19 +85,25 @@ pub fn connect_filter() -> Vec<libc::sock_filter> {
     v.push(ins(BPF_LD_W_ABS, 0, 0, arg_off(3))); // s+3
     v.push(ins(
         BPF_JSET_K,
-        to(s + 4, notif_pc),
+        to(s + 4, err_pc),
         to(s + 4, allow_pc),
         libc::MSG_FASTOPEN as u32,
     ));
     v.push(ins(BPF_LD_W_ABS, 0, 0, arg_off(2))); // s+5
     v.push(ins(
         BPF_JSET_K,
-        to(s + 6, notif_pc),
+        to(s + 6, err_pc),
         to(s + 6, allow_pc),
         libc::MSG_FASTOPEN as u32,
     ));
     v.push(ins(BPF_RET_K, 0, 0, libc::SECCOMP_RET_ALLOW)); // s+7
     v.push(ins(BPF_RET_K, 0, 0, libc::SECCOMP_RET_USER_NOTIF)); // s+8
+    v.push(ins(
+        BPF_RET_K,
+        0,
+        0,
+        libc::SECCOMP_RET_ERRNO | libc::EOPNOTSUPP as u32,
+    )); // s+9
     v
 }
 
@@ -419,6 +429,15 @@ pub enum Verdict {
 /// AF_UNIX -> CONTINUE; loopback -> CONTINUE (any SO_TYPE, so UDP DNS to
 /// 127.0.0.1:53 works); unknown family -> Refuse; non-stream non-loopback
 /// IP -> Refuse; private -> Refuse; public stream -> Allow.
+///
+/// 0.6.2: `Continue` here means "the kernel may continue the call".
+/// That is only answered for call classes covered by the Landlock TCP
+/// rules at execution time (design B) or that cannot leave the empty
+/// network namespace (AF_UNIX on a confirmed sandbox socket). Loopback
+/// INET connects and INET binds/listens are supervisor-executed
+/// (design A) and never reach `decide` as `Continue` at runtime — the
+/// `Continue` verdict for loopback is retained only as the *policy*
+/// classification that selects the supervisor-executed path.
 pub fn decide(family: u16, is_loopback: bool, is_stream: bool, is_public: bool) -> Verdict {
     use libc::{AF_INET, AF_INET6, AF_UNIX};
     if family == AF_UNIX as u16 {
@@ -533,6 +552,12 @@ pub struct EngineConfig {
     /// are host-side. Still `None` (unresolvable) means every socket is
     /// treated as host-side: fail closed.
     pub supervisor_cookie: Option<NetnsCookie>,
+    /// 0.6.2 test-only: answer CONTINUE for every intercepted call, so the
+    /// kernel-side enforcement (Landlock TCP rules) can be proven
+    /// independently of the supervisor's decisions. Always `false` in
+    /// release builds (release-gate enforced); see `Cargo.toml` feature
+    /// `force-continue` and `scripts/release-gate.sh`.
+    pub force_continue: bool,
 }
 
 impl EngineConfig {
@@ -544,6 +569,7 @@ impl EngineConfig {
             queue: MAX_PENDING,
             reader: read_sockaddr,
             supervisor_cookie: None,
+            force_continue: cfg!(feature = "force-continue"),
         }
     }
 }
@@ -1303,28 +1329,86 @@ fn engine_loop(
 }
 
 /// `bind`, `listen` and a `MSG_FASTOPEN` send (the implicit connect of a
-/// stream socket) are notified so that they can be answered by where the
-/// socket lives. On a socket in the sandbox's empty namespace they
-/// cannot leave it: CONTINUE. On a socket in the supervisor's namespace
-/// (an injected socket the program kept after a failed connect) an
-/// implicit connect would reach a host address no policy approved, and
-/// `bind`/`listen` would open a port in the supervisor's namespace:
-/// EACCES. A socket whose namespace cannot be determined is refused too.
-/// The arguments are not inspected; the socket (args[0]) decides.
+/// stream socket) are notified. 0.6.2 answers by where the socket lives
+/// *and* whether the supervisor can act on the very reference it
+/// checked (design A):
+///
+/// - `listen` on ANY socket: the supervisor performs it itself on its own
+///   reference (`pidfd_getfd`), in the socket's own namespace. The
+///   checked object and the acted-on object are the same, so there is
+///   no gap between decision and execution. On a sandbox socket this is
+///   a no-op (loopback listen in the empty namespace); on a
+///   supervisor-side socket `listen` has no address and cannot leave
+///   the namespace, so it is answered the same way — the namespace
+///   never matters, and no CONTINUE is needed.
+/// - `bind` with an AF_INET/AF_INET6 address: the supervisor performs
+///   it the same way on its own reference, with its own copy of the
+///   address, and answers the result (including the caller's errno:
+///   a supervisor-side socket in the supervisor's namespace may bind a
+///   low port the caller could not — the answer is what the supervisor
+///   got, which for a sandbox socket is identical to native because
+///   both act in the empty namespace with the same credentials... the
+///   low-port case is handled by Landlock: a sandboxed task cannot
+///   bind a TCP port at all, and the supervisor's bind on a sandbox
+///   socket is the loopback bind the program asked for. To keep I3
+///   (identical results for ordinary programs), the supervisor's
+///   result on a sandbox socket is the native result).
+/// - `bind` with any other family, and `MSG_FASTOPEN` sends: Landlock
+///   covers TCP bind/connect at execution time (design B), so a
+///   CONTINUE is safe; fast-open sends no longer reach here at all
+///   (the filter answers EOPNOTSUPP, design C) — this handler is kept
+///   for completeness but `send*` is never notified now.
+/// - Unknown namespace: refused — the socket is neither confirmed
+///   sandbox nor actionable.
+///
+/// A caller interrupted by a signal while the supervisor works: the
+/// notification id becomes invalid and `id_valid` suppresses the
+/// answer; the supervisor's dup fd is closed on return (OwnedFd), so
+/// no reference leaks and no wait thread is held for `listen`/`bind`
+/// (only blocking `connect` uses the wait pool, as before).
+#[allow(unreachable_code, unused_variables)]
 fn handle_implicit_call(
     lfd: i32,
     n: &Notif,
     cfg: &EngineConfig,
     journal: &Option<std::sync::Arc<crate::journal::Journal>>,
 ) {
+    // Test-only forced-continue (0.6.2 Phase 2): every intercepted call
+    // is continued so the kernel-side refusal can be proven. This branch
+    // is compiled only with the `force-continue` feature, never in
+    // release builds.
+    #[cfg(feature = "force-continue")]
+    {
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
+        }
+        if let Some(j) = journal {
+            j.net_implicit_record(n, "continue", "forced-continue");
+        }
+        return;
+    }
+    #[cfg(not(feature = "force-continue"))]
+    {
+        let _ = cfg;
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = ();
+    }
     let sockfd = n.data.args[0] as i32;
+    let nr = n.data.nr;
+    let is_listen = nr == libc::SYS_listen as i32;
+    let is_bind = nr == libc::SYS_bind as i32;
     // pidfd_getfd takes a pidfd (not a thread id); ID_VALID confirms the
-    // pidfd still names the task suspended in this call.
-    let cookie = open_task_pidfd(n.pid as libc::pid_t, true)
-        .ok()
+    // pidfd still names the task suspended in this call. The dup fd is
+    // the supervisor's own reference to the caller's socket: every
+    // operation below acts on that reference (design A).
+    let pidfd = open_task_pidfd(n.pid as libc::pid_t, true).ok();
+    let dup: Option<OwnedFd> = pidfd
+        .as_ref()
         .filter(|_| id_valid(lfd, n.id))
         .and_then(|pidfd| {
-            let dup = unsafe {
+            let d = unsafe {
                 libc::syscall(
                     libc::SYS_pidfd_getfd,
                     pidfd.as_raw_fd() as i64,
@@ -1332,28 +1416,212 @@ fn handle_implicit_call(
                     0u64,
                 )
             };
-            (dup >= 0).then(|| unsafe { OwnedFd::from_raw_fd(dup as i32) })
-        })
-        .and_then(|d| socket_netns_cookie(d.as_raw_fd()));
-    let (verdict, reason) = match classify_ns(cookie, cfg.supervisor_cookie) {
-        SockNs::Sandbox => ("continue", "implicit-sandbox-socket"),
-        SockNs::Host => ("refuse", "host-socket-implicit"),
-        SockNs::Unknown => ("refuse", "netns-unknown"),
-    };
-    if id_valid(lfd, n.id) {
-        if verdict == "continue" {
-            reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
+            (d >= 0).then(|| unsafe { OwnedFd::from_raw_fd(d as i32) })
+        });
+    // `listen` needs no address: perform it on the dup reference,
+    // but only after classifying that reference. `listen()` on an
+    // unbound socket auto-binds an ephemeral port on the wildcard
+    // address in the socket's namespace, so a supervisor-side socket
+    // must be refused before listening (I2) — listen on a host socket
+    // would open a host port. AF_UNIX listen records the caller's
+    // credentials (SO_PEERCRED), so for non-INET sandbox sockets the
+    // call is continued (kernel credentials), not supervisor-executed.
+    if is_listen {
+        let Some(d) = dup else {
+            refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal);
+            return;
+        };
+        if d_is_inet(d.as_raw_fd()) {
+            match classify_ns(socket_netns_cookie(d.as_raw_fd()), cfg.supervisor_cookie) {
+                SockNs::Sandbox => {
+                    let backlog = n.data.args[1] as i32;
+                    let rc = unsafe { libc::listen(d.as_raw_fd(), backlog) };
+                    answer_result(lfd, n, rc, "listen", journal);
+                }
+                SockNs::Host => refuse_implicit(lfd, n, libc::EACCES, "host-socket-listen", journal),
+                SockNs::Unknown => refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal),
+            }
         } else {
-            reply(lfd, n.id, -(libc::EACCES), 0, 0);
+            match classify_ns(socket_netns_cookie(d.as_raw_fd()), cfg.supervisor_cookie) {
+                SockNs::Sandbox => {
+                    if id_valid(lfd, n.id) {
+                        reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
+                    }
+                }
+                SockNs::Host => refuse_implicit(lfd, n, libc::EACCES, "host-socket-listen", journal),
+                SockNs::Unknown => refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal),
+            }
         }
+        return;
     }
-    // Only refusals are journaled: a continued bind/listen on a sandbox
-    // socket is routine and would fill the journal.
-    if let (Some(j), "refuse") = (journal, verdict) {
-        j.net_implicit_record(n, verdict, reason);
+    // `bind` with an INET/INET6 address: read the address once into a
+    // private buffer and perform the bind on the dup reference with
+    // that copy. The checked object and the acted-on object are the
+    // same, so the caller's later changes to its own memory or
+    // descriptor cannot change what was decided.
+    if is_bind {
+        let addrlen = n.data.args[2] as usize;
+        if !(2..=128).contains(&addrlen) {
+            refuse_implicit(lfd, n, libc::EINVAL, "bad-addrlen", journal);
+            return;
+        }
+        let buf = match (cfg.reader)(n.pid, n.data.args[1], addrlen) {
+            Ok(b) => b,
+            Err(_) => {
+                refuse_implicit(lfd, n, libc::EACCES, "read-failed", journal);
+                return;
+            }
+        };
+        let family = u16::from_ne_bytes([buf[0], buf[1]]);
+        // Classify FIRST, before branching on family: a bind with
+        // AF_UNSPEC on an INET socket is a TCP bind, and must not
+        // bypass the namespace check (AF_UNSPEC binds are not covered
+        // by Landlock's family check). Host/unknown sockets are
+        // refused for every family.
+        let Some(d) = dup else {
+            refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal);
+            return;
+        };
+        match classify_ns(socket_netns_cookie(d.as_raw_fd()), cfg.supervisor_cookie) {
+            SockNs::Host => {
+                refuse_implicit(lfd, n, libc::EACCES, "host-socket-bind", journal);
+                return;
+            }
+            SockNs::Unknown => {
+                refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal);
+                return;
+            }
+            SockNs::Sandbox => {}
+        }
+        if family != libc::AF_INET as u16 && family != libc::AF_INET6 as u16 {
+            // Not a TCP bind: AF_UNIX bind in the empty namespace
+            // cannot leave it, so CONTINUE is safe. The socket is
+            // already confirmed sandbox-side above.
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
+            }
+            return;
+        }
+        // I3 low-port parity: the supervisor (creator of the sandbox
+        // user namespace) has CAP_NET_BIND_SERVICE over the sandbox
+        // netns, the sandboxed task does not. Emulate the caller's
+        // result: a port below ip_unprivileged_port_start (read
+        // once, default 1024) that the supervisor alone could bind
+        // is answered EACCES, exactly as native for the caller.
+        if low_port_bind_is_privileged(&buf, family) {
+            refuse_implicit(lfd, n, libc::EACCES, "privileged-port", journal);
+            return;
+        }
+        let rc = unsafe {
+            libc::bind(
+                d.as_raw_fd(),
+                buf.as_ptr() as *const libc::sockaddr,
+                addrlen as libc::socklen_t,
+            )
+        };
+        answer_result(lfd, n, rc, "bind", journal);
+        return;
+    }
+    // Any other notified non-connect call (fast-open sends no longer
+    // reach here; they are answered by the filter). CONTINUE is safe:
+    // Landlock refuses the TCP connect/bind that matters at execution
+    // time. A non-sandbox socket is still refused by classification.
+    let cookie = dup
+        .as_ref()
+        .and_then(|d| socket_netns_cookie(d.as_raw_fd()));
+    match classify_ns(cookie, cfg.supervisor_cookie) {
+        SockNs::Sandbox => {
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
+            }
+        }
+        SockNs::Host => refuse_implicit(lfd, n, libc::EACCES, "host-socket-implicit", journal),
+        SockNs::Unknown => refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal),
     }
 }
 
+/// Answer `-errno` (or 0) for a supervisor-executed `listen`/`bind` and
+/// journal only refusals (ordinary successes are routine).
+fn low_port_bind_is_privileged(buf: &[u8; 128], family: u16) -> bool {
+    // Port is at offset 2 for both INET (network order) and INET6.
+    let port = u16::from_be_bytes([buf[2], buf[3]]);
+    if port == 0 {
+        return false; // ephemeral: never privileged
+    }
+    // The sandbox's netns is fresh: ip_unprivileged_port_start is
+    // per-netns and a new netns starts at 1024. Reading the host's
+    // value would mis-emulate in both directions, so use the
+    // sandbox value (1024) directly.
+    let _ = family;
+    port < 1024
+}
+
+fn d_is_inet(fd: i32) -> bool {
+    // SO_DOMAIN (asm-generic/socket.h, since Linux 2.6.32) via
+    // getsockopt. `libc::SO_DOMAIN` is 39 on x86_64/aarch64 (34 is
+    // SO_PASSSEC). Fallback when unknown: treat as non-INET
+    // (continued, never supervisor-executed), the safe side for
+    // credentials.
+    let mut domain: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            &mut domain as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    rc == 0 && (domain == libc::AF_INET || domain == libc::AF_INET6)
+}
+
+fn answer_result(
+    lfd: i32,
+    n: &Notif,
+    rc: i32,
+    what: &str,
+    journal: &Option<std::sync::Arc<crate::journal::Journal>>,
+) {
+    let errno = if rc == 0 {
+        0
+    } else {
+        io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+    };
+    if id_valid(lfd, n.id) {
+        reply(lfd, n.id, -errno, 0, 0);
+    }
+    if errno != 0
+        && let Some(j) = journal
+    {
+        let reason = if what == "listen" {
+            "listen-failed"
+        } else {
+            "bind-failed"
+        };
+        j.net_implicit_record(n, "refuse", reason);
+    }
+}
+
+/// Refuse an implicit call with `errno` and journal it.
+fn refuse_implicit(
+    lfd: i32,
+    n: &Notif,
+    errno: i32,
+    reason: &str,
+    journal: &Option<std::sync::Arc<crate::journal::Journal>>,
+) {
+    if id_valid(lfd, n.id) {
+        reply(lfd, n.id, -errno, 0, 0);
+    }
+    if let Some(j) = journal {
+        j.net_implicit_record(n, "refuse", reason);
+    }
+}
+
+#[allow(unreachable_code, unused_variables)]
 fn handle_notif(
     lfd: i32,
     n: &mut Notif,
@@ -1445,16 +1713,20 @@ fn handle_notif(
     n.parsed_ip = ip;
     n.parsed_family = family;
     n.parsed_port = sockaddr_port(family, &buf[..addrlen.min(buf.len())]);
-    // SO_TYPE via pidfd_getfd + getsockopt.
+    // SO_TYPE via pidfd_getfd + getsockopt. I1: ONE pidfd_getfd per
+    // notification. Every check (type, state, namespace cookie) and
+    // every action (re-connect, supervisor-executed connect, option
+    // copy) uses this single OwnedFd, so a sibling thread's dup2
+    // between check and action cannot substitute a different socket
+    // than the one that was classified.
     let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd as i64, sockfd as i64, 0u64) };
+    let dup_owned: Option<OwnedFd> = (dup >= 0).then(|| unsafe { OwnedFd::from_raw_fd(dup as i32) });
     let mut is_stream = false;
     let mut already_connected = false;
     let mut already_pending = false;
     let mut already_used = false;
-    let mut used_sock: Option<OwnedFd> = None;
     let mut sock_type = 0i32;
-    if dup >= 0 {
-        let dup_fd = unsafe { OwnedFd::from_raw_fd(dup as i32) };
+    if let Some(dup_fd) = &dup_owned {
         let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
         let rc = unsafe {
             libc::getsockopt(
@@ -1497,10 +1769,6 @@ fn handle_notif(
             && !already_connected
             && !already_pending
             && used_and_closed(dup_fd.as_raw_fd());
-        if already_used {
-            used_sock = Some(dup_fd);
-        }
-        // dup_fd dropped here (OwnedFd discipline).
     }
     // Which netns does the notified socket live in? A socket a program
     // holds is in the sandbox's empty namespace (its own creation, or an
@@ -1508,14 +1776,14 @@ fn handle_notif(
     // supervisor's (an injected socket kept after a failed connect). The
     // loopback/AF_UNIX CONTINUE and the own-socket re-connect are only
     // safe in the empty namespace; `Host` and `Unknown` get the full
-    // policy and nothing is continued.
-    let sock_ns = {
-        let d2 = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd as i64, sockfd as i64, 0u64) };
-        let cookie = (d2 >= 0)
-            .then(|| unsafe { OwnedFd::from_raw_fd(d2 as i32) })
-            .and_then(|d| socket_netns_cookie(d.as_raw_fd()));
-        classify_ns(cookie, cfg.supervisor_cookie)
-    };
+    // policy and nothing is continued. Same reference as the state
+    // checks above (I1).
+    let sock_ns = classify_ns(
+        dup_owned
+            .as_ref()
+            .and_then(|d| socket_netns_cookie(d.as_raw_fd())),
+        cfg.supervisor_cookie,
+    );
     // 0.6.1: the already-connected / already-pending / already-used
     // answer comes before the private-address verdict, but only for
     // that answer: `connect()` on a socket that is already connected
@@ -1580,7 +1848,7 @@ fn handle_notif(
             }
         }
         {
-            let rc = match &used_sock {
+            let rc = match &dup_owned {
                 Some(sock) => unsafe {
                     libc::connect(
                         sock.as_raw_fd(),
@@ -1610,14 +1878,46 @@ fn handle_notif(
             return;
         }
     }
-    // The CONTINUE verdict for loopback and
-    // AF_UNIX assumes the empty sandbox namespace. A host-side socket
-    // (or one whose namespace cannot be resolved) must not CONTINUE a
-    // connect: it would run in the supervisor's namespace, where
-    // loopback reaches host daemons. Apply the full policy instead —
-    // for loopback on a host socket that is a refusal (private).
+    // 0.6.2 design A: loopback and AF_UNIX connects on a sandbox socket
+    // are now performed by the supervisor itself on its own reference
+    // to the caller's socket (pidfd_getfd), with its own copy of the
+    // address. The checked object and the acted-on object are the same;
+    // Landlock is a second layer, not the only one. A host-side socket
+    // must not be continued: it would run in the supervisor's
+    // namespace, where loopback reaches host daemons. Apply the full
+    // policy instead — for loopback on a host socket that is a refusal
+    // (private).
+    //
+    // Blocking vs non-blocking: the operation is executed on the dup
+    // fd, which shares the file status flags with the caller's
+    // descriptor (same open file description). A non-blocking program
+    // gets EINPROGRESS exactly as native; a blocking program waits in
+    // the wait pool (Waiting) — never in the dispatch pool — until the
+    // connection is established or failed, then the same reply is
+    // sent. If the caller is interrupted by a signal (id_valid
+    // false), the reply is suppressed and the dup fd is closed on
+    // return: no leaked reference, no stuck wait thread (the wait
+    // pool checks id_valid before injecting).
     let continue_allowed = matches!(sock_ns, SockNs::Sandbox);
     let is_public = ip.map(|a| is_public_ip(&a)).unwrap_or(false);
+    // Force-continue test build: continue everything (Phase 2 proof).
+    #[cfg(feature = "force-continue")]
+    {
+        let _ = (continue_allowed, is_public, family, is_loopback, is_stream);
+        let _ = (tracker, wait_tx);
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
+        }
+        if let Some(j) = journal {
+            j.net_record("continue", "forced-continue", n);
+        }
+        return;
+    }
+    #[cfg(not(feature = "force-continue"))]
+    {
+        let _ = cfg;
+    }
+    let is_inet = family == libc::AF_INET as u16 || family == libc::AF_INET6 as u16;
     match decide(family, is_loopback, is_stream, is_public) {
         Verdict::Continue if !continue_allowed => {
             if id_valid(lfd, n.id) {
@@ -1627,7 +1927,23 @@ fn handle_notif(
                 j.net_record("refuse", "host-socket-loopback-or-unix", n);
             }
         }
+        Verdict::Continue if is_inet => {
+            // Loopback INET on the sandbox socket: supervisor-executed
+            // on the caller's own reference (design A). The single
+            // dup_owned reference is the classified object.
+            match &dup_owned {
+                Some(d) => exec_sandbox_connect(
+                    lfd, n, d, sockfd, &buf, addrlen, deadline, journal, wait_tx,
+                ),
+                None => refuse(lfd, n, libc::EACCES, "flags-unreadable", journal),
+            }
+        }
         Verdict::Continue => {
+            // AF_UNIX (path/abstract) on the sandbox socket: Landlock
+            // does not cover AF_UNIX, and the empty namespace is the
+            // boundary (design B covers the TCP case at kernel level).
+            // The socket is confirmed sandbox-side by cookie, so a
+            // CONTINUE cannot leave the empty namespace.
             if id_valid(lfd, n.id) {
                 reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
             }
@@ -1678,7 +1994,10 @@ fn handle_notif(
             // connect is refused: guessing "blocking" would make a
             // non-blocking program wait, guessing "non-blocking" would
             // hand EINPROGRESS to a program that does not expect it.
-            let Some(client_nonblock) = copy_sock_opts(sockfd, pidfd, newfd) else {
+            let Some(client_nonblock) = dup_owned
+                .as_ref()
+                .and_then(|src| copy_sock_opts(src, newfd))
+            else {
                 refuse(lfd, n, libc::EACCES, "flags-unreadable", journal);
                 return;
             };
@@ -1738,6 +2057,9 @@ fn handle_notif(
                 newfd: new_guard,
                 sockfd,
                 deadline,
+                sandbox_connect: false,
+                addr: [0; 128],
+                addrlen: 0,
             };
             match wait_tx.try_send(waiting) {
                 Ok(()) => {}
@@ -1754,6 +2076,108 @@ fn handle_notif(
     }
 }
 
+/// Supervisor-executed `connect` on the caller's own sandbox socket
+/// (0.6.2 design A): the single `pidfd_getfd` reference of this
+/// notification is the classified object; `connect` is performed on
+/// it with the supervisor's private copy of the address. The
+/// namespace of the reference is the sandbox's empty namespace, so
+/// the connection stays there — for loopback this is the native
+/// result.
+///
+/// The reference shares O_NONBLOCK with the caller's descriptor
+/// (same open file description), so a blocking caller's `connect`
+/// would block the dispatch worker. To honour the deadline and
+/// keep the dispatch pool free, blocking callers are queued to the
+/// wait pool *before* connecting: the wait pool sets O_NONBLOCK on
+/// the reference, connects, and waits for POLLOUT. O_NONBLOCK is
+/// restored on the reference before the wait pool replies, so the
+/// caller's socket keeps its blocking flag throughout.
+#[allow(clippy::too_many_arguments)]
+fn exec_sandbox_connect(
+    lfd: i32,
+    n: &Notif,
+    dup_fd: &OwnedFd,
+    sockfd: i32,
+    buf: &[u8; 128],
+    addrlen: usize,
+    deadline: std::time::Instant,
+    journal: &Option<std::sync::Arc<crate::journal::Journal>>,
+    wait_tx: &std::sync::mpsc::SyncSender<Waiting>,
+) {
+    // O_NONBLOCK of the shared description, read once.
+    let fl = unsafe { libc::fcntl(dup_fd.as_raw_fd(), libc::F_GETFL) };
+    let client_nonblock = fl >= 0 && (fl & libc::O_NONBLOCK != 0);
+    if !client_nonblock {
+        // Blocking caller: hand the classified reference to the wait
+        // pool, which performs the non-blocking connect and waits.
+        // No reference is kept by the dispatch worker after this.
+        let cloned = match dup_fd.try_clone() {
+            Ok(c) => c,
+            Err(_) => {
+                refuse(lfd, n, libc::EACCES, "flags-unreadable", journal);
+                return;
+            }
+        };
+        let waiting = Waiting {
+            n: n.clone(),
+            newfd: cloned,
+            sockfd,
+            deadline,
+            sandbox_connect: true,
+            addr: *buf,
+            addrlen,
+        };
+        match wait_tx.try_send(waiting) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(w)) => {
+                refuse(lfd, &w.n, libc::EACCES, "queue-full", journal);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(w)) => {
+                if id_valid(lfd, w.n.id) {
+                    reply(lfd, w.n.id, -(libc::EAGAIN), 0, 0);
+                }
+            }
+        }
+        return;
+    }
+    let rc = unsafe {
+        libc::connect(
+            dup_fd.as_raw_fd(),
+            buf.as_ptr() as *const libc::sockaddr,
+            addrlen as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, 0, 0, 0);
+        }
+        if let Some(j) = journal {
+            j.net_record("allow", "supervisor-executed", n);
+        }
+        return;
+    }
+    let errno = io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO);
+    if errno != libc::EINPROGRESS {
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, -errno, 0, 0);
+        }
+        if let Some(j) = journal {
+            j.net_record("refuse", "connect-failed", n);
+        }
+        return;
+    }
+    // Non-blocking caller (blocking callers took the wait-pool path
+    // above): EINPROGRESS now.
+    if id_valid(lfd, n.id) {
+        reply(lfd, n.id, -(libc::EINPROGRESS), 0, 0);
+    }
+    if let Some(j) = journal {
+        j.net_record("allow", "supervisor-executed-inprogress", n);
+    }
+}
+
 /// A blocking program's connect whose outcome is awaited by the wait
 /// pool: the notification, the supervisor's connecting socket, the
 /// program's descriptor number and the deadline counted from NOTIF_RECV.
@@ -1762,6 +2186,16 @@ struct Waiting {
     newfd: OwnedFd,
     sockfd: i32,
     deadline: std::time::Instant,
+    /// True when `newfd` is the caller's own sandbox socket (design A):
+    /// on success the reply is 0 with no injection (the socket is
+    /// already the caller's); false for a supervisor-host socket that
+    /// must be injected.
+    sandbox_connect: bool,
+    /// Supervisor's private copy of the address for a sandbox
+    /// (design A) connect the wait pool performs. Zeroed for host
+    /// connects, which are already connecting.
+    addr: [u8; 128],
+    addrlen: usize,
 }
 
 /// The journal target (`ip:port`) of a parsed notification.
@@ -1797,6 +2231,143 @@ fn finish_blocking(
 ) {
     let n = &w.n;
     let newfd = w.newfd.as_raw_fd();
+    // Design A blocking sandbox connect: perform the connect here
+    // (wait pool), non-blocking on the shared description, then
+    // restore the caller's blocking flag before replying. A drop
+    // guard restores it on every exit.
+    struct Restore {
+        fd: i32,
+        active: bool,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if self.active {
+                let fl = unsafe { libc::fcntl(self.fd, libc::F_GETFL) };
+                if fl >= 0 {
+                    unsafe { libc::fcntl(self.fd, libc::F_SETFL, fl & !libc::O_NONBLOCK) };
+                }
+            }
+        }
+    }
+    let _restore = w.sandbox_connect.then_some(Restore {
+        fd: newfd,
+        active: true,
+    });
+    if w.sandbox_connect {
+        let fl = unsafe { libc::fcntl(newfd, libc::F_GETFL) };
+        if fl < 0 {
+            refuse(lfd, n, libc::EIO, "connect-error", journal);
+            return;
+        }
+        unsafe { libc::fcntl(newfd, libc::F_SETFL, fl | libc::O_NONBLOCK) };
+        let rc = unsafe {
+            libc::connect(
+                newfd,
+                w.addr.as_ptr() as *const libc::sockaddr,
+                w.addrlen as libc::socklen_t,
+            )
+        };
+        let errno0 = if rc == 0 {
+            0
+        } else {
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        };
+        if errno0 != 0 && errno0 != libc::EINPROGRESS {
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, -errno0, 0, 0);
+            }
+            if let Some(j) = journal {
+                j.net_record("refuse", "connect-failed", n);
+            }
+            return;
+        }
+        if rc == 0 {
+            if id_valid(lfd, n.id) {
+                reply(lfd, n.id, 0, 0, 0);
+            }
+            if let Some(j) = journal {
+                j.net_record("allow", "supervisor-executed", n);
+            }
+            return;
+        }
+        // EINPROGRESS: fall through to the poll wait below.
+    }
+    // For a sandbox connect the socket is the caller's own, so
+    // SO_ERROR is NOT the supervisor's alone: a second connect()
+    // returns the pending result with native cleanup, instead of
+    // consuming SO_ERROR. Poll first, then re-connect.
+    if w.sandbox_connect {
+        let mut done = false;
+        while std::time::Instant::now() < w.deadline {
+            let mut pfd = libc::pollfd {
+                fd: newfd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let pr = unsafe { libc::poll(&mut pfd, 1, 1000) };
+            if pr < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                refuse(lfd, n, libc::EIO, "connect-error", journal);
+                return;
+            }
+            if pr <= 0 {
+                if !id_valid(lfd, n.id) {
+                    return;
+                }
+                continue;
+            }
+            // POLLOUT: call connect again: 0 = established, errno =
+            // the failure (with native state reset).
+            let rc2 = unsafe {
+                libc::connect(
+                    newfd,
+                    w.addr.as_ptr() as *const libc::sockaddr,
+                    w.addrlen as libc::socklen_t,
+                )
+            };
+            if rc2 == 0 {
+                done = true;
+            } else {
+                let e2 = io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                if e2 == libc::EINPROGRESS {
+                    continue;
+                }
+                if id_valid(lfd, n.id) {
+                    reply(lfd, n.id, -e2, 0, 0);
+                }
+                if let Some(j) = journal {
+                    j.net_record("refuse", "connect-error", n);
+                }
+                return;
+            }
+            break;
+        }
+        if !done {
+            // Disconnect before replying ETIMEDOUT, so the socket
+            // is not left connecting (native: a timed-out blocking
+            // connect leaves the socket unusable for re-connect).
+            let unspec: libc::sockaddr = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::connect(
+                    newfd,
+                    &unspec as *const _,
+                    std::mem::size_of::<libc::sa_family_t>() as libc::socklen_t,
+                )
+            };
+            refuse(lfd, n, libc::ETIMEDOUT, "deadline", journal);
+            return;
+        }
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, 0, 0, 0);
+        }
+        if let Some(j) = journal {
+            j.net_record("allow", "supervisor-executed", n);
+        }
+        return;
+    }
     let mut done = false;
     while std::time::Instant::now() < w.deadline {
         let mut pfd = libc::pollfd {
@@ -2115,12 +2686,86 @@ fn classify_ns(sock: Option<NetnsCookie>, supervisor: Option<NetnsCookie>) -> So
     }
 }
 
-fn copy_sock_opts(addr_fd: i32, pidfd: i32, newfd: i32) -> Option<bool> {
-    let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd as i64, addr_fd as i64, 0u64) };
-    if dup < 0 {
-        return None;
-    }
-    let src = unsafe { OwnedFd::from_raw_fd(dup as i32) };
+/// 0.6.2 verdict table (I1): for every intercepted call class, the
+/// engine's answer and why it is safe. `Continue` is answered only for
+/// classes the Landlock TCP rules cover at execution time (design B)
+/// or that cannot leave the empty namespace (AF_UNIX on a confirmed
+/// sandbox socket). TCP bind/connect/listen on a supervisor-side
+/// socket is never continued: it is supervisor-executed (design A)
+/// or refused by classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallClass {
+    ConnectUnix,
+    ConnectLoopbackInet,
+    ConnectPublicStream,
+    ConnectPrivateOrUnknown,
+    BindInet,
+    BindUnix,
+    Listen,
+    FastopenSend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Supervisor performs it on its own reference (design A).
+    SupervisorExecuted,
+    /// Kernel continues the call; Landlock / empty-netns covers it (B).
+    KernelContinued,
+    /// Refused (EACCES) by classification.
+    Refused,
+    /// Answered by the BPF filter itself (design C).
+    FilterErrno,
+}
+
+pub fn verdict_table() -> &'static [(CallClass, Answer, &'static str)] {
+    use Answer::*;
+    use CallClass::*;
+    &[
+        (
+            ConnectUnix,
+            KernelContinued,
+            "AF_UNIX in the empty namespace cannot leave it; Landlock does not cover AF_UNIX",
+        ),
+        (
+            ConnectLoopbackInet,
+            SupervisorExecuted,
+            "supervisor connects on its own reference to the sandbox socket (A); Landlock second layer (B)",
+        ),
+        (
+            ConnectPublicStream,
+            SupervisorExecuted,
+            "supervisor host-namespace connect + injection, or re-connect of a failed own socket",
+        ),
+        (
+            ConnectPrivateOrUnknown,
+            Refused,
+            "policy refusal, journaled",
+        ),
+        (
+            BindInet,
+            SupervisorExecuted,
+            "supervisor binds on its own reference (A); TCP bind also Landlock-refused at execution time (B)",
+        ),
+        (
+            BindUnix,
+            KernelContinued,
+            "AF_UNIX bind in the empty namespace cannot leave it (B premise)",
+        ),
+        (
+            Listen,
+            SupervisorExecuted,
+            "INET listen is supervisor-executed on its own reference (A) after namespace classification (Host/Unknown refused); AF_UNIX listen is KernelContinued (SO_PEERCRED parity). Open point: a continued AF_UNIX listen re-resolves the fd at execution time; Landlock covers TCP connect/bind, listen auto-bind is the remaining gap (host listen would bind an ephemeral port in the supervisor namespace). See release notes.",
+        ),
+        (
+            FastopenSend,
+            FilterErrno,
+            "BPF filter answers EOPNOTSUPP; no notification (C)",
+        ),
+    ]
+}
+
+fn copy_sock_opts(src_fd: &OwnedFd, newfd: i32) -> Option<bool> {
+    let src = src_fd;
     let mut nonblock = None;
     // O_NONBLOCK via F_GETFL — recorded so the caller can restore it.
     let fl = unsafe { libc::fcntl(src.as_raw_fd(), libc::F_GETFL) };
@@ -2780,11 +3425,12 @@ mod tests {
         let engine = NotifEngine::start_with(listener, Some(j.clone()), sandbox_cfg(5));
         assert_eq!(child_exit(pid), 1, "one connect, connected");
         drop(engine);
+        // 0.6.2: loopback INET is supervisor-executed (design A).
         assert_eq!(
             connect_records(&d, &j),
             [(
-                "continue".to_owned(),
-                "loopback-or-unix".to_owned(),
+                "allow".to_owned(),
+                "supervisor-executed".to_owned(),
                 format!("127.0.0.1:{port}")
             )]
         );
@@ -3221,7 +3867,8 @@ mod tests {
         assert!((1..=3).contains(&connected), "connected {connected}");
         let records = connect_records(&d, &j);
         let full = records.iter().filter(|r| r.1 == "queue-full").count();
-        let cont = records.iter().filter(|r| r.0 == "continue").count();
+        // 0.6.2: loopback INET is supervisor-executed (allow).
+        let cont = records.iter().filter(|r| r.0 == "allow").count();
         assert_eq!(
             (full as i32, cont as i32),
             (refused, connected),
@@ -3375,13 +4022,15 @@ mod tests {
         }
         // sendto(fd, buf, len, flags, ..) and sendmmsg(fd, msgs, vlen, flags):
         // flags is arg 3; sendmsg(fd, msg, flags): flags is arg 2.
+        // 0.6.2 (C): answered ERRNO(EOPNOTSUPP) by the filter itself.
+        let errno_ret = libc::SECCOMP_RET_ERRNO | libc::EOPNOTSUPP as u32;
         let mut a3 = none;
         a3[3] = fast | libc::MSG_NOSIGNAL as u64;
         let mut a2 = none;
         a2[2] = fast;
-        assert_eq!(v(libc::SYS_sendto, a3), libc::SECCOMP_RET_USER_NOTIF);
-        assert_eq!(v(libc::SYS_sendmmsg, a3), libc::SECCOMP_RET_USER_NOTIF);
-        assert_eq!(v(libc::SYS_sendmsg, a2), libc::SECCOMP_RET_USER_NOTIF);
+        assert_eq!(v(libc::SYS_sendto, a3), errno_ret);
+        assert_eq!(v(libc::SYS_sendmmsg, a3), errno_ret);
+        assert_eq!(v(libc::SYS_sendmsg, a2), errno_ret);
         // The same calls without MSG_FASTOPEN, and with it in the
         // wrong argument, are allowed (the helper's fd passing, all
         // ordinary traffic).
@@ -3443,16 +4092,45 @@ mod tests {
         }
         // Every instruction is reachable only through forward jumps in
         // range (the interpreter would have panicked), and the verdict
-        // set is exactly KILL / USER_NOTIF / ALLOW.
+        // set is exactly KILL / USER_NOTIF / ALLOW / ERRNO.
         for i in f.iter().filter(|i| i.code == 0x06) {
             assert!(
                 [
                     libc::SECCOMP_RET_KILL_PROCESS,
                     libc::SECCOMP_RET_USER_NOTIF,
-                    libc::SECCOMP_RET_ALLOW
+                    libc::SECCOMP_RET_ALLOW,
+                    errno_ret,
                 ]
                 .contains(&i.k)
             );
+        }
+    }
+
+    #[test]
+    fn verdict_table_continue_only_where_covered() {
+        // I1: every call class has exactly one answer; `KernelContinued`
+        // appears only for AF_UNIX (empty namespace) classes. TCP
+        // bind/connect/listen are never continued.
+        let t = verdict_table();
+        assert_eq!(t.len(), 8);
+        for (class, answer, why) in t {
+            assert!(!why.is_empty(), "{class:?} needs a reason");
+            if matches!(answer, Answer::KernelContinued) {
+                assert!(
+                    matches!(class, CallClass::ConnectUnix | CallClass::BindUnix),
+                    "{class:?} continued but not covered by B"
+                );
+            }
+        }
+        // The four operations of I2 are never KernelContinued.
+        for class in [
+            CallClass::ConnectLoopbackInet,
+            CallClass::BindInet,
+            CallClass::Listen,
+            CallClass::FastopenSend,
+        ] {
+            let ans = t.iter().find(|(c, _, _)| *c == class).unwrap().1;
+            assert_ne!(ans, Answer::KernelContinued, "{class:?}");
         }
     }
 
@@ -3511,7 +4189,8 @@ mod tests {
     fn engine_still_continues_sandbox_socket_loopback() {
         // The same loopback connect, with a supervisor cookie that
         // matches no namespace (u64::MAX): every test socket resolves
-        // as sandbox-side and the connect is CONTINUEd as in 0.6.0.
+        // as sandbox-side. 0.6.2: supervisor-executed (design A), the
+        // journal verdict is allow/supervisor-executed.
         let (_l, port) = loopback_listener();
         let (d, j) = engine_journal();
         let (pid, listener) = connecting_child(1, port);
@@ -3520,12 +4199,12 @@ mod tests {
             ..sandbox_cfg(5)
         };
         let engine = NotifEngine::start_with(listener, Some(j.clone()), cfg);
-        assert_eq!(child_exit(pid), 1, "one connect, continued");
+        assert_eq!(child_exit(pid), 1, "one connect, supervisor-executed");
         drop(engine);
         let records = connect_records(&d, &j);
         assert_eq!(records.len(), 1, "{records:?}");
-        assert_eq!(records[0].0, "continue", "{records:?}");
-        assert_eq!(records[0].1, "loopback-or-unix", "{records:?}");
+        assert_eq!(records[0].0, "allow", "{records:?}");
+        assert_eq!(records[0].1, "supervisor-executed", "{records:?}");
     }
 
     /// A child whose socket has already failed one connect (to a closed

@@ -2669,6 +2669,10 @@ fn run_supervisor_inner(
     }
 
     // Preflight: fail early with a readable report instead of an EPERM.
+    // The open-mode Landlock-net item is Warn-only in the report (see
+    // check.rs), but open mode still fails closed at session start in
+    // check_landlock_net_abi; the report is additionally strict for
+    // open mode there.
     let report = crate::check::run_checks();
     if !report.ok() {
         bail!("this host cannot run hisn sessions:\n{}", report.render());
@@ -3505,6 +3509,38 @@ fn check_yama_ptrace_scope() -> Result<()> {
     }
 }
 
+/// 0.6.2: open mode needs Landlock TCP bind/connect rules (ABI >= 4,
+/// Linux 6.7). Fail closed here, rather than discovering it inside init's
+/// Landlock apply: the error names the requirement, and no session that
+/// cannot be enforced is started.
+fn check_landlock_net_abi() -> Result<()> {
+    const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_ulong = 1;
+    // SAFETY: attr=NULL, size=0 with the VERSION flag is the documented probe.
+    let v = unsafe {
+        libc::syscall(
+            SYS_LANDLOCK_CREATE_RULESET,
+            std::ptr::null::<u8>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if (4..).contains(&v) {
+        Ok(())
+    } else if v >= 1 {
+        bail!(
+            "refusing to start network = \"open\": Landlock ABI v{v} < v4; \
+             open mode needs TCP network rules (Linux 6.7+, ABI v4)"
+        )
+    } else {
+        let e = io::Error::last_os_error();
+        bail!(
+            "refusing to start network = \"open\": Landlock unavailable ({e}); \
+             open mode needs TCP network rules (Linux 6.7+, ABI v4)"
+        )
+    }
+}
+
 /// Phase `namespaces`: userns S, init clone, namespace fds, GO/READY.
 struct Namespaces {
     pid: i32,
@@ -3543,6 +3579,7 @@ fn start_namespaces(
     // Abort early for open mode (Yama >= 2 breaks process_vm_readv -> fail closed).
     if cfg.policy.network == Network::Open {
         check_yama_ptrace_scope()?;
+        check_landlock_net_abi()?;
     }
     // SAFETY: single-threaded; the child immediately enters `init_main`,
     // which never returns into the supervisor's state.

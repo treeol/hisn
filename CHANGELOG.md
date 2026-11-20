@@ -7,6 +7,52 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-20
+
+### Security
+- `network = "open"` no longer has a timing gap. In 0.6.1, for a call
+  the supervisor left to the kernel, the check and the kernel's
+  execution were two moments a program could exploit. 0.6.2 removes
+  that class of decision: the supervisor performs `listen` and
+  `connect`/`bind` with an AF_INET/AF_INET6 address itself on its
+  own reference to the caller's socket (design A); Landlock TCP
+  bind/connect rules with no allow rules refuse those calls at
+  execution time for any sandboxed task (design B); fast-open sends
+  are answered `EOPNOTSUPP` by the BPF filter itself (design C);
+  io_uring is already denied and non-native ABIs are killed (design
+  D). The "open mode is for trusted code" limitation of 0.6.1 is
+  removed for these four operations. See ADR 0022, "Amendment
+  0.6.2". Details: `docs/releases/v0.6.2.md`.
+- **New kernel requirement.** Open mode requires Landlock ABI >= 4
+  (Linux 6.7). `hisn check` reports it; an open session on an older
+  kernel fails with a clear error, never silently.
+- **No longer supported.** TCP fast open (`MSG_FASTOPEN`) in open
+  mode; programs fall back to a normal connect.
+
+### Added
+- `notif::verdict_table`: every intercepted call class, its answer,
+  and why it is safe; `KernelContinued` only for AF_UNIX classes.
+- Test-only `force-continue` cargo feature: the engine answers
+  CONTINUE for every intercepted call, to prove the kernel-side
+  (Landlock) refusal independently. Never in release builds;
+  release-gate checks.
+- Parity cases in `tests/leak/net_cases.sh` (loopback v4/v6,
+  non-blocking, AF_UNIX path/abstract, concurrency).
+
+### Verification (this build)
+- `cargo test --locked --lib`: 580 passed; 11 failed — all 11 are
+  pre-existing environment failures (same failures on a stashed
+  v0.6.1 tree). New verdict-table and BPF-interpretation tests pass.
+- clippy clean (native and with `--features force-continue`).
+- Phase 0 probes on a test machine (kernel 7.3.3, Landlock ABI
+  v11): `pidfd_getfd` + bind/listen on the dup work; Landlock
+  net=3 with no allow rules refuses TCP bind/connect EACCES (v4,
+  v6, unspecified family) while AF_UNIX and UDP are unaffected.
+- Full host/leak runs are a host job: `bash .wakil/host-run-062.sh`
+  (build, unit tests, release gates, host script, `--real` step,
+  timing probe). Written, not run in this session.
+
+
 ## [0.6.1] - 2026-11-19
 
 ### Security

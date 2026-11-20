@@ -485,4 +485,15 @@ else
   fail "real: session stops cleanly" "hisn stop exited non-zero"
 fi
 REAL_ID=""
+
+# 0.6.2: timing probe — intercepted-connect time vs loopback connect
+# time. The net_cases.sh already prints timing lines; measure them
+# here against the 0.6.1 baseline (~154 µs intercepted on the
+# reference host). This is informational: it records the numbers,
+# it does not fail on them.
+if [ -f "$LOGDIR/net_cases.log" ]; then
+  INTER=$(grep -o 'intercepted[^ ]* [0-9.]*' "$LOGDIR/net_cases.log" | head -1 || true)
+  LOOP=$(grep -o 'loopback[^ ]* [0-9.]*' "$LOGDIR/net_cases.log" | head -1 || true)
+  note "timing: intercepted $INTER ; loopback $LOOP (0.6.1 baseline ~154us intercepted)"
+fi
 finish

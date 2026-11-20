@@ -847,3 +847,65 @@ closed; `network = "none"` is not affected. Plan for 0.6.2: the
 supervisor performs these calls itself on its own copy of the socket,
 with a kernel-enforced backstop evaluated alongside. No test in this
 release shows the gap closed.
+
+## Amendment 0.6.2 — enforcement independent of timing (design A–D)
+
+**Invariants.** I1: no policy decision in open mode depends on state the
+caller can change between the supervisor's check and the kernel's
+execution. I2: a socket that belongs to the supervisor's namespace can
+never be the object of a new connect, bind, listen or fast-open send,
+whatever the caller does and however calls are timed. I3: ordinary
+programs see the same results and errno values as 0.6.1 (loopback,
+AF_UNIX path and abstract, blocking and non-blocking, IPv4 and IPv6).
+
+**Design.**
+
+- A. Supervisor-executed operations on its own reference. `listen`,
+  and `connect`/`bind` with an AF_INET/AF_INET6 address, are performed
+  by the supervisor on its own `pidfd_getfd` duplicate of the caller's
+  socket, classified by namespace cookie, with the supervisor's own
+  copy of the arguments. The checked object and the acted-on object
+  are the same. Blocking caller connects wait in the wait-thread pool.
+  A signal-interrupted caller: `NOTIF_ID_VALID` suppresses the answer
+  and the dup fd is closed on return (no leaked reference, no stuck
+  wait thread).
+- B. Kernel-side enforcement for everything still continued. Landlock
+  network rules (`AccessNet::BindTcp | ConnectTcp`, ABI v4 = Linux
+  6.7) with no allow rules are added to the sandbox Landlock domain in
+  open mode (main chain and exec helpers). The kernel refuses a TCP
+  connect or bind by any sandboxed task at execution time, on whatever
+  socket it ends up acting on. AF_UNIX and UDP are unaffected.
+- C. Fast-open sends: the BPF filter answers `SECCOMP_RET_ERRNO |
+  EOPNOTSUPP` directly when the flag bit is set. No notification, no
+  supervisor decision. Open mode does not support TCP fast open;
+  programs fall back to a normal connect.
+- D. Other entry paths: io_uring is already denied (`io_uring_setup`,
+  `io_uring_enter`, `io_uring_register` in `BASE_DENY`); non-native
+  ABIs are killed by the foreign-architecture verdict of the connect
+  filter and the x32 guard of the denylist stack. There is no other
+  kernel entry path to the four operations that bypasses the filter.
+
+**New kernel requirement.** Open mode now requires Landlock ABI >= 4
+(Linux 6.7). `hisn check` reports `landlock net rules (open mode)`
+(required) and starting an open session on an older kernel fails with
+a clear error; it never falls back silently.
+
+**What is no longer supported.** TCP fast open (`MSG_FASTOPEN`) in
+open mode. Programs that use it fall back to a normal connect.
+
+**Verdict table.** `notif::verdict_table` lists every intercepted call
+class and its answer; `KernelContinued` appears only for AF_UNIX
+classes. The `filter_verdicts_by_interpretation` test interprets the
+installed BPF array; `verdict_table_continue_only_where_covered`
+asserts the I1 property.
+
+**Tests.** Deterministic proof of B: a test-only `force-continue`
+cargo feature makes the engine answer CONTINUE for every intercepted
+call; in an open session with that build, TCP connect/bind on a
+supervisor-side socket are still refused by the kernel (Landlock).
+The feature is never present in release builds (release-gate).
+Structural proof of A/C: the verdict table, plus L125 (listen
+supervisor-executed, bind refused by classification, fast-open
+EOPNOTSUPP). Parity: `tests/leak/net_cases.sh` 0.6.2 cases
+(loopback v4/v6, non-blocking, AF_UNIX path/abstract, concurrency).
+Unit: `check_landlock_net_abi` error test.

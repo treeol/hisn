@@ -120,6 +120,28 @@ if [ -n "${HISN_BIG_TESTS:-}" ]; then export HISN_BIG_TESTS; fi
 
 run_private_details
 
+# 0.6.2: the `force-continue` feature is test-only. A release build
+# must not contain it: verify it is not enabled by default and that the
+# release binary does not carry the feature (the feature name never
+# appears in the release build's feature list).
+step 0b "force-continue absent from release builds"
+if cargo metadata --locked --format-version 1 2>/dev/null | grep -q '"force-continue"'; then
+  # metadata lists features; the check below is the real one: a
+  # release build with the feature would expose the forced-continue
+  # journal reason. Build the release artifact if present and grep it.
+  :
+fi
+if [ -f target/release/hisn ]; then
+  if strings target/release/hisn 2>/dev/null | grep -q "forced-continue"; then
+    fail "force-continue" "release binary contains the test-only forced-continue path"
+  fi
+fi
+# The feature must not be a default feature.
+if grep -q 'default.*=.*force-continue' Cargo.toml; then
+  fail "force-continue" "force-continue is enabled by default"
+fi
+ok "force-continue-absent"
+
 step 1 "cargo fmt --check"
 cargo fmt --check || fail "fmt" "cargo fmt --check exited $?"
 ok "fmt"

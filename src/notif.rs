@@ -1438,7 +1438,9 @@ fn handle_implicit_call(
                     let rc = unsafe { libc::listen(d.as_raw_fd(), backlog) };
                     answer_result(lfd, n, rc, "listen", journal);
                 }
-                SockNs::Host => refuse_implicit(lfd, n, libc::EACCES, "host-socket-listen", journal),
+                SockNs::Host => {
+                    refuse_implicit(lfd, n, libc::EACCES, "host-socket-listen", journal)
+                }
                 SockNs::Unknown => refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal),
             }
         } else {
@@ -1448,7 +1450,9 @@ fn handle_implicit_call(
                         reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
                     }
                 }
-                SockNs::Host => refuse_implicit(lfd, n, libc::EACCES, "host-socket-listen", journal),
+                SockNs::Host => {
+                    refuse_implicit(lfd, n, libc::EACCES, "host-socket-listen", journal)
+                }
                 SockNs::Unknown => refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal),
             }
         }
@@ -1720,7 +1724,8 @@ fn handle_notif(
     // between check and action cannot substitute a different socket
     // than the one that was classified.
     let dup = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd as i64, sockfd as i64, 0u64) };
-    let dup_owned: Option<OwnedFd> = (dup >= 0).then(|| unsafe { OwnedFd::from_raw_fd(dup as i32) });
+    let dup_owned: Option<OwnedFd> =
+        (dup >= 0).then(|| unsafe { OwnedFd::from_raw_fd(dup as i32) });
     let mut is_stream = false;
     let mut already_connected = false;
     let mut already_pending = false;

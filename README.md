@@ -56,7 +56,9 @@ only when it is granted, and every grant ends with the session.
   `$XDG_STATE_HOME/hisn/audit/` when the session is pruned.
 - **Documented interface.** `hisn ls --json` (schema `hisn-ls/v2`) reports
   session state, and the control socket protocol is specified in
-  [docs/CONTROL-PROTOCOL.md](docs/CONTROL-PROTOCOL.md).
+  [docs/CONTROL-PROTOCOL.md](docs/CONTROL-PROTOCOL.md). A service that drives
+  hisn from outside should start with
+  [docs/EXTERNAL-CALLERS.md](docs/EXTERNAL-CALLERS.md).
 
 ## Architecture
 
@@ -158,6 +160,8 @@ hisn note --session demo "halfway through the migration"   # verbatim, at most 8
 hisn journal --session demo --last 10                       # newest 10 events, one compact line each
 hisn journal --kind exec --since 2026-11-07T12:00:00Z       # exec events since a timestamp (RFC 3339 UTC, Z)
 hisn journal --json                                          # exact records, one per line
+hisn journal --info                                          # first/last sequence number (0.6.3)
+hisn journal --after-wseq 120 --json                         # records after a sequence number (0.6.3)
 ```
 
 The default output is one line per event. A command, its result and its exit

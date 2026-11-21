@@ -357,6 +357,9 @@ when it is ready.
    <id> <name|-> ready
    ```
 
+   With `--json` (0.6.3) the line is `{"schema":"hisn-run/v1","id","name","state":"ready"}`
+   and a failure prints a `hisn-error/v1` object on stderr.
+
    `<name|->` is the `--name` value, or `-` for an unnamed session.
 4. On failure the parent prints the supervisor's first error lines on stderr
    and exits 125. A start failure exits 125 with or without `--detach`.
@@ -365,6 +368,11 @@ when it is ready.
 it works with and without `--detach`. On a failed start nothing is written.
 
 ## Driving hisn from a program
+
+An external service that hosts sessions for several people should read
+[EXTERNAL-CALLERS](EXTERNAL-CALLERS.md) first: `--json` for `run --detach`,
+`stop`, `seat` and `rootfs list`, the journal cursor, the credential on stdin
+and the end-of-session cause (all 0.6.3).
 
 This is the one place the programmatic contract is described; the README and
 [WAKIL-INTEGRATION](WAKIL-INTEGRATION.md) link here.

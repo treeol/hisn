@@ -7,6 +7,41 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-11-21
+
+hisn 0.6.3 makes the CLI usable from an external service that hosts sessions
+for several people. The control protocol stays at revision 3 and every change
+is additive: a client built for 0.6.2 works unchanged, and a 0.6.3 CLI sends the
+same requests as 0.6.2 for every command that uses no new option.
+
+### Added
+- `hisn journal --after-wseq N` returns the records after a sequence number and
+  checks that they are contiguous: exit 3 when N is ahead of the journal (it was
+  reset), exit 4 when the records have a hole, a stderr warning when retention
+  deleted records the caller had not read. `hisn journal --info` prints the
+  first and last sequence number (`hisn-journal-info/v1`). `ls --json` gains
+  `journal.first_wseq` and `journal.last_wseq`. There is no follow mode.
+- `--json` for `run --detach` (`hisn-run/v1`), `stop` (`hisn-stop/v1`),
+  `seat add|ls|set-role|revoke` (`hisn-seat/v1`, `hisn-seat-list/v1`) and
+  `rootfs list` (`hisn-rootfs-list/v1`). A failure of these commands prints one
+  `hisn-error/v1` object on stderr with the exit status the plain command uses.
+  Output without `--json` is unchanged.
+- `ls --json` gains `supervisor_pid`, reported by the supervisor itself
+  (`null` for a supervisor older than 0.6.3). `pid` is unchanged (`null`).
+- `--seat-token-file -` reads the seat credential from stdin (one line, at most
+  4096 bytes), so it never appears in argv, a remote shell's environment or a
+  log. On `exec` it requires `--no-tty`; `attach` refuses it.
+- The journal explains how a session and an exec ended. `session/stop` carries
+  `cause` (`idle-expired`, `supervisor-signal`, `stop-request`,
+  `command-signal`, `command-exit`, `init-lost`), the exit code or signal,
+  `duration_ms` and, when readable, `oom_kill_delta`. A new `session/signal`
+  record notes a TERM, INT or HUP the supervisor took. `exec/exit` gains
+  `exec_id`, `pid` and `attach`.
+- `docs/EXTERNAL-CALLERS.md`: how a service drives hisn, including the `setsid`
+  way to run a long command until a detached exec exists, the need for
+  `loginctl enable-linger <user>` for a service user that runs sessions over
+  SSH, and that session state on tmpfs does not survive a reboot.
+
 ### Changed
 - Leak suite timing note: the timing probe printed only a connect to a
   public-class address, which shows network latency. A third line now times

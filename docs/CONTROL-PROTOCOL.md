@@ -160,7 +160,8 @@ Success: `{"ok":true,"clients":[…],"execs":[…],"services":[…], …}`.
 `{"uid","pid","label","label_source","connected_since"}`; each exec is
 `{"exec_id","pid","argv0","tty","attach"}`. 0.5.0 adds two additive keys,
 `journal_failures` and `journal_bytes` (and `workspace`), which older clients
-ignore.
+ignore. 0.6.3 adds `supervisor_pid` (the supervisor's own pid); the protocol
+revision stays 3.
 
 ### `kill`
 
@@ -335,6 +336,9 @@ or `null`), `protocol_revision` (the recorded revision, or `null`),
 `workspace` (`{"id","name"}`), a `journal` summary (`{dir,files,bytes}`)
 and `journal_failures` (the supervisor's failed-journal-write count, or
 `null`).
+0.6.3 adds `supervisor_pid` per session (a number for a live session whose
+supervisor is 0.6.3 or newer, otherwise `null`) and `first_wseq` / `last_wseq`
+in the `journal` summary (`null` for an empty journal); `pid` is still `null`.
 No field is renamed, retyped or removed, so a 0.4.3 client reading a 0.5.0
 `ls --json` sees the same keys and values for the ones it knows.
 

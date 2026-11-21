@@ -287,16 +287,31 @@ fi
 
 # ---- N: netlink bind and interface enumeration (Block 1 decision) ----------
 cat >"$CWD/nl.py" <<'PY'
-import socket
-s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)
-s.bind((0, 0))
-print('NETLINK-BIND-OK')
+import socket, errno
+def attempt(label, make, addr):
+    try:
+        s = make()
+    except OSError as e:
+        print('%s: socket() %s' % (label, errno.errorcode.get(e.errno, e.errno)))
+        return
+    try:
+        s.bind(addr)
+        print('%s: bind OK' % label)
+    except OSError as e:
+        print('%s: bind %s' % (label, errno.errorcode.get(e.errno, e.errno)))
+    finally:
+        s.close()
+attempt('NETLINK', lambda: socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0), (0, 0))
+if hasattr(socket, 'AF_ALG'):
+    attempt('ALG', lambda: socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0), ('hash', 'sha256'))
+attempt('PACKET', lambda: socket.socket(socket.AF_PACKET, socket.SOCK_RAW), ('lo', 0))
+attempt('UNSPEC-low-port', lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM), ('0.0.0.0', 80))
 PY
 for pair in "none|$SNONE" "open|${SOPEN:-}"; do
   mode=${pair%%|*}; sid=${pair#*|}
   [ -n "$sid" ] || continue
-  out=$(X "$sid" python3 nl.py | tail -n 1)
-  info N1 "$mode: AF_NETLINK bind -> ${out:-no output}; socket.if_nameindex -> $(X "$sid" python3 -c 'import socket; print(socket.if_nameindex())' | tail -n 1 | head -c 120)"
+  out=$(X "$sid" python3 nl.py | tr '\n' ';')
+  info N1 "$mode: bind by family (v0.6.2 behaviour): ${out:-no output}; if_nameindex -> $(X "$sid" python3 -c 'import socket; print(socket.if_nameindex())' | tail -n 1 | head -c 120)"
 done
 
 # ---- L: loopback ---------------------------------------------------------------

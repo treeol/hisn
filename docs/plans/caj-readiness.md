@@ -915,3 +915,92 @@ cause. It runs the caj probe as one step.
    goes through another `exec`. Replaced in 0.6.4.
 5. D6 (real SSH) remains UNVERIFIED on the test machine without key auth to
    localhost.
+
+## 10.7 Mashura round 1 on section 10: BLOCKING items and resolutions
+
+Three reviewers; BLOCKING only. Each item was checked against the code at
+`v0.6.2` before being accepted. These resolutions override 10.4 and section 4.
+
+1. **Block 7 stop cause (accepted, checked).** `hisn stop` sends the `kill` op,
+   and the supervisor answers it by signalling the session's init
+   (`supervisor.rs` `Request::Kill` -> `sys::kill(init_pid, ..)`); the supervisor
+   itself takes no signal, so "TERM with state `stopping`" never fires.
+   `end_of_session` (`lifecycle.rs`) accepts `Stopping | Stopped`. Idle expiry
+   also writes `stopping`. New rule, evaluated in this order:
+   `idle-expired` (idle flag from `SessionEnd`) > `supervisor-signal` (the
+   supervisor took TERM/INT/HUP) > `stop-request` (recorded state is `stopping`
+   or `stopped` at the end) > `command-signal` > `command-exit` > `init-lost`.
+   Extra tests: `cause_stop_request_when_state_stopping`,
+   `cause_stop_request_when_state_already_stopped`,
+   `cause_idle_expired_wins_over_stopping_state`,
+   `cause_supervisor_signal_without_stop_state`,
+   `cause_for_detached_session_term_to_init`. For `idle-expired` the journaled
+   `exit_code` is the command's decoded status, not 143.
+2. **Block 3 gap recovery (accepted, checked).** `read_records` pins the file
+   list once per call; a rotation between listing and opening can hide an older
+   file while newer records are read, and a strict `>` cursor then never
+   recovers the hidden record. In cursor mode (`--after-wseq`) the reader checks,
+   before filters, that the selected `wseq` values are contiguous starting at
+   `N+1` (or start at `first_wseq` when `N+1 < first_wseq`). On a gap it re-reads
+   once; a second gap exits 4 with one stderr line and no stdout. Tests:
+   `after_wseq_gap_is_retried_then_exit_4`, plus the existing exactly-once test.
+   With `--json`, exits 3 and 4 also print the Block 4 error object
+   (`E_CURSOR_RESET`, `E_CURSOR_GAP`) on stderr; without `--json` one text line.
+   `--after-wseq 0` on an empty journal is exit 0 with no output; any `N > 0`
+   on an empty journal is exit 3. `--info` conflicts with `--after-wseq`,
+   `--last`, `--since`, `--kind`, `--session`, `--seat` (clap) and prints JSON
+   always. Filtered readers (`--session`, `--kind`) may not see `journal/pruned`;
+   the guide says to compare with `--info`.
+3. **Block 1 bind of other families (accepted, decision recorded).** Probe N1
+   (re-run on the test machine, `hisn 0.6.2`): in both `none` and `open`
+   NETLINK bind OK; AF_ALG bind ENOENT (the call reaches the kernel; the algorithm
+   name is unknown to it, so AF_ALG is continued today); AF_PACKET `socket()`
+   EPERM (so the refusal path of `BindOtherFamily` cannot be exercised end to
+   end; unit tests carry it); AF_INET low-port bind EACCES. Decision: the
+   fail-closed rule of the amendment stands: the table says UNIX and, by the
+   probe, NETLINK; every other domain (including AF_ALG) is `Refused`, and this
+   is a recorded behaviour change in ADR 0022's update (added to Block 8).
+   `SO_DOMAIN` failure refuses. A sockaddr shorter than the family needs is
+   passed to the supervisor's own `bind` so the kernel returns EINVAL; the
+   low-port check reads the port only when `addrlen >= 4` for INET and `>= 24`
+   for INET6 (the kernel accepts the 24-byte RFC 2133 form). Raw/ICMP INET
+   sockets: the port check applies to `SOCK_STREAM`/`SOCK_DGRAM` only; other
+   types are `BindOtherFamily`-style refused. Tests added:
+   `bind_short_addrlen_inet6_24_bytes_is_port_checked`,
+   `bind_so_domain_error_refuses`, `bind_raw_inet_refused`.
+4. **Namespace gate for every verdict_for use (accepted).** `classify_ns` runs
+   first; `Host` and `Unknown` refuse for every call class including
+   `BindNetlink` and `BindOtherFamily`; only `Sandbox` reaches `verdict_for`.
+   Test: `host_netlink_bind_is_refused`, `unknown_ns_other_family_is_refused`.
+   Every continue goes through `continue_reply` (release-gate step 0c); the
+   gate is run on the test machine after Block 1.
+5. **Section 10.1 "a working way" (accepted, checked).** The `setsid` recipe is
+   weaker than stated: `idle_due` (`lifecycle.rs`) counts only connected clients
+   and the exec table, so a session with `idle_timeout` is stopped under a
+   `setsid` job; and `resolve_seat` (`notif.rs`, test
+   `seat_walk_main_command_and_reparented_are_null`) gives `seat: null` to
+   network records of a reparented process. The guide says: do not set
+   `idle_timeout` on sessions that run `setsid` jobs, and expect no seat
+   attribution on their network records. 0.6.4 replaces the recipe.
+6. **Block 5 (accepted: Mashura's blocker plus the non-blocking ones that are
+   cheap).** Default `exec` passes the caller's fds 0-2 (`execcli.rs`
+   `send_with_fds(.., &[0,1,2])`), so after the credential line the program would
+   inherit the rest of stdin (a seekable file could be re-read). Rule:
+   `--seat-token-file -` on `exec` requires `--no-tty` (stdin becomes
+   `/dev/null`); refused with `--tty` and with default mode; the refusal is
+   evaluated before any read. The token is read once per process and cached;
+   the line is capped at 4096 bytes. Tests:
+   `seat_token_dash_requires_no_tty`, `seat_token_dash_refusal_precedes_read`,
+   `seat_token_dash_line_cap`, `seat_token_dash_no_trailing_newline`,
+   `seat_token_dash_crlf_trimmed`.
+
+Open points (not worked in): the `exec`-signal relay is not seat-attributed;
+`pid` namespace naming in exec records (the guide names it: sandbox pid in
+`exec_id` records, host pid in `supervisor_pid`); `memory.events` delta only
+means something with one scope per session; `stop --json` outcome words
+`already-stopped`, `crashed`, `stale` come from the `Command::Stop` path in
+`main.rs` and `StopOutcome` (`lifecycle.rs`, five variants), so the plan's
+test maps both (named `stop_json_outcome_words_cover_every_path`); table size
+is 11 by design (section 4's "10" is superseded); the `host-verify` first line
+is the sha256 of the script file printed by the script (computed by `sha256sum`
+on `$0`), not a line inside it; D6 stays UNVERIFIED without key auth.

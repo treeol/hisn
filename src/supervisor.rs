@@ -1538,7 +1538,8 @@ impl Shared {
         ok(
             json!({ "clients": clients, "execs": execs, "services": services,
                    "journal_failures": journal_failures, "journal_bytes": journal_bytes,
-                   "workspace": self.workspace.id }),
+                   "workspace": self.workspace.id,
+                   "supervisor_pid": std::process::id() }),
         )
     }
 
@@ -2484,8 +2485,23 @@ fn run_detached(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result
     match parse_ready_report(report.trim_end()) {
         ReadyReport::Ready(id) => {
             let name = args.name.as_deref().unwrap_or("-");
-            println!("{id} {name} ready");
+            if args.json {
+                println!("{}", run_ready_json(&id, args.name.as_deref()));
+            } else {
+                println!("{id} {name} ready");
+            }
             return Ok(0);
+        }
+        ReadyReport::Error(msg) if args.json => {
+            let m = if msg.is_empty() {
+                "session failed to start (supervisor exited before reporting)".to_owned()
+            } else {
+                format!("session failed to start: {msg}")
+            };
+            eprintln!(
+                "{}",
+                json!({"schema": "hisn-error/v1", "code": "E_START_FAILED", "message": m})
+            );
         }
         ReadyReport::Error(msg) => {
             if msg.is_empty() {
@@ -2504,6 +2520,11 @@ fn run_detached(args: RunArgs, allow_host_abstract: bool, verbose: u8) -> Result
         unsafe { libc::waitpid(pid, &mut status, 0) };
     }
     Ok(start_failure_exit())
+}
+
+/// The `hisn-run/v1` object a detached `run --json` prints once ready.
+fn run_ready_json(id: &str, name: Option<&str>) -> Value {
+    json!({"schema": "hisn-run/v1", "id": id, "name": name, "state": "ready"})
 }
 
 /// The exit status of a detached `run` that did not reach "ready". Every
@@ -4952,6 +4973,7 @@ mod tests {
             rootfs_path: None,
             grants: vec!["/x:rw".into(), "/y".into()],
             detach: false,
+            json: false,
             ready_fd: None,
             command: vec!["true".into()],
             env: vec![],
@@ -5099,6 +5121,16 @@ mod tests {
         guard.host_pids.push(i32::MAX - 1);
         std::panic::catch_unwind(move || drop(guard))
             .expect("guard Drop must not panic for unknown pids");
+    }
+
+    #[test]
+    fn run_ready_json_shape() {
+        let v = run_ready_json("abc123", Some("seat-a"));
+        assert_eq!(v["schema"], "hisn-run/v1");
+        assert_eq!(v["id"], "abc123");
+        assert_eq!(v["name"], "seat-a");
+        assert_eq!(v["state"], "ready");
+        assert!(run_ready_json("abc123", None)["name"].is_null());
     }
 
     // ---- Item 2: exec/exit record data shape (journal-only) ----

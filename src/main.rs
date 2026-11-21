@@ -111,8 +111,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Run(args) => {
             args.check_command().map_err(anyhow::Error::msg)?;
             let allow = args.allow_host_abstract_sockets;
-            let code = supervisor::run(args, allow, cli.verbose)?;
-            Ok(exit_u8(code))
+            let json = args.json;
+            json_errors(
+                json,
+                "E_RUN",
+                supervisor::run(args, allow, cli.verbose).map(exit_u8),
+            )
         }
         Command::Exec(a) => Ok(exit_u8(execcli::run(a)?)),
         Command::Attach(a) => Ok(exit_u8(attach::run(a)?)),
@@ -155,128 +159,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             print_response(&r)
         }
         Command::Stop(a) => {
-            // 0.4.0 step 5: stop a session. Set state to stopped, audit it,
-            // and send SIGTERM to the sandbox. The dir is kept as stopped.
-            let uid = rustix::process::getuid().as_raw();
-            let roots =
-                session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
-            let reg_root = hisn::registry::registry_root(uid);
-            let id = session::resolve_session_arg(&roots, &reg_root, &a.session)?;
-            let dir = session::find_session(&roots, &id)?;
-            if session::is_stale(&dir) {
-                // 0.4.1 step 6: a session that is not live is not "stopped" by
-                // this command. Report it accurately and exit 0 (nothing to
-                // do, not an error), never claiming to have stopped it.
-                let label = match hisn::sessionmeta::read(&dir).map(|m| m.state) {
-                    Some(hisn::sessionmeta::State::Stopped) => "already stopped",
-                    _ => "crashed, no supervisor",
-                };
-                eprintln!("session {}: {label}", a.session);
-                return Ok(ExitCode::SUCCESS);
-            }
-            // F4: state becomes "stopping" when the kill is sent, "stopped"
-            // only after the session is observed to have exited. A kill that
-            // fails leaves "stopping". Same function as idle expiry.
-            struct Client<'a> {
-                session: &'a str,
-                dir: &'a Path,
-                /// The client object for the kill request (seat credential
-                /// when one is configured; absent otherwise, 0.5.0 shape).
-                client: Option<Value>,
-                /// 0.4.1 step 2: a pidfd on the session's supervisor, when it
-                /// can be opened and still matches supervisor.pid's starttime.
-                /// The stop wait blocks on it instead of polling every 100 ms.
-                pidfd: Option<std::os::fd::OwnedFd>,
-            }
-            impl hisn::lifecycle::StopTarget for Client<'_> {
-                fn signal(&self, _sig: i32) -> Result<(), String> {
-                    let mut req = json!({"op":"kill","signal":"TERM"});
-                    if let Some(c) = &self.client
-                        && let Some(obj) = req.as_object_mut()
-                    {
-                        obj.insert("client".into(), c.clone());
-                    }
-                    let r = supervisor::client_request(self.session, &req)
-                        .map_err(|e| format!("{e:#}"))?;
-                    if r["ok"] == true {
-                        Ok(())
-                    } else {
-                        Err(r["message"].as_str().unwrap_or("unknown error").to_owned())
-                    }
-                }
-                fn exited(&self) -> bool {
-                    // The supervisor keeps a stopped dir; once it is stale
-                    // (or gone) the session has ended.
-                    !self.dir.is_dir() || session::is_stale(self.dir)
-                }
-                fn exit_fd(&self) -> Option<std::os::fd::RawFd> {
-                    self.pidfd.as_ref().map(std::os::fd::AsRawFd::as_raw_fd)
-                }
-            }
-            // A pidfd on the supervisor gives an event-driven exit wait. It is
-            // only used when the recorded pid's starttime still matches, so a
-            // reused pid is never watched.
-            let supervisor_pidfd = session::read_supervisor_pid(&dir).and_then(|(pid, start)| {
-                let fd = hisn::sys::pidfd_open(pid).ok()?;
-                if hisn::sys::stat_starttime(pid).ok() == Some(start) {
-                    Some(fd)
-                } else {
-                    None
-                }
-            });
-            let target = Client {
-                session: &a.session,
-                dir: &dir,
-                client: seat_client(&a.session, a.seat_token_file.as_deref())?,
-                pidfd: supervisor_pidfd,
-            };
-            let write_state = |st: hisn::sessionmeta::State| {
-                if dir.is_dir() {
-                    hisn::sessionmeta::set_state(&dir, st)
-                } else {
-                    // Already removed by its own supervisor: nothing to record.
-                    Ok(())
-                }
-            };
-            match hisn::lifecycle::stop_and_keep(
-                &target,
-                &hisn::lifecycle::SystemClock,
-                hisn::lifecycle::StopPlan::CLIENT,
-                &write_state,
-                &|| {},
-            ) {
-                hisn::lifecycle::StopOutcome::Stopped if !dir.is_dir() => {
-                    // The session ended on its own before the supervisor saw
-                    // the stop (natural completion won the race): removed.
-                    eprintln!("session {} ended before the stop; not kept", a.session);
-                    Ok(ExitCode::SUCCESS)
-                }
-                hisn::lifecycle::StopOutcome::Stopped => {
-                    eprintln!("session {} stopped", a.session);
-                    Ok(ExitCode::SUCCESS)
-                }
-                hisn::lifecycle::StopOutcome::NotStarted(m) => {
-                    eprintln!(
-                        "session {} stop not sent: cannot record stopping: {m}",
-                        a.session
-                    );
-                    Ok(ExitCode::from(1))
-                }
-                hisn::lifecycle::StopOutcome::StoppedUnrecorded(m) => {
-                    eprintln!("session {} stopped; cannot record stopped: {m}", a.session);
-                    Ok(ExitCode::from(1))
-                }
-                hisn::lifecycle::StopOutcome::SignalFailed(m) => {
-                    eprintln!("session {} stop failed: {m}", a.session);
-                    Ok(ExitCode::from(1))
-                }
-                hisn::lifecycle::StopOutcome::Timeout => {
-                    // The session did not exit. Do NOT write Stopped — the
-                    // state stays Stopping, and we report the failure.
-                    eprintln!("session {} stop sent (timeout waiting for exit)", a.session);
-                    Ok(ExitCode::from(1))
-                }
-            }
+            let j = a.json;
+            json_errors(j, "E_STOP", stop_cmd(a))
         }
         Command::Inspect(a) => {
             let r = client_request_with_seat(
@@ -305,10 +189,21 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         ),
         Command::Rootfs { command } => match command {
             RootfsCommand::Import(args) => rootfs_import(args),
-            RootfsCommand::List => {
-                let names = rootfs_store::list()?;
-                for n in names {
-                    println!("{n}");
+            RootfsCommand::List { json } => {
+                let names = match rootfs_store::list() {
+                    Ok(n) => n,
+                    Err(e) if json => {
+                        eprintln!("{}", error_object("E_ROOTFS", &format!("{e:#}")));
+                        return Ok(ExitCode::from(EXIT_INTERNAL));
+                    }
+                    Err(e) => return Err(e),
+                };
+                if json {
+                    println!("{}", rootfs_list_json(&names));
+                } else {
+                    for n in names {
+                        println!("{n}");
+                    }
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -438,6 +333,11 @@ fn seat_workspace(a: &hisn::cli::SeatArgs) -> Result<String> {
 /// running supervisors notice through the stat before each decision).
 /// Seat management is journaled, never with the credential.
 fn seat_cmd(a: hisn::cli::SeatArgs) -> Result<ExitCode> {
+    let j = a.json;
+    json_errors(j, "E_SEAT", seat_cmd_inner(a))
+}
+
+fn seat_cmd_inner(a: hisn::cli::SeatArgs) -> Result<ExitCode> {
     let id = seat_workspace(&a)?;
     let dir = workspace::workspace_dir(&id);
     // The journaling session is the resolved session id when one was named,
@@ -484,14 +384,23 @@ fn seat_cmd(a: hisn::cli::SeatArgs) -> Result<ExitCode> {
                 Some(client),
                 json!({"seat": name, "role": role.as_str()}),
             );
-            println!("{token}");
-            eprintln!(
-                "hisn: seat {name} created (role {}); this credential cannot be shown again",
-                role.as_str()
-            );
+            if a.json {
+                println!("{}", seat_json("added", &name, role.as_str(), Some(&token)));
+            } else {
+                println!("{token}");
+                eprintln!(
+                    "hisn: seat {name} created (role {}); this credential cannot be shown again",
+                    role.as_str()
+                );
+            }
             Ok(ExitCode::SUCCESS)
         }
         hisn::cli::SeatOp::Ls => {
+            if a.json {
+                let views = seats::views(&dir);
+                println!("{}", seat_list_json(&views));
+                return Ok(ExitCode::SUCCESS);
+            }
             for v in seats::views(&dir) {
                 println!(
                     "{}\t{}\t{}\t{}\t{}",
@@ -513,13 +422,21 @@ fn seat_cmd(a: hisn::cli::SeatArgs) -> Result<ExitCode> {
                 Some(client),
                 json!({"seat": name, "role": role.as_str()}),
             );
-            println!("seat {name} is now {}", role.as_str());
+            if a.json {
+                println!("{}", seat_json("role-set", &name, role.as_str(), None));
+            } else {
+                println!("seat {name} is now {}", role.as_str());
+            }
             Ok(ExitCode::SUCCESS)
         }
         hisn::cli::SeatOp::Revoke { name } => {
             seats::revoke(&dir, &name).map_err(|e| anyhow::anyhow!(e))?;
             let _ = j.append("seat-revoke/request", Some(client), json!({"seat": name}));
-            println!("seat {name} revoked");
+            if a.json {
+                println!("{}", seat_json("revoked", &name, "", None));
+            } else {
+                println!("seat {name} revoked");
+            }
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -664,17 +581,17 @@ fn ls(
                         // 0.4.1 step 3: a live session's clients and execs come
                         // from the supervisor (session.json cannot carry them);
                         // a stopped/crashed session has neither.
-                        let (clients, execs, services) = if *live {
-                            live_session_view(n)
+                        let (clients, execs, services, supervisor_pid) = if *live {
+                            live_session_view_pid(n)
                         } else {
-                            (Vec::new(), Vec::new(), Vec::new())
+                            (Vec::new(), Vec::new(), Vec::new(), None)
                         };
                         let journal_failures = if *live {
                             live_journal_failures(n)
                         } else {
                             None
                         };
-                        session_v2_json(
+                        let mut v = session_v2_json(
                             n,
                             p,
                             &state,
@@ -684,7 +601,11 @@ fn ls(
                             execs,
                             services,
                             journal_failures,
-                        )
+                        );
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert("supervisor_pid".into(), json!(supervisor_pid));
+                        }
+                        v
                     })
                     .collect();
                 println!("{}", json!({"schema": "hisn-ls/v2", "sessions": sessions}));
@@ -739,12 +660,24 @@ fn ls(
 /// Returns `(clients, execs, services)`; empty on any error (a session that
 /// stopped between `is_live` and the request simply has none).
 fn live_session_view(session: &str) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
+    let (c, e, s, _) = live_session_view_pid(session);
+    (c, e, s)
+}
+
+/// Like [`live_session_view`], plus the supervisor's own pid from the same
+/// `sessioninfo` reply (`None` from a supervisor older than 0.6.3).
+fn live_session_view_pid(session: &str) -> (Vec<Value>, Vec<Value>, Vec<Value>, Option<u64>) {
     let r = match supervisor::client_request(session, &json!({"op":"sessioninfo"})) {
         Ok(r) if r["ok"] == true => r,
-        _ => return (Vec::new(), Vec::new(), Vec::new()),
+        _ => return (Vec::new(), Vec::new(), Vec::new(), None),
     };
     let arr = |k: &str| r[k].as_array().cloned().unwrap_or_default();
-    (arr("clients"), arr("execs"), arr("services"))
+    (
+        arr("clients"),
+        arr("execs"),
+        arr("services"),
+        r["supervisor_pid"].as_u64(),
+    )
 }
 
 /// The `journal_failures` count reported by a live session's `sessioninfo`
@@ -1153,6 +1086,204 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `hisn stop` (0.4.0 step 5); `--json` (0.6.3) changes only what is printed.
+fn stop_cmd(a: hisn::cli::StopArgs) -> Result<ExitCode> {
+    // 0.4.0 step 5: stop a session. Set state to stopped, audit it,
+    // and send SIGTERM to the sandbox. The dir is kept as stopped.
+    let uid = rustix::process::getuid().as_raw();
+    let roots = session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
+    let reg_root = hisn::registry::registry_root(uid);
+    let id = session::resolve_session_arg(&roots, &reg_root, &a.session)?;
+    let dir = session::find_session(&roots, &id)?;
+    if session::is_stale(&dir) {
+        // 0.4.1 step 6: a session that is not live is not "stopped" by
+        // this command. Report it accurately and exit 0 (nothing to
+        // do, not an error), never claiming to have stopped it.
+        let label = match hisn::sessionmeta::read(&dir).map(|m| m.state) {
+            Some(hisn::sessionmeta::State::Stopped) => "already stopped",
+            _ => "crashed, no supervisor",
+        };
+        if a.json {
+            println!("{}", stop_json(&a.session, "not-live", label, 0));
+        } else {
+            eprintln!("session {}: {label}", a.session);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    // F4: state becomes "stopping" when the kill is sent, "stopped"
+    // only after the session is observed to have exited. A kill that
+    // fails leaves "stopping". Same function as idle expiry.
+    struct Client<'a> {
+        session: &'a str,
+        dir: &'a Path,
+        /// The client object for the kill request (seat credential
+        /// when one is configured; absent otherwise, 0.5.0 shape).
+        client: Option<Value>,
+        /// 0.4.1 step 2: a pidfd on the session's supervisor, when it
+        /// can be opened and still matches supervisor.pid's starttime.
+        /// The stop wait blocks on it instead of polling every 100 ms.
+        pidfd: Option<std::os::fd::OwnedFd>,
+    }
+    impl hisn::lifecycle::StopTarget for Client<'_> {
+        fn signal(&self, _sig: i32) -> Result<(), String> {
+            let mut req = json!({"op":"kill","signal":"TERM"});
+            if let Some(c) = &self.client
+                && let Some(obj) = req.as_object_mut()
+            {
+                obj.insert("client".into(), c.clone());
+            }
+            let r = supervisor::client_request(self.session, &req).map_err(|e| format!("{e:#}"))?;
+            if r["ok"] == true {
+                Ok(())
+            } else {
+                Err(r["message"].as_str().unwrap_or("unknown error").to_owned())
+            }
+        }
+        fn exited(&self) -> bool {
+            // The supervisor keeps a stopped dir; once it is stale
+            // (or gone) the session has ended.
+            !self.dir.is_dir() || session::is_stale(self.dir)
+        }
+        fn exit_fd(&self) -> Option<std::os::fd::RawFd> {
+            self.pidfd.as_ref().map(std::os::fd::AsRawFd::as_raw_fd)
+        }
+    }
+    // A pidfd on the supervisor gives an event-driven exit wait. It is
+    // only used when the recorded pid's starttime still matches, so a
+    // reused pid is never watched.
+    let supervisor_pidfd = session::read_supervisor_pid(&dir).and_then(|(pid, start)| {
+        let fd = hisn::sys::pidfd_open(pid).ok()?;
+        if hisn::sys::stat_starttime(pid).ok() == Some(start) {
+            Some(fd)
+        } else {
+            None
+        }
+    });
+    let target = Client {
+        session: &a.session,
+        dir: &dir,
+        client: seat_client(&a.session, a.seat_token_file.as_deref())?,
+        pidfd: supervisor_pidfd,
+    };
+    let write_state = |st: hisn::sessionmeta::State| {
+        if dir.is_dir() {
+            hisn::sessionmeta::set_state(&dir, st)
+        } else {
+            // Already removed by its own supervisor: nothing to record.
+            Ok(())
+        }
+    };
+    match hisn::lifecycle::stop_and_keep(
+        &target,
+        &hisn::lifecycle::SystemClock,
+        hisn::lifecycle::StopPlan::CLIENT,
+        &write_state,
+        &|| {},
+    ) {
+        hisn::lifecycle::StopOutcome::Stopped if !dir.is_dir() => {
+            // The session ended on its own before the supervisor saw
+            // the stop (natural completion won the race): removed.
+            let m = format!("session {} ended before the stop; not kept", a.session);
+            stop_finish(a.json, &a.session, "ended-before-stop", &m, 0)
+        }
+        hisn::lifecycle::StopOutcome::Stopped => {
+            let m = format!("session {} stopped", a.session);
+            stop_finish(a.json, &a.session, "stopped", &m, 0)
+        }
+        hisn::lifecycle::StopOutcome::NotStarted(m) => {
+            let m = format!(
+                "session {} stop not sent: cannot record stopping: {m}",
+                a.session
+            );
+            stop_finish(a.json, &a.session, "not-started", &m, 1)
+        }
+        hisn::lifecycle::StopOutcome::StoppedUnrecorded(m) => {
+            let m = format!("session {} stopped; cannot record stopped: {m}", a.session);
+            stop_finish(a.json, &a.session, "stopped-unrecorded", &m, 1)
+        }
+        hisn::lifecycle::StopOutcome::SignalFailed(m) => {
+            let m = format!("session {} stop failed: {m}", a.session);
+            stop_finish(a.json, &a.session, "signal-failed", &m, 1)
+        }
+        hisn::lifecycle::StopOutcome::Timeout => {
+            // The session did not exit. Do NOT write Stopped — the
+            // state stays Stopping, and we report the failure.
+            let m = format!("session {} stop sent (timeout waiting for exit)", a.session);
+            stop_finish(a.json, &a.session, "timeout", &m, 1)
+        }
+    }
+}
+
+/// The `hisn-stop/v1` object. `outcome` is one of `stopped`,
+/// `ended-before-stop`, `not-live`, `not-started`, `stopped-unrecorded`,
+/// `signal-failed`, `timeout`; `detail` is the text the plain command prints.
+fn stop_json(session: &str, outcome: &str, detail: &str, exit: u8) -> Value {
+    json!({"schema": "hisn-stop/v1", "session": session, "outcome": outcome,
+           "detail": detail, "exit": exit})
+}
+
+/// Print one stop result: the text line on stderr as before, or the JSON
+/// object (stdout on success, an error object on stderr on failure).
+fn stop_finish(json: bool, session: &str, outcome: &str, msg: &str, exit: u8) -> Result<ExitCode> {
+    if !json {
+        eprintln!("{msg}");
+    } else if exit == 0 {
+        println!("{}", stop_json(session, outcome, msg, exit));
+    } else {
+        eprintln!(
+            "{}",
+            error_object(
+                &format!("E_STOP_{}", outcome.to_uppercase().replace('-', "_")),
+                msg
+            )
+        );
+    }
+    Ok(ExitCode::from(exit))
+}
+
+/// Run a command body; with `--json` an `Err` becomes a `hisn-error/v1`
+/// object on stderr (exit 125, as the plain path) instead of `hisn: ...`.
+fn json_errors(json: bool, code: &str, r: Result<ExitCode>) -> Result<ExitCode> {
+    match r {
+        Err(e) if json => {
+            eprintln!("{}", error_object(code, &format!("{e:#}")));
+            Ok(ExitCode::from(EXIT_INTERNAL))
+        }
+        other => other,
+    }
+}
+
+/// The `hisn-seat/v1` object of `seat add|set-role|revoke --json`. `role` is
+/// omitted for a revoke; `credential` only for `add` (shown once).
+fn seat_json(action: &str, name: &str, role: &str, credential: Option<&str>) -> Value {
+    let mut v = json!({"schema": "hisn-seat/v1", "action": action, "name": name});
+    if !role.is_empty() {
+        v["role"] = json!(role);
+    }
+    if let Some(c) = credential {
+        v["credential"] = json!(c);
+    }
+    v
+}
+
+/// The `hisn-seat-list/v1` object: the same fields `ls --json` carries for
+/// seats, never a credential.
+fn seat_list_json(views: &[seats::SeatView]) -> Value {
+    let seats: Vec<Value> = views
+        .iter()
+        .map(|v| {
+            json!({"name": v.name, "role": v.role, "created": v.created,
+                   "expires": v.expires, "revoked": v.revoked})
+        })
+        .collect();
+    json!({"schema": "hisn-seat-list/v1", "seats": seats})
+}
+
+/// The `hisn-rootfs-list/v1` object.
+fn rootfs_list_json(names: &[String]) -> Value {
+    json!({"schema": "hisn-rootfs-list/v1", "rootfs": names})
+}
+
 /// The `hisn journal --info` document (schema `hisn-journal-info/v1`).
 fn journal_info_json(info: &journal::JournalInfo) -> Value {
     json!({
@@ -1310,6 +1441,97 @@ mod ls_tests {
         let empty = tempfile::tempdir().unwrap();
         let v = super::journal_info_json(&hisn::journal::journal_info(empty.path()));
         assert!(v["first_wseq"].is_null() && v["last_wseq"].is_null());
+    }
+
+    #[test]
+    fn stop_json_outcome_words_cover_every_path() {
+        // Every `StopOutcome` arm and both early exits map to one word, and
+        // the exit status matches the plain command's (0 or 1).
+        for (outcome, exit) in [
+            ("stopped", 0u8),
+            ("ended-before-stop", 0),
+            ("not-live", 0),
+            ("not-started", 1),
+            ("stopped-unrecorded", 1),
+            ("signal-failed", 1),
+            ("timeout", 1),
+        ] {
+            let v = super::stop_json("s1", outcome, "d", exit);
+            assert_eq!(v["schema"], "hisn-stop/v1");
+            assert_eq!(v["session"], "s1");
+            assert_eq!(v["outcome"], outcome);
+            assert_eq!(v["exit"], exit);
+        }
+    }
+
+    #[test]
+    fn json_error_selected_by_flag() {
+        use std::process::ExitCode;
+        // Without --json the Err passes through (main prints `hisn: ...`).
+        let e = super::json_errors(false, "E_X", Err(anyhow::anyhow!("boom")));
+        assert!(e.is_err());
+        // With --json it becomes exit 125 (a printed object), not an Err.
+        let ok = super::json_errors(true, "E_X", Err(anyhow::anyhow!("boom")));
+        assert_eq!(
+            format!("{:?}", ok.unwrap()),
+            format!("{:?}", ExitCode::from(125))
+        );
+        // A success is untouched either way.
+        let ok = super::json_errors(true, "E_X", Ok(ExitCode::from(7)));
+        assert_eq!(
+            format!("{:?}", ok.unwrap()),
+            format!("{:?}", ExitCode::from(7))
+        );
+    }
+
+    #[test]
+    fn seat_json_shapes() {
+        let v = super::seat_json("added", "alice", "member", Some("tok"));
+        assert_eq!(v["schema"], "hisn-seat/v1");
+        assert_eq!(v["action"], "added");
+        assert_eq!(v["role"], "member");
+        assert_eq!(v["credential"], "tok");
+        let v = super::seat_json("revoked", "alice", "", None);
+        assert!(v.get("role").is_none() && v.get("credential").is_none());
+        let views = vec![hisn::seats::SeatView {
+            name: "alice".into(),
+            role: "owner".into(),
+            created: "2026-11-21T00:00:00Z".into(),
+            expires: None,
+            revoked: false,
+        }];
+        let v = super::seat_list_json(&views);
+        assert_eq!(v["schema"], "hisn-seat-list/v1");
+        assert_eq!(v["seats"][0]["name"], "alice");
+        assert!(v["seats"][0]["expires"].is_null());
+        assert!(!v.to_string().contains("credential"));
+    }
+
+    #[test]
+    fn rootfs_list_json_shape() {
+        let v = super::rootfs_list_json(&["a".to_owned(), "b".to_owned()]);
+        assert_eq!(v["schema"], "hisn-rootfs-list/v1");
+        assert_eq!(v["rootfs"], json!(["a", "b"]));
+        assert_eq!(super::rootfs_list_json(&[])["rootfs"], json!([]));
+    }
+
+    #[test]
+    fn ls_json_has_supervisor_pid_and_keeps_pid_null() {
+        // `pid` is not touched by session_v2_json; `supervisor_pid` is added
+        // by `ls` next to it (null when the supervisor does not report it).
+        let v = session_v2_json(
+            "s",
+            Path::new("/x"),
+            "running",
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        assert_eq!(v["pid"], Value::Null);
+        assert!(v.get("supervisor_pid").is_none(), "added by `ls`, not here");
     }
 
     #[test]

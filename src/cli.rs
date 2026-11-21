@@ -74,7 +74,11 @@ pub enum RootfsCommand {
     /// Import a rootfs from a tar archive or Docker image.
     Import(ImportArgs),
     /// List rootfs images in the store.
-    List,
+    List {
+        /// Print `{"schema":"hisn-rootfs-list/v1","rootfs":[...]}` (0.6.3).
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the path of a named rootfs.
     Path { name: String },
     /// Remove a rootfs from the store.
@@ -162,6 +166,10 @@ pub struct RunArgs {
     /// session lives until `hisn kill` / SIGTERM. Use `hisn exec` to run things in it.
     #[arg(long)]
     pub detach: bool,
+    /// With --detach: print `{"schema":"hisn-run/v1",...}` on success and a
+    /// `hisn-error/v1` object on stderr on failure (0.6.3).
+    #[arg(long, requires = "detach")]
+    pub json: bool,
     /// After the session is ready, write "ready\n" to this fd and close it.
     /// For programmatic readiness (Wakil); works with and without --detach.
     #[arg(long, value_name = "FD")]
@@ -367,6 +375,10 @@ pub struct StopArgs {
     /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
     #[arg(long, value_name = "PATH")]
     pub seat_token_file: Option<PathBuf>,
+    /// Print a `hisn-stop/v1` object on stdout and, on failure, a
+    /// `hisn-error/v1` object on stderr. Exit statuses are unchanged (0.6.3).
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -395,6 +407,11 @@ pub struct SeatArgs {
     /// Session name or id whose workspace is managed.
     #[arg(long)]
     pub session: Option<String>,
+    /// Print a JSON object (`hisn-seat/v1`, `hisn-seat-list/v1`) and, on
+    /// failure, a `hisn-error/v1` object on stderr (0.6.3). `seat add` then
+    /// carries the credential in the object instead of on its own line.
+    #[arg(long)]
+    pub json: bool,
     #[command(subcommand)]
     pub op: SeatOp,
 }
@@ -657,5 +674,32 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod json_flag_tests {
+    use super::*;
+
+    #[test]
+    fn new_json_flags_parse_and_default_off() {
+        let c = Cli::try_parse_from(["hisn", "run", "--detach", "--json"]).unwrap();
+        match c.command {
+            Command::Run(a) => assert!(a.json && a.detach),
+            _ => panic!(),
+        }
+        // --json on run needs --detach (a foreground run owns stdout).
+        assert!(Cli::try_parse_from(["hisn", "run", "--json", "--", "ls"]).is_err());
+        let c = Cli::try_parse_from(["hisn", "stop", "--session", "s"]).unwrap();
+        match c.command {
+            Command::Stop(a) => assert!(!a.json),
+            _ => panic!(),
+        }
+        assert!(Cli::try_parse_from(["hisn", "stop", "--session", "s", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["hisn", "seat", "--json", "ls"]).is_ok());
+        assert!(Cli::try_parse_from(["hisn", "rootfs", "list", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["hisn", "rootfs", "list"]).is_ok());
+        // exec has no --json by decision (the exec/exit record is the source).
+        assert!(Cli::try_parse_from(["hisn", "exec", "--json", "s", "--", "ls"]).is_err());
     }
 }

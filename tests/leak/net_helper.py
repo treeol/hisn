@@ -948,6 +948,70 @@ def in_netlink():
     print('NETLINK-REFUSED')
 
 
+def in_bind_families():
+    """0.6.3 (L126): bind by socket domain. NETLINK bind succeeds (getifaddrs,
+    ip), AF_UNIX and a high TCP port bind succeed, an AF_UNSPEC address on a
+    TCP socket is port-checked (port 80 -> EACCES), AF_PACKET is refused
+    (EACCES) when the socket can be created at all."""
+    out = []
+    nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)
+    nl.bind((0, 0))
+    out.append('netlink=ok')
+    nl.close()
+    path = os.path.join(os.getcwd(), '.l126.sock')
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    un = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    un.bind(path)
+    un.close()
+    os.unlink(path)
+    out.append('unix=ok')
+    tcp = socket.socket()
+    tcp.bind(('127.0.0.1', 0))
+    tcp.close()
+    out.append('tcp-high=ok')
+    low = socket.socket()
+    try:
+        low.bind(('127.0.0.1', 80))
+        fail('bind to port 80 was allowed')
+    except OSError as e:
+        if e.errno != EACCES:
+            fail(f'bind to port 80: errno {e.errno} (want EACCES)')
+    low.close()
+    out.append('low-port=EACCES')
+    unspec = socket.socket()
+    try:
+        # AF_UNSPEC (family 0) sockaddr with port 80 on a TCP socket
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        addr = (0).to_bytes(2, 'little') + (80).to_bytes(2, 'big') + bytes(12)
+        rc = libc.bind(unspec.fileno(), addr, len(addr))
+        err = ctypes.get_errno()
+        if rc == 0:
+            fail('AF_UNSPEC bind to port 80 was allowed')
+        if err != EACCES:
+            fail(f'AF_UNSPEC bind to port 80: errno {err} (want EACCES)')
+    finally:
+        unspec.close()
+    out.append('unspec-low-port=EACCES')
+    try:
+        pk = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+    except OSError:
+        out.append('packet=skipped')
+    else:
+        try:
+            pk.bind(('lo', 0))
+            fail('AF_PACKET bind was allowed')
+        except OSError as e:
+            if e.errno != EACCES:
+                fail(f'AF_PACKET bind: errno {e.errno} (want EACCES)')
+        pk.close()
+        out.append('packet=EACCES')
+    print('L126-OK ' + ' '.join(out))
+
+
 def in_vsock():
     """AF_VSOCK connect is refused. Prints VSOCK-UNAVAILABLE when this
     kernel cannot create a vsock socket (then there is no connect)."""
@@ -1255,6 +1319,7 @@ def main(argv):
         'in-thread': lambda: in_thread(int(args[0])),
         'in-private': in_private,
         'in-netlink': in_netlink,
+        'in-bind-families': in_bind_families,
         'in-vsock': in_vsock,
         'in-reconnect': in_reconnect,
         'in-dumpable': lambda: in_dumpable(int(args[0])),

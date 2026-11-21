@@ -4045,7 +4045,7 @@ fi
 # dummy interface, so no traffic can leave the machine, and with hisn's
 # runtime and state directories inside its own work dir. The L118
 # real-network cases run only through the host script's --real step.
-NET_IDS="L90 L94 L96 L97 L98 L99 L100 L102 L103 L104 L105 L106 L107 L109 L110 L111 L112 L113 L114 L115 L116 L117 L119 L120 L121 L122 L123 L124"
+NET_IDS="L90 L94 L96 L97 L98 L99 L100 L102 L103 L104 L105 L106 L107 L109 L110 L111 L112 L113 L114 L115 L116 L117 L119 L120 L121 L122 L123 L124 L126"
 NET_MISSING=""
 command -v ip >/dev/null 2>&1 || NET_MISSING="the ip command (iproute2) is not installed"
 [ -n "$NET_MISSING" ] || timeout 10 unshare -Urn true 2>/dev/null ||

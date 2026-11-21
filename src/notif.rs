@@ -1414,31 +1414,32 @@ fn handle_implicit_call(
     // unbound socket auto-binds an ephemeral port on the wildcard
     // address in the socket's namespace, so a supervisor-side socket
     // must be refused before listening (I2) — listen on a host socket
-    // would open a host port. The supervisor executes `listen` on its
-    // own reference for every address family after namespace
-    // classification; the kernel never executes a continued `listen`
-    // from a sandboxed task.
+    // would open a host port. The answer comes from `verdict_for`
+    // after namespace classification (0.6.3: one source for all calls).
     if is_listen {
         let Some(d) = dup else {
             refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal);
             return;
         };
-        match classify_ns(socket_netns_cookie(d.as_raw_fd()), cfg.supervisor_cookie) {
-            SockNs::Sandbox => {
+        let ns = classify_ns(socket_netns_cookie(d.as_raw_fd()), cfg.supervisor_cookie);
+        match listen_plan(ns) {
+            ImplicitPlan::Execute => {
                 let backlog = n.data.args[1] as i32;
                 let rc = unsafe { libc::listen(d.as_raw_fd(), backlog) };
                 answer_result(lfd, n, rc, "listen", journal);
             }
-            SockNs::Host => refuse_implicit(lfd, n, libc::EACCES, "host-socket-listen", journal),
-            SockNs::Unknown => refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal),
+            ImplicitPlan::Continue(why) => continue_reply(lfd, n, journal, why),
+            ImplicitPlan::Refuse(why) => refuse_implicit(lfd, n, libc::EACCES, why, journal),
         }
         return;
     }
-    // `bind` with an INET/INET6 address: read the address once into a
-    // private buffer and perform the bind on the dup reference with
-    // that copy. The checked object and the acted-on object are the
-    // same, so the caller's later changes to its own memory or
-    // descriptor cannot change what was decided.
+    // `bind`: read the address once into a private buffer and perform an
+    // INET/INET6 bind on the dup reference with that copy. The checked
+    // object and the acted-on object are the same, so the caller's later
+    // changes to its own memory or descriptor cannot change what was
+    // decided. The class follows the SOCKET's own domain (SO_DOMAIN), not
+    // the caller-written sockaddr family: an AF_UNSPEC address on an INET
+    // socket is still a TCP bind.
     if is_bind {
         let addrlen = n.data.args[2] as usize;
         if !(2..=128).contains(&addrlen) {
@@ -1452,42 +1453,32 @@ fn handle_implicit_call(
                 return;
             }
         };
-        let family = u16::from_ne_bytes([buf[0], buf[1]]);
-        // Classify FIRST, before branching on family: a bind with
-        // AF_UNSPEC on an INET socket is a TCP bind, and must not
-        // bypass the namespace check (AF_UNSPEC binds are not covered
-        // by Landlock's family check). Host/unknown sockets are
-        // refused for every family.
         let Some(d) = dup else {
             refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal);
             return;
         };
-        match classify_ns(socket_netns_cookie(d.as_raw_fd()), cfg.supervisor_cookie) {
-            SockNs::Host => {
-                refuse_implicit(lfd, n, libc::EACCES, "host-socket-bind", journal);
+        let ns = classify_ns(socket_netns_cookie(d.as_raw_fd()), cfg.supervisor_cookie);
+        let domain = socket_int_opt(d.as_raw_fd(), libc::SO_DOMAIN);
+        let sock_type = socket_int_opt(d.as_raw_fd(), libc::SO_TYPE);
+        match bind_plan(ns, domain, sock_type) {
+            ImplicitPlan::Refuse(why) => {
+                refuse_implicit(lfd, n, libc::EACCES, why, journal);
                 return;
             }
-            SockNs::Unknown => {
-                refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal);
+            ImplicitPlan::Continue(why) => {
+                continue_reply(lfd, n, journal, why);
                 return;
             }
-            SockNs::Sandbox => {}
-        }
-        if family != libc::AF_INET as u16 && family != libc::AF_INET6 as u16 {
-            // Not a TCP bind: AF_UNIX bind in the empty namespace
-            // cannot leave it, so the kernel may continue. The socket
-            // is already confirmed sandbox-side above. The verdict is
-            // `KernelContinued` for `BindUnix` (verdict table).
-            continue_reply(lfd, n, journal, "af-unix-bind");
-            return;
+            ImplicitPlan::Execute => {}
         }
         // I3 low-port parity: the supervisor (creator of the sandbox
         // user namespace) has CAP_NET_BIND_SERVICE over the sandbox
         // netns, the sandboxed task does not. Emulate the caller's
         // result: a port below ip_unprivileged_port_start (read
         // once, default 1024) that the supervisor alone could bind
-        // is answered EACCES, exactly as native for the caller.
-        if low_port_bind_is_privileged(&buf, family) {
+        // is answered EACCES, exactly as native for the caller. A too
+        // short address is passed on: the kernel answers EINVAL itself.
+        if low_port_bind_is_privileged(&buf, addrlen, domain.unwrap_or(0) as u16) {
             refuse_implicit(lfd, n, libc::EACCES, "privileged-port", journal);
             return;
         }
@@ -1501,34 +1492,151 @@ fn handle_implicit_call(
         answer_result(lfd, n, rc, "bind", journal);
         return;
     }
-    // Any other notified non-connect call (fast-open sends no longer
-    // reach here; they are answered by the filter). This fallthrough is
-    // unreachable in production (only connect/bind/listen are notified),
-    // kept as defensive code. A sandbox socket is continued via the
-    // single `continue_reply` site; a non-sandbox socket is refused.
+    // Any other notified non-connect call. Only connect/bind/listen are
+    // notified (fast-open sends are answered by the filter), so this is
+    // reached only by a call the filter was not meant to notify. 0.6.3:
+    // fail closed. The verdict is `ImplicitOther` (Refused) in the table,
+    // every hit is journaled, and nothing is handed back to the kernel.
     let cookie = dup
         .as_ref()
         .and_then(|d| socket_netns_cookie(d.as_raw_fd()));
-    match classify_ns(cookie, cfg.supervisor_cookie) {
-        SockNs::Sandbox => {
-            continue_reply(lfd, n, journal, "implicit-sandbox-fallthrough");
+    let ns = classify_ns(cookie, cfg.supervisor_cookie);
+    match other_plan(ns) {
+        ImplicitPlan::Continue(why) => continue_reply(lfd, n, journal, why),
+        ImplicitPlan::Refuse(why) => refuse_implicit(lfd, n, libc::EACCES, why, journal),
+        ImplicitPlan::Execute => {
+            refuse_implicit(lfd, n, libc::EACCES, "implicit-unexpected-call", journal)
         }
-        SockNs::Host => refuse_implicit(lfd, n, libc::EACCES, "host-socket-implicit", journal),
-        SockNs::Unknown => refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal),
     }
+}
+
+/// What `handle_implicit_call` does after classification. Built by pure
+/// functions so the decision is unit-testable without a notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplicitPlan {
+    /// The supervisor performs the call on its own reference.
+    Execute,
+    /// The kernel continues the call (only where the table says so).
+    Continue(&'static str),
+    /// Refuse with EACCES; the string is the journal reason.
+    Refuse(&'static str),
+}
+
+/// `getsockopt(SOL_SOCKET, opt)` as an int; `None` on any failure.
+fn socket_int_opt(fd: i32, opt: i32) -> Option<i32> {
+    let mut v: i32 = 0;
+    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+    // SAFETY: getsockopt with an i32 out-buffer and its length.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            &mut v as *mut i32 as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && len as usize == std::mem::size_of::<i32>()).then_some(v)
+}
+
+/// Namespace gate shared by every implicit class: Host and Unknown are
+/// refused whatever the class says.
+fn ns_gate(ns: SockNs, host_reason: &'static str) -> Option<ImplicitPlan> {
+    match ns {
+        SockNs::Sandbox => None,
+        SockNs::Host => Some(ImplicitPlan::Refuse(host_reason)),
+        SockNs::Unknown => Some(ImplicitPlan::Refuse("netns-unknown")),
+    }
+}
+
+/// Map a verdict to a plan. `continue_why`/`refuse_why` are the journal
+/// reasons for the two non-executing answers.
+fn plan_from_verdict(
+    class: CallClass,
+    continue_why: &'static str,
+    refuse_why: &'static str,
+) -> ImplicitPlan {
+    match verdict_for(class) {
+        Answer::SupervisorExecuted => ImplicitPlan::Execute,
+        Answer::KernelContinued => ImplicitPlan::Continue(continue_why),
+        Answer::Refused | Answer::FilterErrno => ImplicitPlan::Refuse(refuse_why),
+    }
+}
+
+fn listen_plan(ns: SockNs) -> ImplicitPlan {
+    ns_gate(ns, "host-socket-listen").unwrap_or_else(|| {
+        plan_from_verdict(CallClass::Listen, "listen-continue", "listen-refused")
+    })
+}
+
+fn other_plan(ns: SockNs) -> ImplicitPlan {
+    ns_gate(ns, "host-socket-implicit").unwrap_or_else(|| {
+        plan_from_verdict(
+            CallClass::ImplicitOther,
+            "implicit-continue",
+            "implicit-unexpected-call",
+        )
+    })
+}
+
+/// The bind class from the socket's own domain and type. INET/INET6
+/// stream and datagram sockets are `BindInet`; raw INET and every domain
+/// other than UNIX, INET, INET6, NETLINK is `BindOtherFamily`.
+fn bind_class(domain: i32, sock_type: Option<i32>) -> CallClass {
+    match domain {
+        libc::AF_UNIX => CallClass::BindUnix,
+        libc::AF_NETLINK => CallClass::BindNetlink,
+        libc::AF_INET | libc::AF_INET6 => {
+            let t = sock_type.map(|t| t & 0xf);
+            if t == Some(libc::SOCK_STREAM) || t == Some(libc::SOCK_DGRAM) {
+                CallClass::BindInet
+            } else {
+                CallClass::BindOtherFamily
+            }
+        }
+        _ => CallClass::BindOtherFamily,
+    }
+}
+
+/// Plan for a `bind` on a socket in namespace `ns`. A socket whose domain
+/// cannot be read is refused.
+fn bind_plan(ns: SockNs, domain: Option<i32>, sock_type: Option<i32>) -> ImplicitPlan {
+    if let Some(p) = ns_gate(ns, "host-socket-bind") {
+        return p;
+    }
+    let Some(domain) = domain else {
+        return ImplicitPlan::Refuse("bind-domain-unknown");
+    };
+    let class = bind_class(domain, sock_type);
+    let cont = match class {
+        CallClass::BindUnix => "af-unix-bind",
+        CallClass::BindNetlink => "netlink-bind",
+        _ => "bind-continue",
+    };
+    plan_from_verdict(class, cont, "bind-other-family")
 }
 
 /// True when the port in `buf` is below the privileged port threshold.
 /// The sandbox's netns is fresh: `ip_unprivileged_port_start` is per-netns
 /// and a new netns starts at 1024. Reading the host's value would
 /// mis-emulate in both directions, so use the sandbox value (1024) directly.
-fn low_port_bind_is_privileged(buf: &[u8; 128], family: u16) -> bool {
-    // Port is at offset 2 for both INET (network order) and INET6.
+fn low_port_bind_is_privileged(buf: &[u8; 128], addrlen: usize, domain: u16) -> bool {
+    // Port is at offset 2 for both INET (network order) and INET6. The
+    // kernel needs sizeof(sockaddr_in) = 16, or the 24-byte RFC 2133 form
+    // of sockaddr_in6, before it reads the port; a shorter address is
+    // EINVAL from the kernel, so it is not "privileged" here.
+    let min = if domain == libc::AF_INET6 as u16 {
+        24
+    } else {
+        16
+    };
+    if addrlen < min {
+        return false;
+    }
     let port = u16::from_be_bytes([buf[2], buf[3]]);
     if port == 0 {
         return false; // ephemeral: never privileged
     }
-    let _ = family;
     port < 1024
 }
 
@@ -2669,8 +2777,14 @@ pub enum CallClass {
     ConnectPrivateOrUnknown,
     BindInet,
     BindUnix,
+    /// Bind on an AF_NETLINK socket in the sandbox namespace (0.6.3).
+    BindNetlink,
+    /// Bind on any other socket domain (0.6.3): refused.
+    BindOtherFamily,
     Listen,
     FastopenSend,
+    /// Any other notified call that reaches the catch-all (0.6.3): refused.
+    ImplicitOther,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2720,6 +2834,16 @@ pub fn verdict_table() -> &'static [(CallClass, Answer, &'static str)] {
             "AF_UNIX bind in the empty namespace cannot leave it (B premise)",
         ),
         (
+            BindNetlink,
+            KernelContinued,
+            "a netlink bind in the empty namespace creates no reachability; getifaddrs, ip and Go's net.Interfaces need it (probe N1)",
+        ),
+        (
+            BindOtherFamily,
+            Refused,
+            "every other socket domain is refused: nothing else is covered by the empty-namespace argument",
+        ),
+        (
             Listen,
             SupervisorExecuted,
             "supervisor executes listen on its own reference for every address family after namespace classification (Host/Unknown refused). Landlock covers TCP connect/bind; listen on a host socket is refused by the supervisor (no auto-bind in the supervisor namespace).",
@@ -2729,16 +2853,23 @@ pub fn verdict_table() -> &'static [(CallClass, Answer, &'static str)] {
             FilterErrno,
             "BPF filter answers EOPNOTSUPP; no notification (C)",
         ),
+        (
+            ImplicitOther,
+            Refused,
+            "a call the filter was not meant to notify is refused (fail closed), journaled",
+        ),
     ]
 }
 
 /// The single authority mapping a [`CallClass`] to its [`Answer`].
 /// The connect dispatch path in `handle_notif` takes its verdict from
 /// this function, which reads the same `verdict_table` that documents
-/// the policy. `KernelContinued` is returned only for `ConnectUnix` and
-/// `BindUnix`. `handle_implicit_call` does not call this function: it
-/// classifies the socket by namespace cookie and continues only a
-/// confirmed sandbox socket (corresponding to the `BindUnix` entry).
+/// the policy. `KernelContinued` is returned only for `ConnectUnix`,
+/// `BindUnix` and `BindNetlink`. Since 0.6.3 `handle_implicit_call` takes
+/// its answer for bind, listen and the catch-all from this function too
+/// (through `bind_plan`, `listen_plan`, `other_plan`), after the socket's
+/// namespace was classified: Host and Unknown sockets are refused whatever
+/// the class says.
 fn verdict_for(class: CallClass) -> Answer {
     verdict_table()
         .iter()
@@ -2782,10 +2913,10 @@ fn classify_connect(
 
 /// The single place in the engine that builds a "continue" response
 /// (`FLAG_CONTINUE`). In `handle_notif` it is called only when
-/// `verdict_for` returns `KernelContinued` (connect dispatch, line 1903).
-/// In `handle_implicit_call` it is called directly after a
-/// `SockNs::Sandbox` classification (AF_UNIX bind at line 1481, defensive
-/// fallthrough at line 1514), not through `verdict_for`. The gate check
+/// `verdict_for` returns `KernelContinued` (connect dispatch).
+/// In `handle_implicit_call` it is called only for a plan built from
+/// `verdict_for` on a `SockNs::Sandbox` socket (AF_UNIX and AF_NETLINK
+/// bind). The gate check
 /// in `scripts/release-gate.sh` fails if a second `FLAG_CONTINUE` site
 /// appears outside this function and outside `cfg(feature =
 /// "force-continue")` blocks.
@@ -4153,7 +4284,7 @@ mod tests {
         // every class through `verdict_for`, the same function the
         // dispatch path uses, so the table and the dispatch path agree.
         let t = verdict_table();
-        assert_eq!(t.len(), 8);
+        assert_eq!(t.len(), 11);
         for (class, answer, why) in t {
             assert!(!why.is_empty(), "{class:?} needs a reason");
             // verdict_for must return the same answer as the table.
@@ -4164,7 +4295,10 @@ mod tests {
             );
             if matches!(answer, Answer::KernelContinued) {
                 assert!(
-                    matches!(class, CallClass::ConnectUnix | CallClass::BindUnix),
+                    matches!(
+                        class,
+                        CallClass::ConnectUnix | CallClass::BindUnix | CallClass::BindNetlink
+                    ),
                     "{class:?} continued but not covered by B"
                 );
             }
@@ -4179,10 +4313,164 @@ mod tests {
             let ans = verdict_for(class);
             assert_ne!(ans, Answer::KernelContinued, "{class:?}");
         }
-        // KernelContinued only for AF_UNIX connect and bind.
-        for class in [CallClass::ConnectUnix, CallClass::BindUnix] {
+        // KernelContinued only for AF_UNIX connect and bind, and netlink bind.
+        for class in [
+            CallClass::ConnectUnix,
+            CallClass::BindUnix,
+            CallClass::BindNetlink,
+        ] {
             assert_eq!(verdict_for(class), Answer::KernelContinued, "{class:?}");
         }
+        for class in [CallClass::BindOtherFamily, CallClass::ImplicitOther] {
+            assert_eq!(verdict_for(class), Answer::Refused, "{class:?}");
+        }
+    }
+
+    #[test]
+    fn implicit_catch_all_refuses_sandbox_socket() {
+        // L-a: the final catch-all never hands a sandbox socket back.
+        assert_eq!(
+            other_plan(SockNs::Sandbox),
+            ImplicitPlan::Refuse("implicit-unexpected-call")
+        );
+        assert!(matches!(other_plan(SockNs::Host), ImplicitPlan::Refuse(_)));
+        assert!(matches!(
+            other_plan(SockNs::Unknown),
+            ImplicitPlan::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn bind_class_follows_socket_domain_not_sockaddr_family() {
+        // L-b: the class is a function of the socket's domain and type.
+        let st = Some(libc::SOCK_STREAM);
+        assert_eq!(bind_class(libc::AF_UNIX, st), CallClass::BindUnix);
+        assert_eq!(bind_class(libc::AF_NETLINK, None), CallClass::BindNetlink);
+        assert_eq!(bind_class(libc::AF_INET, st), CallClass::BindInet);
+        assert_eq!(bind_class(libc::AF_INET6, st), CallClass::BindInet);
+        assert_eq!(
+            bind_class(libc::AF_INET, Some(libc::SOCK_DGRAM | libc::SOCK_CLOEXEC)),
+            CallClass::BindInet
+        );
+        assert_eq!(
+            bind_class(libc::AF_PACKET, None),
+            CallClass::BindOtherFamily
+        );
+        assert_eq!(bind_class(libc::AF_ALG, None), CallClass::BindOtherFamily);
+        // Sandbox plans come from the table.
+        assert_eq!(
+            bind_plan(SockNs::Sandbox, Some(libc::AF_INET), st),
+            ImplicitPlan::Execute
+        );
+        assert_eq!(
+            bind_plan(SockNs::Sandbox, Some(libc::AF_UNIX), st),
+            ImplicitPlan::Continue("af-unix-bind")
+        );
+    }
+
+    #[test]
+    fn bind_unspec_addr_on_inet_socket_is_port_checked() {
+        // An AF_UNSPEC sockaddr on an INET socket is still a TCP bind: the
+        // plan depends on the socket (INET -> Execute, port checked).
+        let mut buf = [0u8; 128];
+        buf[2..4].copy_from_slice(&80u16.to_be_bytes());
+        assert!(low_port_bind_is_privileged(&buf, 16, libc::AF_INET as u16));
+        assert_eq!(
+            bind_plan(
+                SockNs::Sandbox,
+                Some(libc::AF_INET),
+                Some(libc::SOCK_STREAM)
+            ),
+            ImplicitPlan::Execute
+        );
+    }
+
+    #[test]
+    fn bind_short_addrlen_inet6_24_bytes_is_port_checked() {
+        let mut buf = [0u8; 128];
+        buf[2..4].copy_from_slice(&80u16.to_be_bytes());
+        let v6 = libc::AF_INET6 as u16;
+        assert!(low_port_bind_is_privileged(&buf, 24, v6));
+        assert!(low_port_bind_is_privileged(&buf, 28, v6));
+        // shorter than the kernel needs: EINVAL from the kernel, not here
+        assert!(!low_port_bind_is_privileged(&buf, 20, v6));
+        assert!(!low_port_bind_is_privileged(&buf, 8, libc::AF_INET as u16));
+        buf[2..4].copy_from_slice(&1024u16.to_be_bytes());
+        assert!(!low_port_bind_is_privileged(&buf, 16, libc::AF_INET as u16));
+        buf[2..4].copy_from_slice(&0u16.to_be_bytes());
+        assert!(!low_port_bind_is_privileged(&buf, 16, libc::AF_INET as u16));
+    }
+
+    #[test]
+    fn bind_other_family_is_refused() {
+        assert_eq!(
+            bind_plan(SockNs::Sandbox, Some(libc::AF_PACKET), None),
+            ImplicitPlan::Refuse("bind-other-family")
+        );
+        assert_eq!(
+            bind_plan(SockNs::Sandbox, Some(libc::AF_ALG), None),
+            ImplicitPlan::Refuse("bind-other-family")
+        );
+    }
+
+    #[test]
+    fn bind_so_domain_error_refuses() {
+        assert_eq!(
+            bind_plan(SockNs::Sandbox, None, None),
+            ImplicitPlan::Refuse("bind-domain-unknown")
+        );
+    }
+
+    #[test]
+    fn bind_raw_inet_refused() {
+        assert_eq!(
+            bind_plan(SockNs::Sandbox, Some(libc::AF_INET), Some(libc::SOCK_RAW)),
+            ImplicitPlan::Refuse("bind-other-family")
+        );
+    }
+
+    #[test]
+    fn host_netlink_bind_is_refused() {
+        for ns in [SockNs::Host, SockNs::Unknown] {
+            for dom in [
+                libc::AF_NETLINK,
+                libc::AF_UNIX,
+                libc::AF_INET,
+                libc::AF_PACKET,
+            ] {
+                assert!(
+                    matches!(
+                        bind_plan(ns, Some(dom), Some(libc::SOCK_STREAM)),
+                        ImplicitPlan::Refuse(_)
+                    ),
+                    "{ns:?} domain {dom}"
+                );
+            }
+            assert!(matches!(listen_plan(ns), ImplicitPlan::Refuse(_)));
+        }
+        assert_eq!(listen_plan(SockNs::Sandbox), ImplicitPlan::Execute);
+    }
+
+    #[test]
+    fn unknown_ns_other_family_is_refused() {
+        assert_eq!(
+            bind_plan(SockNs::Unknown, Some(libc::AF_PACKET), None),
+            ImplicitPlan::Refuse("netns-unknown")
+        );
+    }
+
+    #[test]
+    fn socket_int_opt_reads_domain_and_type() {
+        let (a, _b) = crate::sys::socketpair_seqpacket().unwrap();
+        assert_eq!(
+            socket_int_opt(a.as_raw_fd(), libc::SO_DOMAIN),
+            Some(libc::AF_UNIX)
+        );
+        assert_eq!(
+            socket_int_opt(a.as_raw_fd(), libc::SO_TYPE),
+            Some(libc::SOCK_SEQPACKET)
+        );
+        assert_eq!(socket_int_opt(-1, libc::SO_DOMAIN), None);
     }
 
     #[test]

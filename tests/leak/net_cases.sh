@@ -534,6 +534,7 @@ journal_is "L103 journal: no connect was refused for an unreadable task" "$AWS" 
 check "L107 private, link-local, CGNAT, ULA and embedded-IPv4 targets refused EACCES" "L107-OK" in_session "$A" in-private
 journal_is "L107 journal: refuse 192.168.1.1:80" "$AWS" 1 kind=network/connect target=192.168.1.1:80 verdict=refuse reason=private-or-unlisted
 journal_is "L107 journal: refuse 6to4 form of 10.0.0.1" "$AWS" 1 kind=network/connect target=2002:a00:1::1:80 verdict=refuse reason=private-or-unlisted
+check "L126 bind by socket domain: netlink, unix, high tcp ok; low port, AF_UNSPEC low port, packet refused" "L126-OK " in_session "$A" in-bind-families
 check "L109 netlink connect is refused EACCES" "NETLINK-REFUSED" in_session "$A" in-netlink
 VSOCK=$(in_session "$A" in-vsock)
 case "$VSOCK" in

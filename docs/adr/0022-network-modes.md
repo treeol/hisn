@@ -895,7 +895,7 @@ open mode. Programs that use it fall back to a normal connect.
 
 **Verdict table.** `notif::verdict_table` lists every intercepted call
 class and its answer; `KernelContinued` appears only for AF_UNIX
-classes. The `filter_verdicts_by_interpretation` test interprets the
+classes (0.6.3: and AF_NETLINK bind, see the amendment below). The `filter_verdicts_by_interpretation` test interprets the
 installed BPF array; `verdict_table_continue_only_where_covered`
 asserts the I1 property.
 
@@ -924,6 +924,32 @@ The verdict table's `Listen` entry is `SupervisorExecuted`; the
 which Landlock backs at kernel level (AF_UNIX is outside Landlock's
 TCP rules, and the empty network namespace prevents fd substitution
 for AF_UNIX — no host-namespace socket can appear as an AF_UNIX fd).
+
+**Amendment (0.6.3): bind by socket domain, catch-all fails closed.**
+Two leftovers of 0.6.2 are closed. (1) The bind path no longer branches on
+the caller-written sockaddr family and no longer continues every
+non-INET family. The class follows the socket's own domain
+(`SO_DOMAIN` on the supervisor's reference): AF_UNIX is `BindUnix`
+(`KernelContinued`), AF_NETLINK is `BindNetlink` (`KernelContinued`: a
+netlink bind in the empty namespace creates no reachability, and
+`getifaddrs`, `ip` and Go's `net.Interfaces` need it; measured on the
+CI host at 0.6.2: the bind succeeds in `none` and `open`), AF_INET and
+AF_INET6 stream and datagram sockets are `BindInet`
+(`SupervisorExecuted`), and every other domain, raw INET sockets and a
+domain that cannot be read are `BindOtherFamily` (`Refused`, EACCES).
+**Behaviour change:** AF_ALG and other exotic domains that 0.6.2
+continued are now refused in open mode. (2) The final catch-all for any
+other notified call is `ImplicitOther` (`Refused`), so a sandbox socket
+is never handed back to the kernel from there. Bind, listen and the
+catch-all take their answer from `verdict_for` after the namespace gate
+(Host and Unknown sockets are refused for every class). The table has 11
+entries; `KernelContinued` appears for `ConnectUnix`, `BindUnix` and
+`BindNetlink` only. Tests: `verdict_table_continue_only_where_covered`,
+`implicit_catch_all_refuses_sandbox_socket`,
+`bind_class_follows_socket_domain_not_sockaddr_family`,
+`bind_unspec_addr_on_inet_socket_is_port_checked`,
+`bind_other_family_is_refused`, `host_netlink_bind_is_refused`; leak
+case `L126`.
 
 **Peer-credential difference (measured on the CI host, kernel 7.3.3,
 Landlock ABI v11).** A client that reads `SO_PEERCRED` on the

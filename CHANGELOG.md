@@ -7,6 +7,15 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+- Open mode, notification engine (ADR 0022 amendment): the catch-all for
+  any other notified call now refuses instead of handing a sandbox socket
+  back to the kernel, and `bind` is classified by the socket's own domain
+  (AF_UNIX and AF_NETLINK continue, INET stream/datagram is executed by
+  the supervisor, everything else is refused with EACCES). Bind, listen and
+  the catch-all take their answer from the verdict table. AF_ALG and other
+  exotic socket domains that 0.6.2 let through are now refused in open mode.
+
 ## [0.6.2] - 2026-11-21
 
 ### Security

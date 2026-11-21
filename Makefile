@@ -9,6 +9,7 @@ build:
 test:
 	$(CARGO) test
 	python3 tests/leak/test_l8.py
+	python3 tests/leak/test_net_helper.py
 
 lint:
 	$(CARGO) fmt --check

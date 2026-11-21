@@ -574,6 +574,10 @@ fi
 # direct ones from this namespace (median of three runs each).
 info "timing intercepted: $(in_session "$A" in-timing)"
 info "timing direct:      $(timeout 60 python3 "$HELPER" in-timing 2>&1)"
+# L-c (0.6.3): the two lines above connect to a public-class address, so they
+# show network latency. This one is a local connect (127.0.0.1) inside the
+# session: the interception cost alone.
+info "timing local (127.0.0.1, in the session): $(in_session "$A" in-timing-local)"
 info "network records of session $A (first of each kind/verdict/reason/result):"
 journal "$AWS" | python3 "$HELPER" journal-dump | python3 -c '
 import json, sys

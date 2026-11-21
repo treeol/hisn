@@ -1271,6 +1271,52 @@ def in_timing():
           f'(runs: {", ".join(f"{r:.1f}" for r in runs)})')
 
 
+def in_timing_local():
+    """0.6.3 (L-c): time a LOCAL connect inside the session. A listener
+    thread on 127.0.0.1 accepts, the main thread connects 100 times, three
+    runs, median. The existing in_timing connects to a public-class address
+    and so shows network latency; this one shows the cost of the interception
+    path for a loopback connect (the supervisor executes it), with no network
+    in the number. Informational, never a gate."""
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('127.0.0.1', 0))
+    srv.listen(128)
+    port = srv.getsockname()[1]
+    stop = threading.Event()
+
+    def accept_loop():
+        srv.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            conn.close()
+
+    thread = threading.Thread(target=accept_loop, daemon=True)
+    thread.start()
+
+    def run():
+        start = time.perf_counter()
+        for _ in range(100):
+            sock = socket.socket()
+            sock.connect(('127.0.0.1', port))
+            sock.close()
+        return (time.perf_counter() - start) * 1e6 / 100
+
+    try:
+        runs = [run() for _ in range(3)]
+    finally:
+        stop.set()
+        thread.join(2)
+        srv.close()
+    print(f'TIMING-LOCAL median {statistics.median(runs):.1f} us/connect '
+          f'(runs: {", ".join(f"{r:.1f}" for r in runs)})')
+
+
 def in_tcp(host, port):
     """Real-network step: one TCP connect; prints the peer address."""
     sock = socket.socket(socket.AF_INET6 if ':' in host else socket.AF_INET)
@@ -1329,6 +1375,7 @@ def main(argv):
         'in-leave-pending': lambda: in_leave_pending(args[0]),
         'in-none': in_none,
         'in-timing': in_timing,
+        'in-timing-local': in_timing_local,
         'in-tcp': lambda: in_tcp(args[0], int(args[1])),
         'in-resolve': lambda: in_resolve(args[0]),
         'in-refused': lambda: in_refused(args[0], int(args[1])),

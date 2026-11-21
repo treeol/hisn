@@ -7,6 +7,13 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Leak suite timing note: the timing probe printed only a connect to a
+  public-class address, which shows network latency. A third line now times
+  a local 127.0.0.1 connect inside the session (`in-timing-local`), and
+  `scripts/host-verify-network.sh` reports all three with what each measures
+  (it also read a log file name that did not exist, so the note was empty).
+
 ### Security
 - Open mode, notification engine (ADR 0022 amendment): the catch-all for
   any other notified call now refuses instead of handing a sandbox socket

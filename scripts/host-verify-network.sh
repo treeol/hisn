@@ -486,14 +486,19 @@ else
 fi
 REAL_ID=""
 
-# 0.6.2: timing probe — intercepted-connect time vs loopback connect
-# time. The net_cases.sh already prints timing lines; measure them
-# here against the 0.6.1 baseline (~154 µs intercepted on the
-# reference host). This is informational: it records the numbers,
-# it does not fail on them.
-if [ -f "$LOGDIR/net_cases.log" ]; then
-  INTER=$(grep -o 'intercepted[^ ]* [0-9.]*' "$LOGDIR/net_cases.log" | head -1 || true)
-  LOOP=$(grep -o 'loopback[^ ]* [0-9.]*' "$LOGDIR/net_cases.log" | head -1 || true)
-  note "timing: intercepted $INTER ; loopback $LOOP (0.6.1 baseline ~154us intercepted)"
+# Timing, informational (never a gate). net-cases.log carries three lines:
+#   "timing intercepted": 100 connects to a public-class address, through the
+#       interception (supervisor injects the connect); includes network latency.
+#   "timing direct": the same connects from the host namespace, no hisn.
+#   "timing local": 100 connects to 127.0.0.1 inside the session (0.6.3); the
+#       supervisor executes them, so this is the interception cost without
+#       any network in the number.
+if [ -f "${NETLOG:-}" ]; then
+  T_INT=$(grep -m1 '^INFO  timing intercepted:' "$NETLOG" | sed 's/^INFO  timing intercepted: *//' || true)
+  T_DIR=$(grep -m1 '^INFO  timing direct:' "$NETLOG" | sed 's/^INFO  timing direct: *//' || true)
+  T_LOC=$(grep -m1 '^INFO  timing local' "$NETLOG" | sed 's/^INFO  timing local[^:]*: *//' || true)
+  note "timing public-address connect through the engine: ${T_INT:-n/a}"
+  note "timing public-address connect, no hisn: ${T_DIR:-n/a}"
+  note "timing local 127.0.0.1 connect inside the session: ${T_LOC:-n/a} (no network in this number; the first two include network latency)"
 fi
 finish

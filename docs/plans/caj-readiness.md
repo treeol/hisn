@@ -708,3 +708,210 @@ Open points not taken into the blocks:
 - The detached log keeps the head, not the tail.
 - The probe overrides `XDG_RUNTIME_DIR`, which `systemd-run --user` also reads;
   the script therefore passes the isolated directories to hisn through `env` inside the scope command (probes C1-C6).
+
+---
+
+# 10. hisn 0.6.3 implementation plan (branch `work/0.6.3`, from tag `v0.6.2`)
+
+Sections 1-9 above are the analysis written on `plan/caj-readiness`. This
+section is the plan for the implementing session and overrides sections 4-9
+where they differ. Facts below are marked **[read]** (code at `v0.6.2`) or
+**[probe]** (measured on the test machine, kernel 7.3.3, with
+`scripts/caj-probe.sh`, 36 PASS, 0 FAIL, 35 INFO, 1 SKIP, binary `hisn 0.6.2`).
+
+## 10.1 Scope decision: Block 6 is out of 0.6.3
+
+Detached exec (`exec --detach`, `exec-status`, `exec-signal`, protocol
+revision 4) moves to hisn 0.6.4. 0.6.3 contains Blocks 1, 2, 3, 4, 5, 7, 8 and
+**stays on protocol revision 3**: no new request field, no new op. Reason
+[probe E11]: a process started with `setsid` inside an exec survives the end of
+that exec call, so a caller has a working way to run long commands today (no
+exit status, no output capture; the guide documents the recipe: start with
+`setsid`, redirect output to a file in the session, find it again by pid).
+Consequences for the other blocks:
+- No revision gate is needed; nothing in 0.6.3 is sent to the supervisor that a
+  revision-3 supervisor would not accept. The only supervisor-side wire change
+  is an additional key in the `sessioninfo` reply (`supervisor_pid`), which old
+  clients ignore.
+- `exec/request` and `exec/exit` journal fields are not owned by Block 6 any
+  more. Block 7 adds only `exec_id`, `attach` and `pid` (all exist today in
+  the exec table, **[read]** `supervisor.rs` `do_exec`, `exit_record_data`).
+  `incarnation` and `detached` move to 0.6.4.
+- ADR 0023 now documents the external-caller interface contract (journal
+  cursor, JSON schemas, error object); the detached-exec ADR is 0.6.4's.
+
+## 10.2 Probe results on the test machine (all measured, `hisn 0.6.2`)
+
+First run (maintainer's host, partly before the script aborted) and the full run
+on the test machine agree where they overlap.
+
+| Probe | Result | Effect on the plan |
+|-------|--------|--------------------|
+| P2, P3 | linger off; `/tmp` and the runtime dir are tmpfs | guide must state linger and that state on tmpfs does not survive a reboot (Block 8) |
+| J1-J9 | `journal --json` is JSON lines with `ts`, `wseq`, `kind`; `--last`, `--since` (Z only) work; 6 reads during 150 note writes all parsed; no follow/after | confirms A1; Block 3 |
+| E1-E6 | status propagates; missing program 127; SIGKILL 137; unknown session 125; program exiting 126 indistinguishable | guide documents; journal `exec/exit` is the unambiguous source |
+| E7 | `ls --json` exec fields: `argv0, attach, exec_id, pid, tty` | confirms A2 |
+| E8, E9 | exec'd process ended 16 ms after its client was killed -9; a TERM-ignoring process after 5019 ms | confirms the 5 s KILL grace |
+| E11 | `setsid` child survives the end of its exec | Block 6 deferred |
+| N1 | `AF_NETLINK` bind succeeds in `none` and `open`; `if_nameindex` shows only `lo` | Block 1 keeps netlink bind (default of the plan) |
+| L1-L6 | listen on 127.0.0.1 and ::1 in one exec, connect from another: works in `none` and `open`; host loopback listener unreachable (ECONNREFUSED) | A3 confirmed, no gap |
+| L7 | no host TCP listener owned by session processes | A6 confirmed |
+| G1 | first run FAIL: the session has no `git` (rc 127). Second run PASS via python3 urllib HTTPS GET to gitlab.com in `open` | network path works; the test rootfs has no git; probe now falls back to HTTPS and says so |
+| M1-M5 | `ls`, `inspect`, `check`, `journal`, `ls --session` print JSON | confirms A4 |
+| M6-M9 | `seat ls`, `rootfs list` not JSON; `note` prints JSON; `profile validate` with no file rc 125 | Block 4 |
+| M10 | `pid` is null for a running session | Block 4 |
+| M12, M13 | unknown session: rc 125, stderr `hisn: no such session <id>`, empty stdout | error object, Block 4 |
+| T1-T6 | seat credential on exec works; journal records the seat; token not in journal files nor client argv | confirms A7 |
+| T4 | without credential: `client = {uid, label:"local", label_source:"none", req_id:null}` | label is `local` when no `--client`; the caller should pass `--client` (documented) |
+| T7 | with `HISN_SEAT_TOKEN` the token is readable in `/proc/<pid>/environ` of the client | stdin path (Block 5) avoids it |
+| D1-D3 | self-killed foreground command: hisn rc 137; `session/stop` data is only `{workspace}` | A11 gap confirmed, Block 7 |
+| D5, D7, D8 | detached session survives the shell that started it; supervisor is its own session leader; dir contents listed | A9 |
+| D6 | SKIP (no key auth to localhost) | UNVERIFIED over a real SSH session; the host-verify script of 0.6.3 repeats it on the test machine only if key auth to localhost exists |
+| C1-C6 | start inside `systemd-run --user --scope -p MemoryMax=512M -p TasksMax=256` works; supervisor stays in the scope cgroup; `memory.max=536870912`, `pids.max=256`; exec and stop work | A8: no conflict. Execs inside the session are in the scope's cgroup too |
+| R1, R2 | stop twice: 0 then 0; dir kept after stop | A9 |
+| I1 | `/tmp/hisn-<uid>/names.json` untouched | isolation claim holds when `--name` is avoided |
+
+No probe contradicted the analysis. One probe expectation was wrong (G1: the
+session image has no `git`); the script is fixed, not the plan.
+Probe script fixes (this branch, `scripts/caj-probe.sh`): the `local id=$1 ... pf="lo-$id.port"` line read `$id` in the same
+`local` statement that assigns it, which aborts under `set -u` (it did abort the
+maintainer's run); E8 printed raw epoch seconds as a window and now prints
+milliseconds.
+
+## 10.3 Test machine rule (amendment 2)
+
+The test machine has no C compiler and no git. Builds use a user-local linker:
+`zig cc` (sha256 checked) in `~/hisn-ci/.tools`, put first on `PATH` for the
+run; nothing is installed system-wide, nothing outside `~/hisn-ci` changes.
+The working tree is synced as a tarball by a sync script kept outside the
+repository. Every block is run there (`cargo test --locked`, the release gate
+when a block touches gated files, the leak suite, finally
+`scripts/host-verify-0.6.3.sh`). A test that fails only in the session's own
+sandbox is not called pre-existing until its result on the test machine is shown.
+
+## 10.4 Blocks and tests
+
+Commit order (one commit per block, subject `feat(0.6.3): ...`, Block 1
+`fix(0.6.3): ...`): 1, 2, 3, 4, 5, 7, 8. The block text of section 4 applies
+except as changed here. Line numbers refer to `v0.6.2` **[read]**.
+
+### Block 1: fail-closed leftovers (`src/notif.rs`)
+- Verified at `v0.6.2`: `handle_implicit_call` (L1361-1519): listen L1421-1436,
+  bind L1442-1503 with `continue_reply(.., "af-unix-bind")` for every
+  non-INET family, final `match classify_ns(..)` L1509-1518 continues a
+  `Sandbox` socket (`implicit-sandbox-fallthrough`). `verdict_table` L2688
+  has 8 entries; `verdict_for` L2742 is a linear find; the only consumer of
+  `CallClass` besides `verdict_for` is the guard at L1905. No exhaustive match
+  on `CallClass` exists, so new variants are compile-neutral; the test
+  `verdict_table_continue_only_where_covered` (L4149) asserts `len() == 8`.
+- Changes, as in section 4 Block 1: socket domain from `SO_DOMAIN` on the
+  pidfd-dup fd; classes `BindNetlink` (KernelContinued, justified by probe N1)
+  and `BindOtherFamily` (Refused, `bind-other-family`) and `ImplicitOther`
+  (Refused, `implicit-unexpected-call`); bind, listen and the catch-all go
+  through `verdict_for`; `low_port_bind_is_privileged` (L1525) follows the
+  socket domain and checks `addrlen`.
+- Tests: updated `verdict_table_continue_only_where_covered` (11 entries
+  expected by design: 8 + 3 new, allowed `KernelContinued`: `ConnectUnix`,
+  `BindUnix`, `BindNetlink`), `implicit_catch_all_refuses_sandbox_socket`,
+  `bind_class_follows_socket_domain_not_sockaddr_family`,
+  `bind_unspec_addr_on_inet_socket_is_port_checked`,
+  `bind_other_family_is_refused`; leak case `in-bind-families` (net_helper.py,
+  net_cases.sh, MANIFEST, run.sh NET_IDS as the leak-suite registration
+  requires **[read]** `tests/leak/MANIFEST`, `run.sh`).
+- The release gate's step 0c (single `FLAG_CONTINUE` site, `release-gate.sh`)
+  must still pass; the catch-all no longer calls `continue_reply`.
+
+### Block 2: local timing probe (`tests/leak/net_helper.py`, `net_cases.sh`, `scripts/host-verify-network.sh`)
+- Verified: `in_timing` (`net_helper.py` L1196) connects 3x100 times to
+  192.0.2.1:18080 and prints `TIMING median X us/connect`; `net_cases.sh`
+  L572-575 runs it in the session and directly. Add `in_timing_local`
+  (listener thread on 127.0.0.1, same format with prefix `TIMING-LOCAL`),
+  register in the `main()` command table, print as an `info` line, report in
+  `host-verify-network.sh`. Informational only.
+- Test: `test_net_helper_timing_local_format` in `tests/leak/` (a python unit
+  test runnable without a session, wired into `make test` next to
+  `test_l8.py`; the Makefile edit is part of this block).
+
+### Block 3: journal cursor (`src/cli.rs`, `src/main.rs`, `src/journal.rs`)
+As section 4 Block 3: `--after-wseq N` (strict `>`, applied before `--last`),
+`--info` (schema `hisn-journal-info/v1`, null for an empty journal), exit 3
+when `N > last_wseq`, warning on stderr when behind retention, `first_wseq` and
+`last_wseq` in the `ls --json` journal object (`session_v2_json`, L814).
+`journal_cmd` (L1002) reads with `journal::read_records`; `--info` reads the
+head of the oldest file and the tail of the newest only. Tests as listed in
+section 4. `ls --json` keeps schema `hisn-ls/v2` (additive keys; no `schemas/`
+directory exists at `v0.6.2` **[read]**, to re-check).
+
+### Block 4: machine interface (`src/cli.rs`, `src/main.rs`, `src/supervisor.rs`)
+As section 4 Block 4: `run --detach --json`, `stop --json`, `seat add/ls/set-role/revoke --json`,
+`rootfs list --json`, error object on stderr under `--json`, `supervisor_pid`
+in the `sessioninfo` reply surfacing as `pid` in `ls --json` (`live_session_view`
+L741 gains it; `session_v2_json` L820 stops hard-coding null). `RunArgs` has no
+JSON field and `detach` is handled inside `supervisor::run` **[read]**, so the
+`--json` flag is added to `RunArgs`, threaded to `report_ready`. Error
+object: `dispatch` result handled in `main` (L17-27), `--json` known from the
+parsed `Cli`. Tests as in section 4. The protocol revision stays 3.
+
+### Block 5: stdin credential (`src/execcli.rs`)
+As section 4 Block 5. `seat_token` (L28) reads the file whole; `-` reads one
+line byte by byte from fd 0. `seat_material` is called before the relay and
+before any stdin forwarding (L309), so `exec --no-tty` is unaffected;
+`exec --tty` and `note -` (main.rs L328) are refused with a message naming both
+options. Applies to every command with `--seat-token-file` except `attach`
+(`attach.rs` L50). Tests as in section 4.
+
+### Block 7: diagnostics that do not need detached exec (`src/supervisor.rs`, `src/init.rs`, `src/lifecycle.rs`, `src/journal.rs`)
+- `session/stop`: `Shared::journal_session` (L807) gets the extra data
+  (`cause`, `exit_code`/`signal`, `duration_ms`). `run_session` (L3320) has the
+  status from `relay_and_wait`. `cause` rules as in section 4 Block 7;
+  `stop-request` is derived from `session.json` state `stopping`, which
+  `lifecycle::stop_and_keep` (L117-149) writes before it signals; `idle-expired`
+  from `SessionEnd`.
+- `session/signal` record when the supervisor takes TERM/INT/HUP.
+- `exec/request` and `exec/exit` gain `exec_id`, `attach`, `pid`. Not
+  `incarnation`/`detached` (0.6.4).
+- OOM evidence from the supervisor's own cgroup: baseline at start, delta at
+  stop; absent when unreadable. Probe C3 shows `memory.max` is readable under a
+  scope; whether `memory.events` is readable is checked by the host script.
+- Tests: `session_stop_record_carries_cause_and_status`,
+  `session_signal_record_on_term`, `exec_records_carry_exec_id_attach_pid`,
+  `oom_events_parsing_handles_missing_file`, readable-render test; leak case
+  `session-stop-cause` (foreground session whose command kills itself with
+  SIGKILL: the journal shows `command-signal`, 9; probe D1-D3 shows today's
+  baseline).
+
+### Block 8: docs, version
+`docs/EXTERNAL-CALLERS.md` (new): node setup with `loginctl enable-linger <user>`
+(without it the user manager and runtime dir go away at the last logout
+[probe P2], and session state on tmpfs does not survive a reboot [probe P3]),
+fixed `XDG_RUNTIME_DIR` and `XDG_STATE_HOME` on every call, `--session-id`
+ownership, no `--name`, `--client` for attribution (T4), the stdin credential,
+JSON shapes, exit-code table, the exec exit-code ambiguity and the journal as
+the unambiguous record, the journal cursor, the `setsid` recipe for long
+commands with a statement that 0.6.4 replaces it, scope wrapping (C1-C6), what
+is not provided (limits, inbound, detached exec). Plus `docs/CONTROL-PROTOCOL.md`
+(`supervisor_pid` in `sessioninfo`; revision unchanged), `docs/sessions.md` (exit
+codes), `README.md` (one link), `CHANGELOG.md`, `docs/releases/`, ADR 0023
+(external caller interface), `Cargo.toml` and `Cargo.lock` version 0.6.3.
+Also `scripts/host-verify-0.6.3.sh`.
+
+## 10.5 Host script `scripts/host-verify-0.6.3.sh`
+First line its own sha256; one line when each step starts and ends with elapsed
+time; a timeout per step; counts of passed/failed/skipped for the gate and the
+leak suite; PASS/FAIL/SKIP lines and a `RESULT:` line; build to `target/`;
+isolated XDG directories; sessions named `host063-<random>`; no `--name`,
+`--prune`, `--purge`. It exercises `journal --after-wseq/--info`, `run --detach --json`,
+`ls --json` (pid), `stop --json`, stdin credential, and the session-stop
+cause. It runs the caj probe as one step.
+
+## 10.6 Open risks (0.6.3)
+1. `SO_DOMAIN` on a pidfd-dup'd fd: behaviour on this kernel to be proven by
+   `in-bind-families` on the test machine, not only by unit tests.
+2. `supervisor_pid` makes `pid` a host-namespace number; callers on another pid
+   namespace must not signal it. Documented.
+3. `--after-wseq` relies on `wseq` monotonicity; deletion of journal files by hand
+   can reuse numbers (module docs). Documented, `--info` gives the detector.
+4. The `setsid` recipe has no status or output capture; `kill` of the group
+   goes through another `exec`. Replaced in 0.6.4.
+5. D6 (real SSH) remains UNVERIFIED on the test machine without key auth to
+   localhost.

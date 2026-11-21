@@ -35,7 +35,6 @@ pub enum LandlockError {
          less; pass --allow-host-abstract-sockets to accept the risk"
     )]
     ScopeUnavailable,
-    #[cfg_attr(not(test), allow(dead_code))]
     #[error(
         "network = \"open\" needs Landlock ABI >= 4 (TCP bind/connect network rules, Linux 6.7), \
          kernel offers less"
@@ -95,13 +94,6 @@ pub fn plan(policy: &ResolvedPolicy, initial_rw_grants: &[PathBuf]) -> LandlockP
 /// the caller explicitly opted out.
 pub fn scope_required(policy: &ResolvedPolicy, allow_host_abstract: bool) -> bool {
     policy.network == Network::Host && !allow_host_abstract
-}
-
-/// `network = "open"` must not start when the kernel cannot provide the
-/// TCP network rules (ABI >= 4). Never degrades silently: without the
-/// rules, a continued interception would again be a check-time decision.
-pub fn net_rules_required(policy: &ResolvedPolicy) -> bool {
-    policy.network == Network::Open
 }
 
 /// Apply the plan to the calling thread (and its future children).

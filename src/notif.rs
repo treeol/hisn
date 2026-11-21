@@ -552,12 +552,6 @@ pub struct EngineConfig {
     /// are host-side. Still `None` (unresolvable) means every socket is
     /// treated as host-side: fail closed.
     pub supervisor_cookie: Option<NetnsCookie>,
-    /// 0.6.2 test-only: answer CONTINUE for every intercepted call, so the
-    /// kernel-side enforcement (Landlock TCP rules) can be proven
-    /// independently of the supervisor's decisions. Always `false` in
-    /// release builds (release-gate enforced); see `Cargo.toml` feature
-    /// `force-continue` and `scripts/release-gate.sh`.
-    pub force_continue: bool,
 }
 
 impl EngineConfig {
@@ -569,7 +563,6 @@ impl EngineConfig {
             queue: MAX_PENDING,
             reader: read_sockaddr,
             supervisor_cookie: None,
-            force_continue: cfg!(feature = "force-continue"),
         }
     }
 }
@@ -1338,9 +1331,7 @@ fn engine_loop(
 ///   checked object and the acted-on object are the same, so there is
 ///   no gap between decision and execution. On a sandbox socket this is
 ///   a no-op (loopback listen in the empty namespace); on a
-///   supervisor-side socket `listen` has no address and cannot leave
-///   the namespace, so it is answered the same way — the namespace
-///   never matters, and no CONTINUE is needed.
+///   supervisor-side or unknown socket `listen` is refused with EACCES.
 /// - `bind` with an AF_INET/AF_INET6 address: the supervisor performs
 ///   it the same way on its own reference, with its own copy of the
 ///   address, and answers the result (including the caller's errno:
@@ -1529,22 +1520,22 @@ fn handle_implicit_call(
     }
 }
 
-/// Answer `-errno` (or 0) for a supervisor-executed `listen`/`bind` and
-/// journal only refusals (ordinary successes are routine).
+/// True when the port in `buf` is below the privileged port threshold.
+/// The sandbox's netns is fresh: `ip_unprivileged_port_start` is per-netns
+/// and a new netns starts at 1024. Reading the host's value would
+/// mis-emulate in both directions, so use the sandbox value (1024) directly.
 fn low_port_bind_is_privileged(buf: &[u8; 128], family: u16) -> bool {
     // Port is at offset 2 for both INET (network order) and INET6.
     let port = u16::from_be_bytes([buf[2], buf[3]]);
     if port == 0 {
         return false; // ephemeral: never privileged
     }
-    // The sandbox's netns is fresh: ip_unprivileged_port_start is
-    // per-netns and a new netns starts at 1024. Reading the host's
-    // value would mis-emulate in both directions, so use the
-    // sandbox value (1024) directly.
     let _ = family;
     port < 1024
 }
 
+/// Answer `-errno` (or 0) for a supervisor-executed `listen`/`bind` and
+/// journal only refusals (ordinary successes are routine).
 fn answer_result(
     lfd: i32,
     n: &Notif,
@@ -1662,6 +1653,24 @@ fn handle_notif(
     };
     if refuse_if_expired(lfd, n, deadline, journal) {
         return;
+    }
+    // Force-continue test build: continue everything (Phase 2 proof).
+    // Placed after the address read (so the journal target is known)
+    // but before any namespace classification or host-socket refusal,
+    // so a CONTINUEd connect on *any* socket reaches Landlock.
+    #[cfg(feature = "force-continue")]
+    {
+        if id_valid(lfd, n.id) {
+            reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
+        }
+        if let Some(j) = journal {
+            j.net_record("continue", "forced-continue", n);
+        }
+        return;
+    }
+    #[cfg(not(feature = "force-continue"))]
+    {
+        let _ = cfg;
     }
     let family = u16::from_ne_bytes([buf[0], buf[1]]);
     // Parse IP when INET/INET6.
@@ -1870,23 +1879,6 @@ fn handle_notif(
     // pool checks id_valid before injecting).
     let continue_allowed = matches!(sock_ns, SockNs::Sandbox);
     let is_public = ip.map(|a| is_public_ip(&a)).unwrap_or(false);
-    // Force-continue test build: continue everything (Phase 2 proof).
-    #[cfg(feature = "force-continue")]
-    {
-        let _ = (continue_allowed, is_public, family, is_loopback, is_stream);
-        let _ = (tracker, wait_tx);
-        if id_valid(lfd, n.id) {
-            reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
-        }
-        if let Some(j) = journal {
-            j.net_record("continue", "forced-continue", n);
-        }
-        return;
-    }
-    #[cfg(not(feature = "force-continue"))]
-    {
-        let _ = cfg;
-    }
     let is_inet = family == libc::AF_INET as u16 || family == libc::AF_INET6 as u16;
     match decide(family, is_loopback, is_stream, is_public) {
         Verdict::Continue if !continue_allowed => {
@@ -2302,16 +2294,24 @@ fn finish_blocking(
                 let e2 = io::Error::last_os_error()
                     .raw_os_error()
                     .unwrap_or(libc::EIO);
-                if e2 == libc::EINPROGRESS {
+                // EISCONN: the handshake completed between the poll and
+                // the second connect — this is success, not an error.
+                // EALREADY: the handshake is still in flight (the kernel
+                // returns EALREADY, not EINPROGRESS, for a repeated connect
+                // on a blocking socket that was made non-blocking).
+                if e2 == libc::EISCONN {
+                    done = true;
+                } else if e2 == libc::EINPROGRESS || e2 == libc::EALREADY {
                     continue;
+                } else {
+                    if id_valid(lfd, n.id) {
+                        reply(lfd, n.id, -e2, 0, 0);
+                    }
+                    if let Some(j) = journal {
+                        j.net_record("refuse", "connect-error", n);
+                    }
+                    return;
                 }
-                if id_valid(lfd, n.id) {
-                    reply(lfd, n.id, -e2, 0, 0);
-                }
-                if let Some(j) = journal {
-                    j.net_record("refuse", "connect-error", n);
-                }
-                return;
             }
             break;
         }
@@ -2724,7 +2724,7 @@ pub fn verdict_table() -> &'static [(CallClass, Answer, &'static str)] {
         (
             Listen,
             SupervisorExecuted,
-            "supervisor executes listen on its own reference for every address family after namespace classification (Host/Unknown refused). Landlock covers TCP connect/bind; listen auto-bind is the remaining gap (host listen would bind an ephemeral port in the supervisor namespace). See release notes.",
+            "supervisor executes listen on its own reference for every address family after namespace classification (Host/Unknown refused). Landlock covers TCP connect/bind; listen on a host socket is refused by the supervisor (no auto-bind in the supervisor namespace).",
         ),
         (
             FastopenSend,

@@ -479,7 +479,9 @@ journal_is "L125 journal: the bind is refuse/host-socket-bind" "$AWS" 1 \
   kind=network/implicit verdict=refuse reason=host-socket-bind
 journal_is "L125 journal: the bind record names bind" "$AWS" 1 \
   kind=network/implicit "target=bind host-socket-bind"
-# listen is supervisor-executed and routine on success: no refusal record.
+# listen on a host socket is refused: journal has the refusal record.
+journal_is "L125 journal: the listen is refuse/host-socket-listen" "$AWS" 1 \
+  kind=network/implicit verdict=refuse reason=host-socket-listen
 if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',19060))==0 else 1)"; then
   fail "L125 host side: port 19060 is not open in the supervisor's namespace" "something listens on 127.0.0.1:19060"
 else

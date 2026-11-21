@@ -43,7 +43,13 @@ pub fn seat_token(token_file: Option<&std::path::Path>) -> Result<Option<String>
             if sys::isatty(0) {
                 bail!("--seat-token-file - reads the credential from stdin, which is a terminal");
             }
-            let t = read_token_line(&mut std::io::stdin().lock(), MAX_TOKEN_BYTES)
+            // Unbuffered on fd 0: std's `Stdin` reads a whole buffer ahead,
+            // which would swallow what follows the credential line.
+            // SAFETY: fd 0 is borrowed, never closed (`ManuallyDrop`).
+            let mut fd0 = std::mem::ManuallyDrop::new(unsafe {
+                <fs::File as std::os::fd::FromRawFd>::from_raw_fd(0)
+            });
+            let t = read_token_line(&mut *fd0, MAX_TOKEN_BYTES)
                 .context("reading the seat credential from stdin")?;
             if t.is_empty() {
                 bail!("the seat credential on stdin is empty");

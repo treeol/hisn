@@ -1054,7 +1054,9 @@ Protocol stays at revision 3; every change is additive.
   past the newline), at most 4096 bytes. A terminal on stdin is refused, empty
   is an error, and `HISN_SEAT_TOKEN` together with `-` is the existing
   "both set" error. With `--no-tty` the exec's stdin is `/dev/null` anyway, so
-  nothing is lost; with `--tty` the rest of stdin goes to the program.
+  nothing is lost. 10.7 item 6 is binding and implemented: `exec` with `-`
+  requires `--no-tty` (`refuse_stdin_token_unless_no_tty`), `attach` refuses it.
+  Stdin is read unbuffered on fd 0 (std's `Stdin` reads ahead).
 - Tests: `seat_token_stdin_reads_one_line_only`,
   `seat_token_stdin_empty_is_error`, `seat_token_stdin_with_env_is_error`.
 
@@ -1064,9 +1066,14 @@ Protocol stays at revision 3; every change is additive.
   1; pure fn `session_end_cause`. `relay_and_wait` returns the decoded detail
   (`init::decode_status_detail`) and the TERM/INT/HUP it took; each of those is
   journaled as `session/signal` (sender unknown) just before `session/stop`.
-- `exec/exit` and `exec/request` gain `exec_id`, `attach`, `pid` only if the
-  values are in scope at the write site; otherwise this part is reported as
-  not done (it does not depend on anything else).
+- `exec/exit` gains `exec_id`, `attach`, `pid`. `exec/request` does NOT: it is
+  written before `exec_id` is allocated (`do_exec`), so those values do not
+  exist yet; reported as not done for `exec/request`. Init folds a signal death
+  into `128 + n` (`init::decode_status`), so `command-signal` is decided from
+  an exit code of 129..=192 (found by Mashura round 2).
+- `ls --json` keeps `pid` null (decision in Block 4); `supervisor_pid` is the
+  new field. Sections 4 and 10.4/10.6 that say `pid` becomes the supervisor pid
+  are superseded.
 - Readable renderer shows the cause. 
 - Tests: `session_stop_record_carries_cause_and_status`, `cause_*` (stop
   request with state `stopping`/`stopped`, idle wins, supervisor signal, command

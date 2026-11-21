@@ -205,6 +205,30 @@ assert d["cause"] == "command-exit" and d["exit_code"] == 3, d
 ' "$W/c.jsonl" 2>"$W/pyerr"; then ok "session/stop after a command that exits 3: command-exit, exit_code 3 (run exit $rc)"
   else bad "session/stop cause command-exit" "rc=$rc $(cat "$W/pyerr") $(tail -c 300 "$W/c.jsonl")"; fi
 
+  # --- a command killed by a signal: cause command-signal, SIGKILL
+  D="host063-$STAMP-d"
+  H 120 run --policy "$W/b.toml" --session-id "$D" --workspace "$WS" -- sh -c 'kill -9 $$' >/dev/null 2>&1; rc=$?
+  H 20 journal --workspace "$WS" --session "$D" --kind session/stop --json >"$W/d.jsonl" 2>/dev/null
+  if py '
+import json, sys
+d = [json.loads(l)["data"] for l in open(sys.argv[1])][-1]
+assert d["cause"] == "command-signal" and d["signal"] == 9 and d["signal_name"] == "SIGKILL", d
+' "$W/d.jsonl" 2>"$W/pyerr"; then ok "session/stop after a command killed by SIGKILL: command-signal, signal 9 (run exit $rc)"
+  else bad "session/stop cause command-signal" "rc=$rc $(cat "$W/pyerr") $(tail -c 300 "$W/d.jsonl")"; fi
+
+  # --- the credential line is read unbuffered: what follows stays on the pipe
+  rest=$( { printf '%s\nREST-OF-PIPE\n' "$tok" | { Hin 20 stop --session host063-nosuch --seat-token-file - >/dev/null 2>&1; cat; }; } )
+  if [ "$rest" = "REST-OF-PIPE" ]; then ok "--seat-token-file - leaves the rest of stdin unread"
+  else bad "stdin read-ahead" "left: [$rest]"; fi
+
+  # --- run --json without --detach is refused; ls --json errors are objects
+  H 20 run --json --policy "$W/b.toml" -- true >/dev/null 2>"$W/e"; rc=$?
+  [ $rc -ne 0 ] && ok "run --json without --detach is refused (exit $rc)" || bad "run --json without --detach" "rc=$rc"
+  H 20 ls --json --session host063-nosuch >/dev/null 2>"$W/e"; rc=$?
+  if [ $rc -ne 0 ] && py 'import json,sys; d=json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); assert d["schema"]=="hisn-error/v1"' "$W/e" 2>/dev/null; then
+    ok "ls --json on an unknown session: hisn-error/v1 object (exit $rc)"
+  else bad "ls --json error object" "rc=$rc $(cat "$W/e")"; fi
+
   # --- the readable journal shows the cause
   if H 20 journal --workspace "$WS" --session "$C" 2>/dev/null | grep -q 'session stopped (command-exit, exit 3)'; then
     ok "the readable journal shows 'session stopped (command-exit, exit 3)'"

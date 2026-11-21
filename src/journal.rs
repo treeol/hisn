@@ -1224,7 +1224,11 @@ pub fn journal_info(dir: &Path) -> JournalInfo {
         .map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0))
         .sum();
     let first_wseq = files.iter().find_map(|p| first_wseq_in_file(p));
-    let last_wseq = files.last().and_then(|cur| last_wseq(cur).ok().flatten());
+    // Newest first: the current file is empty right after a rotation.
+    let last_wseq = files
+        .iter()
+        .rev()
+        .find_map(|p| last_wseq_in_file(p).ok().flatten());
     JournalInfo {
         first_wseq,
         last_wseq,
@@ -1296,7 +1300,13 @@ pub fn cursor_select(recs: &[JournalRecord], after: u64) -> CursorSelect {
 pub fn cursor_read(dir: &Path, after: u64) -> (CursorSelect, usize) {
     let (recs, skipped) = read_records(dir);
     match cursor_select(&recs, after) {
-        r @ CursorSelect::Records { .. } => (r, skipped),
+        // A cursor behind the oldest record may be retention or a rotation
+        // that hid the oldest file from this one pass: read once more and
+        // report only what the second pass also sees.
+        r @ CursorSelect::Records {
+            behind_retention: false,
+            ..
+        } => (r, skipped),
         _ => {
             let (recs, skipped) = read_records(dir);
             (cursor_select(&recs, after), skipped)
@@ -3677,6 +3687,45 @@ mod tests {
             cursor_select(&mk(&[1, 2, 3]), 0),
             CursorSelect::Records { .. }
         ));
+    }
+
+    #[test]
+    fn journal_info_with_empty_current_file_after_rotation() {
+        // Right after a rotation the current file is empty: last_wseq comes
+        // from the newest rotated file, never null next to a non-null first.
+        let (_d, dir) = cursor_ws(200, 6);
+        fs::write(dir.join(JOURNAL_FILE), b"").unwrap();
+        let info = journal_info(&dir);
+        assert!(info.first_wseq.is_some());
+        assert!(info.last_wseq.is_some(), "{info:?}");
+        assert!(info.last_wseq >= info.first_wseq);
+    }
+
+    #[test]
+    fn after_wseq_behind_retention_is_read_twice() {
+        // A cursor behind the oldest record is re-read before it is
+        // reported; with a stable journal both passes agree and the result
+        // is Records { behind_retention: true } with the whole run.
+        let (_d, dir) = cursor_ws(ROTATE_AFTER, 5);
+        // drop the first two records from the file: a retention loss
+        let path = dir.join(JOURNAL_FILE);
+        let text = fs::read_to_string(&path).unwrap();
+        let kept: Vec<&str> = text.lines().skip(2).collect();
+        fs::write(&path, kept.join("\n") + "\n").unwrap();
+        let (sel, _) = cursor_read(&dir, 1);
+        match sel {
+            CursorSelect::Records {
+                records,
+                behind_retention,
+            } => {
+                assert!(behind_retention);
+                assert_eq!(
+                    records.iter().map(|r| r.wseq).collect::<Vec<_>>(),
+                    vec![3, 4, 5]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

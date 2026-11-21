@@ -254,7 +254,8 @@ pub struct AttachArgs {
     /// Label for this client in the audit log (default: derived from SSH or "local").
     #[arg(long)]
     pub client: Option<String>,
-    /// Seat credential file (0.5.1); `-` reads one line from stdin (0.6.3).
+    /// Seat credential file (0.5.1). `-` is not supported here: attach
+    /// uses stdin as its terminal.
     /// Alternatively `HISN_SEAT_TOKEN`.
     #[arg(long, value_name = "PATH")]
     pub seat_token_file: Option<PathBuf>,
@@ -417,7 +418,8 @@ pub struct SeatArgs {
     /// Print a JSON object (`hisn-seat/v1`, `hisn-seat-list/v1`) and, on
     /// failure, a `hisn-error/v1` object on stderr (0.6.3). `seat add` then
     /// carries the credential in the object instead of on its own line.
-    #[arg(long)]
+    /// May be given before or after the subcommand.
+    #[arg(long, global = true)]
     pub json: bool,
     #[command(subcommand)]
     pub op: SeatOp,

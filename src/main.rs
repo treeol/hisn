@@ -109,13 +109,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
         },
         Command::Run(args) => {
-            args.check_command().map_err(anyhow::Error::msg)?;
             let allow = args.allow_host_abstract_sockets;
             let json = args.json;
             json_errors(
                 json,
                 "E_RUN",
-                supervisor::run(args, allow, cli.verbose).map(exit_u8),
+                args.check_command()
+                    .map_err(anyhow::Error::msg)
+                    .and_then(|()| supervisor::run(args, allow, cli.verbose).map(exit_u8)),
             )
         }
         Command::Exec(a) => Ok(exit_u8(execcli::run(a)?)),
@@ -178,14 +179,18 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Command::Ls(a) => ls(
-            a.session.as_deref(),
+        Command::Ls(a) => json_errors(
             a.json,
-            a.prune,
-            a.purge,
-            a.name_prefix.as_deref(),
-            a.dry_run,
-            a.seat_token_file.as_deref(),
+            "E_LS",
+            ls(
+                a.session.as_deref(),
+                a.json,
+                a.prune,
+                a.purge,
+                a.name_prefix.as_deref(),
+                a.dry_run,
+                a.seat_token_file.as_deref(),
+            ),
         ),
         Command::Rootfs { command } => match command {
             RootfsCommand::Import(args) => rootfs_import(args),
@@ -251,7 +256,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             )?;
             print_response(&r)
         }
-        Command::Journal(a) => journal_cmd(a),
+        Command::Journal(a) => {
+            let json = a.json || a.info;
+            json_errors(json, "E_JOURNAL", journal_cmd(a))
+        }
         Command::Seat(a) => seat_cmd(a),
     }
 }

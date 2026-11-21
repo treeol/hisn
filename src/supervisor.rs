@@ -3383,12 +3383,8 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
             json!({ "signal": s, "signal_name": control::signal_name(*s), "sender": "unknown" }),
         );
     }
-    let stop_requested = sessionmeta::read(&sdir.path).is_some_and(|m| {
-        matches!(
-            m.state,
-            sessionmeta::State::Stopping | sessionmeta::State::Stopped
-        )
-    });
+    let stop_requested =
+        sessionmeta::read(&sdir.path).is_some_and(|m| state_is_stop_request(m.state));
     let cause = session_end_cause(
         idle_expired_after.is_some(),
         !relay.signals.is_empty(),
@@ -3400,7 +3396,13 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
         "duration_ms": session_started.elapsed().as_millis(),
     });
     match relay.detail {
-        Some(init::StatusDetail::Code(c)) => stop_data["exit_code"] = json!(c),
+        Some(init::StatusDetail::Code(c)) => {
+            stop_data["exit_code"] = json!(c);
+            if cause == "command-signal" {
+                stop_data["signal"] = json!(c - 128);
+                stop_data["signal_name"] = json!(control::signal_name(c - 128));
+            }
+        }
         Some(init::StatusDetail::Signal(n)) => {
             stop_data["signal"] = json!(n);
             stop_data["signal_name"] = json!(control::signal_name(n));
@@ -4314,7 +4316,13 @@ fn spawn_exec_helper(ctx: ExecContext) -> Result<ExecClient> {
 /// supervisor itself took TERM/INT/HUP) > `stop-request` (the recorded state
 /// is `stopping` or `stopped`: `hisn stop` signals init through the `kill`
 /// op, so the supervisor takes no signal of its own) > `command-signal` >
-/// `command-exit` > `init-lost` (no status was read).
+/// `command-exit` > `init-lost` (no status, or init itself died by a signal).
+///
+/// Init never dies from the command's signal: it folds it into `128 + n`
+/// (`init::decode_status`) and exits with that code, the same convention
+/// `hisn run`/`exec` use. So an exit code in 129..=192 is reported as
+/// `command-signal` (the signal is `code - 128`); a program that itself
+/// calls `exit(137)` is indistinguishable and is reported the same way.
 fn session_end_cause(
     idle_expired: bool,
     supervisor_signal: bool,
@@ -4329,11 +4337,19 @@ fn session_end_cause(
         "stop-request"
     } else {
         match detail {
-            Some(init::StatusDetail::Signal(_)) => "command-signal",
+            Some(init::StatusDetail::Code(c)) if (129..=192).contains(&c) => "command-signal",
             Some(init::StatusDetail::Code(_)) => "command-exit",
-            None => "init-lost",
+            Some(init::StatusDetail::Signal(_)) | None => "init-lost",
         }
     }
+}
+
+/// Both states mean `hisn stop` (or idle expiry) was recorded before the end.
+fn state_is_stop_request(state: sessionmeta::State) -> bool {
+    matches!(
+        state,
+        sessionmeta::State::Stopping | sessionmeta::State::Stopped
+    )
 }
 
 /// `oom_kill` from the text of a cgroup `memory.events` file.
@@ -5301,8 +5317,15 @@ mod tests {
         assert_eq!(c(false, false, true, Some(Signal(15))), "stop-request");
         assert_eq!(c(false, false, true, Some(Code(0))), "stop-request");
         // the command ended by itself
-        assert_eq!(c(false, false, false, Some(Signal(9))), "command-signal");
+        // init folds a signal death into 128 + n (init::decode_status)
+        assert_eq!(c(false, false, false, Some(Code(137))), "command-signal");
+        assert_eq!(c(false, false, false, Some(Code(129))), "command-signal");
+        assert_eq!(c(false, false, false, Some(Code(192))), "command-signal");
+        assert_eq!(c(false, false, false, Some(Code(128))), "command-exit");
+        assert_eq!(c(false, false, false, Some(Code(193))), "command-exit");
         assert_eq!(c(false, false, false, Some(Code(3))), "command-exit");
+        // init itself killed by a signal is not the command's doing
+        assert_eq!(c(false, false, false, Some(Signal(9))), "init-lost");
         assert_eq!(c(false, false, false, None), "init-lost");
     }
 
@@ -5312,20 +5335,13 @@ mod tests {
         // `stopping` and may already have written `stopped` when the
         // supervisor reads the state.
         for state in [sessionmeta::State::Stopping, sessionmeta::State::Stopped] {
-            let requested = matches!(
-                state,
-                sessionmeta::State::Stopping | sessionmeta::State::Stopped
-            );
-            assert!(requested);
+            assert!(super::state_is_stop_request(state), "{state:?}");
             assert_eq!(
-                super::session_end_cause(false, false, requested, None),
+                super::session_end_cause(false, false, true, None),
                 "stop-request"
             );
         }
-        assert!(!matches!(
-            sessionmeta::State::Running,
-            sessionmeta::State::Stopping | sessionmeta::State::Stopped
-        ));
+        assert!(!super::state_is_stop_request(sessionmeta::State::Running));
     }
 
     #[test]

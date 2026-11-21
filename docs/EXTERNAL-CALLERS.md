@@ -40,25 +40,37 @@ hisn stop --session seat-a --json
 - `stop --json` outcomes: `stopped`, `ended-before-stop`, `not-live` (nothing to
   stop; exit 0), and the failures `not-started`, `stopped-unrecorded`,
   `signal-failed`, `timeout` (exit 1, error object on stderr, code
-  `E_STOP_<OUTCOME>`).
+  `E_STOP_<OUTCOME>`). A stop that cannot even find the session (unknown name
+  or id) exits 125 with the generic code `E_STOP`.
 - `rootfs list --json`: `{"schema":"hisn-rootfs-list/v1","rootfs":[...]}`.
 - `seat add|ls|set-role|revoke --json`: `hisn-seat/v1` (`add` carries the
   credential once, in `credential`) and `hisn-seat-list/v1`.
-- Without `--json` every command prints exactly what 0.6.2 printed.
+- Without `--json` the commands that gained it (`run --detach`, `stop`,
+  `seat`, `rootfs list`) print exactly what 0.6.2 printed. The readable
+  `hisn journal` output (not `--json`) is different for two record kinds: a
+  `session/stop` line now names the cause, `session stopped (command-exit, exit 3)`,
+  and a `session/signal` line is new. `journal --json` records only gain keys.
 
 ## Errors and exit codes
 
-With `--json`, a failure prints one object on stderr:
+With `--json`, a failure of `run --detach`, `stop`, `seat`, `rootfs list`,
+`ls` and `journal` prints one object on stderr:
 `{"schema":"hisn-error/v1","code":"E_...","message":"..."}` and exits with the
-status the plain command uses (125 for a hisn error). `hisn exec` has no
-`--json`.
+status the plain command uses (125 for a hisn error). The codes are `E_RUN`,
+`E_START_FAILED`, `E_STOP...`, `E_SEAT`, `E_ROOTFS`, `E_LS`, `E_JOURNAL`,
+`E_CURSOR_RESET` and `E_CURSOR_GAP`. `hisn exec` has no `--json`; `inspect
+--json`, `list --json` and the other control-socket commands keep printing the
+raw `{"ok":false,...}` response on stdout.
+
+`seat --json` may be given before or after the subcommand.
 
 `exec` and `run`: the command's own status; `128+N` when killed by signal `N`;
 125 for a hisn error; 126 when the command could not be executed; 127 when not
 found. A program that itself exits 125 to 127 cannot be told apart. For the
 exact status of a program use the journal `exec/exit` record (below), which
-carries `exit_code` or `signal`, `exec_id`, `pid` (the pid inside the session),
-`attach` and `duration_ms`.
+carries `exit_code` or `signal`, `exec_id`, `pid`, `attach` and `duration_ms`.
+Only `exec/exit` has `exec_id`, `pid` and `attach`; `exec/request` is written
+before the exec is numbered and does not.
 
 `journal` exits 3 when `--after-wseq` is ahead of the journal and 4 when the
 records are not contiguous (see "Journal cursor").
@@ -107,7 +119,11 @@ hisn journal --workspace seat-a --after-wseq 4711 --json
 - Exit 4: the records after `N` have a hole (expected `wseq` missing). Read once
   more; if it repeats, restart from `--info`.
 - Exit 0 with a stderr warning "cursor behind retention": records between `N`
-  and the oldest one on disk were deleted by retention. Take what is returned.
+  and the oldest one on disk were deleted by retention (the journal is read
+  twice before this is reported, to rule out a rotation in flight). Take what
+  is returned.
+- Reading costs the whole journal each poll (up to about 256 MiB on disk); poll
+  at seconds, not milliseconds.
 - With `--json` the exit 3 and 4 failures print a `hisn-error/v1` object
   (`E_CURSOR_RESET`, `E_CURSOR_GAP`) on stderr.
 
@@ -140,9 +156,9 @@ TERM/INT/HUP that the supervisor itself took (sender unknown).
 | `idle-expired` | the idle timer stopped it |
 | `supervisor-signal` | the supervisor took TERM, INT or HUP |
 | `stop-request` | `hisn stop` (state `stopping` or `stopped`) |
-| `command-signal` | the command was killed by a signal (`signal`, `signal_name`) |
+| `command-signal` | the command was killed by a signal: the status is `128+N` (init folds the signal into the exit code, as `hisn run` does), reported with `signal` and `signal_name`; a program that itself exits 129..192 is indistinguishable |
 | `command-exit` | the command exited (`exit_code`) |
-| `init-lost` | no exit status could be read |
+| `init-lost` | no exit status could be read, or init itself died by a signal |
 
 Also `duration_ms` and, when `memory.events` is readable, `oom_kill_delta` (the
 OOM kills in the supervisor's cgroup since start; absent when unreadable, and

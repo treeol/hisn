@@ -37,6 +37,19 @@ pub fn seat_token(token_file: Option<&std::path::Path>) -> Result<Option<String>
             }
             Ok(Some(t))
         }
+        (None, Some(p)) if p == std::path::Path::new("-") => {
+            // 0.6.3: the credential comes from stdin, one line. A terminal
+            // is refused (the prompt would be invisible and echoed).
+            if sys::isatty(0) {
+                bail!("--seat-token-file - reads the credential from stdin, which is a terminal");
+            }
+            let t = read_token_line(&mut std::io::stdin().lock(), MAX_TOKEN_BYTES)
+                .context("reading the seat credential from stdin")?;
+            if t.is_empty() {
+                bail!("the seat credential on stdin is empty");
+            }
+            Ok(Some(t))
+        }
         (None, Some(p)) => {
             let body = fs::read_to_string(p)
                 .with_context(|| format!("reading --seat-token-file {}", p.display()))?;
@@ -48,6 +61,35 @@ pub fn seat_token(token_file: Option<&std::path::Path>) -> Result<Option<String>
         }
         (None, None) => Ok(None),
     }
+}
+
+/// The longest credential line read from stdin (a real one is ~50 bytes).
+const MAX_TOKEN_BYTES: usize = 4096;
+
+/// Read one line (up to `limit` bytes) from `r`, byte by byte, so nothing
+/// after the newline is consumed: whatever follows stays on the stream for
+/// the next reader. Returns the trimmed line; EOF ends the line.
+fn read_token_line<R: std::io::Read>(r: &mut R, limit: usize) -> Result<String> {
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        match r.read(&mut b) {
+            Ok(0) => break,
+            Ok(_) if b[0] == b'\n' => break,
+            Ok(_) => {
+                if line.len() >= limit {
+                    bail!("the credential line is longer than {limit} bytes");
+                }
+                line.push(b[0]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(String::from_utf8(line)
+        .context("the credential is not UTF-8")?
+        .trim()
+        .to_owned())
 }
 
 /// The `client` object for a request: the label when one was given, the
@@ -858,5 +900,48 @@ mod tests {
             let n = libc::read(m.as_raw_fd(), b.as_mut_ptr().cast(), 8);
             assert!(n >= 2 && &b[..2] == b"hi");
         }
+    }
+
+    #[test]
+    fn seat_token_stdin_reads_one_line_only() {
+        let mut r = std::io::Cursor::new(b"tok-123\nrest of stdin\n".to_vec());
+        assert_eq!(read_token_line(&mut r, 4096).unwrap(), "tok-123");
+        // Nothing after the newline was consumed.
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut r, &mut rest).unwrap();
+        assert_eq!(rest, "rest of stdin\n");
+        // No trailing newline: EOF ends the line; CRLF is trimmed.
+        let mut r = std::io::Cursor::new(b"tok\r".to_vec());
+        assert_eq!(read_token_line(&mut r, 4096).unwrap(), "tok");
+    }
+
+    #[test]
+    fn seat_token_stdin_empty_is_error() {
+        let mut r = std::io::Cursor::new(Vec::new());
+        assert_eq!(read_token_line(&mut r, 4096).unwrap(), "");
+        let mut r = std::io::Cursor::new(b"\n".to_vec());
+        assert_eq!(read_token_line(&mut r, 4096).unwrap(), "");
+        // seat_token maps an empty line to an error; here the reader's
+        // limit and encoding checks.
+        let mut r = std::io::Cursor::new(vec![b'a'; 10]);
+        assert!(read_token_line(&mut r, 5).is_err());
+        let mut r = std::io::Cursor::new(vec![0xff, 0xfe, b'\n']);
+        assert!(read_token_line(&mut r, 5).is_err());
+    }
+
+    #[test]
+    fn seat_token_stdin_with_env_is_error() {
+        // The "both sources" error comes first, before stdin is touched.
+        // SAFETY-free: the variable is set and removed within this test
+        // under the crate's env lock-free tests (no other test reads it).
+        let key = "HISN_SEAT_TOKEN";
+        let old = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, "x") };
+        let e = seat_token(Some(std::path::Path::new("-")));
+        match old {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        assert!(e.unwrap_err().to_string().contains("both"));
     }
 }

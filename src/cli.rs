@@ -233,7 +233,8 @@ pub struct ExecArgs {
     /// "local"). Same as `hisn attach --client` (0.4.1).
     #[arg(long)]
     pub client: Option<String>,
-    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    /// Seat credential file (0.5.1); `-` reads one line from stdin (0.6.3).
+    /// Alternatively `HISN_SEAT_TOKEN`.
     /// Never a command-line credential value.
     #[arg(long, value_name = "PATH")]
     pub seat_token_file: Option<PathBuf>,
@@ -253,7 +254,8 @@ pub struct AttachArgs {
     /// Label for this client in the audit log (default: derived from SSH or "local").
     #[arg(long)]
     pub client: Option<String>,
-    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    /// Seat credential file (0.5.1); `-` reads one line from stdin (0.6.3).
+    /// Alternatively `HISN_SEAT_TOKEN`.
     #[arg(long, value_name = "PATH")]
     pub seat_token_file: Option<PathBuf>,
 }
@@ -291,7 +293,8 @@ pub struct InspectArgs {
     /// Print the raw control-socket response (JSON) instead of text.
     #[arg(long)]
     pub json: bool,
-    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    /// Seat credential file (0.5.1); `-` reads one line from stdin (0.6.3).
+    /// Alternatively `HISN_SEAT_TOKEN`.
     #[arg(long, value_name = "PATH")]
     pub seat_token_file: Option<PathBuf>,
 }
@@ -308,7 +311,8 @@ pub struct GrantArgs {
     /// Also expose mounts below the directory.
     #[arg(long)]
     pub recursive: bool,
-    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    /// Seat credential file (0.5.1); `-` reads one line from stdin (0.6.3).
+    /// Alternatively `HISN_SEAT_TOKEN`.
     #[arg(long, value_name = "PATH")]
     pub seat_token_file: Option<PathBuf>,
 }
@@ -324,7 +328,8 @@ pub struct RevokeArgs {
     /// Kill processes found holding the mount open (soft revoke only).
     #[arg(long)]
     pub kill_holders: bool,
-    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    /// Seat credential file (0.5.1); `-` reads one line from stdin (0.6.3).
+    /// Alternatively `HISN_SEAT_TOKEN`.
     #[arg(long, value_name = "PATH")]
     pub seat_token_file: Option<PathBuf>,
 }
@@ -362,7 +367,8 @@ pub struct KillArgs {
     pub session: String,
     #[arg(long, default_value = "TERM")]
     pub signal: String,
-    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    /// Seat credential file (0.5.1); `-` reads one line from stdin (0.6.3).
+    /// Alternatively `HISN_SEAT_TOKEN`.
     #[arg(long, value_name = "PATH")]
     pub seat_token_file: Option<PathBuf>,
 }
@@ -372,7 +378,8 @@ pub struct StopArgs {
     /// Session name or id.
     #[arg(long)]
     pub session: String,
-    /// Seat credential file (0.5.1). Alternatively `HISN_SEAT_TOKEN`.
+    /// Seat credential file (0.5.1); `-` reads one line from stdin (0.6.3).
+    /// Alternatively `HISN_SEAT_TOKEN`.
     #[arg(long, value_name = "PATH")]
     pub seat_token_file: Option<PathBuf>,
     /// Print a `hisn-stop/v1` object on stdout and, on failure, a

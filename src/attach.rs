@@ -46,6 +46,9 @@ pub fn build_request_with(
 /// Run `hisn attach`. Allocates a pty, sends the request, relays I/O, and
 /// intercepts the detach key (Ctrl-] d).
 pub fn run(args: AttachArgs) -> Result<i32> {
+    if args.seat_token_file.as_deref() == Some(std::path::Path::new("-")) {
+        anyhow::bail!("attach uses stdin as its terminal; --seat-token-file - is not supported");
+    }
     let (token, revision) =
         crate::execcli::seat_material(&args.session, args.seat_token_file.as_deref())?;
     let req = build_request_with(&args, token.as_deref(), revision)?;

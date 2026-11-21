@@ -63,6 +63,23 @@ pub fn seat_token(token_file: Option<&std::path::Path>) -> Result<Option<String>
     }
 }
 
+/// `--seat-token-file -` on `exec` needs `--no-tty` (0.6.3): by default the
+/// caller's own fds 0-2 are passed on, so the program would inherit whatever
+/// follows the credential line; with `--no-tty` its stdin is `/dev/null`.
+/// Checked before anything is read from stdin.
+pub fn refuse_stdin_token_unless_no_tty(
+    token_file: Option<&std::path::Path>,
+    no_tty: bool,
+) -> Result<()> {
+    if token_file == Some(std::path::Path::new("-")) && !no_tty {
+        bail!(
+            "--seat-token-file - on exec requires --no-tty (the program's stdin is then /dev/null, \
+             so it cannot read what follows the credential)"
+        );
+    }
+    Ok(())
+}
+
 /// The longest credential line read from stdin (a real one is ~50 bytes).
 const MAX_TOKEN_BYTES: usize = 4096;
 
@@ -348,6 +365,7 @@ pub fn refuse_real_terminal(
 
 /// Run `hisn exec`; returns the process exit code.
 pub fn run(args: ExecArgs) -> Result<i32> {
+    refuse_stdin_token_unless_no_tty(args.seat_token_file.as_deref(), args.no_tty)?;
     let (token, revision) = seat_material(&args.session, args.seat_token_file.as_deref())?;
     let req = build_request_with(&args, token.as_deref(), revision)?;
     refuse_real_terminal(args.tty, args.no_tty, sys::isatty)?;
@@ -900,6 +918,17 @@ mod tests {
             let n = libc::read(m.as_raw_fd(), b.as_mut_ptr().cast(), 8);
             assert!(n >= 2 && &b[..2] == b"hi");
         }
+    }
+
+    #[test]
+    fn seat_token_dash_requires_no_tty() {
+        let dash = Some(std::path::Path::new("-"));
+        assert!(refuse_stdin_token_unless_no_tty(dash, false).is_err());
+        assert!(refuse_stdin_token_unless_no_tty(dash, true).is_ok());
+        // a real file, or no file, is never affected
+        let f = Some(std::path::Path::new("/tmp/t"));
+        assert!(refuse_stdin_token_unless_no_tty(f, false).is_ok());
+        assert!(refuse_stdin_token_unless_no_tty(None, false).is_ok());
     }
 
     #[test]

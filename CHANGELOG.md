@@ -7,7 +7,7 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
-## [0.6.2] - 2026-11-20
+## [0.6.2] - 2026-11-21
 
 ### Security
 - `network = "open"` no longer has a timing gap. In 0.6.1, for a call
@@ -22,12 +22,19 @@ All notable changes to hisn are recorded here. The format follows
   io_uring is already denied and non-native ABIs are killed (design
   D). The "open mode is for trusted code" limitation of 0.6.1 is
   removed for these four operations. See ADR 0022, "Amendment
-  0.6.2". Details: `docs/releases/v0.6.2.md`.
+  0.6.2".
+- **Supervisor-executed listen for every address family.** The
+  supervisor performs `listen` on its own reference for every
+  address family (INET and AF_UNIX), not just INET. The kernel
+  never executes a continued `listen` from a sandboxed task.
 - **New kernel requirement.** Open mode requires Landlock ABI >= 4
   (Linux 6.7). `hisn check` reports it; an open session on an older
   kernel fails with a clear error, never silently.
 - **No longer supported.** TCP fast open (`MSG_FASTOPEN`) in open
   mode; programs fall back to a normal connect.
+- **Peer-credential difference.** A client reading `SO_PEERCRED`
+  on an AF_UNIX listener's accepted socket sees pid 0 instead of
+  the sandbox-internal pid; uid and gid are unchanged.
 
 ### Added
 - `notif::verdict_table`: every intercepted call class, its answer,
@@ -40,17 +47,15 @@ All notable changes to hisn are recorded here. The format follows
   non-blocking, AF_UNIX path/abstract, concurrency).
 
 ### Verification (this build)
-- `cargo test --locked --lib`: 580 passed; 11 failed — all 11 are
-  pre-existing environment failures (same failures on a stashed
-  v0.6.1 tree). New verdict-table and BPF-interpretation tests pass.
-- clippy clean (native and with `--features force-continue`).
-- Phase 0 probes on a test machine (kernel 7.3.3, Landlock ABI
-  v11): `pidfd_getfd` + bind/listen on the dup work; Landlock
-  net=3 with no allow rules refuses TCP bind/connect EACCES (v4,
-  v6, unspecified family) while AF_UNIX and UDP are unaffected.
-- Full host/leak runs are a host job: `bash .wakil/host-run-062.sh`
-  (build, unit tests, release gates, host script, `--real` step,
-  timing probe). Written, not run in this session.
+- CI host (kernel 7.3.3, Landlock ABI v11):
+  `HOST-RUN-062: pass=13 fail=0 timeout=0 skipped=1`.
+  Unit tests 592 passed; 0 failed. Release gate (plain) green
+  (fmt, clippy, cross-clippy aarch64/musl, make-check, make-test,
+  leak-suite pipe/pty). Host-verify hermetic 104 pass / 0 fail.
+  Host-verify --real 111 pass / 0 fail. Forced-continue kernel
+  proof: Landlock refuses TCP connect and bind with EACCES.
+  Timing: intercepted median 178 µs, direct 23 µs.
+- Rootfs not available on the CI host; rootfs steps skipped.
 
 
 ## [0.6.1] - 2026-11-19

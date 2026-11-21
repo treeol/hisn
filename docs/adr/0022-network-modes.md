@@ -909,3 +909,36 @@ supervisor-executed, bind refused by classification, fast-open
 EOPNOTSUPP). Parity: `tests/leak/net_cases.sh` 0.6.2 cases
 (loopback v4/v6, non-blocking, AF_UNIX path/abstract, concurrency).
 Unit: `check_landlock_net_abi` error test.
+
+**Amendment (Block 3): supervisor-executed listen for every address
+family.** In the initial 0.6.2 implementation, `listen` on AF_UNIX
+sockets was left to the kernel (`FLAG_CONTINUE`) while INET listen was
+supervisor-executed. This is closed: the supervisor takes its one
+reference to the caller's socket, classifies it by namespace cookie,
+refuses a supervisor-side or unknown socket, and otherwise performs
+`listen` itself on that reference, for every address family. The
+kernel never executes a continued `listen` from a sandboxed task.
+
+The verdict table's `Listen` entry is `SupervisorExecuted`; the
+`KernelContinued` answer remains only for `ConnectUnix` and `BindUnix`,
+which Landlock backs at kernel level (AF_UNIX is outside Landlock's
+TCP rules, and the empty network namespace prevents fd substitution
+for AF_UNIX — no host-namespace socket can appear as an AF_UNIX fd).
+
+**Peer-credential difference (measured on the CI host, kernel 7.3.3,
+Landlock ABI v11).** A client that reads `SO_PEERCRED` on the
+listener's accepted socket sees a different pid after this change.
+At 0.6.1 and at 0.6.2 before Block 3, the server's pid reads as the
+sandbox-internal pid (2). After Block 3, the supervisor owns the
+listening socket, which is outside the sandbox pid namespace, so the
+pid reads as 0. Uid and gid are unchanged (1000/1000 in both builds).
+This is expected: the supervisor performs the listen and accept, so
+the listening socket's credentials are the supervisor's. The data
+exchange is unaffected; only the pid field of `SO_PEERCRED` differs.
+
+**Measured evidence (CI host, 2026-11-21).**
+`HOST-RUN-062: pass=13 fail=0 timeout=0 skipped=1` — unit tests 592
+passed; release gate (plain) green; host-verify 104 pass / 0 fail;
+host-verify --real 111 pass / 0 fail; forced-continue kernel proof
+shows Landlock refusing TCP connect and bind with EACCES; timing:
+intercepted median 178 µs, direct 23 µs.

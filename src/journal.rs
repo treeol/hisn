@@ -1691,7 +1691,27 @@ fn summary_for(rec: &JournalRecord) -> String {
             format!("{} {}", escape_terminal(path), escape_terminal(result))
         }
         "session/start" => "session started".to_owned(),
-        "session/stop" => "session stopped".to_owned(),
+        "session/stop" => match d.get("cause").and_then(|c| c.as_str()) {
+            Some(cause) => {
+                let status = if let Some(n) = d.get("signal_name").and_then(|v| v.as_str()) {
+                    format!(", killed by {}", escape_terminal(n))
+                } else if let Some(c) = d.get("exit_code").and_then(|v| v.as_i64()) {
+                    format!(", exit {c}")
+                } else {
+                    String::new()
+                };
+                format!("session stopped ({}{status})", escape_terminal(cause))
+            }
+            None => "session stopped".to_owned(),
+        },
+        "session/signal" => format!(
+            "session took {}",
+            escape_terminal(
+                d.get("signal_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("a signal")
+            )
+        ),
         "git-change" => git_change_summary(d),
         "network/connect" | "network/implicit" => {
             let target = d.get("target").and_then(|v| v.as_str()).unwrap_or("?");
@@ -3678,6 +3698,35 @@ mod tests {
         assert_eq!(info.last_wseq, Some(9));
         assert!(info.files >= 3);
         assert!(info.bytes > 0);
+    }
+
+    #[test]
+    fn readable_session_stop_shows_cause() {
+        let stop = |data: Value| rec(1, "session/stop", "abcdef0123456789", None, data);
+        assert_eq!(
+            summary_for(&stop(
+                json!({"cause": "command-signal", "signal_name": "SIGKILL", "signal": 9})
+            )),
+            "session stopped (command-signal, killed by SIGKILL)"
+        );
+        assert_eq!(
+            summary_for(&stop(json!({"cause": "stop-request", "exit_code": 143}))),
+            "session stopped (stop-request, exit 143)"
+        );
+        assert_eq!(
+            summary_for(&stop(json!({"workspace": "w"}))),
+            "session stopped"
+        );
+        assert_eq!(
+            summary_for(&rec(
+                2,
+                "session/signal",
+                "abcdef0123456789",
+                None,
+                json!({"signal_name": "SIGTERM"})
+            )),
+            "session took SIGTERM"
+        );
     }
 
     // ---- Item 3: collapsed readable output ----

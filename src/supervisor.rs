@@ -108,6 +108,14 @@ fn log_client_record(
     );
 }
 
+/// Which exec an `exec/exit` record is about (0.6.3).
+#[derive(Debug, Clone, Copy)]
+struct ExecIdent {
+    exec_id: u64,
+    pid: i32,
+    attach: bool,
+}
+
 fn journal_exec_exit_record(
     journal: &Journal,
     client: &authz::ClientRecord,
@@ -115,8 +123,14 @@ fn journal_exec_exit_record(
     cancelled: bool,
     lost: bool,
     duration_ms: u128,
+    ident: Option<ExecIdent>,
 ) {
-    let data = exit_record_data(client, exit, cancelled, lost, duration_ms);
+    let mut data = exit_record_data(client, exit, cancelled, lost, duration_ms);
+    if let Some(i) = ident {
+        data["exec_id"] = json!(format!("e-{}", i.exec_id));
+        data["pid"] = json!(i.pid);
+        data["attach"] = json!(i.attach);
+    }
     let _ = journal.append("exec/exit", Some(journal_client(client)), data);
 }
 
@@ -748,6 +762,7 @@ impl Shared {
     /// triple collapses by (session, seq) in readable output. Journal-only:
     /// the audit `exec/result` line is unchanged (rule 4). A journal failure
     /// never fails the exec (rule 5).
+    #[allow(clippy::too_many_arguments)]
     fn journal_exec_exit(
         &self,
         client: &authz::ClientRecord,
@@ -755,8 +770,17 @@ impl Shared {
         cancelled: bool,
         lost: bool,
         duration_ms: u128,
+        ident: ExecIdent,
     ) {
-        journal_exec_exit_record(&self.journal, client, exit, cancelled, lost, duration_ms);
+        journal_exec_exit_record(
+            &self.journal,
+            client,
+            exit,
+            cancelled,
+            lost,
+            duration_ms,
+            Some(ident),
+        );
     }
 
     /// Journal one exec request with the argv (capped) and cwd (item 1).
@@ -803,13 +827,17 @@ impl Shared {
         let _ = self.journal.append("git-change", None, data);
     }
 
-    /// Journal session start / stop (B3). Best-effort (rule 5).
-    fn journal_session(&self, which: &str) {
-        let _ = self.journal.append(
-            &format!("session/{which}"),
-            None,
-            json!({ "workspace": self.workspace.id }),
-        );
+    /// Journal `session/<which>` (B3; best-effort, rule 5) with extra data
+    /// fields (0.6.3: the stop
+    /// record's cause and status, the `session/signal` record).
+    fn journal_session_with(&self, which: &str, extra: Value) {
+        let mut data = json!({ "workspace": self.workspace.id });
+        if let (Some(d), Some(e)) = (data.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                d.insert(k.clone(), v.clone());
+            }
+        }
+        let _ = self.journal.append(&format!("session/{which}"), None, data);
         // Durability point (journal module docs): on session stop, sync the
         // journal to disk. No sync is paid per record.
         if which == "stop" {
@@ -819,7 +847,7 @@ impl Shared {
 
     /// Sync the journal to disk (durability point — see
     /// `journal_session`). Called after the stop-time `git-change` append,
-    /// which happens after `journal_session("stop")` and would otherwise
+    /// which happens after `journal_session_with("stop", ..)` and would otherwise
     /// never be synced.
     fn sync_journal(&self) {
         self.journal.sync();
@@ -1397,6 +1425,11 @@ impl Shared {
             client,
             true,
         );
+        let ident = ExecIdent {
+            exec_id,
+            pid: sp.pid,
+            attach: req.attach,
+        };
         // Item 2: one `exec/exit` record on every post-spawn end path.
         // `Outcome::Lost` (status socket EOF/poll error) covers session
         // stop while running and monitor death; `Exited(Signal)` covers
@@ -1405,10 +1438,10 @@ impl Shared {
         // write `exec/result` with the error code and ran nothing.
         match outcome {
             exec::Outcome::Exited(exit) => {
-                self.journal_exec_exit(client, Some(&exit), cancelled, false, duration_ms)
+                self.journal_exec_exit(client, Some(&exit), cancelled, false, duration_ms, ident)
             }
             exec::Outcome::Lost => {
-                self.journal_exec_exit(client, None, cancelled, true, duration_ms)
+                self.journal_exec_exit(client, None, cancelled, true, duration_ms, ident)
             }
         }
         line
@@ -3099,6 +3132,8 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
         declared_env,
         ready_fd,
     } = start;
+    let session_started = std::time::Instant::now();
+    let oom_baseline = read_oom_kill(&own_memory_events_path());
     // Phase: prepare.
     prepare_session_files(sdir, &policy, risk_entries)?;
     let (audit, tty, root_dir) = prepare_session_dirs(sdir, args)?;
@@ -3315,7 +3350,8 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
 
     // Phase: wait (idle timer + relay).
     let idle_timer = start_idle_timer(&policy, &shared, pid);
-    let code = relay_and_wait(pid, master, tty);
+    let relay = relay_and_wait(pid, master, tty);
+    let code = relay.code;
     // ADR 0022: the sandbox is gone. Stop the DNS responder and write
     // out the network records still queued (bounded), so `hisn journal`
     // right after the session shows them. The engines stop when
@@ -3335,10 +3371,46 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
 
     // 0.5.0 (B3, C2): session stop and the git-change report, journaled after
     // the sandbox has exited. Report only (Part C): nothing is reverted.
-    // `journal_session("stop")` syncs; the git-change append after it must
+    // `journal_session_with("stop", ..)` syncs; the git-change append after it must
     // be synced too, or the stop record can be lost on a power failure
     // right after exit (R2).
-    shared.journal_session("stop");
+    // 0.6.3 (Block 7): why the session ended. The state is read here, after
+    // the idle timer was joined: `hisn stop` and idle expiry both record
+    // `stopping` before anything is signalled.
+    for s in &relay.signals {
+        shared.journal_session_with(
+            "signal",
+            json!({ "signal": s, "signal_name": control::signal_name(*s), "sender": "unknown" }),
+        );
+    }
+    let stop_requested = sessionmeta::read(&sdir.path).is_some_and(|m| {
+        matches!(
+            m.state,
+            sessionmeta::State::Stopping | sessionmeta::State::Stopped
+        )
+    });
+    let cause = session_end_cause(
+        idle_expired_after.is_some(),
+        !relay.signals.is_empty(),
+        stop_requested,
+        relay.detail,
+    );
+    let mut stop_data = json!({
+        "cause": cause,
+        "duration_ms": session_started.elapsed().as_millis(),
+    });
+    match relay.detail {
+        Some(init::StatusDetail::Code(c)) => stop_data["exit_code"] = json!(c),
+        Some(init::StatusDetail::Signal(n)) => {
+            stop_data["signal"] = json!(n);
+            stop_data["signal_name"] = json!(control::signal_name(n));
+        }
+        None => {}
+    }
+    if let Some(d) = oom_kill_delta(oom_baseline, read_oom_kill(&own_memory_events_path())) {
+        stop_data["oom_kill_delta"] = json!(d);
+    }
+    shared.journal_session_with("stop", stop_data);
     shared.journal_git_change(&policy.cwd);
     shared.sync_journal();
 
@@ -4237,7 +4309,75 @@ fn spawn_exec_helper(ctx: ExecContext) -> Result<ExecClient> {
 
 /// Pass stdio through. With a pty: raw mode, bidirectional relay, resize
 /// forwarding. Returns the command's exit code.
-fn relay_and_wait(init_pid: i32, master: Option<OwnedFd>, tty: bool) -> i32 {
+/// Why a session ended (0.6.3), decided from facts in this order:
+/// `idle-expired` (the idle timer stopped it) > `supervisor-signal` (the
+/// supervisor itself took TERM/INT/HUP) > `stop-request` (the recorded state
+/// is `stopping` or `stopped`: `hisn stop` signals init through the `kill`
+/// op, so the supervisor takes no signal of its own) > `command-signal` >
+/// `command-exit` > `init-lost` (no status was read).
+fn session_end_cause(
+    idle_expired: bool,
+    supervisor_signal: bool,
+    stop_requested: bool,
+    detail: Option<init::StatusDetail>,
+) -> &'static str {
+    if idle_expired {
+        "idle-expired"
+    } else if supervisor_signal {
+        "supervisor-signal"
+    } else if stop_requested {
+        "stop-request"
+    } else {
+        match detail {
+            Some(init::StatusDetail::Signal(_)) => "command-signal",
+            Some(init::StatusDetail::Code(_)) => "command-exit",
+            None => "init-lost",
+        }
+    }
+}
+
+/// `oom_kill` from the text of a cgroup `memory.events` file.
+fn parse_oom_kill(text: &str) -> Option<u64> {
+    text.lines().find_map(|l| {
+        let (k, v) = l.split_once(' ')?;
+        (k == "oom_kill").then(|| v.trim().parse().ok())?
+    })
+}
+
+/// `oom_kill` from a `memory.events` file; `None` when unreadable or absent.
+fn read_oom_kill(path: &Path) -> Option<u64> {
+    parse_oom_kill(&fs::read_to_string(path).ok()?)
+}
+
+/// The supervisor's own cgroup (v2) `memory.events` path.
+fn own_memory_events_path() -> PathBuf {
+    let rel = fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("0::").map(|p| p.trim().to_owned()))
+        })
+        .unwrap_or_default();
+    Path::new("/sys/fs/cgroup")
+        .join(rel.trim_start_matches('/'))
+        .join("memory.events")
+}
+
+/// The OOM kills between two reads; `None` when either read failed (the
+/// field is then absent from the record, never guessed).
+fn oom_kill_delta(before: Option<u64>, after: Option<u64>) -> Option<u64> {
+    Some(after?.saturating_sub(before?))
+}
+
+/// What `relay_and_wait` saw: init's exit code, how init ended (when the
+/// status was read), and the TERM/INT/HUP the supervisor itself took.
+struct RelayEnd {
+    code: i32,
+    detail: Option<init::StatusDetail>,
+    signals: Vec<i32>,
+}
+
+fn relay_and_wait(init_pid: i32, master: Option<OwnedFd>, tty: bool) -> RelayEnd {
     let handled = [
         libc::SIGTERM,
         libc::SIGINT,
@@ -4247,8 +4387,14 @@ fn relay_and_wait(init_pid: i32, master: Option<OwnedFd>, tty: bool) -> i32 {
     ];
     let _ = sig::install(&handled);
     let Ok(old) = sig::block(&handled) else {
-        return services::reap(init_pid);
+        return RelayEnd {
+            code: services::reap(init_pid),
+            detail: None,
+            signals: Vec::new(),
+        };
     };
+    let mut taken: Vec<i32> = Vec::new();
+    let mut detail: Option<init::StatusDetail> = None;
 
     let raw_guard = if tty { RawTerm::enter(0) } else { None };
     let mut buf = vec![0u8; 16384];
@@ -4267,6 +4413,7 @@ fn relay_and_wait(init_pid: i32, master: Option<OwnedFd>, tty: bool) -> i32 {
                     }
                 }
                 libc::SIGTERM | libc::SIGINT | libc::SIGHUP => {
+                    taken.push(s);
                     let _ = sys::kill(init_pid, s);
                 }
                 _ => {}
@@ -4277,6 +4424,7 @@ fn relay_and_wait(init_pid: i32, master: Option<OwnedFd>, tty: bool) -> i32 {
         let r = unsafe { libc::waitpid(init_pid, &mut st, libc::WNOHANG) };
         if r == init_pid {
             status = Some(init::decode_status(st));
+            detail = init::decode_status_detail(st);
         }
         match (&master, status) {
             (None, Some(_)) => break,
@@ -4329,7 +4477,11 @@ fn relay_and_wait(init_pid: i32, master: Option<OwnedFd>, tty: bool) -> i32 {
         }
     }
     drop(raw_guard);
-    status.unwrap_or_else(|| services::reap(init_pid))
+    RelayEnd {
+        code: status.unwrap_or_else(|| services::reap(init_pid)),
+        detail,
+        signals: taken,
+    }
 }
 
 pub(crate) fn resize_to(from_fd: RawFd, to_fd: RawFd) {
@@ -4490,6 +4642,7 @@ mod tests {
             false,
             false,
             120,
+            None,
         );
         let (mut records, skipped) = crate::journal::read_records(&d.path().join("workspace"));
         assert_eq!(skipped, 0);
@@ -5131,6 +5284,119 @@ mod tests {
         assert_eq!(v["name"], "seat-a");
         assert_eq!(v["state"], "ready");
         assert!(run_ready_json("abc123", None)["name"].is_null());
+    }
+
+    // ---- 0.6.3 Block 7: end-of-session and exec diagnostics ----
+
+    #[test]
+    fn cause_table_follows_the_documented_order() {
+        use super::init::StatusDetail::{Code, Signal};
+        let c = super::session_end_cause;
+        // idle expiry wins over everything, including the `stopping` state
+        assert_eq!(c(true, true, true, Some(Signal(15))), "idle-expired");
+        assert_eq!(c(true, false, true, Some(Code(0))), "idle-expired");
+        // the supervisor took a signal itself
+        assert_eq!(c(false, true, true, Some(Signal(15))), "supervisor-signal");
+        // `hisn stop`: the state is stopping/stopped, init got TERM
+        assert_eq!(c(false, false, true, Some(Signal(15))), "stop-request");
+        assert_eq!(c(false, false, true, Some(Code(0))), "stop-request");
+        // the command ended by itself
+        assert_eq!(c(false, false, false, Some(Signal(9))), "command-signal");
+        assert_eq!(c(false, false, false, Some(Code(3))), "command-exit");
+        assert_eq!(c(false, false, false, None), "init-lost");
+    }
+
+    #[test]
+    fn cause_stop_request_when_state_stopping_and_stopped() {
+        // Both recorded states count as a stop request: `hisn stop` writes
+        // `stopping` and may already have written `stopped` when the
+        // supervisor reads the state.
+        for state in [sessionmeta::State::Stopping, sessionmeta::State::Stopped] {
+            let requested = matches!(
+                state,
+                sessionmeta::State::Stopping | sessionmeta::State::Stopped
+            );
+            assert!(requested);
+            assert_eq!(
+                super::session_end_cause(false, false, requested, None),
+                "stop-request"
+            );
+        }
+        assert!(!matches!(
+            sessionmeta::State::Running,
+            sessionmeta::State::Stopping | sessionmeta::State::Stopped
+        ));
+    }
+
+    #[test]
+    fn oom_events_parsing_handles_missing_file() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("memory.events");
+        // missing file: no number, no delta
+        assert_eq!(super::read_oom_kill(&f), None);
+        assert_eq!(super::oom_kill_delta(None, Some(3)), None);
+        assert_eq!(super::oom_kill_delta(Some(3), None), None);
+        std::fs::write(
+            &f,
+            "low 0\nhigh 0\nmax 4\noom 2\noom_kill 5\noom_group_kill 0\n",
+        )
+        .unwrap();
+        assert_eq!(super::read_oom_kill(&f), Some(5));
+        assert_eq!(super::oom_kill_delta(Some(5), Some(7)), Some(2));
+        // the line is absent: absent, not 0
+        std::fs::write(&f, "low 0\nhigh 0\n").unwrap();
+        assert_eq!(super::read_oom_kill(&f), None);
+        // a counter that went down (cgroup recreated) never underflows
+        assert_eq!(super::oom_kill_delta(Some(9), Some(2)), Some(0));
+    }
+
+    #[test]
+    fn exec_records_carry_exec_id_attach_pid() {
+        use super::*;
+        let d = tempfile::tempdir_in("target").unwrap();
+        let journal = Journal::new(d.path().join("workspace"), "abcdef0123456789".into());
+        let client = authz::ClientRecord {
+            principal: None,
+            uid: 1000,
+            pid: Some(7),
+            label: "local".into(),
+            label_source: "flag".into(),
+            req_id: Some("r1".into()),
+            seq: 7,
+            seat: None,
+            seat_role: None,
+        };
+        journal_exec_exit_record(
+            &journal,
+            &client,
+            Some(&exec::Exit::Code(3)),
+            false,
+            false,
+            10,
+            Some(ExecIdent {
+                exec_id: 4,
+                pid: 99,
+                attach: true,
+            }),
+        );
+        let (records, _) = crate::journal::read_records(&d.path().join("workspace"));
+        let data = &records[0].data;
+        assert_eq!(records[0].kind, "exec/exit");
+        assert_eq!(data["exec_id"], "e-4");
+        assert_eq!(data["pid"], 99);
+        assert_eq!(data["attach"], true);
+        assert_eq!(data["exit_code"], 3);
+    }
+
+    #[test]
+    fn decode_status_detail_splits_code_and_signal() {
+        use super::init::{StatusDetail, decode_status, decode_status_detail};
+        // exit(3): status 3 << 8; killed by SIGKILL: status 9
+        assert_eq!(decode_status_detail(3 << 8), Some(StatusDetail::Code(3)));
+        assert_eq!(decode_status_detail(9), Some(StatusDetail::Signal(9)));
+        assert_eq!(decode_status(9), 128 + 9, "the folded form is unchanged");
+        // a stopped child (0x7f low byte) is neither
+        assert_eq!(decode_status_detail(0x137f), None);
     }
 
     // ---- Item 2: exec/exit record data shape (journal-only) ----

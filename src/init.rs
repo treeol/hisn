@@ -315,6 +315,26 @@ fn reap_all() -> usize {
     }
 }
 
+/// How a waited process ended, with the code and the signal kept apart
+/// (`decode_status` folds a signal into `128 + n`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusDetail {
+    Code(i32),
+    Signal(i32),
+}
+
+/// Split a `waitpid` status into exit code or terminating signal; `None`
+/// for a status that is neither (stopped, continued).
+pub fn decode_status_detail(st: i32) -> Option<StatusDetail> {
+    if libc::WIFEXITED(st) {
+        Some(StatusDetail::Code(libc::WEXITSTATUS(st)))
+    } else if libc::WIFSIGNALED(st) {
+        Some(StatusDetail::Signal(libc::WTERMSIG(st)))
+    } else {
+        None
+    }
+}
+
 pub fn decode_status(st: i32) -> i32 {
     if libc::WIFEXITED(st) {
         libc::WEXITSTATUS(st)

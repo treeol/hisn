@@ -446,6 +446,19 @@ pub struct JournalArgs {
     /// Show the newest N displayed events; with --json, N raw records.
     #[arg(long, value_name = "N")]
     pub last: Option<usize>,
+    /// Only records with a sequence number (`wseq`) greater than N, checked
+    /// to be contiguous (0.6.3). Exit 3 when N is ahead of the newest record
+    /// (the journal was reset), exit 4 when the records have a hole. A
+    /// cursor for callers that poll; there is no follow mode.
+    #[arg(long, value_name = "N", conflicts_with = "info")]
+    pub after_wseq: Option<u64>,
+    /// Print `{"schema":"hisn-journal-info/v1","first_wseq","last_wseq",
+    /// "files","bytes"}` for the workspace and exit (0.6.3). Always JSON.
+    #[arg(
+        long,
+        conflicts_with_all = ["session", "seat", "kind", "since", "last", "after_wseq"]
+    )]
+    pub info: bool,
     /// Print the records unchanged as JSON (one per line).
     #[arg(long)]
     pub json: bool,

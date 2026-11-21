@@ -815,7 +815,9 @@ fn session_v2_json(
             let dir = hisn::workspace::workspace_dir(&w.id);
             let files = hisn::journal::journal_files(&dir);
             let bytes: u64 = files.iter().map(|p| std::fs::metadata(p).map(|mm| mm.len()).unwrap_or(0)).sum();
-            json!({ "dir": dir.display().to_string(), "files": files.len(), "bytes": bytes })
+            let info = hisn::journal::journal_info(&dir);
+            json!({ "dir": dir.display().to_string(), "files": files.len(), "bytes": bytes,
+                    "first_wseq": info.first_wseq, "last_wseq": info.last_wseq })
         })).unwrap_or(Value::Null),
         "pid": Value::Null,
         "started": meta.map(|m| Value::String(m.created.ts.clone())).unwrap_or(Value::Null),
@@ -1042,7 +1044,57 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
         }
     };
     let dir = workspace::workspace_dir(&id);
-    let (recs, skipped) = journal::read_records(&dir);
+    if a.info {
+        let info = journal::journal_info(&dir);
+        println!("{}", journal_info_json(&info));
+        return Ok(ExitCode::SUCCESS);
+    }
+    // 0.6.3 cursor: select after N and check contiguity BEFORE any other
+    // filter, so a hole is never hidden by `--session`/`--kind`.
+    let mut cursor_behind = false;
+    let (recs, skipped) = if let Some(after) = a.after_wseq {
+        let (sel, skipped) = journal::cursor_read(&dir, after);
+        match sel {
+            journal::CursorSelect::Records {
+                records,
+                behind_retention,
+            } => {
+                cursor_behind = behind_retention;
+                (records, skipped)
+            }
+            journal::CursorSelect::Reset { last_wseq } => {
+                return Ok(cursor_failure(
+                    a.json,
+                    3,
+                    "E_CURSOR_RESET",
+                    &format!(
+                        "--after-wseq {after} is ahead of the journal (last wseq {}); \
+                         the journal was reset, restart from `hisn journal --info`",
+                        last_wseq.map_or("none".to_owned(), |w| w.to_string())
+                    ),
+                ));
+            }
+            journal::CursorSelect::Gap { expected, got } => {
+                return Ok(cursor_failure(
+                    a.json,
+                    4,
+                    "E_CURSOR_GAP",
+                    &format!(
+                        "journal records are not contiguous after wseq {after}: \
+                         expected {expected}, found {got}; read again or restart from \
+                         `hisn journal --info`"
+                    ),
+                ));
+            }
+        }
+    } else {
+        journal::read_records(&dir)
+    };
+    if cursor_behind {
+        eprintln!(
+            "hisn: cursor behind retention: records before the oldest one on disk were deleted"
+        );
+    }
     // `--since` is enforced: an unparseable timestamp is an error, not a
     // silent "show everything" (item 5). Only Zulu (Z) timestamps are
     // accepted: an offset like +02:00 would otherwise be silently parsed
@@ -1099,6 +1151,33 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The `hisn journal --info` document (schema `hisn-journal-info/v1`).
+fn journal_info_json(info: &journal::JournalInfo) -> Value {
+    json!({
+        "schema": "hisn-journal-info/v1",
+        "first_wseq": info.first_wseq,
+        "last_wseq": info.last_wseq,
+        "files": info.files,
+        "bytes": info.bytes,
+    })
+}
+
+/// A cursor failure: one stderr line (an error object under `--json`), no
+/// stdout, and the exit status the plan assigns (3 reset, 4 gap).
+fn cursor_failure(json: bool, status: u8, code: &str, message: &str) -> ExitCode {
+    if json {
+        eprintln!("{}", error_object(code, message));
+    } else {
+        eprintln!("hisn: {message}");
+    }
+    ExitCode::from(status)
+}
+
+/// The one error object format of the machine interface (0.6.3).
+fn error_object(code: &str, message: &str) -> Value {
+    json!({"schema": "hisn-error/v1", "code": code, "message": message})
 }
 
 /// `hisn rootfs import`: thin wrapper over [`hisn::rootfs_import::import`].
@@ -1204,6 +1283,42 @@ mod ls_tests {
     use super::{archive_session, parse_rfc3339_secs, prune_prefix_matches, session_v2_json};
     use serde_json::{Value, json};
     use std::path::Path;
+
+    #[test]
+    fn ls_json_journal_reports_wseq_range() {
+        // The `journal` object of `ls --json` carries first_wseq/last_wseq
+        // from the same helper as `journal --info`.
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("ws");
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        }
+        let j = hisn::journal::Journal::with_rotate_after(
+            dir.clone(),
+            "s".into(),
+            hisn::journal::ROTATE_AFTER,
+        );
+        j.append("note", None, json!({"a": 1})).unwrap();
+        j.append("note", None, json!({"a": 2})).unwrap();
+        let info = hisn::journal::journal_info(&dir);
+        let v = super::journal_info_json(&info);
+        assert_eq!(v["schema"], "hisn-journal-info/v1");
+        assert_eq!(v["first_wseq"], 1);
+        assert_eq!(v["last_wseq"], 2);
+        assert_eq!(v["files"], 1);
+        let empty = tempfile::tempdir().unwrap();
+        let v = super::journal_info_json(&hisn::journal::journal_info(empty.path()));
+        assert!(v["first_wseq"].is_null() && v["last_wseq"].is_null());
+    }
+
+    #[test]
+    fn error_object_has_schema_code_message() {
+        let v = super::error_object("E_X", "boom");
+        assert_eq!(v["schema"], "hisn-error/v1");
+        assert_eq!(v["code"], "E_X");
+        assert_eq!(v["message"], "boom");
+    }
 
     #[test]
     fn prune_prefix_filter_selects_named_sessions_only() {

@@ -1191,6 +1191,119 @@ pub fn read_records(dir: &Path) -> (Vec<JournalRecord>, usize) {
     (out, skipped)
 }
 
+/// Where a journal starts and ends (0.6.3, `hisn journal --info` and the
+/// `journal` object of `ls --json`). Cheap: reads the head of the oldest
+/// non-empty file and the tail of the newest, never the whole journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalInfo {
+    /// Lowest `wseq` still on disk; `None` for an empty journal.
+    pub first_wseq: Option<u64>,
+    /// Highest `wseq` on disk; `None` for an empty journal.
+    pub last_wseq: Option<u64>,
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// The first parseable record's `wseq` in one file (head window only).
+fn first_wseq_in_file(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let mut f = File::open(path).ok()?;
+    let mut buf = Vec::new();
+    (&mut f).take(TAIL_BYTES).read_to_end(&mut buf).ok()?;
+    buf.split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .find_map(|l| serde_json::from_slice::<JournalRecord>(l).ok())
+        .map(|r| r.wseq)
+}
+
+/// First/last `wseq`, file count and byte size of the journal in `dir`.
+pub fn journal_info(dir: &Path) -> JournalInfo {
+    let files = journal_files(dir);
+    let bytes: u64 = files
+        .iter()
+        .map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum();
+    let first_wseq = files.iter().find_map(|p| first_wseq_in_file(p));
+    let last_wseq = files.last().and_then(|cur| last_wseq(cur).ok().flatten());
+    JournalInfo {
+        first_wseq,
+        last_wseq,
+        files: files.len(),
+        bytes,
+    }
+}
+
+/// What a cursor read found (0.6.3, `hisn journal --after-wseq N`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorSelect {
+    /// Records with `wseq > after`, contiguous. `behind_retention` is set
+    /// when `after + 1` is older than the oldest record still on disk.
+    Records {
+        records: Vec<JournalRecord>,
+        behind_retention: bool,
+    },
+    /// `after` is ahead of the newest record: the journal was reset.
+    Reset { last_wseq: Option<u64> },
+    /// A hole inside the returned run: `expected` is missing, `got` came.
+    Gap { expected: u64, got: u64 },
+}
+
+/// Select the records after `after` from `recs` (file order) and check
+/// that they are contiguous, BEFORE any other filter is applied. A strict
+/// `>` cursor cannot recover a record hidden in the middle of one pass, so
+/// a hole is reported instead of returned.
+pub fn cursor_select(recs: &[JournalRecord], after: u64) -> CursorSelect {
+    let last = recs.iter().map(|r| r.wseq).max();
+    if after > last.unwrap_or(0) {
+        return CursorSelect::Reset { last_wseq: last };
+    }
+    let mut records: Vec<JournalRecord> = recs.iter().filter(|r| r.wseq > after).cloned().collect();
+    // The journal's own order is wseq order; sort defensively so a
+    // rotated file read late cannot look like a hole.
+    records.sort_by_key(|r| r.wseq);
+    let first = recs.iter().map(|r| r.wseq).min();
+    // Retention deleted records the caller had not read when the oldest
+    // record on disk is newer than `after + 1`.
+    let behind_retention = first.is_some_and(|f| after + 1 < f);
+    // Without a retention loss the run must start exactly at `after + 1`.
+    if !behind_retention
+        && let Some(r) = records.first()
+        && r.wseq != after + 1
+    {
+        return CursorSelect::Gap {
+            expected: after + 1,
+            got: r.wseq,
+        };
+    }
+    for pair in records.windows(2) {
+        if pair[1].wseq != pair[0].wseq + 1 {
+            return CursorSelect::Gap {
+                expected: pair[0].wseq + 1,
+                got: pair[1].wseq,
+            };
+        }
+    }
+    CursorSelect::Records {
+        records,
+        behind_retention,
+    }
+}
+
+/// Read the journal in `dir` and select after `after`. A reset or a hole
+/// is read once more (a rotation racing the reader's pinning is transient
+/// and the second pass sees a consistent set); only a repeated result is
+/// reported. Also returns the count of unparseable lines.
+pub fn cursor_read(dir: &Path, after: u64) -> (CursorSelect, usize) {
+    let (recs, skipped) = read_records(dir);
+    match cursor_select(&recs, after) {
+        r @ CursorSelect::Records { .. } => (r, skipped),
+        _ => {
+            let (recs, skipped) = read_records(dir);
+            (cursor_select(&recs, after), skipped)
+        }
+    }
+}
+
 /// Query filters for `hisn journal`.
 #[derive(Debug, Default)]
 pub struct Query {
@@ -3385,6 +3498,186 @@ mod tests {
         let (records, _) = read_records(&dir);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].kind, "session/start");
+    }
+
+    // ---- 0.6.3: journal cursor ----
+
+    fn cursor_ws(rotate_after: u64, n: usize) -> (tempfile::TempDir, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("ws");
+        create_test_ws_dir(&dir);
+        let mut j = Journal::with_rotate_after(dir.clone(), "s".into(), rotate_after);
+        j.retention_bytes = None;
+        for i in 0..n {
+            j.append("note", None, json!({"i": i, "pad": "x".repeat(40)}))
+                .unwrap();
+        }
+        (d, dir)
+    }
+
+    fn wseqs(sel: &CursorSelect) -> Vec<u64> {
+        match sel {
+            CursorSelect::Records { records, .. } => records.iter().map(|r| r.wseq).collect(),
+            other => panic!("not records: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn after_wseq_filters_strictly_greater() {
+        let (_d, dir) = cursor_ws(ROTATE_AFTER, 6);
+        let (sel, _) = cursor_read(&dir, 3);
+        assert_eq!(wseqs(&sel), vec![4, 5, 6]);
+        let (all, _) = cursor_read(&dir, 0);
+        assert_eq!(wseqs(&all), vec![1, 2, 3, 4, 5, 6]);
+        let (none, _) = cursor_read(&dir, 6);
+        assert_eq!(wseqs(&none), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn after_wseq_across_rotation_exactly_once() {
+        // 200-byte files: many rotations. Walking the cursor one record at
+        // a time sees every record exactly once, in order.
+        let (_d, dir) = cursor_ws(200, 12);
+        assert!(journal_files(&dir).len() >= 3, "needs rotated files");
+        let mut seen = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let (sel, _) = cursor_read(&dir, cursor);
+            let got = wseqs(&sel);
+            let Some(first) = got.first().copied() else {
+                break;
+            };
+            seen.push(first);
+            cursor = first;
+        }
+        assert_eq!(seen, (1..=12).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn after_wseq_with_last() {
+        // The cursor is applied before `--last`: last N of the records
+        // after the cursor.
+        let (_d, dir) = cursor_ws(ROTATE_AFTER, 8);
+        let (sel, _) = cursor_read(&dir, 2);
+        let CursorSelect::Records { records, .. } = sel else {
+            panic!()
+        };
+        let out = query(
+            &records,
+            &Query {
+                last: Some(2),
+                ..Default::default()
+            },
+        );
+        assert_eq!(out.iter().map(|r| r.wseq).collect::<Vec<_>>(), vec![7, 8]);
+    }
+
+    #[test]
+    fn after_wseq_ahead_of_head_exits_3() {
+        // `Reset` is what main maps to exit 3.
+        let (_d, dir) = cursor_ws(ROTATE_AFTER, 3);
+        let (sel, _) = cursor_read(&dir, 4);
+        assert_eq!(sel, CursorSelect::Reset { last_wseq: Some(3) });
+        // On an empty journal only N > 0 is a reset.
+        let d = tempfile::tempdir().unwrap();
+        let empty = d.path().join("ws");
+        create_test_ws_dir(&empty);
+        let (zero, _) = cursor_read(&empty, 0);
+        assert_eq!(wseqs(&zero), Vec::<u64>::new());
+        let (one, _) = cursor_read(&empty, 1);
+        assert_eq!(one, CursorSelect::Reset { last_wseq: None });
+    }
+
+    #[test]
+    fn after_wseq_behind_retention_warns_and_reads() {
+        // The oldest record on disk is 5: a cursor at 1 lost 2..4.
+        let recs: Vec<JournalRecord> = (5..=8)
+            .map(|w| JournalRecord {
+                v: 1,
+                ts: "2026-11-21T00:00:00Z".into(),
+                wseq: w,
+                session: "s".into(),
+                kind: "note".into(),
+                client: None,
+                data: json!({}),
+            })
+            .collect();
+        match cursor_select(&recs, 1) {
+            CursorSelect::Records {
+                records,
+                behind_retention,
+            } => {
+                assert!(behind_retention);
+                assert_eq!(records.len(), 4);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A cursor exactly before the oldest record lost nothing.
+        match cursor_select(&recs, 4) {
+            CursorSelect::Records {
+                behind_retention, ..
+            } => assert!(!behind_retention),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn after_wseq_gap_is_retried_then_exit_4() {
+        let mk = |ws: &[u64]| -> Vec<JournalRecord> {
+            ws.iter()
+                .map(|w| JournalRecord {
+                    v: 1,
+                    ts: "2026-11-21T00:00:00Z".into(),
+                    wseq: *w,
+                    session: "s".into(),
+                    kind: "note".into(),
+                    client: None,
+                    data: json!({}),
+                })
+                .collect()
+        };
+        // a hole in the middle: 3 is missing between 2 and 4
+        assert_eq!(
+            cursor_select(&mk(&[1, 2, 4, 5]), 0),
+            CursorSelect::Gap {
+                expected: 3,
+                got: 4
+            }
+        );
+        // a run that does not start at after + 1 (and no retention loss)
+        assert_eq!(
+            cursor_select(&mk(&[1, 2, 4, 5]), 2),
+            CursorSelect::Gap {
+                expected: 3,
+                got: 4
+            }
+        );
+        // the gap is visible even when a later filter would drop the hole
+        assert!(matches!(
+            cursor_select(&mk(&[1, 2, 3]), 0),
+            CursorSelect::Records { .. }
+        ));
+    }
+
+    #[test]
+    fn journal_info_empty_journal_is_null() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("ws");
+        create_test_ws_dir(&dir);
+        let info = journal_info(&dir);
+        assert_eq!(info.first_wseq, None);
+        assert_eq!(info.last_wseq, None);
+        assert_eq!(info.bytes, 0);
+    }
+
+    #[test]
+    fn journal_info_reports_first_and_last() {
+        let (_d, dir) = cursor_ws(200, 9);
+        let info = journal_info(&dir);
+        assert_eq!(info.first_wseq, Some(1));
+        assert_eq!(info.last_wseq, Some(9));
+        assert!(info.files >= 3);
+        assert!(info.bytes > 0);
     }
 
     // ---- Item 3: collapsed readable output ----

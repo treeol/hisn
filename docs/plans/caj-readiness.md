@@ -1004,3 +1004,84 @@ test maps both (named `stop_json_outcome_words_cover_every_path`); table size
 is 11 by design (section 4's "10" is superseded); the `host-verify` first line
 is the sha256 of the script file printed by the script (computed by `sha256sum`
 on `$0`), not a line inside it; D6 stays UNVERIFIED without key auth.
+
+## 10.8 Continuation (blocks 3, 4, 5, 7, 8 and the host script)
+
+Verified state: branch `work/0.6.3`, HEAD `c0961ea` (cut from `v0.6.2`);
+done: probe, plan 10 to 10.7, Block 1 (`143b072`), Block 2 (`c0961ea`).
+Where the code differs from 10.4 the code wins; differences are listed per block.
+Protocol stays at revision 3; every change is additive.
+
+### Block 3: journal cursor (`src/journal.rs`, `src/cli.rs`, `src/main.rs`)
+- `journal.rs`: `JournalInfo`, `journal_info`, `first_wseq_in_file`,
+  `CursorSelect`, `cursor_select`, `cursor_read`. `journal_cmd` (`main.rs`)
+  selects by cursor BEFORE every other filter and checks contiguity on the
+  selected run: a run must start at `after + 1` unless retention removed
+  older records (`behind_retention`, warned on stderr, exit 0).
+- Exit 3: `--after-wseq N` with N above the newest `wseq` (reset). Exit 4: a
+  hole in the run, after one re-read (a racing rotation). With `--json` the
+  failure is a `hisn-error/v1` object on stderr.
+- `--info` prints `hisn-journal-info/v1` (`first_wseq`, `last_wseq`, `files`,
+  `bytes`); `ls --json` `journal` gains `first_wseq`, `last_wseq`.
+- Code vs plan: 10.4 left the exit code for a hole open; 4 is chosen so that 3
+  keeps one meaning (reset).
+- Tests: `after_wseq_filters_strictly_greater`,
+  `after_wseq_across_rotation_exactly_once`, `after_wseq_with_last`,
+  `after_wseq_ahead_of_head_exits_3`, `after_wseq_behind_retention_warns_and_reads`,
+  `after_wseq_gap_is_retried_then_exit_4`, `journal_info_empty_journal_is_null`,
+  `journal_info_reports_first_and_last`, `ls_json_journal_reports_wseq_range`,
+  `error_object_has_schema_code_message`.
+
+### Block 4: machine interface (`src/cli.rs`, `src/main.rs`, `src/supervisor.rs`)
+- `--json` on `run --detach` (`run_detached`, prints `<id> <name|-> ready`
+  today), `stop` (`Command::Stop`), `seat add|ls|set-role|revoke`
+  (`seat_cmd`), `rootfs list`. Text output without `--json` is untouched.
+  Schemas: `hisn-run/v1`, `hisn-stop/v1`, `hisn-seat/v1`, `hisn-seat-list/v1`,
+  `hisn-rootfs-list/v1`. Failures of a command run with `--json`: one
+  `hisn-error/v1` object on stderr (`code`, `message`), same exit status as
+  today (125 internal, 1 for stop failures).
+- `ls --json`: `supervisor_pid` from the supervisor's own `sessioninfo` reply
+  (additive key; `null` against an older supervisor). `pid` stays `null`.
+- `hisn exec` gets no `--json`; the `exec/exit` journal record is the source.
+- Tests: `run_json_line_shape`, `stop_json_outcome_words_cover_every_path`,
+  `seat_json_shapes`, `rootfs_list_json_shape`, `json_error_selected_by_flag`,
+  `session_info_carries_supervisor_pid`,
+  `ls_json_has_supervisor_pid_and_keeps_pid_null`,
+  `text_requests_unchanged_without_new_options`; leak/host: the host script.
+
+### Block 5: seat credential on stdin (`src/execcli.rs::seat_token`)
+- `--seat-token-file -` reads ONE line from fd 0, byte by byte (never reads
+  past the newline), at most 4096 bytes. A terminal on stdin is refused, empty
+  is an error, and `HISN_SEAT_TOKEN` together with `-` is the existing
+  "both set" error. With `--no-tty` the exec's stdin is `/dev/null` anyway, so
+  nothing is lost; with `--tty` the rest of stdin goes to the program.
+- Tests: `seat_token_stdin_reads_one_line_only`,
+  `seat_token_stdin_empty_is_error`, `seat_token_stdin_with_env_is_error`.
+
+### Block 7: diagnostics (`src/supervisor.rs`, `src/init.rs`, `src/journal.rs`)
+- `session/stop` data gains `cause`, `exit_code` or `signal`+`signal_name`,
+  `duration_ms`, optional `oom_kill_delta`. Cause order is the one in 10.7 item
+  1; pure fn `session_end_cause`. `relay_and_wait` returns the decoded detail
+  (`init::decode_status_detail`) and the TERM/INT/HUP it took; each of those is
+  journaled as `session/signal` (sender unknown) just before `session/stop`.
+- `exec/exit` and `exec/request` gain `exec_id`, `attach`, `pid` only if the
+  values are in scope at the write site; otherwise this part is reported as
+  not done (it does not depend on anything else).
+- Readable renderer shows the cause. 
+- Tests: `session_stop_record_carries_cause_and_status`, `cause_*` (stop
+  request with state `stopping`/`stopped`, idle wins, supervisor signal, command
+  signal/exit, init lost), `decode_status_detail_splits_code_and_signal`,
+  `oom_events_parsing_handles_missing_file`, `readable_session_stop_shows_cause`.
+
+### Block 8: docs and version
+`docs/EXTERNAL-CALLERS.md`, `docs/CONTROL-PROTOCOL.md`, `docs/sessions.md`,
+`README.md`, `CHANGELOG.md`, `docs/releases/v0.6.3.md`; version in the last
+commit. No ADR (the plan assigns none to 0.6.3 content; ADR 0022 was amended
+in Block 1).
+
+### Open risks
+- `session/signal` is written after the signal was handled, so its timestamp is
+  later than the signal; the record says "sender unknown".
+- A hole (exit 4) can also be a corrupted file; the caller restarts from
+  `--info`.
+- `supervisor_pid` is `null` against a pre-0.6.3 supervisor.

@@ -147,6 +147,11 @@ assert any(r["kind"] == "exec/request" for r in recs), [r["kind"] for r in recs]
   if [ $rc -ne 0 ] && grep -qi 'empty' "$W/x.err"; then ok "an empty credential line on stdin is refused"
   else bad "empty credential on stdin" "rc=$rc $(cat "$W/x.err")"; fi
 
+  # --- the credential line is read unbuffered: what follows stays on the pipe
+  rest=$( { printf '%s\nREST-OF-PIPE\n' "$tok" | { Hin 60 exec --no-tty --seat-token-file - --session "$A" -- true >/dev/null 2>&1; cat; }; } )
+  if [ "$rest" = "REST-OF-PIPE" ]; then ok "--seat-token-file - leaves the rest of stdin unread"
+  else bad "stdin read-ahead" "left: [$rest]"; fi
+
   # --- the error object of a failing call
   H 20 stop --session "host063-nosuch" --json >"$W/o" 2>"$W/e"; rc=$?
   if [ $rc -eq 125 ] && py 'import json,sys; d=json.loads(open(sys.argv[1]).read()); assert d["schema"]=="hisn-error/v1" and d["code"] and d["message"]' "$W/e" 2>/dev/null; then
@@ -212,14 +217,9 @@ assert d["cause"] == "command-exit" and d["exit_code"] == 3, d
   if py '
 import json, sys
 d = [json.loads(l)["data"] for l in open(sys.argv[1])][-1]
-assert d["cause"] == "command-signal" and d["signal"] == 9 and d["signal_name"] == "SIGKILL", d
+assert d["cause"] == "command-signal" and d["signal"] == 9 and d["signal_name"] == "KILL", d
 ' "$W/d.jsonl" 2>"$W/pyerr"; then ok "session/stop after a command killed by SIGKILL: command-signal, signal 9 (run exit $rc)"
   else bad "session/stop cause command-signal" "rc=$rc $(cat "$W/pyerr") $(tail -c 300 "$W/d.jsonl")"; fi
-
-  # --- the credential line is read unbuffered: what follows stays on the pipe
-  rest=$( { printf '%s\nREST-OF-PIPE\n' "$tok" | { Hin 20 stop --session host063-nosuch --seat-token-file - >/dev/null 2>&1; cat; }; } )
-  if [ "$rest" = "REST-OF-PIPE" ]; then ok "--seat-token-file - leaves the rest of stdin unread"
-  else bad "stdin read-ahead" "left: [$rest]"; fi
 
   # --- run --json without --detach is refused; ls --json errors are objects
   H 20 run --json --policy "$W/b.toml" -- true >/dev/null 2>"$W/e"; rc=$?

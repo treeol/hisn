@@ -45,7 +45,7 @@ same requests as 0.6.2 for every command that uses no new option.
 ### Changed
 - `hisn journal` (readable output, not `--json`): a `session/stop` line names
   the cause, for example `session stopped (command-exit, exit 3)`, and a new
-  `session/signal` record is shown as `session took SIGTERM`. Journal records
+  `session/signal` record is shown as `session took TERM`. Journal records
   only gain keys.
 - Leak suite timing note: the timing probe printed only a connect to a
   public-class address, which shows network latency. A third line now times

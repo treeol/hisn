@@ -48,14 +48,25 @@ All notable changes to hisn are recorded here. The format follows
 
 ### Verification (this build)
 - CI host (kernel 7.3.3, Landlock ABI v11):
-  `HOST-RUN-062: pass=13 fail=0 timeout=0 skipped=1`.
+  `HOST-RUN-062: pass=11 fail=0 timeout=0 skipped=1`.
   Unit tests 592 passed; 0 failed. Release gate (plain) green
   (fmt, clippy, cross-clippy aarch64/musl, make-check, make-test,
-  leak-suite pipe/pty). Host-verify hermetic 104 pass / 0 fail.
-  Host-verify --real 111 pass / 0 fail. Forced-continue kernel
-  proof: Landlock refuses TCP connect and bind with EACCES.
-  Timing: intercepted median 158 µs, direct 26 µs.
+  leak-suite pipe 467/0, pty 468/0). Host-verify hermetic 104/0.
+  Host-verify --real 111/0. Forced-continue kernel proof: Landlock
+  refuses TCP connect and bind with EACCES on all three chains
+  (main, exec helper, child of exec'd command). Timing comparison
+  (v0.6.1 vs 0.6.2, same host): intercepted 1489.9 vs 1484.6 µs;
+  direct 1485.3 vs 1478.4 µs.
 - Rootfs not available on the CI host; rootfs steps skipped.
+- Leak-suite counts: v0.6.1 466/0/12/4, 0.6.2 467/0/12/4 (pipe);
+  pty 468/0/12/3. Net +1 (two new parity/concurrency cases).
+
+### Known limitations
+- The caller's `O_NONBLOCK` flag is briefly changed while the
+  supervisor completes a blocking connect.
+- Calls interrupted by a signal may be notified again by the kernel.
+- TCP fast-open sends (`MSG_FASTOPEN`) are refused with `EOPNOTSUPP`
+  for every socket type.
 
 
 ## [0.6.1] - 2026-11-19

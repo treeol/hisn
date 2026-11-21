@@ -937,8 +937,25 @@ the listening socket's credentials are the supervisor's. The data
 exchange is unaffected; only the pid field of `SO_PEERCRED` differs.
 
 **Measured evidence (CI host, 2026-11-21).**
-`HOST-RUN-062: pass=13 fail=0 timeout=0 skipped=1` — unit tests 592
+`HOST-RUN-062: pass=11 fail=0 timeout=0 skipped=1` — unit tests 592
 passed; release gate (plain) green; host-verify 104 pass / 0 fail;
 host-verify --real 111 pass / 0 fail; forced-continue kernel proof
-shows Landlock refusing TCP connect and bind with EACCES; timing:
-intercepted median 178 µs, direct 23 µs.
+shows Landlock refusing TCP connect and bind with EACCES on all
+three chains (main command, exec helper, child of exec'd command);
+timing comparison v0.6.1 vs 0.6.2 on the same host: intercepted
+1489.9 vs 1484.6 µs, direct 1485.3 vs 1478.4 µs. Leak-suite: v0.6.1
+466/0/12/4, 0.6.2 467/0/12/4 (pipe), 468/0/12/3 (pty).
+
+### Amendment 0.6.2 closing session — single verdict function
+
+The closing session (Block 2) made `notif::verdict_table` the
+single source of truth for the dispatch path. `verdict_for(CallClass)
+-> Answer` reads the table and is the only function the dispatch
+path in `handle_notif` and `handle_implicit_call` consults. The
+only `FLAG_CONTINUE` write in production code is `continue_reply`,
+reachable only when `verdict_for` returns `KernelContinued`. A
+release-gate gate check (step 0c) fails if a second `FLAG_CONTINUE`
+site appears outside `continue_reply` or `cfg(feature =
+"force-continue")` blocks. The test `verdict_table_continue_only_where_covered`
+enumerates every `CallClass` through `verdict_for` and asserts
+`KernelContinued` only for `ConnectUnix` and `BindUnix`.

@@ -54,7 +54,7 @@ All notable changes to hisn are recorded here. The format follows
   leak-suite pipe/pty). Host-verify hermetic 104 pass / 0 fail.
   Host-verify --real 111 pass / 0 fail. Forced-continue kernel
   proof: Landlock refuses TCP connect and bind with EACCES.
-  Timing: intercepted median 178 µs, direct 23 µs.
+  Timing: intercepted median 158 µs, direct 26 µs.
 - Rootfs not available on the CI host; rootfs steps skipped.
 
 

@@ -949,12 +949,24 @@ timing comparison v0.6.1 vs 0.6.2 on the same host: intercepted
 ### Amendment 0.6.2 closing session — single verdict function
 
 The closing session (Block 2) made `notif::verdict_table` the
-single source of truth for the dispatch path. `verdict_for(CallClass)
--> Answer` reads the table and is the only function the dispatch
-path in `handle_notif` and `handle_implicit_call` consults. The
-only `FLAG_CONTINUE` write in production code is `continue_reply`,
-reachable only when `verdict_for` returns `KernelContinued`. A
-release-gate gate check (step 0c) fails if a second `FLAG_CONTINUE`
+single source of truth for the connect dispatch path.
+`verdict_for(CallClass) -> Answer` reads the table and is the only
+function the connect dispatch in `handle_notif` consults (line 1896).
+`handle_implicit_call`, which handles `bind`, `listen` and the
+defensive fallthrough, does not call `verdict_for`: it classifies
+the socket by namespace cookie and continues only a confirmed
+sandbox socket, which corresponds to the `BindUnix` entry
+(`KernelContinued`) in the table. The two `continue_reply` calls
+in `handle_implicit_call` (AF_UNIX bind at line 1481, defensive
+fallthrough at line 1514) are the only production sites that call
+`continue_reply` without first going through `verdict_for`; both
+are guarded by a prior `SockNs::Sandbox` classification, and the
+fallthrough at line 1514 is unreachable in production (only
+`connect`, `bind` and `listen` are notified, and `connect` goes
+through `handle_notif`).
+
+The only `FLAG_CONTINUE` write in production code is `continue_reply`.
+A release-gate gate check (step 0c) fails if a second `FLAG_CONTINUE`
 site appears outside `continue_reply` or `cfg(feature =
 "force-continue")` blocks. The test `verdict_table_continue_only_where_covered`
 enumerates every `CallClass` through `verdict_for` and asserts

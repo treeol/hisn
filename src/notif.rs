@@ -2733,10 +2733,12 @@ pub fn verdict_table() -> &'static [(CallClass, Answer, &'static str)] {
 }
 
 /// The single authority mapping a [`CallClass`] to its [`Answer`].
-/// The dispatch path in `handle_notif` and `handle_implicit_call` takes
-/// its verdict from this function, which reads the same `verdict_table`
-/// that documents the policy. `KernelContinued` is returned only for
-/// `ConnectUnix` and `BindUnix`.
+/// The connect dispatch path in `handle_notif` takes its verdict from
+/// this function, which reads the same `verdict_table` that documents
+/// the policy. `KernelContinued` is returned only for `ConnectUnix` and
+/// `BindUnix`. `handle_implicit_call` does not call this function: it
+/// classifies the socket by namespace cookie and continues only a
+/// confirmed sandbox socket (corresponding to the `BindUnix` entry).
 fn verdict_for(class: CallClass) -> Answer {
     verdict_table()
         .iter()
@@ -2779,10 +2781,12 @@ fn classify_connect(
 }
 
 /// The single place in the engine that builds a "continue" response
-/// (`FLAG_CONTINUE`). Reachable only when `verdict_for` returns
-/// `KernelContinued` — call sites must have already classified the call
-/// and confirmed the socket is sandbox-side. The gate check in
-/// `scripts/release-gate.sh` fails if a second `FLAG_CONTINUE` site
+/// (`FLAG_CONTINUE`). In `handle_notif` it is called only when
+/// `verdict_for` returns `KernelContinued` (connect dispatch, line 1903).
+/// In `handle_implicit_call` it is called directly after a
+/// `SockNs::Sandbox` classification (AF_UNIX bind at line 1481, defensive
+/// fallthrough at line 1514), not through `verdict_for`. The gate check
+/// in `scripts/release-gate.sh` fails if a second `FLAG_CONTINUE` site
 /// appears outside this function and outside `cfg(feature =
 /// "force-continue")` blocks.
 fn continue_reply(

@@ -119,7 +119,7 @@ const COMMON_CORE: &[(&str, i64)] = syscall_table![
 const KEXEC_FILE_LOAD_NR: i64 = libc::SYS_kexec_file_load;
 
 #[cfg(all(target_arch = "aarch64", target_env = "musl"))]
-const KEXEC_FILE_LOAD_NR: i64 = 295;
+const KEXEC_FILE_LOAD_NR: i64 = 294;
 
 /// Full common table: core entries plus the conditional `kexec_file_load`.
 /// Built at runtime because const-slice concatenation is not stable.

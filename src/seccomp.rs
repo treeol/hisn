@@ -41,7 +41,10 @@ macro_rules! syscall_table {
 
 /// Syscalls present on both x86_64 and aarch64 that hisn knows by name.
 /// (`extra_deny` accepts exactly these plus [`ARCH_SPECIFIC`].)
-const COMMON: &[(&str, i64)] = syscall_table![
+// `SYS_kexec_file_load` is absent from `libc` on `aarch64-unknown-linux-musl`,
+// so it is appended conditionally below. The raw number (295 on aarch64,
+// 320 on x86_64) is used as a fallback where the `libc` constant is missing.
+const COMMON_CORE: &[(&str, i64)] = syscall_table![
     SYS_mount,
     SYS_umount2,
     SYS_pivot_root,
@@ -65,7 +68,6 @@ const COMMON: &[(&str, i64)] = syscall_table![
     SYS_io_uring_register,
     SYS_perf_event_open,
     SYS_kexec_load,
-    SYS_kexec_file_load,
     SYS_reboot,
     SYS_swapon,
     SYS_swapoff,
@@ -108,6 +110,24 @@ const COMMON: &[(&str, i64)] = syscall_table![
     SYS_connect,
     SYS_getpid,
 ];
+
+/// `SYS_kexec_file_load` from `libc` when available; otherwise the raw
+/// syscall number. The constant is absent from `libc` on
+/// `aarch64-unknown-linux-musl` (libc ≤ 0.2.191), so we fall back to
+/// the known number (320 on x86_64, 295 on aarch64).
+#[cfg(any(target_arch = "x86_64", target_env = "gnu"))]
+const KEXEC_FILE_LOAD_NR: i64 = libc::SYS_kexec_file_load;
+
+#[cfg(all(target_arch = "aarch64", target_env = "musl"))]
+const KEXEC_FILE_LOAD_NR: i64 = 295;
+
+/// Full common table: core entries plus the conditional `kexec_file_load`.
+/// Built at runtime because const-slice concatenation is not stable.
+fn common_table() -> Vec<(&'static str, i64)> {
+    let mut v = COMMON_CORE.to_vec();
+    v.push(("SYS_kexec_file_load", KEXEC_FILE_LOAD_NR));
+    v
+}
 
 #[cfg(target_arch = "x86_64")]
 const ARCH_SPECIFIC: &[(&str, i64)] = syscall_table![
@@ -202,7 +222,7 @@ const TARGET: TargetArch = TargetArch::aarch64;
 
 fn lookup(name: &str) -> Option<i64> {
     let full = format!("SYS_{name}");
-    COMMON
+    common_table()
         .iter()
         .chain(ARCH_SPECIFIC)
         .find(|(n, _)| *n == full)

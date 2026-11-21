@@ -1475,11 +1475,10 @@ fn handle_implicit_call(
         }
         if family != libc::AF_INET as u16 && family != libc::AF_INET6 as u16 {
             // Not a TCP bind: AF_UNIX bind in the empty namespace
-            // cannot leave it, so CONTINUE is safe. The socket is
-            // already confirmed sandbox-side above.
-            if id_valid(lfd, n.id) {
-                reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
-            }
+            // cannot leave it, so the kernel may continue. The socket
+            // is already confirmed sandbox-side above. The verdict is
+            // `KernelContinued` for `BindUnix` (verdict table).
+            continue_reply(lfd, n, journal, "af-unix-bind");
             return;
         }
         // I3 low-port parity: the supervisor (creator of the sandbox
@@ -1503,17 +1502,16 @@ fn handle_implicit_call(
         return;
     }
     // Any other notified non-connect call (fast-open sends no longer
-    // reach here; they are answered by the filter). CONTINUE is safe:
-    // Landlock refuses the TCP connect/bind that matters at execution
-    // time. A non-sandbox socket is still refused by classification.
+    // reach here; they are answered by the filter). This fallthrough is
+    // unreachable in production (only connect/bind/listen are notified),
+    // kept as defensive code. A sandbox socket is continued via the
+    // single `continue_reply` site; a non-sandbox socket is refused.
     let cookie = dup
         .as_ref()
         .and_then(|d| socket_netns_cookie(d.as_raw_fd()));
     match classify_ns(cookie, cfg.supervisor_cookie) {
         SockNs::Sandbox => {
-            if id_valid(lfd, n.id) {
-                reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
-            }
+            continue_reply(lfd, n, journal, "implicit-sandbox-fallthrough");
         }
         SockNs::Host => refuse_implicit(lfd, n, libc::EACCES, "host-socket-implicit", journal),
         SockNs::Unknown => refuse_implicit(lfd, n, libc::EACCES, "netns-unknown", journal),
@@ -1810,9 +1808,10 @@ fn handle_notif(
         // unlisted targets are refused here.
         if off_sandbox {
             let public = ip.map(|a| is_public_ip(&a)).unwrap_or(false);
-            let verdict = decide(family, is_loopback, is_stream, public);
-            if !matches!(verdict, Verdict::Allow) {
-                let reason = if matches!(verdict, Verdict::Continue) {
+            let class = classify_connect(family, is_loopback, is_stream, public, sock_ns);
+            let answer = verdict_for(class);
+            if !matches!(answer, Answer::SupervisorExecuted) {
+                let reason = if is_loopback || family == libc::AF_UNIX as u16 {
                     "host-socket-loopback-or-unix"
                 } else {
                     "private-or-unlisted"
@@ -1879,17 +1878,31 @@ fn handle_notif(
     // pool checks id_valid before injecting).
     let continue_allowed = matches!(sock_ns, SockNs::Sandbox);
     let is_public = ip.map(|a| is_public_ip(&a)).unwrap_or(false);
-    let is_inet = family == libc::AF_INET as u16 || family == libc::AF_INET6 as u16;
-    match decide(family, is_loopback, is_stream, is_public) {
-        Verdict::Continue if !continue_allowed => {
-            if id_valid(lfd, n.id) {
-                reply(lfd, n.id, -(libc::EACCES), 0, 0);
-            }
-            if let Some(j) = journal {
-                j.net_record("refuse", "host-socket-loopback-or-unix", n);
-            }
+    // Host/unknown socket: the kernel-continue path (AF_UNIX, loopback)
+    // is not safe — it would run in the supervisor's namespace. Refuse
+    // those targets before classification; the remaining targets fall
+    // through to `verdict_for` with the full policy.
+    if !continue_allowed && (is_loopback || family == libc::AF_UNIX as u16) {
+        refuse(
+            lfd,
+            n,
+            libc::EACCES,
+            "host-socket-loopback-or-unix",
+            journal,
+        );
+        return;
+    }
+    let class = classify_connect(family, is_loopback, is_stream, is_public, sock_ns);
+    match verdict_for(class) {
+        Answer::KernelContinued => {
+            // AF_UNIX (path/abstract) on the sandbox socket: Landlock
+            // does not cover AF_UNIX, and the empty namespace is the
+            // boundary (design B covers the TCP case at kernel level).
+            // The socket is confirmed sandbox-side by cookie, so the
+            // continue cannot leave the empty namespace.
+            continue_reply(lfd, n, journal, "loopback-or-unix");
         }
-        Verdict::Continue if is_inet => {
+        Answer::SupervisorExecuted if matches!(class, CallClass::ConnectLoopbackInet) => {
             // Loopback INET on the sandbox socket: supervisor-executed
             // on the caller's own reference (design A). The single
             // dup_owned reference is the classified object.
@@ -1900,38 +1913,7 @@ fn handle_notif(
                 None => refuse(lfd, n, libc::EACCES, "flags-unreadable", journal),
             }
         }
-        Verdict::Continue => {
-            // AF_UNIX (path/abstract) on the sandbox socket: Landlock
-            // does not cover AF_UNIX, and the empty namespace is the
-            // boundary (design B covers the TCP case at kernel level).
-            // The socket is confirmed sandbox-side by cookie, so a
-            // CONTINUE cannot leave the empty namespace.
-            if id_valid(lfd, n.id) {
-                reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
-            }
-            if let Some(j) = journal {
-                j.net_record("continue", "loopback-or-unix", n);
-            }
-        }
-        Verdict::Refuse => {
-            let reason = if family != libc::AF_UNIX as u16
-                && family != libc::AF_INET as u16
-                && family != libc::AF_INET6 as u16
-            {
-                "unknown-family"
-            } else if !is_stream {
-                "non-stream"
-            } else {
-                "private-or-unlisted"
-            };
-            if id_valid(lfd, n.id) {
-                reply(lfd, n.id, -(libc::EACCES), 0, 0);
-            }
-            if let Some(j) = journal {
-                j.net_record("refuse", reason, n);
-            }
-        }
-        Verdict::Allow => {
+        Answer::SupervisorExecuted => {
             // Fresh socket in the supervisor's (host) netns.
             let domain = family as i32;
             let newfd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
@@ -2034,6 +2016,22 @@ fn handle_notif(
                     }
                 }
             }
+        }
+        Answer::Refused => {
+            let reason = if family != libc::AF_UNIX as u16
+                && family != libc::AF_INET as u16
+                && family != libc::AF_INET6 as u16
+            {
+                "unknown-family"
+            } else if !is_stream {
+                "non-stream"
+            } else {
+                "private-or-unlisted"
+            };
+            refuse(lfd, n, libc::EACCES, reason, journal);
+        }
+        Answer::FilterErrno => {
+            unreachable!("FastopenSend is answered by the BPF filter, not notified")
         }
     }
 }
@@ -2732,6 +2730,73 @@ pub fn verdict_table() -> &'static [(CallClass, Answer, &'static str)] {
             "BPF filter answers EOPNOTSUPP; no notification (C)",
         ),
     ]
+}
+
+/// The single authority mapping a [`CallClass`] to its [`Answer`].
+/// The dispatch path in `handle_notif` and `handle_implicit_call` takes
+/// its verdict from this function, which reads the same `verdict_table`
+/// that documents the policy. `KernelContinued` is returned only for
+/// `ConnectUnix` and `BindUnix`.
+fn verdict_for(class: CallClass) -> Answer {
+    verdict_table()
+        .iter()
+        .find(|(c, _, _)| *c == class)
+        .map(|(_, a, _)| *a)
+        .expect("verdict_table must cover every CallClass")
+}
+
+/// Classify a `connect` notification into its [`CallClass`], using the
+/// same inputs as [`decide`] plus the socket's namespace. A host/unknown
+/// socket is never `KernelContinued`: AF_UNIX and loopback on a host
+/// socket map to `ConnectPrivateOrUnknown` (refused).
+fn classify_connect(
+    family: u16,
+    is_loopback: bool,
+    is_stream: bool,
+    is_public: bool,
+    sock_ns: SockNs,
+) -> CallClass {
+    use libc::{AF_INET, AF_INET6, AF_UNIX};
+    let off_sandbox = matches!(sock_ns, SockNs::Host | SockNs::Unknown);
+    if off_sandbox {
+        // Host/unknown socket: no KernelContinued. Only a public-stream
+        // connect is allowed (re-connect of a failed own socket).
+        if is_stream && is_public && !is_loopback && family != AF_UNIX as u16 {
+            return CallClass::ConnectPublicStream;
+        }
+        return CallClass::ConnectPrivateOrUnknown;
+    }
+    if family == AF_UNIX as u16 {
+        return CallClass::ConnectUnix;
+    }
+    if is_loopback {
+        return CallClass::ConnectLoopbackInet;
+    }
+    if is_stream && is_public && (family == AF_INET as u16 || family == AF_INET6 as u16) {
+        return CallClass::ConnectPublicStream;
+    }
+    CallClass::ConnectPrivateOrUnknown
+}
+
+/// The single place in the engine that builds a "continue" response
+/// (`FLAG_CONTINUE`). Reachable only when `verdict_for` returns
+/// `KernelContinued` — call sites must have already classified the call
+/// and confirmed the socket is sandbox-side. The gate check in
+/// `scripts/release-gate.sh` fails if a second `FLAG_CONTINUE` site
+/// appears outside this function and outside `cfg(feature =
+/// "force-continue")` blocks.
+fn continue_reply(
+    lfd: i32,
+    n: &Notif,
+    journal: &Option<std::sync::Arc<crate::journal::Journal>>,
+    reason: &str,
+) {
+    if id_valid(lfd, n.id) {
+        reply(lfd, n.id, 0, 0, FLAG_CONTINUE);
+    }
+    if let Some(j) = journal {
+        j.net_record("continue", reason, n);
+    }
 }
 
 fn copy_sock_opts(src_fd: &OwnedFd, newfd: i32) -> Option<bool> {
@@ -4080,11 +4145,19 @@ mod tests {
     fn verdict_table_continue_only_where_covered() {
         // I1: every call class has exactly one answer; `KernelContinued`
         // appears only for AF_UNIX (empty namespace) classes. TCP
-        // bind/connect/listen are never continued.
+        // bind/connect/listen are never continued. The test enumerates
+        // every class through `verdict_for`, the same function the
+        // dispatch path uses, so the table and the dispatch path agree.
         let t = verdict_table();
         assert_eq!(t.len(), 8);
         for (class, answer, why) in t {
             assert!(!why.is_empty(), "{class:?} needs a reason");
+            // verdict_for must return the same answer as the table.
+            assert_eq!(
+                verdict_for(*class),
+                *answer,
+                "{class:?}: verdict_for disagrees with table"
+            );
             if matches!(answer, Answer::KernelContinued) {
                 assert!(
                     matches!(class, CallClass::ConnectUnix | CallClass::BindUnix),
@@ -4099,8 +4172,12 @@ mod tests {
             CallClass::Listen,
             CallClass::FastopenSend,
         ] {
-            let ans = t.iter().find(|(c, _, _)| *c == class).unwrap().1;
+            let ans = verdict_for(class);
             assert_ne!(ans, Answer::KernelContinued, "{class:?}");
+        }
+        // KernelContinued only for AF_UNIX connect and bind.
+        for class in [CallClass::ConnectUnix, CallClass::BindUnix] {
+            assert_eq!(verdict_for(class), Answer::KernelContinued, "{class:?}");
         }
     }
 

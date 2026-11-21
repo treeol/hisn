@@ -132,15 +132,66 @@ if cargo metadata --locked --format-version 1 2>/dev/null | grep -q '"force-cont
   :
 fi
 if [ -f target/release/hisn ]; then
-  if strings target/release/hisn 2>/dev/null | grep -q "forced-continue"; then
-    fail "force-continue" "release binary contains the test-only forced-continue path"
+  fc_count=$(grep -ac 'forced-continue' target/release/hisn 2>/dev/null)
+  fc_count=${fc_count:-0}
+  if [ "$fc_count" -gt 0 ]; then
+    fail "force-continue" "release binary contains the test-only forced-continue path ($fc_count matches)"
   fi
+  printf 'release-gate: forced-continue count in release binary: %s\n' "$fc_count"
 fi
 # The feature must not be a default feature.
 if grep -q 'default.*=.*force-continue' Cargo.toml; then
   fail "force-continue" "force-continue is enabled by default"
 fi
 ok "force-continue-absent"
+
+# 0.6.2: the single continue site. `FLAG_CONTINUE` must appear only in
+# `continue_reply` and in `cfg(feature = "force-continue")` blocks (which
+# are not in release builds). Any other `FLAG_CONTINUE` write site fails
+# the gate — it means the dispatch path bypasses `verdict_for`.
+step 0c "single FLAG_CONTINUE site in notif.rs"
+bad_sites=$(python3 -c '
+import sys
+lines = open("src/notif.rs").readlines()
+in_fc = False
+in_cr = False
+fc_depth = 0
+cr_depth = 0
+bad = []
+for i, line in enumerate(lines, 1):
+    stripped = line.strip()
+    if "cfg(feature = \"force-continue\")" in line and not stripped.startswith("//"):
+        in_fc = True
+        fc_depth = 0
+        continue
+    if in_fc:
+        for ch in stripped:
+            if ch == "{": fc_depth += 1
+            elif ch == "}": fc_depth -= 1
+        if fc_depth <= 0 and stripped.startswith("}"):
+            in_fc = False
+        continue
+    if "fn continue_reply" in line and not stripped.startswith("//"):
+        in_cr = True
+        cr_depth = 0
+        continue
+    if in_cr:
+        for ch in stripped:
+            if ch == "{": cr_depth += 1
+            elif ch == "}": cr_depth -= 1
+        if cr_depth <= 0 and stripped.startswith("}"):
+            in_cr = False
+        continue
+    if "FLAG_CONTINUE" in line and "pub const" not in line and not stripped.startswith("//"):
+        bad.append("  line %d: %s" % (i, stripped))
+if bad:
+    print("\\n".join(bad))
+    sys.exit(1)
+' 2>&1 || true)
+if [ -n "$bad_sites" ]; then
+  fail "single-continue-site" "FLAG_CONTINUE appears outside continue_reply:$bad_sites"
+fi
+ok "single-continue-site"
 
 step 1 "cargo fmt --check"
 cargo fmt --check || fail "fmt" "cargo fmt --check exited $?"

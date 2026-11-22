@@ -26,7 +26,7 @@ only when it is granted, and every grant ends with the session.
   can be imported once with `hisn rootfs import` and reused by every session.
 - **Named sessions.** A session has a name, a recorded state (`creating`,
   `running`, `stopping`, `stopped`, `crashed`) and an optional `idle_timeout`
-  after which an unused session stops.
+  after which an unused session stops. A running detached exec counts as use.
 - **Exec and attach.** Commands and interactive shells run inside a running
   session. Every request carries a client record (uid and pid from
   `SO_PEERCRED`, and a label), and one `authorize()` function decides every
@@ -109,6 +109,10 @@ hisn rootfs import dev --from-image debian:12           # import one image; need
 hisn run --name demo --detach --rootfs-path "$(hisn rootfs path dev)"
                                                         # prints "<id> demo ready"
 hisn exec --session demo -- uname -a                    # run a command in the session
+hisn exec --detach --session demo -- sleep 600           # runs on after the client; prints exec_id (0.6.4)
+hisn exec-status --session demo --exec e-1 --json        # state of a detached exec
+hisn exec-output --session demo --exec e-1 --offset 0    # its stdout from a byte offset (--stream stderr)
+hisn exec-signal --session demo --exec e-1 --signal TERM # TERM, INT, KILL or HUP
 hisn attach --session demo                              # interactive shell; Ctrl-] d detaches
 hisn note --session demo "first test run"               # add a note to the journal
 hisn journal --session demo --last 10                   # show the last 10 events

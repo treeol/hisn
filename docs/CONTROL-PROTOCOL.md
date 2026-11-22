@@ -92,6 +92,8 @@ Error response: `{"ok":false,"error":"<CODE>","message":"…"}`.
 | `E_INTERNAL` | the sandbox failed (setup, a hard revoke that could not complete — the session is then killed, a supervisor error). |
 | `E_UNAUTHORIZED` | the authorization seam refused the request (the peer was not the session owner; or a presented seat credential is unknown, revoked or expired; or the seat's role does not allow the op). The message names the seat, the op and the required role. |
 | `E_EXEC` | the program could not be started (confinement failed, not found, not executable). |
+| `E_UNSUPPORTED` | **0.6.4**: `detach` or one of `execstatus`/`execoutput`/`execsignal` from a client that declares no `protocol_version` or one below 4. Answered after authorization, before any effect. |
+| `E_BUSY` | **0.6.4**: 32 detached execs are already running in the session. |
 | `E_VERSION` | **0.5.0**: the request declares a protocol revision newer than the supervisor supports. The message names the supported revision. See "Version rule". An unknown op string is never `E_VERSION`: it fails parsing first and is answered `E_BAD_REQUEST` + close, exactly as in 0.4.3. |
 
 There are no CLI exit codes for these wire errors: a client maps a failed
@@ -221,6 +223,64 @@ ids are separated); `--json` keeps each original record. See
 program's process group. `E_NOT_FOUND` for a stale `exec_id`, a recycled
 `pid`, or a pid that is not a live exec of this session.
 
+### `exec` with `detach` (0.6.4, revision 4)
+
+```json
+{"op":"exec","argv":["x"],"detach":true,"client":{"protocol_version":4}}
+```
+
+`detach` (bool; the CLI omits the key unless `--detach`) conflicts with `tty` and
+`attach`, and the request carries **no** fds: the supervisor builds stdin
+(`/dev/null`) and two pipes. Reply, then the connection may be closed (the exec
+runs on): `{"ok":true,"pid":N,"exec_id":"e-n","incarnation":"…","detached":true}`.
+A detached exec is identified by `(incarnation, exec_id)`; the incarnation is
+created once per supervisor start. Needs `client.protocol_version >= 4`
+(`E_UNSUPPORTED` otherwise); `E_BUSY` beyond 32.
+
+### `execstatus` (0.6.4, revision 4)
+
+```json
+{"op":"execstatus","exec_id":"e-1","incarnation":"20261122T101500Z-9f3a"}
+```
+
+`incarnation` is optional, default the live one. Reply: a `hisn-exec-state/v1` object: `incarnation`,
+`exec_id`, `seat` (string or null), `argv0`, `started`, `ended`, `state`
+(`running`, `exited`, `signalled`, `lost`), `exit_code`, `signal`, `signal_name`,
+`cause` (`exit`, `signal`, `exec-signal`, `session-stop`), `pid`, `output_open`,
+`stdout` and `stderr` as `{"total","base"}`. An older incarnation is read from
+its state file.
+
+### `execoutput` (0.6.4, revision 4)
+
+```json
+{"op":"execoutput","exec_id":"e-1","stream":"stdout","offset":0,"max":1048576}
+```
+
+`stream` default `stdout`; `max` default and cap 1 MiB; `offset` an absolute
+byte offset). Reply: `data_b64`, `offset` (where the data starts), `next`,
+`total`, `oldest`, `rotated_away` (the requested offset was older than the kept
+tail; data starts at `oldest`), `eof` (the exec is final, the stream's pump saw
+EOF and `next == total`), `state`. An offset beyond `total` returns empty data
+with `offset = next = total`. Each stream keeps two files of 8 MiB.
+
+### `execsignal` (0.6.4, revision 4)
+
+```json
+{"op":"execsignal","exec_id":"e-1","signal":"TERM"}
+```
+
+The signal is `TERM`, `INT`,
+`KILL` or `HUP`. Live incarnation only. Success: `{"ok":true,"exec_id","incarnation"}`.
+The legacy `signal` op refuses a detached exec with `E_BAD_REQUEST`.
+
+**Authorization of the exec target.** `authorize` takes the target's seat.
+Owner: all three ops. Member: `execstatus`, `execoutput` for any exec;
+`execsignal` only when the exec was started by the same seat. Observer:
+`execstatus` only. A member's `execsignal` for an unknown exec, an exec of
+another incarnation or an owner-started exec is `E_UNAUTHORIZED` (no existence
+oracle). Refusals are journaled as `execstatus/refused`, `execoutput/refused`,
+`execsignal/refused`.
+
 ### `note` (0.5.0)
 
 ```json
@@ -300,7 +360,7 @@ directions**:
 
 - The supervisor records its own version in `session.json` as the optional
   `hisn_version` field (e.g. `"0.5.0-dev"`) and its protocol revision as
-  `protocol_revision` (this build: `3`), both written at session creation.
+  `protocol_revision` (this build: `4`; the version commands declare is still `3`, see below), both written at session creation.
   A pre-0.5.0 `session.json` has neither field (or a `null`).
 - `hisn_version` is **information only and is never compared** — not by the
   CLI, not by the supervisor. The gate is the integer revision: that is what
@@ -313,7 +373,7 @@ directions**:
   still-running 0.4.3 supervisor behaves exactly as 0.4.3 for the old ops,
   and for a new op (`note`) it refuses locally rather than sending an op the
   old supervisor would close.
-- The supervisor speaks protocol revision `3`. A request that declares a
+- The supervisor speaks protocol revision `4` (0.6.4). A request that declares a
   revision **newer** than the supervisor's is answered
   `{"ok":false,"error":"E_VERSION", …}` naming the supported revision,
   before any effect and before the connection counts as a client. Requests
@@ -325,6 +385,18 @@ directions**:
   `deny_unknown_fields`, so a 0.4.3 reader ignores the new `hisn_version`,
   `protocol_revision` and `workspace` fields, and a 0.5.0 reader loads a
   0.4.3 file with `None`.
+
+### Revision 4 and the declared version (0.6.4)
+
+Two numbers. `PROTOCOL_REVISION` is 4: what the supervisor speaks and writes to
+`session.json` (`protocol_revision`). The **declared** `client.protocol_version`
+of every existing command stays `3`, so their request bytes equal 0.6.3's
+(pinned by a fixture recorded from a v0.6.3 build). Only `exec --detach`,
+`exec-status`, `exec-output` and `exec-signal` declare `4`. The supervisor
+accepts clients declaring 3 and 4 and still answers `E_VERSION` to a client
+declaring more than 4. A 0.6.4 CLI that finds a session with revision below 4
+refuses the four new commands locally (exit 125, `hisn-error/v1` code
+`E_UNSUPPORTED`) and sends nothing.
 
 ## `ls --json` (the on-disk schema)
 

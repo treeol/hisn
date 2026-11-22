@@ -7,6 +7,63 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-11-22
+
+hisn 0.6.4 lets an exec outlive its client and makes the journal cursor cheap.
+The control protocol moves to revision 4; the version existing commands declare
+stays 3, so a 0.6.3 supervisor and a 0.6.3 CLI keep working with it.
+
+### Added
+- `hisn exec --detach`: the command runs under the session supervisor with the
+  same sandbox, network policy and seat attribution as any exec, and the CLI
+  returns at once with a `hisn-exec-start/v1` object (`exec_id`, `incarnation`,
+  `pid`). It survives the death of the client. At most 32 run at once per
+  session (`E_BUSY`); a running one keeps the session from counting as idle.
+- `hisn exec-status` (`hisn-exec-state/v1`), `hisn exec-output` (stdout or
+  stderr from an absolute byte offset; `next`, `rotated_away`, `eof`) and
+  `hisn exec-signal` (TERM, INT, KILL, HUP). Roles: the owner may do all, a
+  member may read any exec and signal only its own seat's, an observer reads
+  status only. Each stream keeps the last 16 MiB (two files of 8 MiB); finished
+  execs are removed with journal retention or beyond 256.
+- `exec/exit` of a detached exec carries `incarnation`, `exec_id`, `seat`, `pid`
+  and `cause` (`exit`, `signal`, `exec-signal`, `session-stop`); `execsignal/delivered`
+  records each signal; `session/stop` lists `detached_execs_ended`. Stopping a
+  session ends its detached execs (TERM, then KILL after 2 s).
+- `ls --json` gains `incarnation` and lists detached execs.
+- `hisn journal --after-wseq` reads through a cache (`journal.idx.<inode>`). A
+  line that cannot be read now yields a `journal/unreadable` record per missing
+  sequence number, so the cursor moves on; a real hole is still exit 4.
+  `journal --info` gains `unreadable`.
+- `make release-gate` also runs the net harness (detached-exec cases included)
+  and the 0.6.3 compatibility script against a binary built from tag v0.6.3.
+
+### Changed
+- Protocol revision 4, declared version 3: the supervisor writes revision 4;
+  existing commands still declare 3 and send the same bytes as 0.6.3. Only
+  `--detach` and the three new commands declare 4. Against an older session the
+  CLI refuses them locally (exit 125, `E_UNSUPPORTED`); a new supervisor answers
+  `E_UNSUPPORTED` to a client declaring less.
+- The legacy `signal` op refuses a detached exec (`E_BAD_REQUEST`, use
+  `exec-signal`).
+- `journal --info` now scans each journal file once (to count unreadable lines);
+  later calls extend a cached index.
+
+### Measured
+- `journal --after-wseq` on a journal of 100 000 records, 10 records behind the
+  end: median 114 ms with 0.6.3, 3 ms with 0.6.4 (test machine).
+
+### Known limits
+- If the pump cannot rotate a stream file, it keeps appending and the 8 MiB
+  bound is exceeded; no data is lost.
+- Output of a detached exec cannot be read once its session has stopped; the
+  files stay in the workspace directory.
+- On the cursor path, the stderr count of skipped lines covers only the lines
+  that were read, not the whole journal.
+- A killed `journal` reader can leave a `journal.idx.<inode>.tmp*` file; the
+  next index write removes it.
+- `setsid` backgrounding still works with its old limits (no status or output,
+  idle accounting does not see it).
+
 ## [0.6.3] - 2026-11-21
 
 hisn 0.6.3 makes the CLI usable from an external service that hosts sessions

@@ -1965,8 +1965,8 @@ mod tests {
                 assert_eq!(field.req_id.as_deref(), Some("7f3a"));
             }
         }
-        // The doc documents exactly the 13 ops (8 of 0.4.3 + note + the
-        // four 0.5.1 seat ops) and one client field example. Adding an op
+        // The doc documents exactly the 17 ops (8 of 0.4.3 + note + the
+        // four 0.5.1 seat ops + the detached exec and the three 0.6.4 exec ops) and one client field example. Adding an op
         // to either side without the other fails here.
         assert_eq!(
             ops_seen,
@@ -1979,6 +1979,10 @@ mod tests {
                 "kill",
                 "exec",
                 "signal",
+                "exec",
+                "execstatus",
+                "execoutput",
+                "execsignal",
                 "note",
                 "seat-add",
                 "seat-ls",
@@ -2006,6 +2010,8 @@ mod tests {
             E_UNAUTHORIZED,
             E_EXEC,
             E_VERSION,
+            E_UNSUPPORTED,
+            E_BUSY,
         ];
         for code in real {
             assert!(

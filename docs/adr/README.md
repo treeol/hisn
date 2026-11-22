@@ -27,6 +27,7 @@ note in the same file.
 | [0017](0017-session-env-snapshot.md) | accepted | `--env K=V` at run declares a session env snapshot; precedence: scrub < declared < computed; E_ENV_LOCKED. |
 | 0018 | draft, not in the tree | Egress proxy default (draft; the proxy is planned, not yet scheduled). |
 | [0019](0019-leases-and-idle.md) | accepted | Leases: idle_timeout from the policy; idle = zero clients ∧ no exec ∧ timeout elapsed; stop keeps the dir; prune archives first. |
+| [0023](0023-detached-exec.md) | accepted | Detached exec: one spawn path, supervisor-owned output files with absolute offsets, owner/member/observer rules, protocol revision 4 with declared version 3. |
 
 Status `proposed` means the record was written as a design and is not fully
 matched by what shipped; the line under its status names the gap. An `accepted`

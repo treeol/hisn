@@ -292,7 +292,7 @@ connection leaves `clients` when it closes.
 `[session] idle_timeout` in the policy is a duration string; the default is
 none, meaning the session never expires. `last_activity` is updated on
 admitted requests, at most every 10 s. A session is idle when all of these
-hold: no connected client, no running exec, and the timeout has elapsed since
+hold: no connected client, no running exec (a detached exec, 0.6.4, counts), and the timeout has elapsed since
 the later of the last admitted request and the last client disconnect (the
 session start counts as activity). The session's main command does not count as
 activity, so set `idle_timeout` only on sessions whose main command is a
@@ -303,6 +303,18 @@ On expiry the audit gets a line with `op:"lease"`, `stage:"expired"` and
 `hisn stop`. A foreground `hisn run` prints
 `hisn: session <name|id> stopped: idle for <d> (idle_timeout <d>)` on stderr
 and exits 143. `hisn ls` shows the timeout in the LEASE column.
+
+## Detached execs (0.6.4)
+
+`hisn exec --detach` starts a command that outlives the client. Its output goes
+to `<workspace>/exec/<incarnation>-e<N>.{stdout,stderr}` (mode 0600, directory
+0700; at 8 MiB a file becomes `.1`, so 16 MiB per stream are kept) with a
+`.state.json` next to them. `hisn exec-status`, `exec-output --offset` and
+`exec-signal` use them; see [EXTERNAL-CALLERS.md](EXTERNAL-CALLERS.md) and
+[ADR 0023](adr/0023-detached-exec.md). A running one keeps the session from
+being idle, so `idle_timeout` does not stop a session under it. `hisn stop`
+and idle expiry end detached execs (TERM, KILL after 2 s). Finished execs'
+files are deleted when older than the oldest journal record or beyond 256.
 
 ## Stopping
 

@@ -1,4 +1,4 @@
-# Driving hisn from an external service (0.6.3)
+# Driving hisn from an external service (0.6.4)
 
 This guide is for a service that hosts hisn sessions for several people and
 talks to hisn only through the CLI, for example over non-interactive SSH. It
@@ -81,23 +81,53 @@ Each tool call is `hisn exec --no-tty --session <id> -- <argv>`. The call lasts
 as long as the program; killing the `hisn exec` client ends the program (TERM,
 then KILL after about 5 s).
 
-**A long-running command until 0.6.4.** Start it detached from the call:
+**A long-running command: detached exec (0.6.4).** Start it under the
+supervisor and come back to it later:
 
 ```sh
-hisn exec --no-tty --session seat-a -- sh -c \
-  'setsid sh -c "echo \$\$ >/work/dev.pid; exec dev-server >/work/dev.log 2>&1" \
-     >/dev/null 2>&1 </dev/null &'
+hisn exec --detach --session seat-a -- dev-server
+# {"schema":"hisn-exec-start/v1","exec_id":"e-3","incarnation":"20261122T101500Z-9f3a","pid":41}
+hisn exec-status --session seat-a --exec e-3 --json
+hisn exec-output --session seat-a --exec e-3 --offset 0          # raw bytes; "next=<n> [rotated_away oldest=<n>] [eof]" on stderr
+hisn exec-output --session seat-a --exec e-3 --stream stderr --offset 4096 --json
+hisn exec-signal --session seat-a --exec e-3 --signal TERM       # TERM, INT, KILL or HUP
 ```
 
-The process survives the end of the exec call (measured on 0.6.2, probe E11).
-The shape is the one probe E11 measured: `setsid`, every descriptor redirected, backgrounded with `&`. The job writes its own pid to a file in the session and its output to a log file; find it again by that pid (`hisn exec ... -- kill -0 <pid>`). There is
-no status or output capture; 0.6.4 replaces this with a detached exec that has
-both. Two limits:
+- `exec --detach` returns at once and the command survives the client. It runs
+  in the same sandbox, with the same network policy and seat, as any exec. Its
+  stdin is `/dev/null`; stdout and stderr are captured by the supervisor. It
+  cannot be combined with `--tty` or `attach`. At most 32 per session
+  (`E_BUSY`).
+- **Identity** is `(incarnation, exec_id)`. `--incarnation` selects an older
+  one for status and output; signalling works on the live one only.
+- **Output by offset.** Offsets are absolute byte offsets in the stream.
+  Keep `next` and pass it as the next `--offset`. Each stream keeps the last
+  16 MiB (two files of 8 MiB). If your offset is older than what is kept the
+  read starts at `oldest` and reports `rotated_away: true`. `eof: true` means
+  the exec is finished, the pipe is drained and you have read to `total`;
+  an empty read with `eof: false` means poll again.
+- **Roles.** Owner: everything. Member: read status and output of any exec,
+  signal only execs started by its own seat. Observer: status only. A refusal
+  is exit 125 with a `hisn-error/v1` object and is journaled
+  (`execsignal/refused` and so on).
+- **Lifecycle.** The `exec/exit` journal record carries `incarnation`,
+  `exec_id`, `seat`, `pid` and `cause` (`exit`, `signal`, `exec-signal`,
+  `session-stop`). Stopping the session ends detached execs (TERM, then KILL
+  after 2 s) and `session/stop` lists them in `detached_execs_ended`. A running
+  detached exec keeps the session from being idle.
+- **Retention.** Files of a finished exec are removed when older than the
+  oldest journal record or beyond 256 finished execs. After the session has
+  stopped there is no supervisor to read output; the files stay in the
+  workspace directory.
+- The four commands need a session of protocol revision 4 (started by a 0.6.4
+  supervisor): older sessions give exit 125 with code `E_UNSUPPORTED`.
+  Existing commands are unaffected.
+- The legacy `signal` refuses a detached exec: use `exec-signal`.
 
-1. The session's idle timeout can stop the session while only such a job runs:
-   idle accounting counts connected clients and live execs, not background
-   processes. Do not set `idle_timeout` on a session that runs these jobs.
-2. Network records of the reparented process carry no seat (`seat: null`).
+**`setsid` still works** as before (probe E11: `setsid`, every descriptor
+redirected, backgrounded with `&`), with its old limits: no status or output
+capture, the idle timeout can stop the session while only such a job runs, and
+network records of the reparented process carry no seat (`seat: null`).
 
 ## Journal cursor
 
@@ -116,14 +146,25 @@ hisn journal --workspace seat-a --after-wseq 4711 --json
   several processes, so read `wseq` from the records, never count lines.
 - Exit 3: `N` is larger than the newest record, so the journal was reset or
   replaced. Restart from `--info`.
-- Exit 4: the records after `N` have a hole (expected `wseq` missing). Read once
-  more; if it repeats, restart from `--info`.
+- Exit 4: the records after `N` have a hole (expected `wseq` missing) that no
+  unreadable line explains. Read once more; if it repeats, restart from `--info`.
 - Exit 0 with a stderr warning "cursor behind retention": records between `N`
   and the oldest one on disk were deleted by retention (the journal is read
   twice before this is reported, to rule out a rotation in flight). Take what
   is returned.
-- Reading costs the whole journal each poll (up to about 256 MiB on disk); poll
-  at seconds, not milliseconds.
+- Reading is cheap (0.6.4): the reader seeks with a cache
+  `journal.idx.<inode>` next to the journal (verified on every use; any doubt
+  falls back to a full read) and parses about the records after your cursor.
+  Median 114 ms to 3 ms on 100 000 records (test machine). Still no follow
+  mode: poll. `--info` scans each file once to count unreadable lines.
+- **Unreadable lines.** A line that cannot be parsed no longer blocks the
+  cursor. When it explains missing sequence numbers you get one
+  `journal/unreadable` record per number (`data`: `file`, `offset`,
+  `wseq_from`, `wseq_to`, `count`) and the cursor moves on. `journal --info`
+  has an `unreadable` field (count over all files). A hole that no unreadable
+  line explains is still exit 4. On this path the stderr "skipped N lines"
+  count covers only what was read. Plain `hisn journal` (no cursor) does not
+  emit the record.
 - With `--json` the exit 3 and 4 failures print a `hisn-error/v1` object
   (`E_CURSOR_RESET`, `E_CURSOR_GAP`) on stderr.
 

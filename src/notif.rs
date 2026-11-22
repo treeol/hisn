@@ -4279,7 +4279,7 @@ mod tests {
     #[test]
     fn verdict_table_continue_only_where_covered() {
         // I1: every call class has exactly one answer; `KernelContinued`
-        // appears only for AF_UNIX (empty namespace) classes. TCP
+        // appears only for AF_UNIX (empty namespace) classes and netlink bind. TCP
         // bind/connect/listen are never continued. The test enumerates
         // every class through `verdict_for`, the same function the
         // dispatch path uses, so the table and the dispatch path agree.

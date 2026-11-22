@@ -968,6 +968,36 @@ else
   fail "DX5 session starts" "[$(cat "$T/$DX5.log" 2>/dev/null)]"
 fi
 
+# DX12 (0.6.4 round 2): `hisn stop` gives a detached exec its TERM while the
+# sandbox still lives: a program that traps TERM runs its handler before it is
+# gone, and the journal says session-stop.
+DX12="$TOKEN-dx12"
+DX12CWD="$T/dx12-cwd"
+write_policy "$T/dx12.toml" "$DX12CWD" none
+if start_session "$DX12" "$DX12CWD" --policy "$T/dx12.toml" sleep 3600; then
+  DX12WS=$(session_field "$DX12" workspace.id)
+  DX12_OUT=$(dx_start "$DX12" sh -c "trap 'echo got-term >$DX12CWD/dx12.out; exit 0' TERM; echo ready >$DX12CWD/dx12.ready; while :; do sleep 1; done")
+  DX12_ID=$(dx_id "$DX12_OUT")
+  wait_file "$DX12CWD/dx12.ready" 10
+  timeout 60 "$HISN" stop --session "$DX12" </dev/null >/dev/null 2>&1
+  if [ "$(cat "$DX12CWD/dx12.out" 2>/dev/null)" = got-term ]; then pass "DX12 session stop delivers TERM to a detached exec before the sandbox ends (the trap ran)"; else fail "DX12 session stop delivers TERM to a detached exec before the sandbox ends (the trap ran)" "[$(cat "$DX12CWD/dx12.out" 2>&1)]"; fi
+  DX12_J=$(journal "$DX12WS" | python3 -c '
+import json,sys
+eid=sys.argv[1]
+e=s=False
+for l in sys.stdin:
+    l=l.strip()
+    if not l: continue
+    r=json.loads(l); d=r.get("data",{})
+    if r["kind"]=="exec/exit" and d.get("exec_id")==eid and d.get("cause")=="session-stop": e=True
+    if r["kind"]=="session/stop" and any(x.get("exec_id")==eid for x in d.get("detached_execs_ended",[])): s=True
+print("exit=%s stop=%s" % (e,s))
+' "$DX12_ID")
+  if [ "$DX12_J" = "exit=True stop=True" ]; then pass "DX12 journal: exec/exit cause session-stop and session/stop lists the exec"; else fail "DX12 journal: exec/exit cause session-stop and session/stop lists the exec" "[$DX12_J]"; fi
+else
+  fail "DX12 session starts" "[$(cat "$T/$DX12.log" 2>/dev/null)]"
+fi
+
 # DX10: a running detached exec keeps its session alive past the idle timeout;
 # once it ends, the session idles out.
 DX10="$TOKEN-dx10"
@@ -989,6 +1019,47 @@ if start_session "$DX10" "$DX10CWD" --policy "$T/dx10.toml" sleep 3600; then
   if [ "$DX10_GONE" = 0 ]; then pass "DX10 after the exec ended the session idled out ($(session_field "$DX10" state))"; else fail "DX10 after the exec ended the session idled out" "still running after 30 s"; fi
 else
   fail "DX10 session starts" "[$(cat "$T/$DX10.log" 2>/dev/null)]"
+fi
+
+# DX11 (0.6.4 round 2): a grandchild keeps the output pipe open after the
+# exec ended. The state turns final at once with output_open true; later
+# output (here 20 MiB, past a rotation) is still read with correct offsets,
+# and eof arrives only when the grandchild closes the pipe.
+cat >"$ACWD/dx11.py" <<'PY'
+import sys, time
+time.sleep(4)
+p = b'0123456789abcdef\n'
+n = 20 * 1024 * 1024
+sys.stdout.buffer.write((p * (n // len(p) + 1))[:n])
+sys.stdout.buffer.flush()
+PY
+DX11_OUT=$(dx_start "$A" sh -c "python3 '$ACWD/dx11.py' & exit 0")
+DX11_ID=$(dx_id "$DX11_OUT")
+if dx_wait_state "$A" "$DX11_ID" exited; then
+  sleep 3
+  DX11_ST=$(timeout 20 "$HISN" exec-status --session "$A" --exec "$DX11_ID" --json </dev/null 2>&1)
+  if [ "$(printf '%s' "$DX11_ST" | jget output_open)" = true ] && [ "$(printf '%s' "$DX11_ST" | jget state)" = exited ]; then
+    pass "DX11 exited state is final while a grandchild holds the pipe (output_open true after the 2 s drain)"
+  else
+    fail "DX11 exited state is final while a grandchild holds the pipe (output_open true after the 2 s drain)" "[$DX11_ST]"
+  fi
+  DX11_OK=0
+  for _ in $(seq 150); do
+    DX11_R=$(timeout 20 "$HISN" exec-output --session "$A" --exec "$DX11_ID" --offset 20971000 --json </dev/null 2>/dev/null | jget eof)
+    [ "$DX11_R" = true ] && { DX11_OK=1; break; }
+    sleep 0.2
+  done
+  DX11_ST=$(timeout 20 "$HISN" exec-status --session "$A" --exec "$DX11_ID" --json </dev/null 2>&1)
+  DX11_F=$(timeout 20 "$HISN" exec-output --session "$A" --exec "$DX11_ID" --offset 0 --json </dev/null 2>&1)
+  if [ "$DX11_OK" = 1 ] && [ "$(printf '%s' "$DX11_ST" | jget output_open)" = false ] \
+    && [ "$(printf '%s' "$DX11_ST" | jget stdout.total)" = 20971520 ] && [ "$(printf '%s' "$DX11_ST" | jget stdout.base)" = 8388608 ] \
+    && [ "$(printf '%s' "$DX11_F" | jget oldest)" = 8388608 ] && [ "$(printf '%s' "$DX11_F" | jget rotated_away)" = true ]; then
+    pass "DX11 late output after the exec ended: eof arrives, output_open false, total 20 MiB, base moved past the rotation"
+  else
+    fail "DX11 late output after the exec ended: eof arrives, output_open false, total 20 MiB, base moved past the rotation" "ok=$DX11_OK [$DX11_ST]"
+  fi
+else
+  fail "DX11 the exec ends" "[$DX11_OUT]"
 fi
 
 check "net harness: open session stops cleanly" "" timeout 30 "$HISN" stop --session "$A" </dev/null

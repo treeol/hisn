@@ -362,6 +362,9 @@ pub struct Shared {
     detached: execlog::Registry,
     /// 0.6.4: the 32-detached-exec limit.
     detach_slots: Arc<execlog::Slots>,
+    /// `detached_execs_ended` of the stop sequence (it may run before init is
+    /// signalled and again after it is gone; the list is kept across both).
+    stop_ended: Mutex<Vec<Value>>,
 }
 
 /// 0.4.1 R2: the live control connections. The client count and the per-
@@ -1894,6 +1897,16 @@ impl Shared {
         self.exec_seats.lock().expect("exec_seats").remove(&pid);
         self.detached.remove(exec_id);
         self.prune_exec_logs();
+        // B10 (round 2): a grandchild may hold the pipes past `DRAIN_WAIT`.
+        // Keep this entry alive (its rotation hook is a `Weak` to it, and it
+        // owns the state-file writer) until both pumps have seen EOF, then
+        // write the final counters and `output_open: false`. The pumps end
+        // at the latest when the session's sandbox is gone.
+        while !execlog::wait_pumps(
+            &[&w.entry.stdout, &w.entry.stderr],
+            std::time::Duration::from_secs(1),
+        ) {}
+        w.entry.update(|_| {});
     }
 
     /// Retention of finished execs' files (plan 2.5): at supervisor start
@@ -1912,7 +1925,7 @@ impl Shared {
     /// The session-stop sequence for detached execs (plan 7 B9); returns the
     /// `detached_execs_ended` list for `session/stop`.
     fn stop_detached(&self) -> Vec<Value> {
-        execlog::stop_sequence(
+        let ended = execlog::stop_sequence(
             &self.detached,
             &self.incarnation,
             &|id, sig| {
@@ -1920,7 +1933,10 @@ impl Shared {
             },
             std::time::Duration::from_secs(2),
             std::time::Duration::from_secs(5),
-        )
+        );
+        let mut all = self.stop_ended.lock().expect("stop_ended");
+        all.extend(ended);
+        all.clone()
     }
 
     /// The authorization target of an exec op (plan 7 B11): for `execsignal`
@@ -2756,6 +2772,20 @@ impl Handler for Ctl {
                     .log_client("kill", "request", None, None, Some(&signal), &client, true);
                 match control::parse_signal(&signal) {
                     None => err(control::E_BAD_REQUEST, format!("unknown signal {signal:?}")),
+                    // B9 (round 2): `hisn stop` is this op. A terminating
+                    // signal first runs the detached-exec stop sequence (TERM,
+                    // KILL after 2 s) while the sandbox and the monitors
+                    // still live, then reaches init. Off the control thread,
+                    // so the reply is not delayed; a second request while it
+                    // runs finds the execs gone or stopping.
+                    Some(s) if matches!(s, libc::SIGTERM | libc::SIGINT | libc::SIGHUP) => {
+                        let sh = Arc::clone(&self.sh);
+                        thread::spawn(move || {
+                            let _ = sh.stop_detached();
+                            let _ = sys::kill(sh.init_pid, s);
+                        });
+                        ok(json!({}))
+                    }
                     Some(s) => match sys::kill(self.sh.init_pid, s) {
                         Ok(()) => ok(json!({})),
                         Err(e) => err(control::E_INTERNAL, e.to_string()),
@@ -4091,7 +4121,9 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
 
     // Phase: wait (idle timer + relay).
     let idle_timer = start_idle_timer(&policy, &shared, pid);
-    let relay = relay_and_wait(pid, master, tty);
+    let relay = relay_and_wait(pid, master, tty, &|| {
+        let _ = shared.stop_detached();
+    });
     let code = relay.code;
     // 0.6.4 (B9): init is gone. Set the stop flag at once (a waiter that sees
     // its status socket close waits for it, bounded) and end the detached
@@ -4628,6 +4660,7 @@ fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
         incarnation: execlog::new_incarnation(),
         detached: execlog::Registry::default(),
         detach_slots: execlog::Slots::new(execlog::MAX_DETACHED),
+        stop_ended: Mutex::new(Vec::new()),
         next_exec_id: std::sync::atomic::AtomicU64::new(1),
         seq: std::sync::atomic::AtomicU64::new(1),
         conns: Mutex::new(ConnRegistry::default()),
@@ -5147,7 +5180,12 @@ struct RelayEnd {
     signals: Vec<i32>,
 }
 
-fn relay_and_wait(init_pid: i32, master: Option<OwnedFd>, tty: bool) -> RelayEnd {
+fn relay_and_wait(
+    init_pid: i32,
+    master: Option<OwnedFd>,
+    tty: bool,
+    before_stop_signal: &dyn Fn(),
+) -> RelayEnd {
     let handled = [
         libc::SIGTERM,
         libc::SIGINT,
@@ -5184,6 +5222,10 @@ fn relay_and_wait(init_pid: i32, master: Option<OwnedFd>, tty: bool) -> RelayEnd
                 }
                 libc::SIGTERM | libc::SIGINT | libc::SIGHUP => {
                     taken.push(s);
+                    // B9 (round 2): the detached execs get TERM, then KILL
+                    // after 2 s, while their monitors still live; init's exit
+                    // kills the whole pid namespace.
+                    before_stop_signal();
                     let _ = sys::kill(init_pid, s);
                 }
                 _ => {}

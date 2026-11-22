@@ -475,7 +475,8 @@ pub(super) struct Forward {
 
 /// Read from `(pins[start], off)` to the end of the journal. A run of
 /// unreadable lines between good records `a` and `b` explains
-/// `missing = b - max(a, after) - 1` wseq values when `0 < missing <= lines`:
+/// `missing = b - a - 1` wseq values (those above `after` are emitted) when
+/// `0 < missing <= lines`:
 /// one `journal/unreadable` record per explained wseq (B8). Unreadable lines at
 /// the end, an unterminated tail and a read error explain nothing.
 pub(super) fn read_forward(pins: &[Pinned], start: usize, off: u64, after: u64) -> Forward {
@@ -511,12 +512,20 @@ pub(super) fn read_forward(pins: &[Pinned], start: usize, off: u64, after: u64) 
                     true
                 }
                 Line::Good(rec) => {
-                    let anchor = last_good.map_or(after, |a| a.max(after));
-                    if rec.wseq > anchor.saturating_add(1) && !pending.is_empty() {
-                        let missing = rec.wseq - anchor - 1;
-                        if missing <= pending.len() as u64 {
-                            for (k, b) in pending.iter().take(missing as usize).enumerate() {
-                                let w = anchor + 1 + k as u64;
+                    // The unreadable lines can only explain wseq values that
+                    // are missing after the last good record (round 2): the
+                    // whole hole must be covered by lines, and only the part
+                    // above the cursor is emitted. A corrupt line below the
+                    // cursor never hides a real hole above it.
+                    let base = last_good.unwrap_or(after);
+                    if rec.wseq > base.saturating_add(1) && !pending.is_empty() {
+                        let hole = rec.wseq - base - 1;
+                        if hole <= pending.len() as u64 {
+                            for (k, b) in pending.iter().take(hole as usize).enumerate() {
+                                let w = base + 1 + k as u64;
+                                if w <= after {
+                                    continue;
+                                }
                                 out.records.push(JournalRecord {
                                     v: JOURNAL_VERSION,
                                     ts: rec.ts.clone(),
@@ -1002,6 +1011,32 @@ mod tests {
                 got: 7
             }
         );
+    }
+
+    #[test]
+    fn unreadable_line_below_the_cursor_does_not_hide_a_real_hole() {
+        // Round 2: the line of wseq 4 is corrupt and the record wseq 5 is
+        // gone. A cursor at 4 (the caller read 4 before it was damaged) has a
+        // real hole above it; the corrupt line below the cursor must not be
+        // turned into an `unreadable` record for wseq 5.
+        let (_d, dir) = ws(ROTATE_AFTER, 12);
+        edit_lines(&dir.join(JOURNAL_FILE), |i, l| match i {
+            3 => Some("x".into()),
+            4 => None,
+            _ => Some(l.to_owned()),
+        });
+        let (sel, _) = cursor_read(&dir, 4);
+        assert_eq!(
+            sel,
+            CursorSelect::Gap {
+                expected: 5,
+                got: 6
+            }
+        );
+        assert_eq!(cursor_full(&dir, 4).0, sel);
+        // and with the cursor below the corrupt line the line explains wseq 4
+        // while 5 stays a hole: still a gap
+        assert!(matches!(cursor_read(&dir, 3).0, CursorSelect::Gap { .. }));
     }
 
     #[test]

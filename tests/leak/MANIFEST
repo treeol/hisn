@@ -186,3 +186,7 @@ DX7b: legacy signal by id and by pid refuses a detached exec
 DX8: an observer is refused exec output
 DX9: 20 MiB output: offset 0 is rotated_away
 DX10: a running detached exec is alive after 8 s
+DX11: exited state is final while a grandchild holds the pipe
+DX11: late output after the exec ended
+DX12: session stop delivers TERM to a detached exec before the sandbox ends
+DX12: journal: exec/exit cause session-stop

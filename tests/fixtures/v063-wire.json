@@ -1,0 +1,57 @@
+{
+ "exec": [
+  "{\"argv\":[\"echo\",\"hi\"],\"client\":{\"protocol_version\":3},\"cwd\":null,\"env\":{},\"op\":\"exec\",\"tty\":false}"
+ ],
+ "exec_env_cwd_client": [
+  "{\"argv\":[\"sh\",\"-c\",\"x y\"],\"client\":{\"label\":\"lbl\",\"label_source\":\"flag\",\"protocol_version\":3},\"cwd\":\"/w\",\"env\":{\"A\":\"1\",\"B\":\"two\"},\"op\":\"exec\",\"tty\":false}"
+ ],
+ "exec_seat_token": [
+  "{\"argv\":[\"id\"],\"client\":{\"protocol_version\":3,\"seat_token\":\"tok-compat-0123456789\"},\"cwd\":null,\"env\":{},\"op\":\"exec\",\"tty\":false}"
+ ],
+ "grant": [
+  "{\"client\":{\"protocol_version\":3},\"mode\":\"ro\",\"op\":\"grant\",\"path\":\"/a/b\",\"recursive\":false}"
+ ],
+ "grant_rw_recursive": [
+  "{\"client\":{\"protocol_version\":3},\"mode\":\"rw\",\"op\":\"grant\",\"path\":\"/a/b\",\"recursive\":true}"
+ ],
+ "grant_seat_token": [
+  "{\"client\":{\"protocol_version\":3,\"seat_token\":\"tok-compat-0123456789\"},\"mode\":\"ro\",\"op\":\"grant\",\"path\":\"/a/b\",\"recursive\":false}"
+ ],
+ "inspect": [
+  "{\"client\":{\"protocol_version\":3},\"op\":\"inspect\"}"
+ ],
+ "kill": [
+  "{\"client\":{\"protocol_version\":3},\"op\":\"kill\",\"signal\":\"TERM\"}"
+ ],
+ "kill_int": [
+  "{\"client\":{\"protocol_version\":3},\"op\":\"kill\",\"signal\":\"INT\"}"
+ ],
+ "kill_seat_token": [
+  "{\"client\":{\"protocol_version\":3,\"seat_token\":\"tok-compat-0123456789\"},\"op\":\"kill\",\"signal\":\"TERM\"}"
+ ],
+ "ls_all": [
+  "{\"op\":\"sessioninfo\"}",
+  "{\"op\":\"sessioninfo\"}"
+ ],
+ "ls_session": [
+  "{\"client\":{\"protocol_version\":3},\"op\":\"list\"}"
+ ],
+ "ls_session_seat_token": [
+  "{\"client\":{\"protocol_version\":3,\"seat_token\":\"tok-compat-0123456789\"},\"op\":\"list\"}"
+ ],
+ "note": [
+  "{\"client\":{\"protocol_version\":3},\"kind\":\"note\",\"op\":\"note\",\"text\":\"hello world\"}"
+ ],
+ "note_marker": [
+  "{\"client\":{\"protocol_version\":3},\"kind\":\"marker\",\"op\":\"note\",\"text\":\"m1\"}"
+ ],
+ "note_seat_token": [
+  "{\"client\":{\"protocol_version\":3,\"seat_token\":\"tok-compat-0123456789\"},\"kind\":\"note\",\"op\":\"note\",\"text\":\"hello\"}"
+ ],
+ "revoke": [
+  "{\"client\":{\"protocol_version\":3},\"hard\":false,\"kill_holders\":false,\"op\":\"revoke\",\"path\":\"/a/b\"}"
+ ],
+ "revoke_hard_kill_holders": [
+  "{\"client\":{\"protocol_version\":3},\"hard\":true,\"kill_holders\":true,\"op\":\"revoke\",\"path\":\"/a/b\"}"
+ ]
+}

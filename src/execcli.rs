@@ -1039,6 +1039,54 @@ mod tests {
         assert_eq!(EXIT_INTERNAL, 125);
     }
 
+    /// 0.6.4 B3: the exec requests equal the lines recorded from a v0.6.3
+    /// build (`tests/fixtures/v063-wire.json`, plan section 10.4), byte for byte.
+    #[test]
+    fn request_bytes_unchanged_exec_matches_v063_fixture() {
+        let fx: Value = serde_json::from_str(include_str!("../tests/fixtures/v063-wire.json"))
+            .expect("fixture parses");
+        let want = |k: &str| {
+            fx[k][0]
+                .as_str()
+                .unwrap_or_else(|| panic!("no {k}"))
+                .to_owned()
+        };
+        let a = exec_args(&["hisn", "exec", "--session", "s", "--", "echo", "hi"]);
+        assert_eq!(
+            build_request_with(&a, None, Some(3)).unwrap().to_string(),
+            want("exec")
+        );
+        let a = exec_args(&[
+            "hisn",
+            "exec",
+            "--session",
+            "s",
+            "--cwd",
+            "/w",
+            "--env",
+            "A=1",
+            "--env",
+            "B=two",
+            "--client",
+            "lbl",
+            "--",
+            "sh",
+            "-c",
+            "x y",
+        ]);
+        assert_eq!(
+            build_request_with(&a, None, Some(3)).unwrap().to_string(),
+            want("exec_env_cwd_client")
+        );
+        let a = exec_args(&["hisn", "exec", "--session", "s", "--", "id"]);
+        assert_eq!(
+            build_request_with(&a, Some("tok-compat-0123456789"), Some(3))
+                .unwrap()
+                .to_string(),
+            want("exec_seat_token")
+        );
+    }
+
     #[test]
     fn declared_version_stays_3_revision_is_4() {
         assert_eq!(crate::sessionmeta::PROTOCOL_VERSION, 3);

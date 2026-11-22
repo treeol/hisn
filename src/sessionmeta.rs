@@ -40,12 +40,21 @@ pub const HISN_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// declares a higher revision is answered `E_VERSION`; absent means
 /// revision 1 (0.4.3 behaviour). The release version string must never be
 /// compared, so a `-dev` build can use its own feature.
-pub const PROTOCOL_REVISION: u32 = 3;
+pub const PROTOCOL_REVISION: u32 = 4;
 
 /// The wire field name for the revision (`client.protocol_version`).
 /// Kept as the historical field name; there is one concept — the protocol
 /// revision — and one number, declared here.
-pub const PROTOCOL_VERSION: u32 = PROTOCOL_REVISION;
+///
+/// 0.6.4 (plan section 7 B3): this is now the revision that *existing*
+/// commands declare, and it stays 3 while [`PROTOCOL_REVISION`] (what a
+/// supervisor speaks and records) is 4, so a request from this CLI is
+/// byte-identical to v0.6.3 and a v0.6.3 supervisor still accepts it.
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// 0.6.4: the revision declared only by requests that use a revision-4
+/// feature (`exec --detach`, `exec-status`, `exec-output`, `exec-signal`).
+pub const DETACH_REVISION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -382,8 +391,9 @@ mod tests {
         // Item 1: the gate is the integer revision, not the release version.
         // This build is `0.5.1-dev` (Cargo.toml) and must still declare
         // revision 3 so its own CLI can use its own feature.
-        assert_eq!(PROTOCOL_REVISION, 3);
+        assert_eq!(PROTOCOL_REVISION, 4);
         assert_eq!(crate::control::PROTOCOL_VERSION, 3);
+        assert_eq!(crate::control::PROTOCOL_REVISION, 4);
         // A dev version string does not lower the revision.
         assert!(HISN_VERSION.contains(env!("CARGO_PKG_VERSION")));
     }

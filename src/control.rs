@@ -43,6 +43,11 @@ pub const E_EXEC: &str = "E_EXEC";
 /// the CLI maps any failed response through `print_response` exactly as
 /// before.
 pub const E_VERSION: &str = "E_VERSION";
+/// 0.6.4: the request uses a revision-4 feature (`detach`, the exec-status
+/// family) but does not declare `protocol_version >= 4`.
+pub const E_UNSUPPORTED: &str = "E_UNSUPPORTED";
+/// 0.6.4: a limit is reached (at most 32 live detached execs).
+pub const E_BUSY: &str = "E_BUSY";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -118,6 +123,12 @@ pub enum Request {
         /// don't send this field default to `false` (a normal exec).
         #[serde(default)]
         attach: bool,
+        /// 0.6.4 (revision 4): run detached, with no client stdio. The CLI
+        /// omits the key unless `--detach` is given. Needs
+        /// `client.protocol_version >= 4`; refused with `tty`/`attach` or
+        /// with descriptors ([`check_detach`]).
+        #[serde(default)]
+        detach: bool,
         #[serde(default)]
         client: Option<ClientField>,
     },
@@ -188,16 +199,20 @@ pub enum Request {
     },
 }
 
-/// The highest protocol revision this build speaks (Part A). One concept,
-/// one number: `crate::sessionmeta::PROTOCOL_REVISION`.
-pub const PROTOCOL_VERSION: u32 = crate::sessionmeta::PROTOCOL_REVISION;
+/// The highest protocol revision this build speaks (Part A), the one a
+/// supervisor compares against: `crate::sessionmeta::PROTOCOL_REVISION`.
+pub const PROTOCOL_REVISION: u32 = crate::sessionmeta::PROTOCOL_REVISION;
+
+/// The revision existing commands declare (0.6.4: 3, unchanged from v0.6.3;
+/// see `sessionmeta::PROTOCOL_VERSION`).
+pub const PROTOCOL_VERSION: u32 = crate::sessionmeta::PROTOCOL_VERSION;
 
 /// The version gate (Part A): decide, from the request's declared
 /// `client.protocol_version`, whether to answer `E_VERSION` before dispatch.
 ///
 /// - No declared version ⇒ a 0.4.3 client ⇒ always pass (exactly as before).
 /// - Declared revision newer than this supervisor supports ⇒ `E_VERSION`.
-/// - Declared revision at most [`PROTOCOL_VERSION`] ⇒ pass.
+/// - Declared revision at most [`PROTOCOL_REVISION`] ⇒ pass.
 ///
 /// An *unknown op string* never reaches this gate: it fails `parse_request`
 /// first and the connection is closed with `E_BAD_REQUEST` exactly as in
@@ -211,11 +226,50 @@ pub const PROTOCOL_VERSION: u32 = crate::sessionmeta::PROTOCOL_REVISION;
 pub fn version_gate(declared: Option<u32>) -> Result<(), String> {
     match declared {
         None => Ok(()),
-        Some(v) if v > PROTOCOL_VERSION => Err(format!(
-            "protocol_version {v} is newer than the supported revision {PROTOCOL_VERSION}"
+        Some(v) if v > PROTOCOL_REVISION => Err(format!(
+            "protocol_version {v} is newer than the supported revision {PROTOCOL_REVISION}"
         )),
         Some(_) => Ok(()),
     }
+}
+
+/// Why a detached `exec` is refused before any effect (0.6.4, plan section 7
+/// B3/B12), as `(error code, message)`. Pure; `None` = acceptable (or not a
+/// detached exec). A detached exec carries no descriptors and cannot be a
+/// tty or an attach; it must declare revision 4 (an absent declaration is
+/// refused too: only a client that knows the feature can ask for it).
+pub fn check_detach(req: &Request, fds: usize) -> Option<(&'static str, String)> {
+    let Request::Exec {
+        tty,
+        attach,
+        detach,
+        ..
+    } = req
+    else {
+        return None;
+    };
+    if !*detach {
+        return None;
+    }
+    if req
+        .declared_version()
+        .is_none_or(|v| v < crate::sessionmeta::DETACH_REVISION)
+    {
+        return Some((
+            E_UNSUPPORTED,
+            format!(
+                "detach requires protocol_version >= {}",
+                crate::sessionmeta::DETACH_REVISION
+            ),
+        ));
+    }
+    if *tty || *attach {
+        return Some((E_BAD_REQUEST, "detach conflicts with tty and attach".into()));
+    }
+    if fds != 0 {
+        return Some((E_BAD_REQUEST, "a detached exec takes no descriptors".into()));
+    }
+    None
 }
 
 /// The client-supplied identity fields (0.4.0 F1). The supervisor fills
@@ -1391,6 +1445,7 @@ mod tests {
                 env: BTreeMap::new(),
                 tty: false,
                 attach: false,
+                detach: false,
                 client: None
             }
         );
@@ -1405,6 +1460,7 @@ mod tests {
                 env: BTreeMap::from([("K".into(), "V".into())]),
                 tty: true,
                 attach: false,
+                detach: false,
                 client: None
             }
         );
@@ -1416,6 +1472,7 @@ mod tests {
                 env: BTreeMap::new(),
                 tty: false,
                 attach: false,
+                detach: false,
                 client: None
             }
         );
@@ -1428,6 +1485,74 @@ mod tests {
                 client: None
             }
         );
+    }
+
+    fn detach_req(extra: &str) -> Request {
+        parse_request(&format!(
+            r#"{{"op":"exec","argv":["x"],"detach":true{extra}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn detach_request_with_zero_fds_parses() {
+        let r = detach_req(r#","client":{"protocol_version":4}"#);
+        assert!(matches!(r, Request::Exec { detach: true, .. }));
+        assert!(check_detach(&r, 0).is_none(), "zero fds are acceptable");
+        // And the framing layer hands over an empty fd list for such a line
+        // (FdLineReader: `fds` is whatever arrived, here nothing).
+        let (a, b) = crate::sys::socketpair().unwrap();
+        crate::sys::send_all(
+            a.as_raw_fd(),
+            format!("{}\n", r#"{"op":"exec","argv":["x"],"detach":true}"#).as_bytes(),
+        )
+        .unwrap();
+        let mut rd = FdLineReader::new(b.as_raw_fd());
+        let l = rd.next_line().unwrap().unwrap();
+        assert!(l.fds.is_empty());
+        assert!(l.line.contains("detach"));
+    }
+
+    #[test]
+    fn detach_request_with_fds_refused() {
+        let r = detach_req(r#","client":{"protocol_version":4}"#);
+        let (code, msg) = check_detach(&r, 3).unwrap();
+        assert_eq!(code, E_BAD_REQUEST);
+        assert!(msg.contains("no descriptors"), "{msg}");
+    }
+
+    #[test]
+    fn absent_protocol_version_refused_for_new_ops() {
+        for extra in [
+            "",
+            r#","client":{"label":"x"}"#,
+            r#","client":{"protocol_version":3}"#,
+        ] {
+            let r = detach_req(extra);
+            let (code, msg) = check_detach(&r, 0).unwrap();
+            assert_eq!(code, E_UNSUPPORTED, "{extra}");
+            assert!(msg.contains('4'), "{msg}");
+        }
+        // A plain exec is never touched by the check.
+        let plain = parse_request(r#"{"op":"exec","argv":["x"]}"#).unwrap();
+        assert!(check_detach(&plain, 3).is_none());
+        assert!(check_detach(&plain, 0).is_none());
+    }
+
+    #[test]
+    fn supervisor_rejects_detach_from_revision_3_client() {
+        let r = detach_req(r#","client":{"protocol_version":3}"#);
+        assert_eq!(check_detach(&r, 0).unwrap().0, E_UNSUPPORTED);
+    }
+
+    #[test]
+    fn supervisor_accepts_revision_3_and_4_clients() {
+        // The gate compares with the supervisor's revision (4): both pass,
+        // 5 does not.
+        assert!(version_gate(Some(3)).is_ok());
+        assert!(version_gate(Some(4)).is_ok());
+        assert!(version_gate(Some(5)).is_err());
+        assert_eq!(PROTOCOL_REVISION, 4);
     }
 
     #[test]
@@ -1636,8 +1761,8 @@ mod tests {
         assert!(version_gate(Some(1)).is_ok());
         assert!(version_gate(Some(PROTOCOL_VERSION)).is_ok());
         // Declared newer than the supervisor.
-        let e = version_gate(Some(PROTOCOL_VERSION + 1)).unwrap_err();
-        assert!(e.contains(&format!("{PROTOCOL_VERSION}")), "{e}");
+        let e = version_gate(Some(PROTOCOL_REVISION + 1)).unwrap_err();
+        assert!(e.contains(&format!("{PROTOCOL_REVISION}")), "{e}");
     }
 
     /// A request declaring a newer revision is answered `E_VERSION` before
@@ -1649,7 +1774,7 @@ mod tests {
         // Declaring a revision newer than this build's.
         let v = request(
             &sock,
-            &json!({"op":"list","client":{"protocol_version": PROTOCOL_VERSION + 1}}),
+            &json!({"op":"list","client":{"protocol_version": PROTOCOL_REVISION + 1}}),
         )
         .unwrap();
         assert_eq!(v["ok"], false);
@@ -1659,7 +1784,7 @@ mod tests {
             v["message"]
                 .as_str()
                 .unwrap()
-                .contains(&format!("{PROTOCOL_VERSION}"))
+                .contains(&format!("{PROTOCOL_REVISION}"))
         );
         // A 0.4.3-shaped request (no client) is dispatched and answered ok.
         let v = request(&sock, &json!({"op":"list"})).unwrap();

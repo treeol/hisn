@@ -208,14 +208,92 @@ pub fn build_request_with(
         let (k, v) = parse_env_spec(spec).map_err(|e| anyhow!(e))?;
         env.insert(k, v);
     }
-    Ok(json!({
+    let mut req = json!({
         "op": "exec",
         "argv": args.command,
         "cwd": args.cwd,
         "env": env,
         "tty": args.tty,
         "client": client_field(args.client.as_deref(), token, revision),
-    }))
+    });
+    // 0.6.4: the key exists only when asked for, so every request without
+    // `--detach` is byte-identical to v0.6.3.
+    if args.detach {
+        req["detach"] = json!(true);
+    }
+    Ok(req)
+}
+
+/// The client's decision before it sends a revision-4 request (plan 2.6 and
+/// section 7 B3): the session must record `protocol_revision >= min`.
+/// `Err((code, message))` is printed as a `hisn-error/v1` object (exit 125)
+/// and nothing is sent. `None` = the session could not be resolved, which is
+/// reported separately from "too old".
+pub fn require_revision(
+    session: &str,
+    found: Option<u32>,
+    min: u32,
+) -> Result<(), (&'static str, String)> {
+    match found {
+        None => Err((
+            control::E_NOT_FOUND,
+            format!("session {session} not found (or it records no protocol revision)"),
+        )),
+        Some(r) if r < min => Err((
+            control::E_UNSUPPORTED,
+            format!("requires protocol revision {min}, session has {r}"),
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The `hisn-error/v1` object printed on stderr by the revision-4 commands.
+pub fn error_object(code: &str, message: &str) -> Value {
+    json!({"schema": "hisn-error/v1", "code": code, "message": message})
+}
+
+/// Seat material for a revision-4 request: the credential, and the revision
+/// it declares ([`crate::sessionmeta::DETACH_REVISION`]). The session must
+/// already have passed [`require_revision`].
+pub fn seat_material_v4(
+    token_file: Option<&std::path::Path>,
+) -> Result<(Option<String>, Option<u32>)> {
+    let token = seat_token(token_file)?;
+    Ok((token, Some(crate::sessionmeta::DETACH_REVISION)))
+}
+
+/// `hisn exec --detach`: send one request with no descriptors, print the
+/// reply's identity as a JSON object, exit. The connection is then closed;
+/// the exec runs on. Never relays anything.
+fn run_detached(args: ExecArgs) -> Result<i32> {
+    let found = session_revision(&args.session);
+    if let Err((code, msg)) =
+        require_revision(&args.session, found, crate::sessionmeta::DETACH_REVISION)
+    {
+        eprintln!("{}", error_object(code, &msg));
+        return Ok(EXIT_INTERNAL);
+    }
+    let (token, revision) = seat_material_v4(args.seat_token_file.as_deref())?;
+    let req = build_request_with(&args, token.as_deref(), revision)?;
+    let sock = supervisor::socket_for(&args.session)?;
+    let reply = control::request(&sock, &req)
+        .with_context(|| format!("talking to session {}", args.session))?;
+    if reply["ok"] != true {
+        let code = reply["error"].as_str().unwrap_or(control::E_INTERNAL);
+        let msg = reply["message"].as_str().unwrap_or("");
+        eprintln!("{}", error_object(code, msg));
+        return Ok(EXIT_INTERNAL);
+    }
+    println!(
+        "{}",
+        json!({
+            "schema": "hisn-exec-start/v1",
+            "exec_id": reply["exec_id"],
+            "incarnation": reply["incarnation"],
+            "pid": reply["pid"],
+        })
+    );
+    Ok(0)
 }
 
 /// One parsed response line from the supervisor.
@@ -371,6 +449,11 @@ pub fn refuse_real_terminal(
 
 /// Run `hisn exec`; returns the process exit code.
 pub fn run(args: ExecArgs) -> Result<i32> {
+    if args.detach {
+        // No stdio is passed on, so a credential read from stdin cannot leak
+        // into the program: `--seat-token-file -` is fine here.
+        return run_detached(args);
+    }
     refuse_stdin_token_unless_no_tty(args.seat_token_file.as_deref(), args.no_tty)?;
     let (token, revision) = seat_material(&args.session, args.seat_token_file.as_deref())?;
     let req = build_request_with(&args, token.as_deref(), revision)?;
@@ -674,6 +757,102 @@ mod tests {
             Command::Exec(e) => e,
             _ => panic!("not exec"),
         }
+    }
+
+    #[test]
+    fn exec_request_omits_detach_when_false() {
+        let a = exec_args(&["hisn", "exec", "--session", "s", "--", "ls"]);
+        let req = build_request(&a).unwrap();
+        assert!(req.get("detach").is_none(), "{req}");
+        assert_eq!(
+            req.to_string(),
+            r#"{"argv":["ls"],"client":null,"cwd":null,"env":{},"op":"exec","tty":false}"#
+        );
+    }
+
+    #[test]
+    fn detach_request_roundtrip() {
+        let a = exec_args(&["hisn", "exec", "--session", "s", "--detach", "--", "ls"]);
+        assert!(a.detach);
+        let req = build_request_with(&a, None, Some(4)).unwrap();
+        assert_eq!(req["detach"], json!(true));
+        assert_eq!(req["client"]["protocol_version"], json!(4));
+        let parsed = control::parse_request(&req.to_string()).unwrap();
+        assert!(matches!(
+            parsed,
+            control::Request::Exec {
+                detach: true,
+                tty: false,
+                attach: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn detach_conflicts_with_tty_and_attach() {
+        for flag in ["--tty", "--no-tty"] {
+            assert!(
+                Cli::try_parse_from([
+                    "hisn",
+                    "exec",
+                    "--session",
+                    "s",
+                    "--detach",
+                    flag,
+                    "--",
+                    "ls"
+                ])
+                .is_err(),
+                "{flag}"
+            );
+        }
+        // The supervisor refuses the combination too (a hand-built request).
+        let req = control::parse_request(
+            r#"{"op":"exec","argv":["x"],"tty":true,"detach":true,"client":{"protocol_version":4}}"#,
+        )
+        .unwrap();
+        let (code, _) = control::check_detach(&req, 0).unwrap();
+        assert_eq!(code, control::E_BAD_REQUEST);
+        let req = control::parse_request(
+            r#"{"op":"exec","argv":["x"],"attach":true,"detach":true,"client":{"protocol_version":4}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            control::check_detach(&req, 0).unwrap().0,
+            control::E_BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn new_commands_refused_below_revision_4_exit_125_unsupported() {
+        let e = require_revision("s", Some(3), 4).unwrap_err();
+        assert_eq!(e.0, control::E_UNSUPPORTED);
+        assert_eq!(e.1, "requires protocol revision 4, session has 3");
+        let obj = error_object(e.0, &e.1);
+        assert_eq!(obj["schema"], "hisn-error/v1");
+        assert_eq!(obj["code"], "E_UNSUPPORTED");
+        assert!(require_revision("s", Some(4), 4).is_ok());
+        assert!(require_revision("s", Some(5), 4).is_ok());
+        // An unresolvable session is "not found", not "too old".
+        assert_eq!(
+            require_revision("s", None, 4).unwrap_err().0,
+            control::E_NOT_FOUND
+        );
+        assert_eq!(EXIT_INTERNAL, 125);
+    }
+
+    #[test]
+    fn declared_version_stays_3_revision_is_4() {
+        assert_eq!(crate::sessionmeta::PROTOCOL_VERSION, 3);
+        assert_eq!(crate::sessionmeta::PROTOCOL_REVISION, 4);
+        assert_eq!(crate::sessionmeta::DETACH_REVISION, 4);
+        // An existing command declares 3 against a session of revision >= 3.
+        let _ = seat_material; // (reads the live session dir; covered by the byte tests in A4)
+        assert_eq!(
+            client_field(None, None, Some(crate::sessionmeta::PROTOCOL_VERSION)),
+            Some(json!({"protocol_version": 3}))
+        );
     }
 
     /// 0.5.1: the seat credential and the revision ride in `client`, and a

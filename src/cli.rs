@@ -229,6 +229,12 @@ pub struct ExecArgs {
     /// sandbox never receives a descriptor for the caller's terminal.
     #[arg(long = "no-tty", conflicts_with = "tty")]
     pub no_tty: bool,
+    /// Run detached (0.6.4, protocol revision 4): the command starts with no
+    /// client stdio, keeps running after this command exits, and is read
+    /// with `hisn exec-status|exec-output|exec-signal`. Prints the exec id
+    /// and incarnation as one JSON object.
+    #[arg(long, conflicts_with_all = ["tty", "no_tty"])]
+    pub detach: bool,
     /// Label for this client in the audit log (default: derived from SSH or
     /// "local"). Same as `hisn attach --client` (0.4.1).
     #[arg(long)]

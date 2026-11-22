@@ -10,6 +10,7 @@ pub mod dns;
 pub mod env;
 pub mod exec;
 pub mod execcli;
+pub mod execlog;
 pub mod gitreport;
 pub mod grant;
 pub mod init;

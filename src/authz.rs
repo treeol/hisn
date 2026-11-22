@@ -358,6 +358,7 @@ mod tests {
                     env: BTreeMap::new(),
                     tty: false,
                     attach: false,
+                    detach: false,
                     client: None,
                 },
                 Op::Exec,
@@ -444,6 +445,7 @@ mod tests {
                 env: BTreeMap::new(),
                 tty: false,
                 attach: false,
+                detach: false,
                 client: None,
             },
             Request::Signal {
@@ -540,6 +542,7 @@ mod tests {
                     env: BTreeMap::new(),
                     tty: false,
                     attach: false,
+                    detach: false,
                     client: None,
                 },
             ),
@@ -613,6 +616,7 @@ mod tests {
                 env: BTreeMap::new(),
                 tty: false,
                 attach: false,
+                detach: false,
                 client: None,
             },
         )

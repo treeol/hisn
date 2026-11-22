@@ -596,6 +596,134 @@ for line in sys.stdin:
 check "0.6.2 I3 parity: loopback v4/v6, non-blocking, AF_UNIX path/abstract" "PARITY-OK" in_session "$A" in-parity
 check "0.6.2 concurrency: 16 threads of ordinary socket work" "CONCURRENCY-OK" in_session "$A" in-concurrency 16
 
+# ======================================================= detached exec (0.6.4)
+# DX1-DX4 run in the open session A: a detached exec is started by
+# `hisn exec --detach` (no client stdio), its work is seen through files in
+# the session cwd, and it gets the same sandbox and open-mode network policy
+# as a normal exec. DX5 uses its own session and stops it.
+wait_file() { # FILE SECS: true once FILE exists
+  local i
+  for i in $(seq $(($2 * 10))); do
+    [ -e "$1" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+dx_start() { # SESSION ARGV...: detached start; prints the JSON object
+  local s=$1
+  shift
+  timeout 20 "$HISN" exec --detach --session "$s" -- "$@" </dev/null 2>&1
+}
+rm -f "$ACWD"/dx*.out
+
+# DX1: the CLI returns at once with the identity, and the program ran.
+DX1_T0=$(date +%s%N)
+DX1_OUT=$(dx_start "$A" sh -c "echo dx1-ran >'$ACWD/dx1.out'")
+DX1_MS=$(( ($(date +%s%N) - DX1_T0) / 1000000 ))
+if printf '%s' "$DX1_OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["schema"]=="hisn-exec-start/v1" and d["exec_id"].startswith("e-") and d["incarnation"] and d["pid"]>0'; then
+  pass "DX1 exec --detach prints hisn-exec-start/v1 with exec_id, incarnation, pid"
+else
+  fail "DX1 exec --detach prints hisn-exec-start/v1 with exec_id, incarnation, pid" "[$DX1_OUT]"
+fi
+if wait_file "$ACWD/dx1.out" 10 && [ "$(cat "$ACWD/dx1.out")" = dx1-ran ]; then
+  pass "DX1 the detached program ran"
+else
+  fail "DX1 the detached program ran" "no $ACWD/dx1.out"
+fi
+DX1_SLEEP=$(dx_start "$A" sleep 7)
+DX1_MS2=$(( ($(date +%s%N) - DX1_T0) / 1000000 ))
+if [ "$DX1_MS" -lt 5000 ]; then pass "DX1 exec --detach returned at once ($DX1_MS ms)"; else fail "DX1 exec --detach returned at once" "$DX1_MS ms"; fi
+DX1_LS=$(timeout 20 "$HISN" ls --json </dev/null 2>/dev/null | python3 -c '
+import json,sys
+for s in json.load(sys.stdin)["sessions"]:
+    if s["id"] == sys.argv[1]:
+        e=[x for x in s["execs"] if x.get("detached")]
+        print(len(e), s.get("incarnation") is not None, e[0]["state"] if e else "-", e[0]["incarnation"]==s["incarnation"] if e else "-")
+' "$A")
+if [ "$DX1_LS" = "1 True running True" ]; then pass "DX1 ls --json lists the detached exec (detached, state, incarnation)"; else fail "DX1 ls --json lists the detached exec (detached, state, incarnation)" "[$DX1_LS]"; fi
+
+# DX2: the exec survives the client. The control connection of a client that
+# asked for a detached exec is closed right after the reply (the CLI is gone
+# anyway); the program must still finish its work 3 s later.
+DXDIR=$(session_field "$A" dir)
+timeout 20 python3 - "$DXDIR/control.sock" "$ACWD" <<'PY'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+req = {"op": "exec", "argv": ["sh", "-c", "sleep 3; echo dx2-alive >" + sys.argv[2] + "/dx2.out"],
+       "cwd": None, "env": {}, "tty": False, "detach": True,
+       "client": {"protocol_version": 4}}
+s.sendall((json.dumps(req) + "\n").encode())
+line = s.makefile().readline()
+assert json.loads(line)["detached"] is True, line
+s.close()
+PY
+if wait_file "$ACWD/dx2.out" 12 && [ "$(cat "$ACWD/dx2.out")" = dx2-alive ]; then
+  pass "DX2 a detached exec survives the death of its client connection"
+else
+  fail "DX2 a detached exec survives the death of its client connection" "no $ACWD/dx2.out"
+fi
+
+# DX3: the sandbox is the one of a normal exec. A file outside the grants is
+# not readable (positive control: a file in the cwd is).
+echo dx3-host-secret >"$T/dx3-secret"
+echo dx3-inside >"$ACWD/dx3-inside"
+dx_start "$A" sh -c "cat '$T/dx3-secret' >'$ACWD/dx3.out' 2>&1; echo rc=\$? >>'$ACWD/dx3.out'; cat '$ACWD/dx3-inside' >>'$ACWD/dx3.out'" >/dev/null
+DX3_OK=0
+for _ in $(seq 100); do
+  grep -q dx3-inside "$ACWD/dx3.out" 2>/dev/null && { DX3_OK=1; break; }
+  sleep 0.1
+done
+if [ "$DX3_OK" = 1 ] && ! grep -q dx3-host-secret "$ACWD/dx3.out" && ! grep -q '^rc=0$' "$ACWD/dx3.out"; then
+  pass "DX3 a detached exec cannot read a host file outside the grants (the cwd file is readable)"
+else
+  fail "DX3 a detached exec cannot read a host file outside the grants (the cwd file is readable)" "[$(cat "$ACWD/dx3.out" 2>&1)]"
+fi
+
+# DX4: the open-mode network policy applies: a listed destination connects
+# through interception, a private one is refused, both journaled with the
+# same verdicts as for a normal exec.
+dx_start "$A" sh -c "python3 '$ACWD/net_helper.py' in-connect 18102 >'$ACWD/dx4a.out' 2>&1; python3 '$ACWD/net_helper.py' in-refused 10.1.2.3 80 >'$ACWD/dx4b.out' 2>&1" >/dev/null
+wait_file "$ACWD/dx4b.out" 20
+sleep 1
+if grep -q 'CONNECT-OK' "$ACWD/dx4a.out" 2>/dev/null; then pass "DX4 detached: a connect to the listener works through interception"; else fail "DX4 detached: a connect to the listener works through interception" "[$(cat "$ACWD/dx4a.out" 2>&1)]"; fi
+if grep -q 'REFUSED-OK' "$ACWD/dx4b.out" 2>/dev/null; then pass "DX4 detached: a connect to a private address is refused EACCES"; else fail "DX4 detached: a connect to a private address is refused EACCES" "[$(cat "$ACWD/dx4b.out" 2>&1)]"; fi
+journal_is "DX4 journal: the private target is refuse/private-or-unlisted" "$AWS" 1 \
+  kind=network/connect target=10.1.2.3:80 verdict=refuse reason=private-or-unlisted
+
+# DX5: a detached exec ends when its session stops: the process is gone, the
+# exec's journal record says session-stop, and session/stop lists it.
+DX5="$TOKEN-dx5"
+DX5CWD="$T/dx5-cwd"
+write_policy "$T/dx5.toml" "$DX5CWD" none
+if start_session "$DX5" "$DX5CWD" --policy "$T/dx5.toml" sleep 3600; then
+  DX5WS=$(session_field "$DX5" workspace.id)
+  DX5_OUT=$(dx_start "$DX5" sh -c "sleep 300; true # dx5-token-$TOKEN")
+  DX5_ID=$(printf '%s' "$DX5_OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["exec_id"])' 2>/dev/null)
+  if pgrep -f "dx5-token-$TOKEN" >/dev/null 2>&1; then pass "DX5 the detached sleeper runs before the stop"; else fail "DX5 the detached sleeper runs before the stop" "[$DX5_OUT]"; fi
+  timeout 60 "$HISN" stop --session "$DX5" </dev/null >/dev/null 2>&1
+  sleep 1
+  if pgrep -f "dx5-token-$TOKEN" >/dev/null 2>&1; then fail "DX5 the detached exec ends at session stop" "sleeper still running"; else pass "DX5 the detached exec ends at session stop"; fi
+  DX5_J=$(journal "$DX5WS" | python3 -c '
+import json,sys
+eid=sys.argv[1]
+exit_ok=stop_ok=False
+for l in sys.stdin:
+    l=l.strip()
+    if not l: continue
+    r=json.loads(l)
+    d=r.get("data",{})
+    if r["kind"]=="exec/exit" and d.get("exec_id")==eid and d.get("cause")=="session-stop" and d.get("incarnation") and "seat" in d:
+        exit_ok=True
+    if r["kind"]=="session/stop" and any(x.get("exec_id")==eid for x in d.get("detached_execs_ended",[])):
+        stop_ok=True
+print("exit=%s stop=%s" % (exit_ok, stop_ok))
+' "$DX5_ID")
+  if [ "$DX5_J" = "exit=True stop=True" ]; then pass "DX5 journal: exec/exit cause session-stop and session/stop lists the exec"; else fail "DX5 journal: exec/exit cause session-stop and session/stop lists the exec" "[$DX5_J] id [$DX5_ID]"; fi
+else
+  fail "DX5 session starts" "[$(cat "$T/$DX5.log" 2>/dev/null)]"
+fi
+
 check "net harness: open session stops cleanly" "" timeout 30 "$HISN" stop --session "$A" </dev/null
 for _ in $(seq 50); do [ "$(session_field "$A" state)" != running ] && break; sleep 0.1; done
 check "net harness: open session is no longer running" "stopped" session_field "$A" state

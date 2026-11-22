@@ -175,3 +175,8 @@ L122: pending-at-deadline
 L123: stops cleanly
 L124: returns ECONNREFUSED
 L126: bind by socket domain: netlink, unix, high tcp ok; low port, AF_UNSPEC low port, packet refused
+DX1: the detached program ran
+DX2: survives the death of its client connection
+DX3: cannot read a host file outside the grants
+DX4: a connect to a private address is refused EACCES
+DX5: the detached exec ends at session stop

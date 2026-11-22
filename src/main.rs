@@ -589,10 +589,10 @@ fn ls(
                         // 0.4.1 step 3: a live session's clients and execs come
                         // from the supervisor (session.json cannot carry them);
                         // a stopped/crashed session has neither.
-                        let (clients, execs, services, supervisor_pid) = if *live {
+                        let (clients, execs, services, supervisor_pid, incarnation) = if *live {
                             live_session_view_pid(n)
                         } else {
-                            (Vec::new(), Vec::new(), Vec::new(), None)
+                            (Vec::new(), Vec::new(), Vec::new(), None, None)
                         };
                         let journal_failures = if *live {
                             live_journal_failures(n)
@@ -612,6 +612,10 @@ fn ls(
                         );
                         if let Some(o) = v.as_object_mut() {
                             o.insert("supervisor_pid".into(), json!(supervisor_pid));
+                            // 0.6.4: the supervisor's incarnation (additive;
+                            // null from a supervisor older than 0.6.4 and for
+                            // a session that is not live).
+                            o.insert("incarnation".into(), json!(incarnation));
                         }
                         v
                     })
@@ -668,16 +672,25 @@ fn ls(
 /// Returns `(clients, execs, services)`; empty on any error (a session that
 /// stopped between `is_live` and the request simply has none).
 fn live_session_view(session: &str) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
-    let (c, e, s, _) = live_session_view_pid(session);
+    let (c, e, s, _, _) = live_session_view_pid(session);
     (c, e, s)
 }
 
 /// Like [`live_session_view`], plus the supervisor's own pid from the same
 /// `sessioninfo` reply (`None` from a supervisor older than 0.6.3).
-fn live_session_view_pid(session: &str) -> (Vec<Value>, Vec<Value>, Vec<Value>, Option<u64>) {
+#[allow(clippy::type_complexity)]
+fn live_session_view_pid(
+    session: &str,
+) -> (
+    Vec<Value>,
+    Vec<Value>,
+    Vec<Value>,
+    Option<u64>,
+    Option<String>,
+) {
     let r = match supervisor::client_request(session, &json!({"op":"sessioninfo"})) {
         Ok(r) if r["ok"] == true => r,
-        _ => return (Vec::new(), Vec::new(), Vec::new(), None),
+        _ => return (Vec::new(), Vec::new(), Vec::new(), None, None),
     };
     let arr = |k: &str| r[k].as_array().cloned().unwrap_or_default();
     (
@@ -685,6 +698,7 @@ fn live_session_view_pid(session: &str) -> (Vec<Value>, Vec<Value>, Vec<Value>, 
         arr("execs"),
         arr("services"),
         r["supervisor_pid"].as_u64(),
+        r["incarnation"].as_str().map(str::to_owned),
     )
 }
 

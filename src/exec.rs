@@ -612,6 +612,14 @@ pub fn drive(status: &OwnedFd, lines: Lines, conn: RawFd, grace: Duration) -> Ou
     drive_from(status, lines, conn, grace, false)
 }
 
+/// Wait for a started exec that has **no client** (a detached exec, 0.6.4):
+/// relay the status socket until the exit line arrives or the socket closes.
+/// Nothing is watched but the status socket, so no disconnect can cancel it;
+/// signals reach the program only through the supervisor's own `K` writes.
+pub fn wait_exit(status: &OwnedFd, pending: Lines) -> Outcome {
+    drive_from_with_flag(status, pending, -1, Duration::ZERO, false).0
+}
+
 /// [`drive`] with the client already gone at entry (`already_cancelled`):
 /// starts in the `TERM`-then-`KILL` path instead of waiting for a poll event
 /// that a dead connection can never produce.
@@ -1652,6 +1660,51 @@ mod tests {
         pre.push(b"X sig 9\n");
         let o = drive(&mine, pre, conn.as_raw_fd(), Duration::from_secs(5));
         assert_eq!(o, Outcome::Exited(Exit::Signal(9)));
+    }
+
+    #[test]
+    fn wait_exit_returns_code_without_a_client() {
+        let (mine, w) = sys::socketpair().unwrap();
+        sys::send_all(w.as_raw_fd(), b"X exit 7\n").unwrap();
+        assert_eq!(
+            wait_exit(&mine, Lines::default()),
+            Outcome::Exited(Exit::Code(7))
+        );
+        let mut pre = Lines::default();
+        pre.push(b"X sig 15\n");
+        assert_eq!(wait_exit(&mine, pre), Outcome::Exited(Exit::Signal(15)));
+    }
+
+    #[test]
+    fn wait_exit_reports_lost_on_eof() {
+        let (mine, w) = sys::socketpair().unwrap();
+        drop(w);
+        assert_eq!(wait_exit(&mine, Lines::default()), Outcome::Lost);
+    }
+
+    #[test]
+    fn wait_exit_never_cancels_on_its_own() {
+        // No client fd is watched, so nothing is written to the status socket.
+        let (mine, w) = sys::socketpair().unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            // Whatever arrived on `w` before the exit line would show up here.
+            let buf = [0u8; 16];
+            let mut p = [libc::pollfd {
+                fd: w.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let got = sys::poll(&mut p, 0).unwrap();
+            sys::send_all(w.as_raw_fd(), b"X exit 0\n").unwrap();
+            (got, buf.len())
+        });
+        assert_eq!(
+            wait_exit(&mine, Lines::default()),
+            Outcome::Exited(Exit::Code(0))
+        );
+        let (got, _) = t.join().unwrap();
+        assert_eq!(got, 0, "wait_exit wrote nothing to the monitor");
     }
 
     #[test]

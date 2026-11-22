@@ -32,6 +32,7 @@ use crate::cli::{RunArgs, parse_grant_spec};
 use crate::control::{self, ConnId, Handler, Mode, Request, err, ok};
 use crate::env as senv;
 use crate::exec::{self, ExecClient, ExecContext, ExecRules, NsFds};
+use crate::execlog;
 use crate::gitreport;
 use crate::grant::{self, Grant, GrantTable, HelperClient, Holder, HolderKind, Rules};
 use crate::init::{self, InitConfig, MSG_ERROR, MSG_GO, MSG_READY, MSG_START};
@@ -109,11 +110,22 @@ fn log_client_record(
 }
 
 /// Which exec an `exec/exit` record is about (0.6.3).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ExecIdent {
     exec_id: u64,
     pid: i32,
     attach: bool,
+    /// 0.6.4: set only for a detached exec; a plain exec's record keeps the
+    /// v0.6.3 shape exactly.
+    detached: Option<DetachedIdent>,
+}
+
+/// The extra `exec/exit` fields of a detached exec (plan 2.9).
+#[derive(Debug, Clone)]
+struct DetachedIdent {
+    incarnation: String,
+    seat: Option<String>,
+    cause: &'static str,
 }
 
 fn journal_exec_exit_record(
@@ -130,6 +142,11 @@ fn journal_exec_exit_record(
         data["exec_id"] = json!(format!("e-{}", i.exec_id));
         data["pid"] = json!(i.pid);
         data["attach"] = json!(i.attach);
+        if let Some(d) = &i.detached {
+            data["incarnation"] = json!(d.incarnation);
+            data["seat"] = json!(d.seat);
+            data["cause"] = json!(d.cause);
+        }
     }
     let _ = journal.append("exec/exit", Some(journal_client(client)), data);
 }
@@ -338,6 +355,13 @@ pub struct Shared {
     /// (one entry per live exec plus one per service); a miss means the
     /// program is not a known exec of this session, so seat stays null.
     exec_seats: Mutex<std::collections::BTreeMap<i32, Option<String>>>,
+    /// 0.6.4: this supervisor's incarnation id; a detached exec is
+    /// `(incarnation, exec_id)`.
+    incarnation: String,
+    /// 0.6.4: live detached execs and the session `stopping` flag.
+    detached: execlog::Registry,
+    /// 0.6.4: the 32-detached-exec limit.
+    detach_slots: Arc<execlog::Slots>,
 }
 
 /// 0.4.1 R2: the live control connections. The client count and the per-
@@ -400,6 +424,89 @@ struct ExecInfo {
     argv0: String,
     tty: bool,
     attach: bool,
+    /// 0.6.4: `Some` for a detached exec (its `ls --json` entry gains
+    /// `detached`, `incarnation`, `state`, `seat`).
+    detached: Option<DetachedInfo>,
+}
+
+#[derive(Clone)]
+struct DetachedInfo {
+    seat: Option<String>,
+}
+
+/// One `execs[]` entry of `sessioninfo` / `ls --json`. A plain exec keeps
+/// its v0.6.3 keys exactly; a detached one adds `detached`, `incarnation`,
+/// `state` and `seat` (additive).
+fn exec_info_json(id: u64, e: &ExecInfo, incarnation: &str) -> Value {
+    let mut v = json!({
+        "exec_id": format!("e-{id}"),
+        "pid": e.pid,
+        "argv0": e.argv0,
+        "tty": e.tty,
+        "attach": e.attach,
+    });
+    if let Some(d) = &e.detached {
+        v["detached"] = json!(true);
+        v["incarnation"] = json!(incarnation);
+        v["state"] = json!("running");
+        v["seat"] = json!(d.seat);
+    }
+    v
+}
+
+/// How a started exec relates to a client (0.6.4).
+enum ExecMode<'a> {
+    /// The classic exec: the client's connection and its stdio fds.
+    Client(&'a UnixStream),
+    /// No client: supervisor-built stdio, a waiter thread, output files.
+    Detached,
+}
+
+struct DetachedPaths {
+    state: PathBuf,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+/// What `detached_stdio` hands to the start of a detached exec.
+struct DetachedParts {
+    exec_id: u64,
+    paths: DetachedPaths,
+    stdout: Arc<execlog::Stream>,
+    stderr: Arc<execlog::Stream>,
+}
+
+impl DetachedParts {
+    /// A failed spawn leaves no files behind.
+    fn remove_files(&self) {
+        let _ = fs::remove_file(&self.paths.stdout);
+        let _ = fs::remove_file(&self.paths.stderr);
+        let _ = fs::remove_file(&self.paths.state);
+        let _ = self.exec_id;
+    }
+}
+
+struct DetachedStart {
+    sp: exec::Spawned,
+    parts: DetachedParts,
+    slot: execlog::SlotGuard,
+    client: authz::ClientRecord,
+    argv0: String,
+    ident: ExecIdent,
+    drive_started: std::time::Instant,
+}
+
+struct DetachedWaiter {
+    status: OwnedFd,
+    pending: exec::Lines,
+    entry: Arc<execlog::DetachedExec>,
+    parts: DetachedParts,
+    base: execlog::ExecState,
+    client: authz::ClientRecord,
+    argv0: String,
+    ident: ExecIdent,
+    drive_started: std::time::Instant,
+    _slot: execlog::SlotGuard,
 }
 
 /// One live exec, held in [`ExecTable`]: the `ls --json` info, the pid, and
@@ -477,6 +584,19 @@ impl ExecTable {
             .values()
             .find(|e| e.info.pid == pid)
             .and_then(|e| e.status_by_pid.as_ref())
+    }
+
+    /// Is `exec_id` a live detached exec? (Legacy `signal` refuses it, B1.)
+    fn is_detached(&self, exec_id: u64) -> bool {
+        self.live
+            .get(&exec_id)
+            .is_some_and(|e| e.info.detached.is_some())
+    }
+
+    fn pid_is_detached(&self, pid: i32) -> bool {
+        self.live
+            .values()
+            .any(|e| e.info.pid == pid && e.info.detached.is_some())
     }
 
     fn is_recycled(&self, pid: i32) -> bool {
@@ -1288,14 +1408,35 @@ impl Shared {
     /// `exec`: validate, spawn through the helper, stream the exit status
     /// (DESIGN §14). Writes `{"ok":true,"pid":N}` to `conn` itself and returns
     /// the final `{"exit":…}` line (or an error response).
+    ///
+    /// 0.6.4: `req.detach` selects the detached mode. Both modes run the same
+    /// [`Shared::do_exec_common`], the one place that calls the exec helper
+    /// (`exec.spawn`): same sandbox, Landlock domain, network policy and seat
+    /// attribution. Only the stdio differs.
     fn do_exec(
-        &self,
+        self: &Arc<Self>,
         _auth: &authz::Authorized,
         client: &authz::ClientRecord,
         req: ExecRequest,
         stdio: Vec<OwnedFd>,
         conn: &UnixStream,
     ) -> Value {
+        let mode = if req.detach {
+            ExecMode::Detached
+        } else {
+            ExecMode::Client(conn)
+        };
+        self.do_exec_common(client, req, stdio, mode)
+    }
+
+    fn do_exec_common(
+        self: &Arc<Self>,
+        client: &authz::ClientRecord,
+        req: ExecRequest,
+        stdio: Vec<OwnedFd>,
+        mode: ExecMode<'_>,
+    ) -> Value {
+        let detached = matches!(mode, ExecMode::Detached);
         let argv0 = req.argv.first().cloned().unwrap_or_default();
         let op = if req.attach { "attach" } else { "exec" };
         self.log_client(op, "request", Some(&argv0), None, None, client, true);
@@ -1311,16 +1452,53 @@ impl Shared {
             self.log_client(op, "result", Some(&argv0), None, Some(code), client, true);
             err(code, msg)
         };
+        // 0.6.4: a detached exec takes one of 32 slots, reserved before the
+        // spawn and released by the guard on every failure path.
+        let slot = if detached {
+            match self.detach_slots.reserve() {
+                Some(g) => Some(g),
+                None => {
+                    return fail(
+                        control::E_BUSY,
+                        format!(
+                            "at most {} detached execs may run at once",
+                            execlog::MAX_DETACHED
+                        ),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        let stdio_len = if detached { 3 } else { stdio.len() };
         let spec = match exec::validate(
             req.argv,
             req.cwd,
             req.env,
             req.tty,
-            stdio.len(),
+            stdio_len,
             &self.exec_rules,
         ) {
             Ok(s) => s,
             Err(e) => return fail(control::E_BAD_REQUEST, e.to_string()),
+        };
+        // A detached exec's id is needed for its file names before the spawn;
+        // a failed spawn leaves a gap in the ids (never reused).
+        let pre_id = detached.then(|| {
+            self.next_exec_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        });
+        let mut parts: Option<DetachedParts> = None;
+        let stdio = if let Some(id) = pre_id {
+            match self.detached_stdio(id) {
+                Ok((fds, p)) => {
+                    parts = Some(p);
+                    fds
+                }
+                Err(e) => return fail(control::E_INTERNAL, format!("detached output: {e}")),
+            }
+        } else {
+            stdio
         };
         let spawned = {
             let _gate = self.spawn_gate.read().unwrap_or_else(|e| e.into_inner());
@@ -1328,15 +1506,21 @@ impl Shared {
         };
         let sp = match spawned {
             Ok(sp) => sp,
-            Err(exec::SpawnError::Exec { message, .. }) => {
-                return fail(control::E_EXEC, message);
+            Err(e) => {
+                if let Some(p) = &parts {
+                    p.remove_files();
+                }
+                return match e {
+                    exec::SpawnError::Exec { message, .. } => fail(control::E_EXEC, message),
+                    exec::SpawnError::Internal(m) => fail(control::E_INTERNAL, m),
+                };
             }
-            Err(exec::SpawnError::Internal(m)) => return fail(control::E_INTERNAL, m),
         };
         // Register for `signal` before the client learns the pid.
-        let exec_id = self
-            .next_exec_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let exec_id = pre_id.unwrap_or_else(|| {
+            self.next_exec_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        });
         // Register for `signal` before the client learns the pid. One
         // admission inserts one table entry (info + both status dups +
         // pid-recycling); the idle check therefore sees the exec atomically.
@@ -1366,6 +1550,9 @@ impl Shared {
                     argv0: argv0.clone(),
                     tty: req.tty,
                     attach: req.attach,
+                    detached: detached.then(|| DetachedInfo {
+                        seat: client.seat.clone(),
+                    }),
                 },
             );
             if let (Some(by_pid), Some(by_id)) = (by_pid, by_id) {
@@ -1377,6 +1564,27 @@ impl Shared {
             .lock()
             .expect("exec_seats")
             .insert(sp.pid, client.seat.clone());
+        let ident = ExecIdent {
+            exec_id,
+            pid: sp.pid,
+            attach: req.attach,
+            detached: None,
+        };
+        let drive_started = std::time::Instant::now();
+        if let (Some(parts), Some(slot)) = (parts, slot) {
+            return self.start_detached_waiter(DetachedStart {
+                sp,
+                parts,
+                slot,
+                client: client.clone(),
+                argv0,
+                ident,
+                drive_started,
+            });
+        }
+        let ExecMode::Client(conn) = mode else {
+            unreachable!("a detached exec always has its parts");
+        };
         let mut w = conn;
         let started = writeln!(
             w,
@@ -1425,11 +1633,6 @@ impl Shared {
             client,
             true,
         );
-        let ident = ExecIdent {
-            exec_id,
-            pid: sp.pid,
-            attach: req.attach,
-        };
         // Item 2: one `exec/exit` record on every post-spawn end path.
         // `Outcome::Lost` (status socket EOF/poll error) covers session
         // stop while running and monitor death; `Exited(Signal)` covers
@@ -1445,6 +1648,225 @@ impl Shared {
             }
         }
         line
+    }
+
+    /// The stdio of a detached exec and the pumps that drain it: stdin is
+    /// `/dev/null`; stdout and stderr are pipes whose read ends feed one
+    /// file each in `<workspace>/exec/`. The write ends travel to the helper
+    /// inside the returned fds and are closed by `spawn`, so the pumps see
+    /// EOF when the program and its children close the pipes.
+    fn detached_stdio(&self, exec_id: u64) -> io::Result<(Vec<OwnedFd>, DetachedParts)> {
+        let dir = execlog::exec_dir(&self.workspace_dir)?;
+        let stdin = OwnedFd::from(fs::File::open("/dev/null")?);
+        let (out_r, out_w) = execlog::pipe()?;
+        let (err_r, err_w) = execlog::pipe()?;
+        let paths = DetachedPaths {
+            state: execlog::exec_file(&dir, &self.incarnation, exec_id, "state.json"),
+            stdout: execlog::exec_file(&dir, &self.incarnation, exec_id, "stdout"),
+            stderr: execlog::exec_file(&dir, &self.incarnation, exec_id, "stderr"),
+        };
+        let so = execlog::start_pump(out_r, &paths.stdout)?;
+        let se = match execlog::start_pump(err_r, &paths.stderr) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = fs::remove_file(&paths.stdout);
+                return Err(e);
+            }
+        };
+        Ok((
+            vec![stdin, out_w, err_w],
+            DetachedParts {
+                exec_id,
+                paths,
+                stdout: so,
+                stderr: se,
+            },
+        ))
+    }
+
+    /// Deliver `sig` to a live exec through its status socket (the `K <n>`
+    /// path, as `signal`). `false` when the exec is not live or not
+    /// signal-able.
+    fn signal_exec(&self, exec_id: u64, sig: i32) -> bool {
+        let table = self.exec_table.lock().expect("exec_table");
+        table.by_id(exec_id).is_some_and(|h| {
+            sys::send_all(h.as_raw_fd(), exec::format_kill(sig).as_bytes()).is_ok()
+        })
+    }
+
+    /// Register a started detached exec, write its first state file, answer
+    /// the request and hand the exec to its waiter thread. The reply is the
+    /// connection's only line; the exec runs on after the client is gone.
+    fn start_detached_waiter(self: &Arc<Self>, d: DetachedStart) -> Value {
+        let DetachedStart {
+            sp,
+            parts,
+            slot,
+            client,
+            argv0,
+            ident,
+            drive_started,
+        } = d;
+        let started = crate::session::rfc3339_now();
+        let entry = Arc::new(execlog::DetachedExec {
+            exec_id: ident.exec_id,
+            seat: client.seat.clone(),
+            argv0: argv0.clone(),
+            pid: sp.pid,
+            started: started.clone(),
+            stdout: Arc::clone(&parts.stdout),
+            stderr: Arc::clone(&parts.stderr),
+            signalled: std::sync::atomic::AtomicBool::new(false),
+        });
+        let base = execlog::ExecState {
+            schema: execlog::STATE_SCHEMA.into(),
+            incarnation: self.incarnation.clone(),
+            exec_id: format!("e-{}", ident.exec_id),
+            seat: client.seat.clone(),
+            argv0: argv0.clone(),
+            started,
+            ended: None,
+            state: "running".into(),
+            exit_code: None,
+            signal: None,
+            signal_name: None,
+            cause: None,
+            pid: sp.pid,
+            output_open: true,
+            stdout: execlog::StreamCounts::default(),
+            stderr: execlog::StreamCounts::default(),
+        };
+        // Best effort: a state file that cannot be written does not stop the
+        // exec (the live table still answers); the end write is retried.
+        let _ = execlog::write_state(&parts.paths.state, &base);
+        self.detached.insert(Arc::clone(&entry));
+        let reply = ok(json!({
+            "pid": sp.pid,
+            "exec_id": format!("e-{}", ident.exec_id),
+            "incarnation": self.incarnation,
+            "detached": true,
+        }));
+        let shared = Arc::clone(self);
+        let (exec_id, pid) = (ident.exec_id, ident.pid);
+        let ctx = DetachedWaiter {
+            status: sp.status,
+            pending: sp.pending,
+            entry,
+            parts,
+            base,
+            client,
+            argv0,
+            ident,
+            drive_started,
+            _slot: slot,
+        };
+        let spawned = std::thread::Builder::new()
+            .name("exec-waiter".into())
+            .spawn(move || shared.detached_wait(ctx));
+        if let Err(e) = spawned {
+            // The closure (and with it the status socket) is dropped: the
+            // monitor kills the program group. Undo the registration.
+            self.exec_table.lock().expect("exec_table").remove(exec_id);
+            self.exec_seats.lock().expect("exec_seats").remove(&pid);
+            self.detached.remove(exec_id);
+            return err(control::E_INTERNAL, format!("waiter thread: {e}"));
+        }
+        reply
+    }
+
+    /// The waiter of one detached exec (plan 2.7, B9, B10): block on the
+    /// status socket only, decide the cause, let the pumps drain (bounded),
+    /// write the final state, journal `exec/exit`, then drop the exec from
+    /// every table (the registry last, so the stop sequence waits for the
+    /// journal record).
+    fn detached_wait(self: Arc<Self>, w: DetachedWaiter) {
+        let outcome = exec::wait_exit(&w.status, w.pending);
+        let (exit, lost) = match outcome {
+            exec::Outcome::Exited(x) => (Some(x), false),
+            exec::Outcome::Lost => (None, true),
+        };
+        // A closed status socket is `lost` unless the session is stopping:
+        // the stop flag is set right after init is gone, so give it a moment.
+        let stopping = if lost {
+            self.detached.wait_stopping(execlog::STOP_FLAG_WAIT)
+        } else {
+            self.detached.is_stopping()
+        };
+        let cause = execlog::detached_cause(
+            exit,
+            stopping,
+            w.entry.signalled.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        let drained = execlog::wait_pumps(&[&w.entry.stdout, &w.entry.stderr], execlog::DRAIN_WAIT);
+        let duration_ms = w.drive_started.elapsed().as_millis();
+        let mut st = w.base;
+        st.ended = Some(crate::session::rfc3339_now());
+        st.output_open = !drained;
+        st.stdout.total = w
+            .entry
+            .stdout
+            .total
+            .load(std::sync::atomic::Ordering::SeqCst);
+        st.stderr.total = w
+            .entry
+            .stderr
+            .total
+            .load(std::sync::atomic::Ordering::SeqCst);
+        st.cause = Some(cause.into());
+        match exit {
+            Some(exec::Exit::Code(c)) => {
+                st.state = "exited".into();
+                st.exit_code = Some(c);
+            }
+            Some(exec::Exit::Signal(n)) => {
+                st.state = "signalled".into();
+                st.signal = Some(n);
+                st.signal_name = Some(control::signal_name(n).to_owned());
+            }
+            None => st.state = if stopping { "signalled" } else { "lost" }.into(),
+        }
+        let _ = execlog::write_state(&w.parts.paths.state, &st);
+        self.log_client(
+            "exec",
+            "result",
+            Some(&w.argv0),
+            None,
+            Some(if lost && !stopping { "lost" } else { "ok" }),
+            &w.client,
+            true,
+        );
+        let (exec_id, pid) = (w.ident.exec_id, w.ident.pid);
+        let mut ident = w.ident;
+        ident.detached = Some(DetachedIdent {
+            incarnation: self.incarnation.clone(),
+            seat: w.client.seat.clone(),
+            cause,
+        });
+        self.journal_exec_exit(
+            &w.client,
+            exit.as_ref(),
+            false,
+            lost && !stopping,
+            duration_ms,
+            ident,
+        );
+        self.exec_table.lock().expect("exec_table").remove(exec_id);
+        self.exec_seats.lock().expect("exec_seats").remove(&pid);
+        self.detached.remove(exec_id);
+    }
+
+    /// The session-stop sequence for detached execs (plan 7 B9); returns the
+    /// `detached_execs_ended` list for `session/stop`.
+    fn stop_detached(&self) -> Vec<Value> {
+        execlog::stop_sequence(
+            &self.detached,
+            &self.incarnation,
+            &|id, sig| {
+                self.signal_exec(id, sig);
+            },
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
+        )
     }
 
     /// `signal`: deliver to a live exec'd program of *this* session only.
@@ -1468,6 +1890,12 @@ impl Shared {
                 return err(control::E_BAD_REQUEST, format!("invalid exec_id {eid:?}"));
             };
             let table = self.exec_table.lock().expect("exec_table");
+            if table.is_detached(eid_num) {
+                return err(
+                    control::E_BAD_REQUEST,
+                    format!("{eid} is a detached exec; use exec-signal"),
+                );
+            }
             let Some(h) = table.by_id(eid_num) else {
                 return err(
                     control::E_NOT_FOUND,
@@ -1487,6 +1915,12 @@ impl Shared {
             );
         };
         let table = self.exec_table.lock().expect("exec_table");
+        if table.pid_is_detached(pid) {
+            return err(
+                control::E_BAD_REQUEST,
+                format!("pid {pid} is a detached exec; use exec-signal"),
+            );
+        }
         if table.is_recycled(pid) {
             return err(
                 control::E_NOT_FOUND,
@@ -1537,15 +1971,7 @@ impl Shared {
             .lock()
             .expect("exec_table")
             .infos()
-            .map(|(id, e)| {
-                json!({
-                    "exec_id": format!("e-{id}"),
-                    "pid": e.pid,
-                    "argv0": e.argv0,
-                    "tty": e.tty,
-                    "attach": e.attach,
-                })
-            })
+            .map(|(id, e)| exec_info_json(id, e, &self.incarnation))
             .collect();
         // `"starting"`: a service whose readiness has not passed yet is
         // reported as starting. `start_in_sandbox_service` inserts the
@@ -1572,7 +1998,8 @@ impl Shared {
             json!({ "clients": clients, "execs": execs, "services": services,
                    "journal_failures": journal_failures, "journal_bytes": journal_bytes,
                    "workspace": self.workspace.id,
-                   "supervisor_pid": std::process::id() }),
+                   "supervisor_pid": std::process::id(),
+                   "incarnation": self.incarnation }),
         )
     }
 
@@ -1801,6 +2228,8 @@ struct ExecRequest {
     tty: bool,
     /// 0.4.0 step 2: when true, this is an attach (interactive shell).
     attach: bool,
+    /// 0.6.4: detached (no client stdio).
+    detach: bool,
 }
 
 struct Ctl {
@@ -1945,6 +2374,13 @@ impl Handler for Ctl {
             self.sh.touch_lease();
             self.sh.update_client(conn, &client);
         }
+        // 0.6.4: a detached exec is refused (nothing spawned) unless it
+        // declares revision 4, and never takes descriptors, tty or attach.
+        if let Some((code, msg)) = control::check_detach(&req, fds.len()) {
+            self.sh
+                .log_client("exec", "refused", None, None, Some(code), &client, false);
+            return err(code, msg);
+        }
         match req {
             Request::Exec {
                 argv,
@@ -1952,6 +2388,7 @@ impl Handler for Ctl {
                 env,
                 tty,
                 attach,
+                detach,
                 client: _,
             } => {
                 if attach {
@@ -1983,6 +2420,7 @@ impl Handler for Ctl {
                             env,
                             tty: true,
                             attach: true,
+                            detach: false,
                         },
                         fds,
                         peer,
@@ -1997,6 +2435,7 @@ impl Handler for Ctl {
                         env,
                         tty,
                         attach: false,
+                        detach,
                     },
                     fds,
                     peer,
@@ -3352,6 +3791,10 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     let idle_timer = start_idle_timer(&policy, &shared, pid);
     let relay = relay_and_wait(pid, master, tty);
     let code = relay.code;
+    // 0.6.4 (B9): init is gone. Set the stop flag at once (a waiter that sees
+    // its status socket close waits for it, bounded) and end the detached
+    // execs; the list goes into `session/stop` below.
+    let detached_ended = shared.stop_detached();
     // ADR 0022: the sandbox is gone. Stop the DNS responder and write
     // out the network records still queued (bounded), so `hisn journal`
     // right after the session shows them. The engines stop when
@@ -3411,6 +3854,9 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     }
     if let Some(d) = oom_kill_delta(oom_baseline, read_oom_kill(&own_memory_events_path())) {
         stop_data["oom_kill_delta"] = json!(d);
+    }
+    if !detached_ended.is_empty() {
+        stop_data["detached_execs_ended"] = Value::Array(detached_ended);
     }
     shared.journal_session_with("stop", stop_data);
     shared.journal_git_change(&policy.cwd);
@@ -3877,6 +4323,9 @@ fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
         exec_rules: a.exec_rules.take().expect("exec rules moved into control"),
         spawn_gate: RwLock::new(()),
         exec_table: Mutex::new(ExecTable::default()),
+        incarnation: execlog::new_incarnation(),
+        detached: execlog::Registry::default(),
+        detach_slots: execlog::Slots::new(execlog::MAX_DETACHED),
         next_exec_id: std::sync::atomic::AtomicU64::new(1),
         seq: std::sync::atomic::AtomicU64::new(1),
         conns: Mutex::new(ConnRegistry::default()),
@@ -4565,6 +5014,146 @@ pub fn client_request(session_arg: &str, req: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    // ---- 0.6.4 A1: detached exec
+
+    fn exec_info(detached: Option<DetachedInfo>) -> ExecInfo {
+        ExecInfo {
+            pid: 9,
+            argv0: "sleep".into(),
+            tty: false,
+            attach: false,
+            detached,
+        }
+    }
+
+    #[test]
+    fn ls_json_lists_detached_execs() {
+        let plain = exec_info_json(1, &exec_info(None), "INC");
+        assert_eq!(
+            plain,
+            json!({"exec_id":"e-1","pid":9,"argv0":"sleep","tty":false,"attach":false}),
+            "a plain exec keeps its v0.6.3 keys exactly"
+        );
+        let d = exec_info_json(
+            2,
+            &exec_info(Some(DetachedInfo {
+                seat: Some("bob".into()),
+            })),
+            "INC",
+        );
+        assert_eq!(d["detached"], true);
+        assert_eq!(d["incarnation"], "INC");
+        assert_eq!(d["state"], "running");
+        assert_eq!(d["seat"], "bob");
+        assert_eq!(d["exec_id"], "e-2");
+        let owner = exec_info_json(3, &exec_info(Some(DetachedInfo { seat: None })), "INC");
+        assert!(owner["seat"].is_null());
+    }
+
+    #[test]
+    fn detached_exec_counts_as_running_for_idle() {
+        // `has_running_execs` / `idle_snapshot` read `!exec_table.is_empty()`;
+        // a detached exec is registered in that same table (do_exec_common),
+        // so it is activity for `idle_due` with no change to lifecycle.rs.
+        let mut t = ExecTable::default();
+        assert!(t.is_empty());
+        t.insert_info(1, exec_info(Some(DetachedInfo { seat: None })));
+        assert!(!t.is_empty());
+        assert!(!crate::lifecycle::idle_due(
+            false,
+            !t.is_empty(),
+            100,
+            10_000,
+            60
+        ));
+        t.remove(1);
+        assert!(crate::lifecycle::idle_due(
+            false,
+            !t.is_empty(),
+            100,
+            10_000,
+            60
+        ));
+    }
+
+    #[test]
+    fn legacy_signal_table_knows_detached_execs() {
+        let mut t = ExecTable::default();
+        t.insert_info(1, exec_info(Some(DetachedInfo { seat: None })));
+        t.insert_info(
+            2,
+            ExecInfo {
+                pid: 10,
+                ..exec_info(None)
+            },
+        );
+        assert!(t.is_detached(1) && !t.is_detached(2) && !t.is_detached(3));
+        assert!(t.pid_is_detached(9) && !t.pid_is_detached(10));
+    }
+
+    /// B13: `exec.spawn(` is called from one place in non-test supervisor
+    /// code, `do_exec_common`, which both exec modes use. (A guard, not a
+    /// proof: a spawn through another name would not be seen.)
+    #[test]
+    fn only_one_spawn_call_site() {
+        let src = include_str!("supervisor.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let calls: Vec<usize> = body.match_indices("exec.spawn(").map(|(i, _)| i).collect();
+        assert_eq!(calls.len(), 1, "exec.spawn( call sites in supervisor.rs");
+        let fn_start = body.find("fn do_exec_common(").unwrap();
+        assert!(calls[0] > fn_start, "the call is inside do_exec_common");
+        let next_fn = body[fn_start + 1..].find("\n    fn ").unwrap() + fn_start;
+        assert!(calls[0] < next_fn, "and before the next function");
+        // The detached path is a mode of that function, not a second spawn.
+        assert!(body.contains("self.do_exec_common(client, req, stdio, mode)"));
+        // Nowhere else in the crate starts a process through the helper
+        // except the services' in-sandbox start (existing, journal-visible).
+        for f in [
+            "control.rs",
+            "execcli.rs",
+            "execlog.rs",
+            "authz.rs",
+            "main.rs",
+        ] {
+            let t =
+                std::fs::read_to_string(format!("{}/src/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+            let t = &t[..t.find("#[cfg(test)]").unwrap_or(t.len())];
+            assert!(
+                !t.contains("exec.spawn(") && !t.contains(".exec().spawn("),
+                "{f}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_exec_exit_record_unchanged() {
+        let client = authz::ClientRecord::internal(1000, 7);
+        let ident = ExecIdent {
+            exec_id: 1,
+            pid: 5,
+            attach: false,
+            detached: None,
+        };
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("workspace");
+        let journal = Journal::new(dir.clone(), "sess".into());
+        journal_exec_exit_record(
+            &journal,
+            &client,
+            Some(&exec::Exit::Code(0)),
+            false,
+            false,
+            3,
+            Some(ident),
+        );
+        let (recs, _) = crate::journal::read_records(&dir);
+        let d = &recs.last().unwrap().data;
+        for k in ["incarnation", "seat", "cause"] {
+            assert!(d.get(k).is_none(), "{k} must not appear on a plain exec");
+        }
+        assert_eq!(d["exec_id"], "e-1");
+    }
+
     use super::{ClientInfo, ConnRegistry};
 
     #[test]
@@ -5393,6 +5982,7 @@ mod tests {
                 exec_id: 4,
                 pid: 99,
                 attach: true,
+                detached: None,
             }),
         );
         let (records, _) = crate::journal::read_records(&d.path().join("workspace"));

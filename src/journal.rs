@@ -1216,6 +1216,25 @@ fn first_wseq_in_file(path: &Path) -> Option<u64> {
         .map(|r| r.wseq)
 }
 
+/// The first parseable record's `ts` in one file (head window only).
+fn first_ts_in_file(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = File::open(path).ok()?;
+    let mut buf = Vec::new();
+    (&mut f).take(TAIL_BYTES).read_to_end(&mut buf).ok()?;
+    buf.split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .find_map(|l| serde_json::from_slice::<JournalRecord>(l).ok())
+        .map(|r| r.ts)
+}
+
+/// The `ts` of the oldest record still on disk; `None` for an empty (or
+/// unreadable) journal. Used by the exec-log retention (0.6.4): an empty
+/// journal means no age rule. Cheap: reads one head window.
+pub fn oldest_ts(dir: &Path) -> Option<String> {
+    journal_files(dir).iter().find_map(|p| first_ts_in_file(p))
+}
+
 /// First/last `wseq`, file count and byte size of the journal in `dir`.
 pub fn journal_info(dir: &Path) -> JournalInfo {
     let files = journal_files(dir);
@@ -3726,6 +3745,18 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn oldest_ts_is_the_first_record_and_none_when_empty() {
+        let d = tempfile::tempdir_in("target").unwrap();
+        let dir = d.path().join("workspace");
+        assert_eq!(oldest_ts(&dir), None, "no journal: no age rule");
+        let j = Journal::new(dir.clone(), "abcdef0123456789".into());
+        j.append("note/x", None, serde_json::json!({})).unwrap();
+        j.append("note/y", None, serde_json::json!({})).unwrap();
+        let (records, _) = read_records(&dir);
+        assert_eq!(oldest_ts(&dir), Some(records[0].ts.clone()));
     }
 
     #[test]

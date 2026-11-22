@@ -846,6 +846,95 @@ if [ "$?" = 125 ] && dx_wait_state "$A" "$DX8_ID" running; then pass "DX8 an obs
 journal_is "DX8 journal: execoutput/refused for the observer" "$AWS" 1 kind=execoutput/refused
 timeout 20 "$HISN" exec-signal --session "$A" --exec "$DX8_ID" --signal KILL </dev/null >/dev/null 2>&1
 
+# DX9: output capture keeps the tail. A program writes 20 MiB of a 17-byte
+# pattern to stdout; the rotation (8 MiB) leaves the last 12 MiB. Reading from
+# offset 0 reports rotated_away and the oldest kept offset; reading on from
+# `next` continues without gaps or duplicates; the files are mode 600 and at
+# most two per stream; the state file's base moved.
+DX9_OUT=$(dx_start "$A" python3 -c "
+import sys
+p = b'0123456789abcdef\n'
+n = 20 * 1024 * 1024
+buf = (p * (n // len(p) + 1))[:n]
+sys.stdout.buffer.write(buf)
+sys.stdout.buffer.flush()
+sys.stderr.write('dx9-err')")
+DX9_ID=$(dx_id "$DX9_OUT")
+if dx_wait_state "$A" "$DX9_ID" exited; then
+  DX9_ST=$(timeout 20 "$HISN" exec-status --session "$A" --exec "$DX9_ID" --json </dev/null 2>&1)
+  DX9_R=$(timeout 120 python3 - "$HISN" "$A" "$DX9_ID" <<'PY'
+import base64, json, subprocess, sys
+hisn, sess, eid = sys.argv[1:4]
+def out(offset):
+    r = subprocess.run([hisn, "exec-output", "--session", sess, "--exec", eid, "--offset", str(offset), "--json"],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)
+PAT = b"0123456789abcdef\n"
+first = out(0)
+res = []
+res.append("rotated_away=%s" % str(first["rotated_away"]).lower())
+res.append("oldest=%d" % first["oldest"])
+res.append("offset=%d" % first["offset"])
+total_expected = 20 * 1024 * 1024
+res.append("total=%d" % first["total"])
+# follow from the returned offset to the end: no gap, no duplicate
+off, got, ok, eof = first["offset"], 0, True, False
+r = first
+while True:
+    data = base64.b64decode(r["data_b64"])
+    if r["offset"] != off:
+        ok = False; break
+    exp = bytes(PAT[(off + i) % len(PAT)] for i in range(min(len(data), 64)))
+    if data[:64] != exp or len(data) != r["next"] - r["offset"]:
+        ok = False; break
+    got += len(data); off = r["next"]
+    if r["eof"]:
+        eof = True; break
+    if not data:
+        break
+    r = out(off)
+res.append("contiguous=%s" % str(ok).lower())
+res.append("bytes=%d" % got)
+res.append("end=%d" % off)
+res.append("eof=%s" % str(eof).lower())
+# a later offset is not rotated away
+late = out(off - 5)
+res.append("late_rotated=%s" % str(late["rotated_away"]).lower())
+print(" ".join(res))
+PY
+)
+  DX9_WANT="rotated_away=true oldest=8388608 offset=8388608 total=20971520 contiguous=true bytes=12582912 end=20971520 eof=true late_rotated=false"
+  if [ "$DX9_R" = "$DX9_WANT" ]; then
+    pass "DX9 20 MiB output: offset 0 is rotated_away, the 12 MiB tail reads without gaps or duplicates, eof at the end"
+  else
+    fail "DX9 20 MiB output: offset 0 is rotated_away, the 12 MiB tail reads without gaps or duplicates, eof at the end" "got [$DX9_R] want [$DX9_WANT]"
+  fi
+  if [ "$(printf '%s' "$DX9_ST" | jget stdout.base)" = 8388608 ] && [ "$(printf '%s' "$DX9_ST" | jget stdout.total)" = 20971520 ] && [ "$(printf '%s' "$DX9_ST" | jget output_open)" = false ]; then
+    pass "DX9 the state file's stdout.base moved to 8388608, total 20971520, output closed"
+  else
+    fail "DX9 the state file's stdout.base moved to 8388608, total 20971520, output closed" "[$DX9_ST]"
+  fi
+  DX9_E=$(timeout 20 "$HISN" exec-output --session "$A" --exec "$DX9_ID" --stream stderr </dev/null 2>/dev/null)
+  if [ "$DX9_E" = dx9-err ]; then pass "DX9 stderr stayed small and separate"; else fail "DX9 stderr stayed small and separate" "[$DX9_E]"; fi
+  DX9_FILES=$(find "$T/state" -name "*-e${DX9_ID#e-}.std*" -o -name "*-e${DX9_ID#e-}.state.json" 2>/dev/null | sort)
+  DX9_BAD=""
+  DX9_N=0
+  for f in $DX9_FILES; do
+    DX9_N=$((DX9_N + 1))
+    [ "$(stat -c %a "$f")" = 600 ] || DX9_BAD="$DX9_BAD $f"
+    [ "$(stat -c %s "$f")" -le 8388608 ] || DX9_BAD="$DX9_BAD big:$f"
+  done
+  DX9_STDOUT_FILES=$(printf '%s\n' $DX9_FILES | grep -c '\.stdout\(\.1\)\{0,1\}$')
+  if [ "$DX9_N" = 4 ] && [ -z "$DX9_BAD" ] && [ "$DX9_STDOUT_FILES" = 2 ] && [ "$(stat -c %a "$(dirname "$(printf '%s\n' $DX9_FILES | head -1)")")" = 700 ]; then
+    pass "DX9 files are mode 600 in a 700 dir, at most 8 MiB each, two stdout files"
+  else
+    fail "DX9 files are mode 600 in a 700 dir, at most 8 MiB each, two stdout files" "n=$DX9_N stdout files=$DX9_STDOUT_FILES bad=[$DX9_BAD] files=[$DX9_FILES]"
+  fi
+else
+  fail "DX9 the 20 MiB writer finishes" "[$DX9_OUT]"
+fi
+
 # DX5: a detached exec ends when its session stops: the process is gone, the
 # exec's journal record says session-stop, and session/stop lists it.
 DX5="$TOKEN-dx5"

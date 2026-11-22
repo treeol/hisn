@@ -145,6 +145,11 @@ pub fn read_state(path: &Path) -> io::Result<ExecState> {
 
 /// Upper bound of one `exec-output` reply (and its default).
 pub const READ_MAX: usize = 1024 * 1024;
+/// A stream file is rotated when it reaches this size: the current file plus
+/// one previous file are kept, so at most twice this per stream (plan 2.3).
+pub const EXEC_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+/// At most this many finished execs keep their files (plan 2.5).
+pub const MAX_FINISHED: usize = 256;
 
 #[derive(Debug, Default)]
 struct StreamInner {
@@ -164,6 +169,11 @@ pub struct Stream {
     pub eof: AtomicBool,
     path: PathBuf,
     inner: Mutex<StreamInner>,
+    /// Rotation size; 0 = [`EXEC_ROTATE_BYTES`] (tests inject a small one).
+    limit: u64,
+    /// Called by the pump thread after a rotation (outside `inner`), so the
+    /// state file's `base` follows the files.
+    on_rotate: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl std::fmt::Debug for Stream {
@@ -183,11 +193,25 @@ pub fn prev_path(path: &Path) -> PathBuf {
 }
 
 impl Stream {
-    fn new(path: &Path) -> Self {
+    fn new(path: &Path, limit: u64) -> Self {
         Self {
             path: path.to_path_buf(),
+            limit,
             ..Self::default()
         }
+    }
+
+    fn rotate_at(&self) -> u64 {
+        if self.limit == 0 {
+            EXEC_ROTATE_BYTES
+        } else {
+            self.limit
+        }
+    }
+
+    /// Register the callback run after each rotation.
+    pub fn set_on_rotate(&self, f: Arc<dyn Fn() + Send + Sync>) {
+        *self.on_rotate.lock().expect("on_rotate") = Some(f);
     }
 
     /// `total` and the oldest offset still kept, for the state file.
@@ -212,10 +236,58 @@ impl Stream {
         read_layout(&l, offset, max)
     }
 
-    fn append(&self, file: &mut fs::File, chunk: &[u8]) {
-        let _g = self.inner.lock().expect("stream");
-        if file.write_all(chunk).is_ok() {
-            self.total.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+    /// Append `chunk`, rotating whenever the current file reaches the limit.
+    /// A write error discards the rest of the chunk (nothing is counted);
+    /// a failed rotation keeps writing to the current file (R-a). Returns
+    /// whether a rotation happened.
+    fn append(&self, file: &mut fs::File, mut chunk: &[u8]) -> bool {
+        let mut rotated = false;
+        let mut g = self.inner.lock().expect("stream");
+        while !chunk.is_empty() {
+            let cur_len = self.total.load(Ordering::SeqCst).saturating_sub(g.cur_base);
+            let room = self.rotate_at().saturating_sub(cur_len);
+            let n = if room == 0 {
+                chunk.len()
+            } else {
+                chunk.len().min(room as usize)
+            };
+            if file.write_all(&chunk[..n]).is_err() {
+                return rotated;
+            }
+            self.total.fetch_add(n as u64, Ordering::SeqCst);
+            chunk = &chunk[n..];
+            let cur_len = self.total.load(Ordering::SeqCst).saturating_sub(g.cur_base);
+            if cur_len >= self.rotate_at() && self.rotate(&mut g, file) {
+                rotated = true;
+            }
+        }
+        rotated
+    }
+
+    /// Move the current file to `<path>.1` (replacing the previous one) and
+    /// start a new current file. `false` = nothing changed.
+    fn rotate(&self, g: &mut StreamInner, file: &mut fs::File) -> bool {
+        let prev = prev_path(&self.path);
+        if fs::rename(&self.path, &prev).is_err() {
+            return false;
+        }
+        match fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&self.path)
+        {
+            Ok(f) => {
+                *file = f;
+                g.prev_base = Some(g.cur_base);
+                g.cur_base = self.total.load(Ordering::SeqCst);
+                true
+            }
+            Err(_) => {
+                // Undo: the old descriptor keeps writing to the old file.
+                let _ = fs::rename(&prev, &self.path);
+                false
+            }
         }
     }
 }
@@ -337,16 +409,27 @@ pub fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 /// Start the pump of one stream: a thread that reads `read` until EOF and
-/// appends to a new `0600` file at `path`. A write error (ENOSPC, ...) keeps
-/// draining and discards, so the program never blocks on a full pipe (B10).
+/// appends to a new `0600` file at `path`, rotating at [`EXEC_ROTATE_BYTES`].
+/// A write error (ENOSPC, ...) keeps draining and discards, so the program
+/// never blocks on a full pipe (B10).
 pub fn start_pump(read: OwnedFd, path: &Path) -> io::Result<Arc<Stream>> {
-    let mut file = fs::OpenOptions::new()
+    start_pump_limit(read, path, EXEC_ROTATE_BYTES)
+}
+
+/// [`start_pump`] with an injected rotation size.
+pub fn start_pump_limit(read: OwnedFd, path: &Path, limit: u64) -> io::Result<Arc<Stream>> {
+    let file = fs::OpenOptions::new()
         .append(true)
         .create_new(true)
         .mode(0o600)
         .open(path)?;
-    let stream = Arc::new(Stream::new(path));
-    let s = Arc::clone(&stream);
+    let stream = Arc::new(Stream::new(path, limit));
+    pump_into(read, file, &stream)?;
+    Ok(stream)
+}
+
+fn pump_into(read: OwnedFd, mut file: fs::File, stream: &Arc<Stream>) -> io::Result<()> {
+    let s = Arc::clone(stream);
     std::thread::Builder::new()
         .name("exec-pump".into())
         .spawn(move || {
@@ -355,14 +438,28 @@ pub fn start_pump(read: OwnedFd, path: &Path) -> io::Result<Arc<Stream>> {
             loop {
                 match src.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => s.append(&mut file, &buf[..n]),
+                    Ok(n) => {
+                        if s.append(&mut file, &buf[..n]) {
+                            let cb = s.on_rotate.lock().expect("on_rotate").clone();
+                            if let Some(cb) = cb {
+                                cb();
+                            }
+                        }
+                    }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Err(_) => break,
                 }
             }
             s.eof.store(true, Ordering::SeqCst);
         })?;
-    Ok(stream)
+    Ok(())
+}
+
+/// The `eof` of one `exec-output` reply (plan 7 B10): the exec's state was
+/// final **and** this stream's pump had seen EOF — both observed *before*
+/// the read, so `total` is final — and the reader reached `total`.
+pub fn output_eof(final_before: bool, pump_eof_before: bool, next: u64, total: u64) -> bool {
+    final_before && pump_eof_before && next >= total
 }
 
 /// Wait until every stream's pump has seen EOF, at most `timeout`.
@@ -524,6 +621,84 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+// ------------------------------------------------------------- retention
+
+/// The files of one exec (`<incarnation>-e<N>.*`), all kinds.
+fn exec_files_of(dir: &Path, stem: &str) -> Vec<PathBuf> {
+    [
+        "state.json",
+        "state.json.tmp",
+        "stdout",
+        "stdout.1",
+        "stderr",
+        "stderr.1",
+    ]
+    .iter()
+    .map(|k| dir.join(format!("{stem}.{k}")))
+    .collect()
+}
+
+/// Delete the logs of finished execs (plan 2.5, B5): a finished exec whose
+/// `ended` is older than `oldest_ts` (the oldest journal record; `None` = no
+/// age rule), then the oldest beyond `max_finished`. A `running` file of the
+/// live incarnation is never touched; one of another incarnation counts as
+/// lost only when its writer is gone, and a file with no writer identity is
+/// left alone. Best effort; returns the number of execs removed.
+pub fn prune(
+    dir: &Path,
+    live_incarnation: &str,
+    oldest_ts: Option<&str>,
+    max_finished: usize,
+) -> usize {
+    let Ok(rd) = fs::read_dir(dir) else { return 0 };
+    // (ended-or-started, stem)
+    let mut finished: Vec<(String, String)> = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".state.json") else {
+            continue;
+        };
+        let Ok(st) = read_state(&e.path()) else {
+            continue;
+        };
+        if st.state == "running" {
+            if st.incarnation == live_incarnation || writer_gone(&st) != Some(true) {
+                continue;
+            }
+            finished.push((st.started.clone(), stem.to_owned()));
+        } else {
+            finished.push((
+                st.ended.clone().unwrap_or(st.started.clone()),
+                stem.to_owned(),
+            ));
+        }
+    }
+    finished.sort();
+    let mut doomed: Vec<&str> = Vec::new();
+    for (t, stem) in &finished {
+        if oldest_ts.is_some_and(|o| t.as_str() < o) {
+            doomed.push(stem);
+        }
+    }
+    let kept = finished.len() - doomed.len();
+    if kept > max_finished {
+        let extra = kept - max_finished;
+        let more: Vec<&str> = finished
+            .iter()
+            .map(|(_, stem)| stem.as_str())
+            .filter(|stem| !doomed.contains(stem))
+            .take(extra)
+            .collect();
+        doomed.extend(more);
+    }
+    for stem in &doomed {
+        for f in exec_files_of(dir, stem) {
+            let _ = fs::remove_file(f);
+        }
+    }
+    doomed.len()
 }
 
 // -------------------------------------------------------------- registry
@@ -1087,6 +1262,308 @@ mod tests {
         assert!(o.data.is_empty());
         assert_eq!((o.offset, o.next, o.total), (10, 10, 10));
         assert_eq!(s.counts(), StreamCounts { total: 10, base: 0 });
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn pump_with(limit: u64, name: &str) -> (PathBuf, Arc<Stream>, fs::File) {
+        let d = tmp(name);
+        let (r, w) = pipe().unwrap();
+        let p = exec_file(&d, "i", 1, "stdout");
+        let s = start_pump_limit(r, &p, limit).unwrap();
+        (d, s, fs::File::from(w))
+    }
+
+    fn bytes(range: std::ops::Range<usize>) -> Vec<u8> {
+        range.map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn pump_rotates_at_limit_and_keeps_previous() {
+        let (d, s, mut w) = pump_with(100, "rot");
+        let data = bytes(0..250);
+        w.write_all(&data).unwrap();
+        drop(w);
+        assert!(wait_pumps(&[&s], Duration::from_secs(2)));
+        let p = exec_file(&d, "i", 1, "stdout");
+        // 250 bytes at limit 100: files hold [100..200) (previous) and [200..250).
+        assert_eq!(fs::read(prev_path(&p)).unwrap(), &data[100..200]);
+        assert_eq!(fs::read(&p).unwrap(), &data[200..250]);
+        assert_eq!(
+            s.counts(),
+            StreamCounts {
+                total: 250,
+                base: 100
+            }
+        );
+        // Reading from the start reports rotation and returns the oldest kept.
+        let o = s.read(0, 1000).unwrap();
+        assert!(o.rotated_away);
+        assert_eq!((o.offset, o.oldest, o.total), (100, 100, 250));
+        assert_eq!(o.data, &data[100..250]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn pump_keeps_at_most_two_files_per_stream() {
+        let (d, s, mut w) = pump_with(64, "two");
+        w.write_all(&bytes(0..1000)).unwrap();
+        drop(w);
+        assert!(wait_pumps(&[&s], Duration::from_secs(2)));
+        let names: Vec<String> = fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.iter().any(|n| n.ends_with("-e1.stdout")));
+        assert!(names.iter().any(|n| n.ends_with("-e1.stdout.1")));
+        let c = s.counts();
+        assert!(c.total - c.base <= 128, "{c:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn read_offset_across_rotation() {
+        let (d, s, mut w) = pump_with(100, "across");
+        let data = bytes(0..230);
+        w.write_all(&data).unwrap();
+        drop(w);
+        assert!(wait_pumps(&[&s], Duration::from_secs(2)));
+        // [100,200) previous, [200,230) current; a read spanning both is
+        // stitched with no gap and no duplicate.
+        let o = s.read(150, 60).unwrap();
+        assert!(!o.rotated_away);
+        assert_eq!(o.data, &data[150..210]);
+        assert_eq!((o.offset, o.next), (150, 210));
+        // Chunked reads from the oldest offset reassemble the kept tail.
+        let mut got = Vec::new();
+        let mut off = 0;
+        loop {
+            let o = s.read(off, 37).unwrap();
+            if o.data.is_empty() {
+                break;
+            }
+            got.extend_from_slice(&o.data);
+            off = o.next;
+        }
+        assert_eq!(got, &data[100..230]);
+        // The same layout is rebuilt from the files and the state's base.
+        let p = exec_file(&d, "i", 1, "stdout");
+        let l = layout_from_files(&p, 100).unwrap();
+        assert_eq!((l.prev_base, l.cur_base, l.total), (100, 200, 230));
+        let o = read_layout(&l, 150, 60).unwrap();
+        assert_eq!(o.data, &data[150..210]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn read_rotated_away_sets_flag_and_returns_oldest() {
+        let (d, s, mut w) = pump_with(50, "away");
+        let data = bytes(0..180);
+        w.write_all(&data).unwrap();
+        drop(w);
+        assert!(wait_pumps(&[&s], Duration::from_secs(2)));
+        let c = s.counts();
+        assert_eq!(c.base, 100);
+        let o = s.read(10, 1000).unwrap();
+        assert!(o.rotated_away);
+        assert_eq!((o.offset, o.oldest), (100, 100));
+        assert_eq!(o.data, &data[100..]);
+        // Continuing from `next` has no gap and no duplicate, and no flag.
+        let o2 = s.read(o.next, 10).unwrap();
+        assert!(o2.data.is_empty() && !o2.rotated_away);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn read_past_total_is_empty_not_eof_while_running() {
+        let (d, s, mut w) = pump_with(100, "past");
+        w.write_all(b"abc").unwrap();
+        w.flush().unwrap();
+        for _ in 0..200 {
+            if s.total.load(Ordering::SeqCst) == 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let o = s.read(3, 10).unwrap();
+        assert!(o.data.is_empty());
+        assert_eq!((o.next, o.total), (3, 3));
+        // The pump has not seen EOF (the write end is open): not eof.
+        assert!(!output_eof(
+            true,
+            s.eof.load(Ordering::SeqCst),
+            o.next,
+            o.total
+        ));
+        drop(w);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn eof_requires_pump_eof_and_final_state() {
+        assert!(output_eof(true, true, 10, 10));
+        assert!(!output_eof(false, true, 10, 10), "exec still running");
+        assert!(!output_eof(true, false, 10, 10), "pump still open");
+        assert!(!output_eof(true, true, 9, 10), "not at the end yet");
+        assert!(output_eof(true, true, 0, 0), "empty finished stream");
+    }
+
+    #[test]
+    fn pump_keeps_draining_on_write_error() {
+        // The file refuses every write (/dev/full): the pump still empties
+        // the pipe, so a writer larger than the pipe buffer never blocks,
+        // nothing is counted, and EOF is reached.
+        let d = tmp("full");
+        let (r, w) = pipe().unwrap();
+        let full = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let s = Arc::new(Stream::new(&d.join("x"), 0));
+        pump_into(r, full, &s).unwrap();
+        let mut w = fs::File::from(w);
+        w.write_all(&vec![7u8; 300_000]).unwrap();
+        drop(w);
+        assert!(wait_pumps(&[&s], Duration::from_secs(5)));
+        assert_eq!(s.total.load(Ordering::SeqCst), 0);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn rotation_callback_runs_outside_the_lock() {
+        let (d, s, mut w) = pump_with(10, "cb");
+        let s2 = Arc::clone(&s);
+        let seen = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let seen2 = Arc::clone(&seen);
+        // The callback reads `counts()`, which takes the stream lock: it
+        // would deadlock if the pump held it.
+        s.set_on_rotate(Arc::new(move || {
+            seen2.lock().unwrap().push(s2.counts().base);
+        }));
+        w.write_all(&bytes(0..35)).unwrap();
+        drop(w);
+        assert!(wait_pumps(&[&s], Duration::from_secs(2)));
+        let seen = seen.lock().unwrap().clone();
+        assert!(!seen.is_empty());
+        assert_eq!(s.counts().base, 20);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn write_finished(dir: &Path, inc: &str, id: u64, ended: &str) {
+        let mut st = state(id);
+        st.incarnation = inc.into();
+        st.state = "exited".into();
+        st.exit_code = Some(0);
+        st.ended = Some(ended.into());
+        write_state(&exec_file(dir, inc, id, "state.json"), &st).unwrap();
+        for k in ["stdout", "stdout.1", "stderr"] {
+            fs::write(exec_file(dir, inc, id, k), b"x").unwrap();
+        }
+    }
+
+    fn count_state_files(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".state.json")
+            })
+            .count()
+    }
+
+    #[test]
+    fn prune_removes_logs_older_than_oldest_journal_record() {
+        let d = tmp("prune-age");
+        write_finished(&d, "I0", 1, "2026-11-01T00:00:00Z");
+        write_finished(&d, "I0", 2, "2026-11-20T00:00:00Z");
+        let n = prune(&d, "I1", Some("2026-11-10T00:00:00Z"), 256);
+        assert_eq!(n, 1);
+        assert!(!exec_file(&d, "I0", 1, "state.json").exists());
+        assert!(!exec_file(&d, "I0", 1, "stdout.1").exists(), "all kinds go");
+        assert!(exec_file(&d, "I0", 2, "state.json").exists());
+        assert!(exec_file(&d, "I0", 2, "stdout").exists());
+        // No age rule (empty journal): only the cap applies, nothing here.
+        assert_eq!(prune(&d, "I1", None, 256), 0);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn prune_never_touches_running_exec() {
+        let d = tmp("prune-run");
+        let mut st = state(1);
+        st.incarnation = "I1".into();
+        st.started = "2020-01-01T00:00:00Z".into(); // ancient
+        write_state(&exec_file(&d, "I1", 1, "state.json"), &st).unwrap();
+        fs::write(exec_file(&d, "I1", 1, "stdout"), b"x").unwrap();
+        // Live incarnation, running: untouched by age and by the cap alike.
+        assert_eq!(prune(&d, "I1", Some("2026-11-10T00:00:00Z"), 0), 0);
+        assert!(exec_file(&d, "I1", 1, "state.json").exists());
+        assert!(exec_file(&d, "I1", 1, "stdout").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn prune_leaves_running_state_of_live_foreign_pid() {
+        let d = tmp("prune-foreign");
+        let me = std::process::id() as i32;
+        let old = "2020-01-01T00:00:00Z";
+        // 1: another incarnation, writer alive (this process): left alone.
+        let mut a = state(1);
+        a.incarnation = "I0".into();
+        a.started = old.into();
+        a.supervisor_pid = Some(me);
+        a.supervisor_start = Some(crate::sys::stat_starttime(me).unwrap());
+        write_state(&exec_file(&d, "I0", 1, "state.json"), &a).unwrap();
+        // 2: writer's pid is alive but its start time differs (pid reuse): lost.
+        let mut b = state(2);
+        b.incarnation = "I0".into();
+        b.started = old.into();
+        b.supervisor_pid = Some(me);
+        b.supervisor_start = Some(1);
+        write_state(&exec_file(&d, "I0", 2, "state.json"), &b).unwrap();
+        // 3: writer dead: lost.
+        let mut c = state(3);
+        c.incarnation = "I0".into();
+        c.started = old.into();
+        c.supervisor_pid = Some(i32::MAX);
+        c.supervisor_start = Some(5);
+        write_state(&exec_file(&d, "I0", 3, "state.json"), &c).unwrap();
+        // 4: no writer identity (older build): unknowable, left alone.
+        let mut e = state(4);
+        e.incarnation = "I0".into();
+        e.started = old.into();
+        write_state(&exec_file(&d, "I0", 4, "state.json"), &e).unwrap();
+        let n = prune(&d, "I1", Some("2026-11-10T00:00:00Z"), 256);
+        assert_eq!(n, 2);
+        assert!(exec_file(&d, "I0", 1, "state.json").exists());
+        assert!(!exec_file(&d, "I0", 2, "state.json").exists());
+        assert!(!exec_file(&d, "I0", 3, "state.json").exists());
+        assert!(exec_file(&d, "I0", 4, "state.json").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn prune_caps_finished_execs_at_256() {
+        let d = tmp("prune-cap");
+        for id in 1..=260u64 {
+            write_finished(
+                &d,
+                "I0",
+                id,
+                &format!("2026-11-21T00:{:02}:{:02}Z", id / 60, id % 60),
+            );
+        }
+        assert_eq!(prune(&d, "I1", None, MAX_FINISHED), 4);
+        assert_eq!(count_state_files(&d), 256);
+        // The four oldest went.
+        for id in 1..=4u64 {
+            assert!(!exec_file(&d, "I0", id, "state.json").exists(), "{id}");
+        }
+        assert!(exec_file(&d, "I0", 5, "state.json").exists());
+        assert!(exec_file(&d, "I0", 260, "state.json").exists());
         fs::remove_dir_all(&d).unwrap();
     }
 }

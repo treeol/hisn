@@ -1778,6 +1778,16 @@ impl Shared {
         // Best effort: a state file that cannot be written does not stop the
         // exec (the live entry still answers); the end write is retried.
         entry.update(|_| {});
+        // A rotation moves a stream's `base`: write the state file again.
+        // Weak, so the streams do not keep their own exec alive.
+        for st in [&entry.stdout, &entry.stderr] {
+            let w = Arc::downgrade(&entry);
+            st.set_on_rotate(Arc::new(move || {
+                if let Some(e) = w.upgrade() {
+                    e.update(|_| {});
+                }
+            }));
+        }
         self.detached.insert(Arc::clone(&entry));
         let reply = ok(json!({
             "pid": sp.pid,
@@ -1883,6 +1893,20 @@ impl Shared {
         self.exec_table.lock().expect("exec_table").remove(exec_id);
         self.exec_seats.lock().expect("exec_seats").remove(&pid);
         self.detached.remove(exec_id);
+        self.prune_exec_logs();
+    }
+
+    /// Retention of finished execs' files (plan 2.5): at supervisor start
+    /// and after each exec finishes; never touches a running exec.
+    fn prune_exec_logs(&self) {
+        let dir = self.workspace_dir.join("exec");
+        let oldest = crate::journal::oldest_ts(&self.workspace_dir);
+        execlog::prune(
+            &dir,
+            &self.incarnation,
+            oldest.as_deref(),
+            execlog::MAX_FINISHED,
+        );
     }
 
     /// The session-stop sequence for detached execs (plan 7 B9); returns the
@@ -1993,10 +2017,13 @@ impl Shared {
             } else {
                 &e.stderr
             };
-            // Read the stream first, then the state: a state that is final
-            // here was final before the read, so `eof` cannot be early.
+            // Pump EOF and the final state are observed before the read:
+            // both only ever turn true, so `total` cannot grow after them
+            // and `eof` cannot be early (B10).
+            let pump_eof = s.eof.load(std::sync::atomic::Ordering::SeqCst);
+            let final_state = execlog::is_final(&e.snapshot().state);
             let out = s.read(offset, max);
-            (out, e.snapshot())
+            (out, (final_state, pump_eof, e.snapshot()))
         } else {
             let st = match execlog::read_state(&self.state_path(&inc, id)) {
                 Ok(st) => execlog::effective_state(st, &self.incarnation),
@@ -2016,14 +2043,16 @@ impl Shared {
             let path = execlog::exec_file(&dir, &inc, id, stream);
             let out = execlog::layout_from_files(&path, counts.base)
                 .and_then(|l| execlog::read_layout(&l, offset, max));
-            (out, st)
+            // No live pump: the files are all there is (a foreign or
+            // finished exec), and the state file says whether it ended.
+            (out, (execlog::is_final(&st.state), !st.output_open, st))
         };
+        let (final_before, pump_eof_before, st) = st;
         let out = match out {
             Ok(o) => o,
             Err(e) => return err(control::E_INTERNAL, format!("reading output: {e}")),
         };
-        let pump_done = !st.output_open;
-        let eof = execlog::is_final(&st.state) && pump_done && out.next >= out.total;
+        let eof = execlog::output_eof(final_before, pump_eof_before, out.next, out.total);
         ok(json!({
             "data_b64": execlog::b64_encode(&out.data),
             "offset": out.offset,
@@ -4629,6 +4658,9 @@ fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
             None,
         );
     }
+    // 0.6.4: retention of finished detached execs' files at start (plan 2.5);
+    // best effort, off the start path's error handling.
+    shared.prune_exec_logs();
     let handler: Arc<dyn Handler> = Arc::new(Ctl {
         sh: Arc::clone(&shared),
     });

@@ -49,6 +49,8 @@ use serde_json::{Value, json};
 
 use crate::session::rfc3339_now;
 
+mod index;
+
 /// Record schema version.
 pub const JOURNAL_VERSION: u32 = 1;
 /// File name of the newest journal file, and the rotation prefix.
@@ -1196,6 +1198,10 @@ pub fn read_records(dir: &Path) -> (Vec<JournalRecord>, usize) {
 /// non-empty file and the tail of the newest, never the whole journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalInfo {
+    /// Number of unreadable lines over all files. Only `journal --info`
+    /// computes it (from the index headers); `None` elsewhere and when a file
+    /// cannot be read.
+    pub unreadable: Option<u64>,
     /// Lowest `wseq` still on disk; `None` for an empty journal.
     pub first_wseq: Option<u64>,
     /// Highest `wseq` on disk; `None` for an empty journal.
@@ -1249,11 +1255,21 @@ pub fn journal_info(dir: &Path) -> JournalInfo {
         .rev()
         .find_map(|p| last_wseq_in_file(p).ok().flatten());
     JournalInfo {
+        unreadable: None,
         first_wseq,
         last_wseq,
         files: files.len(),
         bytes,
     }
+}
+
+/// [`journal_info`] plus the unreadable-line count (0.6.4, `journal --info`).
+/// Builds or extends the per-file indexes on the way: once per file, rotated
+/// files are never rescanned.
+pub fn journal_info_with_unreadable(dir: &Path) -> JournalInfo {
+    let mut info = journal_info(dir);
+    info.unreadable = index::unreadable_total(dir);
+    info
 }
 
 /// What a cursor read found (0.6.3, `hisn journal --after-wseq N`).
@@ -1312,24 +1328,36 @@ pub fn cursor_select(recs: &[JournalRecord], after: u64) -> CursorSelect {
     }
 }
 
-/// Read the journal in `dir` and select after `after`. A reset or a hole
-/// is read once more (a rotation racing the reader's pinning is transient
-/// and the second pass sees a consistent set); only a repeated result is
-/// reported. Also returns the count of unparseable lines.
+/// Read the journal in `dir` and select after `after`.
+///
+/// 0.6.4: the read starts near the cursor, using the offset index (see
+/// [`index`]). A clean result is returned as is; anything else (a reset, a hole,
+/// a cursor behind retention, no usable index) is re-run by the full scan, and
+/// that scan is read a second time before it is reported (a rotation racing the
+/// reader's pinning is transient and the second pass sees a consistent set).
+/// The count is of unreadable lines met: with the index, only those on the part
+/// actually read.
 pub fn cursor_read(dir: &Path, after: u64) -> (CursorSelect, usize) {
-    let (recs, skipped) = read_records(dir);
-    match cursor_select(&recs, after) {
-        // A cursor behind the oldest record may be retention or a rotation
-        // that hid the oldest file from this one pass: read once more and
-        // report only what the second pass also sees.
+    if let Some((
         r @ CursorSelect::Records {
             behind_retention: false,
             ..
-        } => (r, skipped),
-        _ => {
-            let (recs, skipped) = read_records(dir);
-            (cursor_select(&recs, after), skipped)
-        }
+        },
+        skipped,
+        _,
+    )) = index::cursor_indexed(dir, after)
+    {
+        return (r, skipped);
+    }
+    match index::cursor_full(dir, after) {
+        (
+            r @ CursorSelect::Records {
+                behind_retention: false,
+                ..
+            },
+            skipped,
+        ) => (r, skipped),
+        _ => index::cursor_full(dir, after),
     }
 }
 

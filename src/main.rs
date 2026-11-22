@@ -1003,7 +1003,7 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
     };
     let dir = workspace::workspace_dir(&id);
     if a.info {
-        let info = journal::journal_info(&dir);
+        let info = journal::journal_info_with_unreadable(&dir);
         println!("{}", journal_info_json(&info));
         return Ok(ExitCode::SUCCESS);
     }
@@ -1317,6 +1317,7 @@ fn journal_info_json(info: &journal::JournalInfo) -> Value {
         "last_wseq": info.last_wseq,
         "files": info.files,
         "bytes": info.bytes,
+        "unreadable": info.unreadable,
     })
 }
 
@@ -1466,6 +1467,17 @@ mod ls_tests {
         let empty = tempfile::tempdir().unwrap();
         let v = super::journal_info_json(&hisn::journal::journal_info(empty.path()));
         assert!(v["first_wseq"].is_null() && v["last_wseq"].is_null());
+    }
+
+    #[test]
+    fn journal_info_json_has_unreadable() {
+        let d = tempfile::tempdir().unwrap();
+        let v = super::journal_info_json(&hisn::journal::journal_info_with_unreadable(d.path()));
+        assert_eq!(v["unreadable"], 0);
+        assert_eq!(v["schema"], "hisn-journal-info/v1");
+        // the cheap form (`ls --json`) does not compute it
+        let cheap = hisn::journal::journal_info(d.path());
+        assert!(super::journal_info_json(&cheap)["unreadable"].is_null());
     }
 
     #[test]

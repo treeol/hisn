@@ -11,6 +11,11 @@
 #   4. make test
 #   5. the leak suite with output through a pipe
 #   6. the leak suite on a pseudo-terminal (via `script` when present)
+#   7. the hermetic net harness (tests/leak/net_cases.sh under `unshare -Urn`,
+#      DX detached-exec cases included), with its own pass/fail/skip counts
+#   8. tests/leak/compat_063.sh against a v0.6.3 binary built from the tag in
+#      a separate git worktree (own target dir under target/, removed after);
+#      a missing tag fails the gate, it is never skipped
 #
 # HISN_TEST_ROOTFS and HISN_BIG_TESTS, when set, are passed through to the
 # leak suite; when they are not set the rootfs and big-import cases skip and
@@ -109,6 +114,73 @@ run_leak_pty() {
     printf 'release-gate: SKIP leak-suite-pty: `script` (util-linux) not present on this host, so the pseudo-terminal run was skipped\n'
     LEAK_PTY=skipped-no-script
   fi
+}
+
+run_net_harness() {
+  step 7 "net harness (net_cases.sh, DX cases included)"
+  local hisn work out rc
+  hisn="$(pwd)/target/release/hisn"
+  [ -x "$hisn" ] || fail "net-harness" "$hisn is missing (make check builds it)"
+  command -v ip >/dev/null 2>&1 || fail "net-harness" "the ip command (iproute2) is not installed"
+  timeout 10 unshare -Urn true 2>/dev/null \
+    || fail "net-harness" "unshare -Urn (unprivileged user + network namespace) is not available"
+  work=$(mktemp -d /tmp/hisn-gate-net.XXXXXX) || fail "net-harness" "mktemp failed"
+  out="$work.out"
+  timeout 900 unshare -Urn bash tests/leak/net_cases.sh "$hisn" "$work" "gate$$" </dev/null >"$out" 2>&1
+  rc=$?
+  if [ -f "$work/supervisor.pids" ]; then
+    local p
+    while read -r p; do
+      [ -n "$p" ] && [ -r "/proc/$p/cmdline" ] \
+        && tr '\0' ' ' <"/proc/$p/cmdline" | grep -qF -- "gate$$" && kill -9 "$p" 2>/dev/null
+    done <"$work/supervisor.pids"
+  fi
+  rm -rf "$work"
+  NET_P=$(grep -c '^PASS  ' "$out"); NET_F=$(grep -c '^FAIL: ' "$out"); NET_S=$(grep -c '^SKIP  ' "$out")
+  NET_DX=$(grep -c '^PASS  DX' "$out")
+  grep -E '^(FAIL: |NET-CASES: )' "$out"
+  local trailer
+  trailer=$(grep '^NET-CASES: ' "$out" | tail -n 1)
+  if [ "$rc" -eq 124 ]; then
+    rm -f "$out"; fail "net-harness" "net_cases.sh timed out after 900 s"
+  elif [ "$trailer" != "NET-CASES: pass=$NET_P fail=$NET_F skip=$NET_S" ]; then
+    tail -n 5 "$out" >&2; rm -f "$out"
+    fail "net-harness" "summary [$trailer] disagrees with the lines read (exit $rc)"
+  elif [ "$rc" -ne 0 ] || [ "$NET_F" -ne 0 ] || [ "$NET_DX" -eq 0 ]; then
+    rm -f "$out"
+    fail "net-harness" "exit $rc, $NET_F failed, $NET_DX DX cases passed (at least one required)"
+  fi
+  rm -f "$out"
+  ok "net-harness (pass=$NET_P fail=$NET_F skip=$NET_S dx-pass=$NET_DX)"
+}
+
+run_compat_063() {
+  step 8 "compat_063.sh against v0.6.3 built from the tag"
+  git rev-parse -q --verify "refs/tags/v0.6.3^{commit}" >/dev/null 2>&1 \
+    || fail "compat-063" "tag v0.6.3 is missing: fetch tags (git fetch --tags); this step is never skipped"
+  local wt="target/gate-v063-wt" tgt="target/gate-v063-target" out rc
+  git worktree remove --force "$wt" >/dev/null 2>&1
+  git worktree add --detach "$wt" v0.6.3 >/dev/null 2>&1 \
+    || fail "compat-063" "git worktree add $wt v0.6.3 failed"
+  (cd "$wt" && CARGO_TARGET_DIR="$(cd .. && pwd)/gate-v063-target" cargo build --release --locked) >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ ! -x "$tgt/release/hisn" ]; then
+    git worktree remove --force "$wt" >/dev/null 2>&1; git worktree prune
+    fail "compat-063" "building v0.6.3 in $wt failed (exit $rc)"
+  fi
+  out=$(mktemp /tmp/hisn-gate-compat.XXXXXX)
+  timeout 900 bash tests/leak/compat_063.sh "$(pwd)/target/release/hisn" "$(pwd)/$tgt/release/hisn" >"$out" 2>&1
+  rc=$?
+  git worktree remove --force "$wt" >/dev/null 2>&1; git worktree prune
+  rm -rf "$tgt"
+  grep -E '^(FAIL|SKIP|RESULT)' "$out"
+  CMP_LINE=$(grep '^RESULT: ' "$out" | tail -n 1)
+  CMP_P=$(grep -c '^PASS' "$out"); CMP_F=$(grep -c '^FAIL' "$out"); CMP_S=$(grep -c '^SKIP' "$out")
+  rm -f "$out"
+  if [ "$rc" -ne 0 ] || [ "$CMP_F" -ne 0 ] || [ -z "$CMP_LINE" ]; then
+    fail "compat-063" "exit $rc, $CMP_F failed"
+  fi
+  ok "compat-063 (pass=$CMP_P fail=$CMP_F skip=$CMP_S)"
 }
 
 if [ -z "${HISN_TEST_ROOTFS:-}" ] || [ -z "${HISN_BIG_TESTS:-}" ]; then
@@ -213,6 +285,9 @@ ok "make-test"
 
 run_leak_pipe
 run_leak_pty
+run_net_harness
+run_compat_063
 
-printf 'release-gate: summary fmt=ok clippy=ok cross-clippy=%s make-check=ok make-test=ok leak-suite-pipe=ok leak-suite-pty=%s\n' \
-  "${CROSS_SKIP:-all-ok}" "${LEAK_PTY:-skipped}"
+printf 'release-gate: summary fmt=ok clippy=ok cross-clippy=%s make-check=ok make-test=ok leak-suite-pipe=ok leak-suite-pty=%s net-harness=ok(pass=%s,fail=%s,skip=%s,dx-pass=%s) compat-063=ok(pass=%s,fail=%s,skip=%s)\n' \
+  "${CROSS_SKIP:-all-ok}" "${LEAK_PTY:-skipped}" \
+  "$NET_P" "$NET_F" "$NET_S" "$NET_DX" "$CMP_P" "$CMP_F" "$CMP_S"

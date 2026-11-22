@@ -348,8 +348,32 @@ fn load(dir: &Path, p: &Pinned) -> Option<Index> {
     Some(idx)
 }
 
+/// R-1: remove temp files (`journal.idx.<ino>.tmp<pid>.<n>`) left by a reader
+/// that was killed between create and rename. Only files whose writer pid no
+/// longer exists are removed; the pid of a live reader (this one included) is
+/// never touched.
+fn remove_stale_temps(dir: &Path) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(INDEX_PREFIX)) else {
+            continue;
+        };
+        let Some((_, tail)) = rest.split_once(".tmp") else {
+            continue;
+        };
+        let Some(Ok(pid)) = tail.split('.').next().map(str::parse::<u32>) else {
+            continue;
+        };
+        if pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+}
+
 /// Atomic write (temp + rename); errors are ignored: it is only a cache.
 fn store(dir: &Path, p: &Pinned, idx: &Index) {
+    remove_stale_temps(dir);
     use std::sync::atomic::AtomicU32;
     static N: AtomicU32 = AtomicU32::new(0);
     let tmp = dir.join(format!(
@@ -641,6 +665,19 @@ mod tests {
             assert!(!n.starts_with(INDEX_PREFIX), "{n}");
         }
         assert_eq!(journal_files(&dir).len(), 1);
+    }
+
+    #[test]
+    fn stale_index_temp_of_a_dead_reader_is_removed_on_next_write() {
+        let (_d, dir) = ws(ROTATE_AFTER, 20);
+        // pid 4294967294 cannot exist (above pid_max); the own pid is live.
+        let dead = dir.join(format!("{INDEX_PREFIX}77.tmp4294967294.0"));
+        let live = dir.join(format!("{INDEX_PREFIX}77.tmp{}.9", std::process::id()));
+        fs::write(&dead, b"x").unwrap();
+        fs::write(&live, b"x").unwrap();
+        let _ = cursor_read(&dir, 5);
+        assert!(!dead.exists(), "dead reader's temp file removed");
+        assert!(live.exists(), "a live pid's temp file is left alone");
     }
 
     #[test]

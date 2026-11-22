@@ -296,6 +296,203 @@ fn run_detached(args: ExecArgs) -> Result<i32> {
     Ok(0)
 }
 
+// ------------------------------------------------- exec-status/output/signal
+
+/// The request line of one of the three revision-4 operations (pure;
+/// unit-tested). Optional keys are present only when given, so a request
+/// without `--incarnation` names the live one.
+pub fn exec_query_request(
+    op: &str,
+    exec: &str,
+    incarnation: Option<&str>,
+    extra: Value,
+    client: Option<Value>,
+) -> Value {
+    let mut req = json!({ "op": op, "exec_id": exec });
+    if let Some(i) = incarnation {
+        req["incarnation"] = json!(i);
+    }
+    if let (Some(o), Some(e)) = (req.as_object_mut(), extra.as_object()) {
+        o.extend(e.clone());
+    }
+    if let Some(c) = client {
+        req["client"] = c;
+    }
+    req
+}
+
+/// Send one revision-4 query and return the supervisor's `ok` reply. Every
+/// failure (old session, refusal, error reply) prints a `hisn-error/v1`
+/// object on stderr and is returned as `Err(exit code)` (125).
+fn exec_query(
+    session: &str,
+    token_file: Option<&std::path::Path>,
+    label: Option<&str>,
+    build: impl FnOnce(Option<Value>) -> Value,
+) -> Result<std::result::Result<Value, i32>> {
+    let found = session_revision(session);
+    if let Err((code, msg)) = require_revision(session, found, crate::sessionmeta::DETACH_REVISION)
+    {
+        eprintln!("{}", error_object(code, &msg));
+        return Ok(Err(EXIT_INTERNAL));
+    }
+    let (token, revision) = seat_material_v4(token_file)?;
+    let req = build(client_field(label, token.as_deref(), revision));
+    let sock = supervisor::socket_for(session)?;
+    let reply =
+        control::request(&sock, &req).with_context(|| format!("talking to session {session}"))?;
+    if reply["ok"] != true {
+        let code = reply["error"].as_str().unwrap_or(control::E_INTERNAL);
+        let msg = reply["message"].as_str().unwrap_or("");
+        eprintln!("{}", error_object(code, msg));
+        return Ok(Err(EXIT_INTERNAL));
+    }
+    Ok(Ok(reply))
+}
+
+/// A reply without its `ok` key.
+fn without_ok(mut v: Value) -> Value {
+    if let Some(o) = v.as_object_mut() {
+        o.remove("ok");
+    }
+    v
+}
+
+/// `hisn exec-status`.
+pub fn run_exec_status(a: crate::cli::ExecStatusArgs) -> Result<i32> {
+    let reply = match exec_query(
+        &a.session,
+        a.seat_token_file.as_deref(),
+        a.client.as_deref(),
+        |c| {
+            exec_query_request(
+                "execstatus",
+                &a.exec,
+                a.incarnation.as_deref(),
+                json!({}),
+                c,
+            )
+        },
+    )? {
+        Ok(r) => r,
+        Err(code) => return Ok(code),
+    };
+    let st = without_ok(reply);
+    if a.json {
+        println!("{st}");
+    } else {
+        print!("{}", status_text(&st));
+    }
+    Ok(0)
+}
+
+/// The plain-text `exec-status` rendering (pure).
+pub fn status_text(st: &Value) -> String {
+    let mut out = String::new();
+    let s = |k: &str| st[k].as_str().unwrap_or("-").to_owned();
+    out.push_str(&format!(
+        "{} (incarnation {}) {}\n",
+        s("exec_id"),
+        s("incarnation"),
+        s("state")
+    ));
+    out.push_str(&format!("  command  {}\n", s("argv0")));
+    out.push_str(&format!(
+        "  seat     {}\n",
+        st["seat"].as_str().unwrap_or("-")
+    ));
+    out.push_str(&format!("  started  {}\n", s("started")));
+    if let Some(e) = st["ended"].as_str() {
+        out.push_str(&format!("  ended    {e}\n"));
+    }
+    if let Some(c) = st["exit_code"].as_i64() {
+        out.push_str(&format!("  exit     {c}\n"));
+    }
+    if let Some(n) = st["signal_name"].as_str() {
+        out.push_str(&format!("  signal   {n}\n"));
+    }
+    if let Some(c) = st["cause"].as_str() {
+        out.push_str(&format!("  cause    {c}\n"));
+    }
+    for k in ["stdout", "stderr"] {
+        out.push_str(&format!(
+            "  {k:<8} total {} oldest {}\n",
+            st[k]["total"], st[k]["base"]
+        ));
+    }
+    if st["output_open"] == true {
+        out.push_str("  output   still open\n");
+    }
+    out
+}
+
+/// `hisn exec-output`: raw bytes on stdout and `next=<n>` on stderr, or the
+/// reply object with `--json`.
+pub fn run_exec_output(a: crate::cli::ExecOutputArgs) -> Result<i32> {
+    let reply = match exec_query(
+        &a.session,
+        a.seat_token_file.as_deref(),
+        a.client.as_deref(),
+        |c| {
+            exec_query_request(
+                "execoutput",
+                &a.exec,
+                a.incarnation.as_deref(),
+                json!({ "stream": a.stream.as_str(), "offset": a.offset }),
+                c,
+            )
+        },
+    )? {
+        Ok(r) => r,
+        Err(code) => return Ok(code),
+    };
+    let r = without_ok(reply);
+    if a.json {
+        println!("{r}");
+        return Ok(0);
+    }
+    let Some(data) = r["data_b64"].as_str().and_then(crate::execlog::b64_decode) else {
+        eprintln!(
+            "{}",
+            error_object(control::E_INTERNAL, "reply carries no readable data_b64")
+        );
+        return Ok(EXIT_INTERNAL);
+    };
+    let mut out = io::stdout().lock();
+    out.write_all(&data)?;
+    out.flush()?;
+    let mut note = format!("next={}", r["next"]);
+    if r["rotated_away"] == true {
+        note.push_str(&format!(" rotated_away oldest={}", r["oldest"]));
+    }
+    if r["eof"] == true {
+        note.push_str(" eof");
+    }
+    eprintln!("{note}");
+    Ok(0)
+}
+
+/// `hisn exec-signal`.
+pub fn run_exec_signal(a: crate::cli::ExecSignalArgs) -> Result<i32> {
+    match exec_query(
+        &a.session,
+        a.seat_token_file.as_deref(),
+        a.client.as_deref(),
+        |c| {
+            exec_query_request(
+                "execsignal",
+                &a.exec,
+                a.incarnation.as_deref(),
+                json!({ "signal": a.signal.as_str() }),
+                c,
+            )
+        },
+    )? {
+        Ok(_) => Ok(0),
+        Err(code) => Ok(code),
+    }
+}
+
 /// One parsed response line from the supervisor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
@@ -1157,5 +1354,42 @@ mod tests {
             None => unsafe { std::env::remove_var(key) },
         }
         assert!(e.unwrap_err().to_string().contains("both"));
+    }
+
+    #[test]
+    fn exec_query_requests_are_minimal() {
+        let c = client_field(None, None, Some(4));
+        let r = exec_query_request("execstatus", "e-3", None, json!({}), c.clone());
+        assert_eq!(
+            r.to_string(),
+            r#"{"client":{"protocol_version":4},"exec_id":"e-3","op":"execstatus"}"#
+        );
+        let r = exec_query_request(
+            "execoutput",
+            "e-3",
+            Some("20261122T101500Z-9f3a"),
+            json!({"stream":"stderr","offset":5}),
+            c,
+        );
+        assert_eq!(r["incarnation"], "20261122T101500Z-9f3a");
+        assert_eq!(
+            (r["stream"].as_str(), r["offset"].as_u64()),
+            (Some("stderr"), Some(5))
+        );
+        assert!(control::parse_request(&r.to_string()).is_ok());
+    }
+
+    #[test]
+    fn exec_status_text_names_the_essentials() {
+        let st = json!({
+            "exec_id":"e-2","incarnation":"I","state":"exited","argv0":"sh","seat":null,
+            "started":"S","ended":"E","exit_code":3,"cause":"exit",
+            "stdout":{"total":10,"base":0},"stderr":{"total":0,"base":0},"output_open":false
+        });
+        let t = status_text(&st);
+        for want in ["e-2", "exited", "exit     3", "cause    exit", "total 10"] {
+            assert!(t.contains(want), "{want} in {t}");
+        }
+        assert!(!t.contains("still open"));
     }
 }

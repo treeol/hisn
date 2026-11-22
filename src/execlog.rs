@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -112,6 +112,13 @@ pub struct ExecState {
     pub output_open: bool,
     pub stdout: StreamCounts,
     pub stderr: StreamCounts,
+    /// The writing supervisor's host pid and `/proc` starttime (plan 9.1 D6):
+    /// the identity the foreign-state rule tests. `pid` above is a pid inside
+    /// the sandbox and says nothing on the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_pid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_start: Option<u64>,
 }
 
 /// Write `st` atomically (temp file `0600` + rename).
@@ -136,13 +143,186 @@ pub fn read_state(path: &Path) -> io::Result<ExecState> {
 
 // ------------------------------------------------------------------ pump
 
-/// Live counters of one output stream, shared with its pump thread.
+/// Upper bound of one `exec-output` reply (and its default).
+pub const READ_MAX: usize = 1024 * 1024;
+
 #[derive(Debug, Default)]
+struct StreamInner {
+    /// Absolute offset of the first byte of the current file.
+    cur_base: u64,
+    /// Absolute offset of the first byte of the previous file, if it exists.
+    prev_base: Option<u64>,
+}
+
+/// Live state of one output stream, shared with its pump thread. Writes and
+/// reads both take `inner`, so a read never sees a half-moved file.
+#[derive(Default)]
 pub struct Stream {
-    /// Bytes appended to the stream file so far.
+    /// Bytes appended to the stream so far (updated under `inner`).
     pub total: AtomicU64,
     /// The pump saw EOF on the pipe (every writer closed it).
     pub eof: AtomicBool,
+    path: PathBuf,
+    inner: Mutex<StreamInner>,
+}
+
+impl std::fmt::Debug for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stream")
+            .field("path", &self.path)
+            .field("total", &self.total.load(Ordering::SeqCst))
+            .finish()
+    }
+}
+
+/// `<path>.1`: the previous file of a stream.
+pub fn prev_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".1");
+    PathBuf::from(s)
+}
+
+impl Stream {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            ..Self::default()
+        }
+    }
+
+    /// `total` and the oldest offset still kept, for the state file.
+    pub fn counts(&self) -> StreamCounts {
+        let g = self.inner.lock().expect("stream");
+        StreamCounts {
+            total: self.total.load(Ordering::SeqCst),
+            base: g.prev_base.unwrap_or(g.cur_base),
+        }
+    }
+
+    /// Read at most `max` bytes from absolute `offset` (see [`read_layout`]).
+    pub fn read(&self, offset: u64, max: usize) -> io::Result<ReadOut> {
+        let g = self.inner.lock().expect("stream");
+        let l = Layout {
+            cur: self.path.clone(),
+            prev: g.prev_base.map(|_| prev_path(&self.path)),
+            prev_base: g.prev_base.unwrap_or(0),
+            cur_base: g.cur_base,
+            total: self.total.load(Ordering::SeqCst),
+        };
+        read_layout(&l, offset, max)
+    }
+
+    fn append(&self, file: &mut fs::File, chunk: &[u8]) {
+        let _g = self.inner.lock().expect("stream");
+        if file.write_all(chunk).is_ok() {
+            self.total.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Where the bytes of one stream are: the current file, the previous file if
+/// any, and the absolute offsets of their first bytes.
+#[derive(Debug, Clone)]
+pub struct Layout {
+    pub cur: PathBuf,
+    pub prev: Option<PathBuf>,
+    pub prev_base: u64,
+    pub cur_base: u64,
+    pub total: u64,
+}
+
+/// The result of one read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOut {
+    pub data: Vec<u8>,
+    /// Absolute offset of `data[0]` (the requested one unless rotated away).
+    pub offset: u64,
+    pub next: u64,
+    pub total: u64,
+    /// The oldest offset still kept.
+    pub oldest: u64,
+    pub rotated_away: bool,
+}
+
+fn read_at_most(path: &Path, pos: u64, n: usize) -> io::Result<Vec<u8>> {
+    let f = fs::File::open(path)?;
+    let mut buf = vec![0u8; n];
+    let mut got = 0;
+    while got < n {
+        match f.read_at(&mut buf[got..], pos + got as u64) {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(got);
+    Ok(buf)
+}
+
+/// Read from absolute `offset` across the previous and current file (plan
+/// 2.4, D7): an offset older than the oldest kept byte starts at the oldest
+/// and sets `rotated_away`; an offset beyond `total` returns nothing with
+/// `next == total`. Arithmetic is saturating.
+pub fn read_layout(l: &Layout, offset: u64, max: usize) -> io::Result<ReadOut> {
+    let oldest = if l.prev.is_some() {
+        l.prev_base
+    } else {
+        l.cur_base
+    };
+    let rotated_away = offset < oldest;
+    let start = offset.max(oldest).min(l.total);
+    let max = max.min(READ_MAX);
+    let mut data = Vec::new();
+    let mut pos = start;
+    while data.len() < max && pos < l.total {
+        let (path, base, limit) = match &l.prev {
+            Some(p) if pos < l.cur_base => (p.as_path(), l.prev_base, l.cur_base),
+            _ => (l.cur.as_path(), l.cur_base, l.total),
+        };
+        let n = (max - data.len()).min(limit.saturating_sub(pos) as usize);
+        let got = read_at_most(path, pos.saturating_sub(base), n)?;
+        if got.is_empty() {
+            break;
+        }
+        pos = pos.saturating_add(got.len() as u64);
+        data.extend_from_slice(&got);
+    }
+    Ok(ReadOut {
+        data,
+        offset: start,
+        next: pos,
+        total: l.total,
+        oldest,
+        rotated_away,
+    })
+}
+
+/// The layout of a stream with no live pump (a finished exec, or another
+/// supervisor's), from its files and the state file's `base`: with a
+/// previous file the current one starts where it ends.
+pub fn layout_from_files(cur: &Path, base: u64) -> io::Result<Layout> {
+    let cur_len = fs::metadata(cur)?.len();
+    let prev = prev_path(cur);
+    match fs::metadata(&prev) {
+        Ok(m) => {
+            let cur_base = base.saturating_add(m.len());
+            Ok(Layout {
+                cur: cur.to_path_buf(),
+                prev: Some(prev),
+                prev_base: base,
+                cur_base,
+                total: cur_base.saturating_add(cur_len),
+            })
+        }
+        Err(_) => Ok(Layout {
+            cur: cur.to_path_buf(),
+            prev: None,
+            prev_base: 0,
+            cur_base: base,
+            total: base.saturating_add(cur_len),
+        }),
+    }
 }
 
 /// A fresh anonymous pipe as `(read, write)`, both close-on-exec.
@@ -165,7 +345,7 @@ pub fn start_pump(read: OwnedFd, path: &Path) -> io::Result<Arc<Stream>> {
         .create_new(true)
         .mode(0o600)
         .open(path)?;
-    let stream = Arc::new(Stream::default());
+    let stream = Arc::new(Stream::new(path));
     let s = Arc::clone(&stream);
     std::thread::Builder::new()
         .name("exec-pump".into())
@@ -175,11 +355,7 @@ pub fn start_pump(read: OwnedFd, path: &Path) -> io::Result<Arc<Stream>> {
             loop {
                 match src.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => {
-                        if file.write_all(&buf[..n]).is_ok() {
-                            s.total.fetch_add(n as u64, Ordering::SeqCst);
-                        }
-                    }
+                    Ok(n) => s.append(&mut file, &buf[..n]),
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Err(_) => break,
                 }
@@ -251,6 +427,105 @@ impl Drop for SlotGuard {
     }
 }
 
+// ---------------------------------------------------------- status & ids
+
+/// `e-N` -> `N`.
+pub fn parse_exec_id(s: &str) -> Option<u64> {
+    s.strip_prefix("e-")?.parse().ok()
+}
+
+/// An incarnation as it may appear in a file name: ASCII alphanumerics and
+/// `-`, non-empty, short. A request value is checked before it is used in a
+/// path.
+pub fn valid_incarnation(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 40 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Is the supervisor that wrote `st` gone? `None` = the file carries no
+/// supervisor identity (written by an older build), so nothing can be said.
+pub fn writer_gone(st: &ExecState) -> Option<bool> {
+    let (pid, start) = (st.supervisor_pid?, st.supervisor_start?);
+    Some(match crate::sys::stat_starttime(pid) {
+        Ok(cur) => cur != start,
+        Err(_) => true,
+    })
+}
+
+/// The state a reader reports: a `running` file of another incarnation whose
+/// writer is gone (or unknowable) is `lost` (plan 2.2, B5).
+pub fn effective_state(mut st: ExecState, live_incarnation: &str) -> ExecState {
+    if st.state == "running"
+        && st.incarnation != live_incarnation
+        && writer_gone(&st).unwrap_or(true)
+    {
+        st.state = "lost".into();
+        st.cause = Some("lost".into());
+    }
+    st
+}
+
+/// The `exec-status` reply object: the state fields, `pid` only while
+/// running, never the supervisor identity.
+pub fn status_json(st: &ExecState) -> Value {
+    let mut v = serde_json::to_value(st).unwrap_or(Value::Null);
+    if let Some(o) = v.as_object_mut() {
+        o.remove("supervisor_pid");
+        o.remove("supervisor_start");
+        if st.state != "running" {
+            o.remove("pid");
+        }
+    }
+    v
+}
+
+/// Is the exec's state final (no longer running)?
+pub fn is_final(state: &str) -> bool {
+    state != "running"
+}
+
+// ---------------------------------------------------------------- base64
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub fn b64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut bits = 0;
+    for ch in s.bytes().filter(|b| *b != b'=') {
+        let v = B64.iter().position(|b| *b == ch)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
 // -------------------------------------------------------------- registry
 
 /// One live detached exec.
@@ -266,6 +541,62 @@ pub struct DetachedExec {
     pub stderr: Arc<Stream>,
     /// An `exec-signal` was delivered before the end (cause bookkeeping).
     pub signalled: AtomicBool,
+    /// The state file's content (plan 9.1 D4): every write of the file goes
+    /// through this mutex, so the waiter and the readers cannot race.
+    state: Mutex<ExecState>,
+    state_path: PathBuf,
+}
+
+impl DetachedExec {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        exec_id: u64,
+        seat: Option<String>,
+        argv0: String,
+        pid: i32,
+        started: String,
+        stdout: Arc<Stream>,
+        stderr: Arc<Stream>,
+        state: ExecState,
+        state_path: PathBuf,
+    ) -> Self {
+        Self {
+            exec_id,
+            seat,
+            argv0,
+            pid,
+            started,
+            stdout,
+            stderr,
+            signalled: AtomicBool::new(false),
+            state: Mutex::new(state),
+            state_path,
+        }
+    }
+
+    fn refresh(&self, st: &mut ExecState) {
+        st.stdout = self.stdout.counts();
+        st.stderr = self.stderr.counts();
+        st.output_open =
+            !(self.stdout.eof.load(Ordering::SeqCst) && self.stderr.eof.load(Ordering::SeqCst));
+    }
+
+    /// The current state with live counters.
+    pub fn snapshot(&self) -> ExecState {
+        let mut st = self.state.lock().expect("exec state").clone();
+        self.refresh(&mut st);
+        st
+    }
+
+    /// Change the state, refresh the counters and write the state file
+    /// (best effort: the live entry still answers if the write fails).
+    pub fn update(&self, f: impl FnOnce(&mut ExecState)) -> ExecState {
+        let mut g = self.state.lock().expect("exec state");
+        f(&mut g);
+        self.refresh(&mut g);
+        let _ = write_state(&self.state_path, &g);
+        g.clone()
+    }
 }
 
 /// The live detached execs plus the session `stopping` flag (B9).
@@ -415,6 +746,8 @@ mod tests {
             output_open: true,
             stdout: StreamCounts::default(),
             stderr: StreamCounts::default(),
+            supervisor_pid: None,
+            supervisor_start: None,
         }
     }
 
@@ -566,16 +899,17 @@ mod tests {
     }
 
     fn entry(id: u64) -> Arc<DetachedExec> {
-        Arc::new(DetachedExec {
-            exec_id: id,
-            seat: None,
-            argv0: "sleep".into(),
-            pid: 10 + id as i32,
-            started: "t".into(),
-            stdout: Arc::default(),
-            stderr: Arc::default(),
-            signalled: AtomicBool::new(false),
-        })
+        Arc::new(DetachedExec::new(
+            id,
+            None,
+            "sleep".into(),
+            10 + id as i32,
+            "t".into(),
+            Arc::default(),
+            Arc::default(),
+            state(id),
+            PathBuf::from("/nonexistent/state.json"),
+        ))
     }
 
     #[test]
@@ -656,5 +990,103 @@ mod tests {
         });
         assert!(reg.wait_stopping(Duration::from_secs(2)));
         t.join().unwrap();
+    }
+
+    #[test]
+    fn base64_roundtrip() {
+        for n in 0..40usize {
+            let d: Vec<u8> = (0..n).map(|i| (i * 37 + 11) as u8).collect();
+            assert_eq!(b64_decode(&b64_encode(&d)).unwrap(), d, "len {n}");
+        }
+        assert_eq!(b64_encode(b"hello"), "aGVsbG8=");
+        assert!(b64_decode("a*b=").is_none());
+    }
+
+    #[test]
+    fn exec_id_and_incarnation_parsing() {
+        assert_eq!(parse_exec_id("e-12"), Some(12));
+        assert_eq!(parse_exec_id("12"), None);
+        assert_eq!(parse_exec_id("e-x"), None);
+        assert!(valid_incarnation("20261122T101500Z-9f3a"));
+        assert!(!valid_incarnation("../x"));
+        assert!(!valid_incarnation(""));
+    }
+
+    #[test]
+    fn status_for_old_incarnation_reads_state_file() {
+        // A running file of another incarnation, writer gone: reported lost;
+        // a finished one is reported as written; pid only while running.
+        let mut st = state(1);
+        st.supervisor_pid = Some(i32::MAX);
+        st.supervisor_start = Some(1);
+        let lost = effective_state(st.clone(), "20261122T999999Z-0000");
+        assert_eq!(lost.state, "lost");
+        assert_eq!(lost.cause.as_deref(), Some("lost"));
+        assert!(status_json(&lost).get("pid").is_none());
+        // Same incarnation: untouched.
+        assert_eq!(
+            effective_state(st.clone(), &st.incarnation).state,
+            "running"
+        );
+        assert!(status_json(&st).get("pid").is_some());
+        // A live writer (this process) keeps it running.
+        let mut alive = state(2);
+        alive.supervisor_pid = Some(std::process::id() as i32);
+        alive.supervisor_start =
+            Some(crate::sys::stat_starttime(std::process::id() as i32).unwrap());
+        assert_eq!(effective_state(alive, "other").state, "running");
+        // Finished stays finished.
+        let mut done = state(3);
+        done.state = "exited".into();
+        assert_eq!(effective_state(done, "other").state, "exited");
+    }
+
+    #[test]
+    fn exec_status_json_shape() {
+        let mut st = state(4);
+        st.supervisor_pid = Some(5);
+        let v = status_json(&st);
+        for k in [
+            "schema",
+            "incarnation",
+            "exec_id",
+            "seat",
+            "argv0",
+            "started",
+            "state",
+            "pid",
+            "output_open",
+            "stdout",
+            "stderr",
+        ] {
+            assert!(v.get(k).is_some(), "{k} in {v}");
+        }
+        assert!(v.get("supervisor_pid").is_none());
+        assert_eq!(v["stdout"], json!({"total":0,"base":0}));
+        assert_eq!(v["exec_id"], "e-4");
+    }
+
+    #[test]
+    fn read_without_rotation_is_a_plain_file_read() {
+        let d = tmp("plainread");
+        let (r, w) = pipe().unwrap();
+        let p = exec_file(&d, "i", 1, "stdout");
+        let s = start_pump(r, &p).unwrap();
+        fs::File::from(w).write_all(b"0123456789").unwrap();
+        assert!(wait_pumps(&[&s], Duration::from_secs(2)));
+        let o = s.read(0, 4).unwrap();
+        assert_eq!(
+            (o.data.as_slice(), o.offset, o.next, o.total),
+            (&b"0123"[..], 0, 4, 10)
+        );
+        assert!(!o.rotated_away);
+        let o = s.read(4, 100).unwrap();
+        assert_eq!((o.data.as_slice(), o.next), (&b"456789"[..], 10));
+        // Past the end: empty, next == total (D7).
+        let o = s.read(99, 10).unwrap();
+        assert!(o.data.is_empty());
+        assert_eq!((o.offset, o.next, o.total), (10, 10, 10));
+        assert_eq!(s.counts(), StreamCounts { total: 10, base: 0 });
+        fs::remove_dir_all(&d).unwrap();
     }
 }

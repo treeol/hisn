@@ -180,3 +180,8 @@ DX2: survives the death of its client connection
 DX3: cannot read a host file outside the grants
 DX4: a connect to a private address is refused EACCES
 DX5: the detached exec ends at session stop
+DX6: exec-status of a running exec: state running, incarnation, pid
+DX7: a member cannot signal another seat's exec
+DX7b: legacy signal by id and by pid refuses a detached exec
+DX8: an observer is refused exec output
+DX10: a running detached exec is alive after 8 s

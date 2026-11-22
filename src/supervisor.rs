@@ -454,6 +454,47 @@ fn exec_info_json(id: u64, e: &ExecInfo, incarnation: &str) -> Value {
     v
 }
 
+/// The authorization target of an `execsignal` (plan 7 B11): the seat of a
+/// live detached exec of the *live* incarnation, else `None`. Pure over the
+/// registry; unit-tested.
+fn exec_target_of(
+    reg: &execlog::Registry,
+    live_incarnation: &str,
+    exec_id: &str,
+    incarnation: Option<&str>,
+) -> Option<authz::ExecTarget> {
+    if incarnation.is_some_and(|i| i != live_incarnation) {
+        return None;
+    }
+    let e = reg.get(execlog::parse_exec_id(exec_id)?)?;
+    Some(authz::ExecTarget {
+        seat: e.seat.clone(),
+    })
+}
+
+/// The legacy `signal` operation refuses a detached exec (B1): `Some(message)`
+/// when `exec_id` / `pid` names one. Pure over the table; unit-tested.
+fn legacy_signal_refusal(
+    table: &ExecTable,
+    exec_id: Option<u64>,
+    pid: Option<i32>,
+) -> Option<String> {
+    if let Some(id) = exec_id {
+        return table
+            .is_detached(id)
+            .then(|| format!("e-{id} is a detached exec; use exec-signal"));
+    }
+    pid.filter(|p| table.pid_is_detached(*p))
+        .map(|p| format!("pid {p} is a detached exec; use exec-signal"))
+}
+
+/// Deliver `sig` through the status socket of a live exec (`K <n>`).
+fn table_signal(table: &ExecTable, exec_id: u64, sig: i32) -> bool {
+    table
+        .by_id(exec_id)
+        .is_some_and(|h| sys::send_all(h.as_raw_fd(), exec::format_kill(sig).as_bytes()).is_ok())
+}
+
 /// How a started exec relates to a client (0.6.4).
 enum ExecMode<'a> {
     /// The classic exec: the client's connection and its stdio fds.
@@ -500,8 +541,6 @@ struct DetachedWaiter {
     status: OwnedFd,
     pending: exec::Lines,
     entry: Arc<execlog::DetachedExec>,
-    parts: DetachedParts,
-    base: execlog::ExecState,
     client: authz::ClientRecord,
     argv0: String,
     ident: ExecIdent,
@@ -1688,10 +1727,7 @@ impl Shared {
     /// path, as `signal`). `false` when the exec is not live or not
     /// signal-able.
     fn signal_exec(&self, exec_id: u64, sig: i32) -> bool {
-        let table = self.exec_table.lock().expect("exec_table");
-        table.by_id(exec_id).is_some_and(|h| {
-            sys::send_all(h.as_raw_fd(), exec::format_kill(sig).as_bytes()).is_ok()
-        })
+        table_signal(&self.exec_table.lock().expect("exec_table"), exec_id, sig)
     }
 
     /// Register a started detached exec, write its first state file, answer
@@ -1708,23 +1744,13 @@ impl Shared {
             drive_started,
         } = d;
         let started = crate::session::rfc3339_now();
-        let entry = Arc::new(execlog::DetachedExec {
-            exec_id: ident.exec_id,
-            seat: client.seat.clone(),
-            argv0: argv0.clone(),
-            pid: sp.pid,
-            started: started.clone(),
-            stdout: Arc::clone(&parts.stdout),
-            stderr: Arc::clone(&parts.stderr),
-            signalled: std::sync::atomic::AtomicBool::new(false),
-        });
         let base = execlog::ExecState {
             schema: execlog::STATE_SCHEMA.into(),
             incarnation: self.incarnation.clone(),
             exec_id: format!("e-{}", ident.exec_id),
             seat: client.seat.clone(),
             argv0: argv0.clone(),
-            started,
+            started: started.clone(),
             ended: None,
             state: "running".into(),
             exit_code: None,
@@ -1735,10 +1761,23 @@ impl Shared {
             output_open: true,
             stdout: execlog::StreamCounts::default(),
             stderr: execlog::StreamCounts::default(),
+            supervisor_pid: Some(std::process::id() as i32),
+            supervisor_start: sys::stat_starttime(std::process::id() as i32).ok(),
         };
+        let entry = Arc::new(execlog::DetachedExec::new(
+            ident.exec_id,
+            client.seat.clone(),
+            argv0.clone(),
+            sp.pid,
+            started,
+            Arc::clone(&parts.stdout),
+            Arc::clone(&parts.stderr),
+            base,
+            parts.paths.state.clone(),
+        ));
         // Best effort: a state file that cannot be written does not stop the
-        // exec (the live table still answers); the end write is retried.
-        let _ = execlog::write_state(&parts.paths.state, &base);
+        // exec (the live entry still answers); the end write is retried.
+        entry.update(|_| {});
         self.detached.insert(Arc::clone(&entry));
         let reply = ok(json!({
             "pid": sp.pid,
@@ -1752,8 +1791,6 @@ impl Shared {
             status: sp.status,
             pending: sp.pending,
             entry,
-            parts,
-            base,
             client,
             argv0,
             ident,
@@ -1797,35 +1834,28 @@ impl Shared {
             stopping,
             w.entry.signalled.load(std::sync::atomic::Ordering::SeqCst),
         );
-        let drained = execlog::wait_pumps(&[&w.entry.stdout, &w.entry.stderr], execlog::DRAIN_WAIT);
         let duration_ms = w.drive_started.elapsed().as_millis();
-        let mut st = w.base;
-        st.ended = Some(crate::session::rfc3339_now());
-        st.output_open = !drained;
-        st.stdout.total = w
-            .entry
-            .stdout
-            .total
-            .load(std::sync::atomic::Ordering::SeqCst);
-        st.stderr.total = w
-            .entry
-            .stderr
-            .total
-            .load(std::sync::atomic::Ordering::SeqCst);
-        st.cause = Some(cause.into());
-        match exit {
-            Some(exec::Exit::Code(c)) => {
-                st.state = "exited".into();
-                st.exit_code = Some(c);
+        // The state turns final as soon as the status line is in (B10); the
+        // pumps get a bounded time to drain, then the counters are written
+        // once more.
+        w.entry.update(|st| {
+            st.ended = Some(crate::session::rfc3339_now());
+            st.cause = Some(cause.into());
+            match exit {
+                Some(exec::Exit::Code(c)) => {
+                    st.state = "exited".into();
+                    st.exit_code = Some(c);
+                }
+                Some(exec::Exit::Signal(n)) => {
+                    st.state = "signalled".into();
+                    st.signal = Some(n);
+                    st.signal_name = Some(control::signal_name(n).to_owned());
+                }
+                None => st.state = if stopping { "signalled" } else { "lost" }.into(),
             }
-            Some(exec::Exit::Signal(n)) => {
-                st.state = "signalled".into();
-                st.signal = Some(n);
-                st.signal_name = Some(control::signal_name(n).to_owned());
-            }
-            None => st.state = if stopping { "signalled" } else { "lost" }.into(),
-        }
-        let _ = execlog::write_state(&w.parts.paths.state, &st);
+        });
+        let _ = execlog::wait_pumps(&[&w.entry.stdout, &w.entry.stderr], execlog::DRAIN_WAIT);
+        w.entry.update(|_| {});
         self.log_client(
             "exec",
             "result",
@@ -1869,6 +1899,225 @@ impl Shared {
         )
     }
 
+    /// The authorization target of an exec op (plan 7 B11): for `execsignal`
+    /// the seat that started a live detached exec of this incarnation; `None`
+    /// for anything unknown, other, or not an `execsignal`.
+    fn exec_target(&self, req: &Request) -> Option<authz::ExecTarget> {
+        let Request::ExecSignal {
+            exec_id,
+            incarnation,
+            ..
+        } = req
+        else {
+            return None;
+        };
+        exec_target_of(
+            &self.detached,
+            &self.incarnation,
+            exec_id,
+            incarnation.as_deref(),
+        )
+    }
+
+    /// Resolve `exec_id` + optional `incarnation` to `(id, incarnation)`.
+    fn exec_ref(&self, exec_id: &str, incarnation: Option<&str>) -> Result<(u64, String), Value> {
+        let Some(id) = execlog::parse_exec_id(exec_id) else {
+            return Err(err(
+                control::E_BAD_REQUEST,
+                format!("invalid exec_id {exec_id:?}"),
+            ));
+        };
+        let inc = incarnation.unwrap_or(&self.incarnation);
+        if !execlog::valid_incarnation(inc) {
+            return Err(err(control::E_BAD_REQUEST, "invalid incarnation"));
+        }
+        Ok((id, inc.to_owned()))
+    }
+
+    fn state_path(&self, inc: &str, id: u64) -> PathBuf {
+        execlog::exec_file(&self.workspace_dir.join("exec"), inc, id, "state.json")
+    }
+
+    /// `execstatus`: the live entry when there is one, else the state file.
+    fn do_execstatus(&self, exec_id: &str, incarnation: Option<&str>) -> Value {
+        let (id, inc) = match self.exec_ref(exec_id, incarnation) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        if inc == self.incarnation
+            && let Some(e) = self.detached.get(id)
+        {
+            return ok(execlog::status_json(&e.snapshot()));
+        }
+        match execlog::read_state(&self.state_path(&inc, id)) {
+            Ok(st) => ok(execlog::status_json(&execlog::effective_state(
+                st,
+                &self.incarnation,
+            ))),
+            Err(_) => err(
+                control::E_NOT_FOUND,
+                format!("no exec {exec_id} of incarnation {inc}"),
+            ),
+        }
+    }
+
+    /// `execoutput`: read one stream from an absolute offset (plan 2.4, B10).
+    fn do_execoutput(
+        &self,
+        exec_id: &str,
+        incarnation: Option<&str>,
+        stream: Option<&str>,
+        offset: u64,
+        max: Option<u64>,
+    ) -> Value {
+        let (id, inc) = match self.exec_ref(exec_id, incarnation) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        let stream = stream.unwrap_or("stdout");
+        if stream != "stdout" && stream != "stderr" {
+            return err(
+                control::E_BAD_REQUEST,
+                format!("stream must be stdout or stderr, not {stream:?}"),
+            );
+        }
+        let max = max
+            .map_or(execlog::READ_MAX, |m| m as usize)
+            .min(execlog::READ_MAX);
+        let live = (inc == self.incarnation)
+            .then(|| self.detached.get(id))
+            .flatten();
+        let (out, st) = if let Some(e) = live {
+            let s = if stream == "stdout" {
+                &e.stdout
+            } else {
+                &e.stderr
+            };
+            // Read the stream first, then the state: a state that is final
+            // here was final before the read, so `eof` cannot be early.
+            let out = s.read(offset, max);
+            (out, e.snapshot())
+        } else {
+            let st = match execlog::read_state(&self.state_path(&inc, id)) {
+                Ok(st) => execlog::effective_state(st, &self.incarnation),
+                Err(_) => {
+                    return err(
+                        control::E_NOT_FOUND,
+                        format!("no exec {exec_id} of incarnation {inc}"),
+                    );
+                }
+            };
+            let counts = if stream == "stdout" {
+                st.stdout
+            } else {
+                st.stderr
+            };
+            let dir = self.workspace_dir.join("exec");
+            let path = execlog::exec_file(&dir, &inc, id, stream);
+            let out = execlog::layout_from_files(&path, counts.base)
+                .and_then(|l| execlog::read_layout(&l, offset, max));
+            (out, st)
+        };
+        let out = match out {
+            Ok(o) => o,
+            Err(e) => return err(control::E_INTERNAL, format!("reading output: {e}")),
+        };
+        let pump_done = !st.output_open;
+        let eof = execlog::is_final(&st.state) && pump_done && out.next >= out.total;
+        ok(json!({
+            "data_b64": execlog::b64_encode(&out.data),
+            "offset": out.offset,
+            "next": out.next,
+            "total": out.total,
+            "oldest": out.oldest,
+            "rotated_away": out.rotated_away,
+            "eof": eof,
+            "state": st.state,
+        }))
+    }
+
+    /// `execsignal`: TERM/INT/KILL/HUP to a live detached exec of this
+    /// incarnation, through the status socket (`K <n>`). The seat is checked
+    /// once more here, under the registry, at delivery (B11).
+    fn do_execsignal(
+        &self,
+        client: &authz::ClientRecord,
+        exec_id: &str,
+        incarnation: Option<&str>,
+        signal: &str,
+    ) -> Value {
+        self.log_client(
+            "execsignal",
+            "request",
+            None,
+            None,
+            Some(signal),
+            client,
+            true,
+        );
+        let Some(sig) = control::parse_exec_signal(signal) else {
+            return err(
+                control::E_BAD_REQUEST,
+                format!("signal must be TERM, INT, KILL or HUP, not {signal:?}"),
+            );
+        };
+        let (id, inc) = match self.exec_ref(exec_id, incarnation) {
+            Ok(x) => x,
+            Err(e) => return e,
+        };
+        if inc != self.incarnation {
+            return err(
+                control::E_BAD_REQUEST,
+                format!(
+                    "{exec_id} belongs to incarnation {inc}, the live one is {}; only a live exec can be signalled",
+                    self.incarnation
+                ),
+            );
+        }
+        let Some(e) = self.detached.get(id) else {
+            return err(
+                control::E_NOT_FOUND,
+                format!("no running detached exec {exec_id}"),
+            );
+        };
+        if client.seat_role == Some(crate::seats::Role::Member) && e.seat != client.seat {
+            self.log_client(
+                "execsignal",
+                "refused",
+                None,
+                None,
+                Some("not the seat that started the exec"),
+                client,
+                false,
+            );
+            return err(
+                control::E_UNAUTHORIZED,
+                "a member may signal only execs started by its own seat",
+            );
+        }
+        let before = e.signalled.swap(true, std::sync::atomic::Ordering::SeqCst);
+        if !self.signal_exec(id, sig) {
+            e.signalled
+                .store(before, std::sync::atomic::Ordering::SeqCst);
+            return err(
+                control::E_NOT_FOUND,
+                format!("detached exec {exec_id} has ended or cannot be signalled"),
+            );
+        }
+        let _ = self.journal.append(
+            "execsignal/delivered",
+            Some(journal_client(client)),
+            json!({
+                "exec_id": format!("e-{id}"),
+                "incarnation": self.incarnation,
+                "signal": control::signal_name(sig),
+                "seat": client.seat,
+                "seq": client.seq,
+            }),
+        );
+        ok(json!({ "exec_id": format!("e-{id}"), "incarnation": self.incarnation }))
+    }
+
     /// `signal`: deliver to a live exec'd program of *this* session only.
     /// Accepts `exec_id` (preferred) or `pid` (deprecated for 0.2 clients).
     fn do_signal(
@@ -1890,11 +2139,8 @@ impl Shared {
                 return err(control::E_BAD_REQUEST, format!("invalid exec_id {eid:?}"));
             };
             let table = self.exec_table.lock().expect("exec_table");
-            if table.is_detached(eid_num) {
-                return err(
-                    control::E_BAD_REQUEST,
-                    format!("{eid} is a detached exec; use exec-signal"),
-                );
+            if let Some(m) = legacy_signal_refusal(&table, Some(eid_num), None) {
+                return err(control::E_BAD_REQUEST, m);
             }
             let Some(h) = table.by_id(eid_num) else {
                 return err(
@@ -1915,11 +2161,8 @@ impl Shared {
             );
         };
         let table = self.exec_table.lock().expect("exec_table");
-        if table.pid_is_detached(pid) {
-            return err(
-                control::E_BAD_REQUEST,
-                format!("pid {pid} is a detached exec; use exec-signal"),
-            );
+        if let Some(m) = legacy_signal_refusal(&table, None, Some(pid)) {
+            return err(control::E_BAD_REQUEST, m);
         }
         if table.is_recycled(pid) {
             return err(
@@ -2298,7 +2541,8 @@ impl Handler for Ctl {
             Some(_) => authz::Credential::Rejected(authz::CredentialFailure::Unknown),
             None => authz::Credential::Absent,
         };
-        authz::authorize(&client, &session, &credential, req).is_ok()
+        let target = self.sh.exec_target(req);
+        authz::authorize_target(&client, &session, &credential, req, target.as_ref()).is_ok()
     }
 
     fn disconnect(&self, conn: ConnId) {
@@ -2351,21 +2595,23 @@ impl Handler for Ctl {
             seat_role,
         };
         let session = self.sh.session_auth();
-        let auth = match authz::authorize(&client, &session, &credential, &req) {
-            Ok(a) => a,
-            Err(refusal) => {
-                self.sh.log_client(
-                    refusal.op.name(),
-                    "refused",
-                    None,
-                    None,
-                    Some(&refusal.reason),
-                    &client,
-                    false,
-                );
-                return err(control::E_UNAUTHORIZED, refusal.reason);
-            }
-        };
+        let target = self.sh.exec_target(&req);
+        let auth =
+            match authz::authorize_target(&client, &session, &credential, &req, target.as_ref()) {
+                Ok(a) => a,
+                Err(refusal) => {
+                    self.sh.log_client(
+                        refusal.op.name(),
+                        "refused",
+                        None,
+                        None,
+                        Some(&refusal.reason),
+                        &client,
+                        false,
+                    );
+                    return err(control::E_UNAUTHORIZED, refusal.reason);
+                }
+            };
         // 0.4.1 R2: an observer request (sessioninfo, inspect, list) creates no
         // member, touches no lease, and refines no client record. Only the
         // authorized mutations that count as clients do those writes.
@@ -2490,6 +2736,33 @@ impl Handler for Ctl {
             // 0.5.1 (ADR 0021, decision E): seat management, owner-only in
             // the role table. The wire ops are one path to the store; the
             // CLI also writes the store directly (one code path, two doors).
+            Request::ExecStatus {
+                exec_id,
+                incarnation,
+                client: _,
+            } => self.sh.do_execstatus(&exec_id, incarnation.as_deref()),
+            Request::ExecOutput {
+                exec_id,
+                incarnation,
+                stream,
+                offset,
+                max,
+                client: _,
+            } => self.sh.do_execoutput(
+                &exec_id,
+                incarnation.as_deref(),
+                stream.as_deref(),
+                offset,
+                max,
+            ),
+            Request::ExecSignal {
+                exec_id,
+                incarnation,
+                signal,
+                client: _,
+            } => self
+                .sh
+                .do_execsignal(&client, &exec_id, incarnation.as_deref(), &signal),
             Request::SeatAdd {
                 name,
                 role,
@@ -5074,6 +5347,146 @@ mod tests {
             10_000,
             60
         ));
+    }
+
+    #[test]
+    fn legacy_signal_refuses_detached_exec() {
+        let mut t = ExecTable::default();
+        t.insert_info(
+            1,
+            exec_info(Some(DetachedInfo {
+                seat: Some("bob".into()),
+            })),
+        );
+        let mut plain = exec_info(None);
+        plain.pid = 10;
+        t.insert_info(2, plain);
+        let m = legacy_signal_refusal(&t, Some(1), None).unwrap();
+        assert!(m.contains("e-1") && m.contains("exec-signal"), "{m}");
+        assert!(
+            legacy_signal_refusal(&t, None, Some(9))
+                .unwrap()
+                .contains("pid 9")
+        );
+        // A plain exec and an unknown one are not refused here.
+        assert!(legacy_signal_refusal(&t, Some(2), None).is_none());
+        assert!(legacy_signal_refusal(&t, Some(77), None).is_none());
+        assert!(legacy_signal_refusal(&t, None, Some(10)).is_none());
+    }
+
+    #[test]
+    fn execsignal_delivers_term_to_group() {
+        // The K line a signal sends travels the status socket that the
+        // monitor reads (the monitor then kills the program's group; that
+        // half is exercised end to end by leak case DX6).
+        use std::io::Read;
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut t = ExecTable::default();
+        t.insert_info(5, exec_info(Some(DetachedInfo { seat: None })));
+        t.set_status(5, OwnedFd::from(a.try_clone().unwrap()), OwnedFd::from(a));
+        assert!(table_signal(&t, 5, libc::SIGTERM));
+        assert!(!table_signal(&t, 6, libc::SIGTERM), "unknown exec");
+        let mut got = [0u8; 5];
+        (&b).read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"K 15\n");
+        assert_eq!(exec::parse_kill("K 15"), Some(libc::SIGTERM));
+    }
+
+    #[test]
+    fn exec_signal_old_incarnation_refused() {
+        use std::sync::Arc;
+        let reg = execlog::Registry::default();
+        reg.insert(Arc::new(execlog::DetachedExec::new(
+            3,
+            Some("bob".into()),
+            "sleep".into(),
+            9,
+            "t".into(),
+            Arc::default(),
+            Arc::default(),
+            execlog::ExecState {
+                schema: execlog::STATE_SCHEMA.into(),
+                incarnation: "I1".into(),
+                exec_id: "e-3".into(),
+                seat: Some("bob".into()),
+                argv0: "sleep".into(),
+                started: "t".into(),
+                ended: None,
+                state: "running".into(),
+                exit_code: None,
+                signal: None,
+                signal_name: None,
+                cause: None,
+                pid: 9,
+                output_open: true,
+                stdout: Default::default(),
+                stderr: Default::default(),
+                supervisor_pid: None,
+                supervisor_start: None,
+            },
+            PathBuf::from("/nonexistent/s.json"),
+        )));
+        // Live incarnation (explicit or implied): the target is the seat.
+        let t = exec_target_of(&reg, "I1", "e-3", None).unwrap();
+        assert_eq!(t.seat.as_deref(), Some("bob"));
+        assert!(exec_target_of(&reg, "I1", "e-3", Some("I1")).is_some());
+        // Another incarnation, an unknown id and a malformed id: no target,
+        // so a member's signal is refused (no oracle), D5.
+        assert!(exec_target_of(&reg, "I1", "e-3", Some("I0")).is_none());
+        assert!(exec_target_of(&reg, "I1", "e-4", None).is_none());
+        assert!(exec_target_of(&reg, "I1", "3", None).is_none());
+    }
+
+    #[test]
+    fn exec_status_refusal_is_journaled() {
+        let d = tempfile::tempdir_in("target").unwrap();
+        let ws = d.path().join("workspace");
+        let journal = Journal::new(ws.clone(), "abcdef0123456789".into());
+        let audit = Audit::open(&d.path().join("grants.jsonl")).unwrap();
+        let client = authz::ClientRecord {
+            principal: None,
+            uid: 1000,
+            pid: Some(7),
+            label: "carol".into(),
+            label_source: "seat".into(),
+            req_id: None,
+            seq: 3,
+            seat: Some("carol".into()),
+            seat_role: Some(crate::seats::Role::Observer),
+        };
+        // What `handle` writes on a refusal: `<op>/refused`, seat in `client`.
+        for op in [
+            authz::Op::ExecStatus,
+            authz::Op::ExecOutput,
+            authz::Op::ExecSignal,
+        ] {
+            log_client_record(
+                &audit,
+                &journal,
+                op.name(),
+                "refused",
+                None,
+                None,
+                Some("seat carol may not do that"),
+                &client,
+                false,
+            );
+        }
+        let (records, _) = crate::journal::read_records(&ws);
+        let kinds: Vec<&str> = records.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "execstatus/refused",
+                "execoutput/refused",
+                "execsignal/refused"
+            ]
+        );
+        assert_eq!(records[0].data["authz"]["allow"], false);
+        assert_eq!(
+            records[0].client.as_ref().and_then(|c| c.seat.as_deref()),
+            Some("carol")
+        );
     }
 
     #[test]

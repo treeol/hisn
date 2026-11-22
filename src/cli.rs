@@ -33,6 +33,12 @@ pub enum Command {
     Inspect(InspectArgs),
     /// Run a command inside a running session (same namespaces and confinement).
     Exec(ExecArgs),
+    /// State of a detached exec (0.6.4, protocol revision 4).
+    ExecStatus(ExecStatusArgs),
+    /// Read the stdout or stderr of a detached exec from a byte offset (0.6.4).
+    ExecOutput(ExecOutputArgs),
+    /// Signal a detached exec: TERM, INT, KILL or HUP (0.6.4).
+    ExecSignal(ExecSignalArgs),
     /// Attach to a session: start an interactive shell in the session's cwd
     /// (0.4.0 step 2). Multiple attaches are peers (same pid namespace, same cwd).
     Attach(AttachArgs),
@@ -247,6 +253,109 @@ pub struct ExecArgs {
     /// Command and arguments.
     #[arg(last = true, required = true, value_name = "CMD")]
     pub command: Vec<String>,
+}
+
+/// `hisn exec-status` (0.6.4).
+#[derive(Debug, Args)]
+pub struct ExecStatusArgs {
+    #[arg(long)]
+    pub session: String,
+    /// Exec id as printed by `exec --detach` (`e-N`).
+    #[arg(long, value_name = "ID")]
+    pub exec: String,
+    /// Incarnation of the exec (default: the session's current one).
+    #[arg(long)]
+    pub incarnation: Option<String>,
+    /// Print the `hisn-exec-state/v1` object.
+    #[arg(long)]
+    pub json: bool,
+    /// Label for this client in the audit log.
+    #[arg(long)]
+    pub client: Option<String>,
+    /// Seat credential file (`-` reads one line from stdin); or `HISN_SEAT_TOKEN`.
+    #[arg(long, value_name = "PATH")]
+    pub seat_token_file: Option<PathBuf>,
+}
+
+/// `hisn exec-output` (0.6.4).
+#[derive(Debug, Args)]
+pub struct ExecOutputArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long, value_name = "ID")]
+    pub exec: String,
+    #[arg(long)]
+    pub incarnation: Option<String>,
+    /// `stdout` (default) or `stderr`.
+    #[arg(long, value_enum, default_value = "stdout")]
+    pub stream: OutputStream,
+    /// Absolute byte offset to read from (default 0). An offset older than
+    /// the kept tail starts at the oldest kept byte and says so.
+    #[arg(long, default_value_t = 0)]
+    pub offset: u64,
+    /// Print the reply object (data as base64) instead of raw bytes.
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub client: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub seat_token_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl OutputStream {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutputStream::Stdout => "stdout",
+            OutputStream::Stderr => "stderr",
+        }
+    }
+}
+
+/// `hisn exec-signal` (0.6.4).
+#[derive(Debug, Args)]
+pub struct ExecSignalArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long, value_name = "ID")]
+    pub exec: String,
+    #[arg(long)]
+    pub incarnation: Option<String>,
+    /// TERM, INT, KILL or HUP.
+    #[arg(long, value_enum)]
+    pub signal: ExecSignalName,
+    #[arg(long)]
+    pub client: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub seat_token_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExecSignalName {
+    #[value(name = "TERM")]
+    Term,
+    #[value(name = "INT")]
+    Int,
+    #[value(name = "KILL")]
+    Kill,
+    #[value(name = "HUP")]
+    Hup,
+}
+
+impl ExecSignalName {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExecSignalName::Term => "TERM",
+            ExecSignalName::Int => "INT",
+            ExecSignalName::Kill => "KILL",
+            ExecSignalName::Hup => "HUP",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -716,5 +825,111 @@ mod json_flag_tests {
         assert!(Cli::try_parse_from(["hisn", "rootfs", "list"]).is_ok());
         // exec has no --json by decision (the exec/exit record is the source).
         assert!(Cli::try_parse_from(["hisn", "exec", "--json", "s", "--", "ls"]).is_err());
+    }
+
+    #[test]
+    fn exec_output_cli_parses_offset_and_stream() {
+        let c = Cli::try_parse_from([
+            "hisn",
+            "exec-output",
+            "--session",
+            "s",
+            "--exec",
+            "e-3",
+            "--stream",
+            "stderr",
+            "--offset",
+            "1048576",
+            "--json",
+        ])
+        .unwrap();
+        let Command::ExecOutput(a) = c.command else {
+            panic!("not exec-output")
+        };
+        assert_eq!(a.stream, OutputStream::Stderr);
+        assert_eq!((a.offset, a.exec.as_str(), a.json), (1048576, "e-3", true));
+        assert_eq!(a.incarnation, None);
+        let c = Cli::try_parse_from(["hisn", "exec-output", "--session", "s", "--exec", "e-1"])
+            .unwrap();
+        let Command::ExecOutput(a) = c.command else {
+            panic!()
+        };
+        assert_eq!((a.stream, a.offset), (OutputStream::Stdout, 0));
+        assert!(
+            Cli::try_parse_from([
+                "hisn",
+                "exec-output",
+                "--session",
+                "s",
+                "--exec",
+                "e-1",
+                "--stream",
+                "x"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exec_signal_cli_accepts_only_the_four() {
+        for n in ["TERM", "INT", "KILL", "HUP"] {
+            let c = Cli::try_parse_from([
+                "hisn",
+                "exec-signal",
+                "--session",
+                "s",
+                "--exec",
+                "e-1",
+                "--signal",
+                n,
+                "--incarnation",
+                "20261122T101500Z-9f3a",
+            ])
+            .unwrap();
+            let Command::ExecSignal(a) = c.command else {
+                panic!()
+            };
+            assert_eq!(a.signal.as_str(), n);
+            assert_eq!(a.incarnation.as_deref(), Some("20261122T101500Z-9f3a"));
+        }
+        for bad in ["USR1", "9", "term2"] {
+            assert!(
+                Cli::try_parse_from([
+                    "hisn",
+                    "exec-signal",
+                    "--session",
+                    "s",
+                    "--exec",
+                    "e-1",
+                    "--signal",
+                    bad
+                ])
+                .is_err(),
+                "{bad}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["hisn", "exec-signal", "--session", "s", "--exec", "e-1"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exec_status_cli_parses() {
+        let c = Cli::try_parse_from([
+            "hisn",
+            "exec-status",
+            "--session",
+            "s",
+            "--exec",
+            "e-9",
+            "--json",
+        ])
+        .unwrap();
+        let Command::ExecStatus(a) = c.command else {
+            panic!()
+        };
+        assert!(a.json);
+        assert_eq!(a.exec, "e-9");
     }
 }

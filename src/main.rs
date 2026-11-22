@@ -120,6 +120,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             )
         }
         Command::Exec(a) => Ok(exit_u8(execcli::run(a)?)),
+        Command::ExecStatus(a) => Ok(exit_u8(execcli::run_exec_status(a)?)),
+        Command::ExecOutput(a) => Ok(exit_u8(execcli::run_exec_output(a)?)),
+        Command::ExecSignal(a) => Ok(exit_u8(execcli::run_exec_signal(a)?)),
         Command::Attach(a) => Ok(exit_u8(attach::run(a)?)),
         Command::Grant(a) => {
             let mode = if a.rw { "rw" } else { "ro" };

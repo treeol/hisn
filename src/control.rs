@@ -144,6 +144,43 @@ pub enum Request {
         #[serde(default)]
         client: Option<ClientField>,
     },
+    /// 0.6.4 (revision 4): the state of a detached exec. Read-only.
+    /// `incarnation` omitted = the live one.
+    #[serde(rename = "execstatus")]
+    ExecStatus {
+        exec_id: String,
+        #[serde(default)]
+        incarnation: Option<String>,
+        #[serde(default)]
+        client: Option<ClientField>,
+    },
+    /// 0.6.4: read a detached exec's stdout or stderr from an absolute byte
+    /// offset. `stream` defaults to `stdout`, `max` to and is capped at 1 MiB.
+    #[serde(rename = "execoutput")]
+    ExecOutput {
+        exec_id: String,
+        #[serde(default)]
+        incarnation: Option<String>,
+        #[serde(default)]
+        stream: Option<String>,
+        #[serde(default)]
+        offset: u64,
+        #[serde(default)]
+        max: Option<u64>,
+        #[serde(default)]
+        client: Option<ClientField>,
+    },
+    /// 0.6.4: signal a live detached exec (`TERM`, `INT`, `KILL`, `HUP`).
+    /// Live incarnation only.
+    #[serde(rename = "execsignal")]
+    ExecSignal {
+        exec_id: String,
+        #[serde(default)]
+        incarnation: Option<String>,
+        signal: String,
+        #[serde(default)]
+        client: Option<ClientField>,
+    },
     /// 0.4.1 step 3: report live clients and execs for `ls --json` (the
     /// per-session view that the on-disk `session.json` cannot supply).
     SessionInfo {
@@ -239,6 +276,27 @@ pub fn version_gate(declared: Option<u32>) -> Result<(), String> {
 /// tty or an attach; it must declare revision 4 (an absent declaration is
 /// refused too: only a client that knows the feature can ask for it).
 pub fn check_detach(req: &Request, fds: usize) -> Option<(&'static str, String)> {
+    let needs_rev = |what: &str| {
+        req.declared_version()
+            .is_none_or(|v| v < crate::sessionmeta::DETACH_REVISION)
+            .then(|| {
+                (
+                    E_UNSUPPORTED,
+                    format!(
+                        "{what} requires protocol_version >= {}",
+                        crate::sessionmeta::DETACH_REVISION
+                    ),
+                )
+            })
+    };
+    match req {
+        // 0.6.4 A2: the three exec ops exist only from revision 4.
+        Request::ExecStatus { .. } | Request::ExecOutput { .. } | Request::ExecSignal { .. } => {
+            return needs_rev(req.op_name());
+        }
+        Request::Exec { .. } => {}
+        _ => return None,
+    }
     let Request::Exec {
         tty,
         attach,
@@ -251,17 +309,8 @@ pub fn check_detach(req: &Request, fds: usize) -> Option<(&'static str, String)>
     if !*detach {
         return None;
     }
-    if req
-        .declared_version()
-        .is_none_or(|v| v < crate::sessionmeta::DETACH_REVISION)
-    {
-        return Some((
-            E_UNSUPPORTED,
-            format!(
-                "detach requires protocol_version >= {}",
-                crate::sessionmeta::DETACH_REVISION
-            ),
-        ));
+    if let Some(e) = needs_rev("detach") {
+        return Some(e);
     }
     if *tty || *attach {
         return Some((E_BAD_REQUEST, "detach conflicts with tty and attach".into()));
@@ -270,6 +319,18 @@ pub fn check_detach(req: &Request, fds: usize) -> Option<(&'static str, String)>
         return Some((E_BAD_REQUEST, "a detached exec takes no descriptors".into()));
     }
     None
+}
+
+/// The signals `exec-signal` accepts (plan 2.6), as the number to deliver.
+/// Pure; anything else is `None`.
+pub fn parse_exec_signal(s: &str) -> Option<i32> {
+    match s.to_ascii_uppercase().as_str() {
+        "TERM" => Some(libc::SIGTERM),
+        "INT" => Some(libc::SIGINT),
+        "KILL" => Some(libc::SIGKILL),
+        "HUP" => Some(libc::SIGHUP),
+        _ => None,
+    }
 }
 
 /// The client-supplied identity fields (0.4.0 F1). The supervisor fills
@@ -316,6 +377,9 @@ impl Request {
             Request::Signal { .. } => "signal",
             Request::SessionInfo { .. } => "sessioninfo",
             Request::Note { .. } => "note",
+            Request::ExecStatus { .. } => "execstatus",
+            Request::ExecOutput { .. } => "execoutput",
+            Request::ExecSignal { .. } => "execsignal",
             Request::SeatAdd { .. } => "seat-add",
             Request::SeatLs { .. } => "seat-ls",
             Request::SeatSetRole { .. } => "seat-set-role",
@@ -339,7 +403,11 @@ impl Request {
     pub fn is_observer(&self) -> bool {
         matches!(
             self,
-            Request::SessionInfo { .. } | Request::Inspect { .. } | Request::List { .. }
+            Request::SessionInfo { .. }
+                | Request::Inspect { .. }
+                | Request::List { .. }
+                | Request::ExecStatus { .. }
+                | Request::ExecOutput { .. }
         )
     }
 
@@ -360,6 +428,9 @@ impl Request {
             | Request::Signal { client, .. }
             | Request::SessionInfo { client, .. }
             | Request::Note { client, .. }
+            | Request::ExecStatus { client, .. }
+            | Request::ExecOutput { client, .. }
+            | Request::ExecSignal { client, .. }
             | Request::SeatAdd { client, .. }
             | Request::SeatLs { client, .. }
             | Request::SeatSetRole { client, .. }
@@ -1949,6 +2020,82 @@ mod tests {
                 real.contains(&token),
                 "doc names unknown error code {token:?}"
             );
+        }
+    }
+
+    #[test]
+    fn execsignal_rejects_other_signals() {
+        for ok in ["TERM", "INT", "KILL", "HUP", "term", "Kill"] {
+            assert!(parse_exec_signal(ok).is_some(), "{ok}");
+        }
+        assert_eq!(parse_exec_signal("TERM"), Some(libc::SIGTERM));
+        assert_eq!(parse_exec_signal("KILL"), Some(libc::SIGKILL));
+        for bad in ["USR1", "STOP", "QUIT", "9", "15", "SIGTERM", ""] {
+            assert!(parse_exec_signal(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn new_ops_request_shapes() {
+        let r = parse_request(
+            r#"{"op":"execstatus","exec_id":"e-1","incarnation":"I","client":{"protocol_version":4}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&r, Request::ExecStatus { exec_id, incarnation: Some(i), .. } if exec_id == "e-1" && i == "I")
+        );
+        assert!(r.is_observer());
+        let r = parse_request(
+            r#"{"op":"execoutput","exec_id":"e-2","stream":"stderr","offset":7,"max":10}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&r, Request::ExecOutput { offset: 7, max: Some(10), stream: Some(s), .. } if s == "stderr")
+        );
+        assert!(r.is_observer());
+        let r = parse_request(r#"{"op":"execoutput","exec_id":"e-2"}"#).unwrap();
+        assert!(matches!(
+            &r,
+            Request::ExecOutput {
+                offset: 0,
+                max: None,
+                stream: None,
+                incarnation: None,
+                ..
+            }
+        ));
+        let r = parse_request(r#"{"op":"execsignal","exec_id":"e-2","signal":"TERM"}"#).unwrap();
+        assert!(!r.is_observer(), "a signal is a mutation");
+        assert_eq!(r.op_name(), "execsignal");
+        // Unknown keys stay errors, a missing signal too.
+        assert!(parse_request(r#"{"op":"execstatus","exec_id":"e-1","x":1}"#).is_err());
+        assert!(parse_request(r#"{"op":"execsignal","exec_id":"e-1"}"#).is_err());
+        assert!(parse_request(r#"{"op":"execstatus"}"#).is_err());
+    }
+
+    #[test]
+    fn new_ops_refused_below_revision_4() {
+        let line = |op: &str, v: Option<&str>| {
+            let extra = if op == "execsignal" {
+                r#","signal":"TERM""#
+            } else {
+                ""
+            };
+            let client = v
+                .map(|v| format!(r#","client":{{"protocol_version":{v}}}"#))
+                .unwrap_or_default();
+            format!(r#"{{"op":"{op}","exec_id":"e-1"{extra}{client}}}"#)
+        };
+        for op in ["execstatus", "execoutput", "execsignal"] {
+            for (v, refused) in [(Some("3"), true), (Some("4"), false), (None, true)] {
+                let r = parse_request(&line(op, v)).unwrap();
+                let got = check_detach(&r, 0);
+                assert_eq!(got.is_some(), refused, "{op} {v:?}");
+                if let Some((code, msg)) = got {
+                    assert_eq!(code, E_UNSUPPORTED);
+                    assert!(msg.contains(op), "{msg}");
+                }
+            }
         }
     }
 }

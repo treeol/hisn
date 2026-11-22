@@ -691,6 +691,161 @@ if grep -q 'REFUSED-OK' "$ACWD/dx4b.out" 2>/dev/null; then pass "DX4 detached: a
 journal_is "DX4 journal: the private target is refuse/private-or-unlisted" "$AWS" 1 \
   kind=network/connect target=10.1.2.3:80 verdict=refuse reason=private-or-unlisted
 
+# ---- 0.6.4 A2: exec-status, exec-output, exec-signal, ownership (DX6-DX8)
+jget() { python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for k in sys.argv[1].split("."): d=d[k]
+print(d if not isinstance(d,bool) else str(d).lower())' "$1" 2>/dev/null; }
+dx_id() { printf '%s' "$1" | jget exec_id; }
+# dx_wait_state SESSION ID WANT [TOKEN]: poll exec-status until state == WANT
+dx_wait_state() {
+  local i st
+  for i in $(seq 100); do
+    if [ -n "${4:-}" ]; then
+      st=$(HISN_SEAT_TOKEN="$4" timeout 20 "$HISN" exec-status --session "$1" --exec "$2" --json </dev/null 2>/dev/null | jget state)
+    else
+      st=$(timeout 20 "$HISN" exec-status --session "$1" --exec "$2" --json </dev/null 2>/dev/null | jget state)
+    fi
+    [ "$st" = "$3" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+# dx_wait_total SESSION ID STREAM: poll until the stream has data
+dx_wait_total() {
+  local i n
+  for i in $(seq 100); do
+    n=$(timeout 20 "$HISN" exec-output --session "$1" --exec "$2" --stream "$3" --json </dev/null 2>/dev/null | jget total)
+    [ "${n:-0}" -gt 0 ] 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+unset HISN_SEAT_TOKEN
+
+# DX6: the owner reads status and both streams of a running exec, signals it,
+# and still reads status and output of the finished one.
+DX6_OUT=$(dx_start "$A" sh -c "echo dx6-out; echo dx6-err >&2; sleep 300")
+DX6_ID=$(dx_id "$DX6_OUT")
+DX6_INC=$(printf '%s' "$DX6_OUT" | jget incarnation)
+dx_wait_total "$A" "$DX6_ID" stdout
+dx_wait_total "$A" "$DX6_ID" stderr
+DX6_ST=$(timeout 20 "$HISN" exec-status --session "$A" --exec "$DX6_ID" --json </dev/null 2>&1)
+if [ "$(printf '%s' "$DX6_ST" | jget state)" = running ] && [ "$(printf '%s' "$DX6_ST" | jget incarnation)" = "$DX6_INC" ] && [ "$(printf '%s' "$DX6_ST" | jget pid)" -gt 0 ] 2>/dev/null; then
+  pass "DX6 exec-status of a running exec: state running, incarnation, pid"
+else
+  fail "DX6 exec-status of a running exec: state running, incarnation, pid" "[$DX6_ST]"
+fi
+DX6_O=$(timeout 20 "$HISN" exec-output --session "$A" --exec "$DX6_ID" </dev/null 2>"$T/dx6.err")
+DX6_E=$(timeout 20 "$HISN" exec-output --session "$A" --exec "$DX6_ID" --stream stderr </dev/null 2>/dev/null)
+if [ "$DX6_O" = dx6-out ] && [ "$DX6_E" = dx6-err ] && grep -q '^next=8' "$T/dx6.err" && ! grep -q eof "$T/dx6.err"; then
+  pass "DX6 exec-output: stdout and stderr are separate, next=8, no eof while running"
+else
+  fail "DX6 exec-output: stdout and stderr are separate, next=8, no eof while running" "[$DX6_O] [$DX6_E] [$(cat "$T/dx6.err")]"
+fi
+DX6_O2=$(timeout 20 "$HISN" exec-output --session "$A" --exec "$DX6_ID" --offset 4 --incarnation "$DX6_INC" </dev/null 2>/dev/null)
+if [ "$DX6_O2" = "out" ]; then pass "DX6 exec-output --offset 4 returns the rest"; else fail "DX6 exec-output --offset 4 returns the rest" "[$DX6_O2]"; fi
+timeout 20 "$HISN" exec-signal --session "$A" --exec "$DX6_ID" --signal TERM </dev/null >/dev/null 2>"$T/dx6.sig"
+DX6_SRC=$?
+if [ "$DX6_SRC" = 0 ] && dx_wait_state "$A" "$DX6_ID" signalled; then
+  DX6_ST=$(timeout 20 "$HISN" exec-status --session "$A" --exec "$DX6_ID" --json </dev/null 2>&1)
+  if [ "$(printf '%s' "$DX6_ST" | jget cause)" = exec-signal ] && [ "$(printf '%s' "$DX6_ST" | jget signal_name)" = TERM ]; then
+    pass "DX6 exec-signal TERM ends the exec: state signalled, cause exec-signal"
+  else
+    fail "DX6 exec-signal TERM ends the exec: state signalled, cause exec-signal" "[$DX6_ST]"
+  fi
+else
+  fail "DX6 exec-signal TERM ends the exec: state signalled, cause exec-signal" "rc=$DX6_SRC [$(cat "$T/dx6.sig")]"
+fi
+DX6_F=$(timeout 20 "$HISN" exec-output --session "$A" --exec "$DX6_ID" --json </dev/null 2>&1)
+if [ "$(printf '%s' "$DX6_F" | jget eof)" = true ] && [ "$(printf '%s' "$DX6_F" | jget next)" = 8 ]; then
+  pass "DX6 finished exec: output still readable, eof true"
+else
+  fail "DX6 finished exec: output still readable, eof true" "[$DX6_F]"
+fi
+DX6_TXT=$(timeout 20 "$HISN" exec-status --session "$A" --exec "$DX6_ID" </dev/null 2>&1)
+if printf '%s' "$DX6_TXT" | grep -q 'signalled' && printf '%s' "$DX6_TXT" | grep -q 'cause    exec-signal'; then pass "DX6 exec-status plain text names state and cause"; else fail "DX6 exec-status plain text names state and cause" "[$DX6_TXT]"; fi
+DX6_BAD=$(timeout 20 "$HISN" exec-status --session "$A" --exec e-9999 --json </dev/null 2>&1)
+DX6_RC=$?
+if [ "$DX6_RC" = 125 ] && printf '%s' "$DX6_BAD" | grep -q 'E_NOT_FOUND'; then pass "DX6 unknown exec: hisn-error/v1 E_NOT_FOUND, exit 125"; else fail "DX6 unknown exec: hisn-error/v1 E_NOT_FOUND, exit 125" "rc=$DX6_RC [$DX6_BAD]"; fi
+DX6_INCBAD=$(timeout 20 "$HISN" exec-signal --session "$A" --exec "$DX6_ID" --signal TERM --incarnation 19990101T000000Z-0000 </dev/null 2>&1)
+DX6_RC=$?
+if [ "$DX6_RC" = 125 ] && printf '%s' "$DX6_INCBAD" | grep -q 'incarnation'; then pass "DX6 exec-signal of another incarnation is a clear error, exit 125"; else fail "DX6 exec-signal of another incarnation is a clear error, exit 125" "rc=$DX6_RC [$DX6_INCBAD]"; fi
+journal_is "DX6 journal: execsignal/delivered names the exec and the signal" "$AWS" 1 \
+  kind=execsignal/delivered signal=TERM
+
+# DX7: a member cannot signal an exec another seat started. dave starts an
+# exec, bob (member) is refused and the exec lives on; dave may signal its own.
+DX_BOB=$("$HISN" seat --workspace "$AWS" add dxbob --role member 2>/dev/null)
+DX_DAVE=$("$HISN" seat --workspace "$AWS" add dxdave --role member 2>/dev/null)
+DX_CAROL=$("$HISN" seat --workspace "$AWS" add dxcarol --role observer 2>/dev/null)
+DX7_OUT=$(HISN_SEAT_TOKEN="$DX_DAVE" dx_start "$A" sh -c "echo dx7-out; sleep 300")
+DX7_ID=$(dx_id "$DX7_OUT")
+if [ -n "$DX7_ID" ]; then
+  HISN_SEAT_TOKEN="$DX_BOB" timeout 20 "$HISN" exec-signal --session "$A" --exec "$DX7_ID" --signal KILL </dev/null >/dev/null 2>"$T/dx7.err"
+  DX7_RC=$?
+  sleep 0.5
+  if [ "$DX7_RC" = 125 ] && grep -q E_UNAUTHORIZED "$T/dx7.err" && dx_wait_state "$A" "$DX7_ID" running; then
+    pass "DX7 a member cannot signal another seat's exec (exit 125, E_UNAUTHORIZED, exec still running)"
+  else
+    fail "DX7 a member cannot signal another seat's exec (exit 125, E_UNAUTHORIZED, exec still running)" "rc=$DX7_RC [$(cat "$T/dx7.err")]"
+  fi
+  journal_is "DX7 journal: execsignal/refused for the member, no delivery" "$AWS" 1 kind=execsignal/refused
+  # the same member may read status and output of any exec (plan B2)
+  DX7_R=$(HISN_SEAT_TOKEN="$DX_BOB" timeout 20 "$HISN" exec-output --session "$A" --exec "$DX7_ID" </dev/null 2>/dev/null)
+  if [ "$DX7_R" = dx7-out ]; then pass "DX7 a member reads output of another seat's exec"; else fail "DX7 a member reads output of another seat's exec" "[$DX7_R]"; fi
+  # an exec the owner started is not signalable by a member either
+  DX7_OWN=$(dx_id "$(dx_start "$A" sleep 300)")
+  HISN_SEAT_TOKEN="$DX_BOB" timeout 20 "$HISN" exec-signal --session "$A" --exec "$DX7_OWN" --signal KILL </dev/null >/dev/null 2>&1
+  if [ "$?" = 125 ] && dx_wait_state "$A" "$DX7_OWN" running; then pass "DX7 a member cannot signal an owner-started exec"; else fail "DX7 a member cannot signal an owner-started exec" "not refused or not running"; fi
+  # the owning seat may
+  HISN_SEAT_TOKEN="$DX_DAVE" timeout 20 "$HISN" exec-signal --session "$A" --exec "$DX7_ID" --signal TERM </dev/null >/dev/null 2>"$T/dx7b.err"
+  if [ "$?" = 0 ] && dx_wait_state "$A" "$DX7_ID" signalled "$DX_DAVE"; then pass "DX7 the starting seat may signal its own exec"; else fail "DX7 the starting seat may signal its own exec" "[$(cat "$T/dx7b.err")]"; fi
+  timeout 20 "$HISN" exec-signal --session "$A" --exec "$DX7_OWN" --signal KILL </dev/null >/dev/null 2>&1
+  # DX7b: the legacy `signal` op refuses a detached target, by id and by pid.
+  DX7B_OUT=$(HISN_SEAT_TOKEN="$DX_DAVE" dx_start "$A" sleep 300)
+  DX7B_ID=$(dx_id "$DX7B_OUT")
+  DX7B_PID=$(printf '%s' "$DX7B_OUT" | jget pid)
+  DX7B=$(timeout 20 python3 - "$DXDIR/control.sock" "$DX_BOB" "$DX7B_ID" "$DX7B_PID" <<'PY'
+import json, socket, sys
+sock, tok, eid, pid = sys.argv[1:5]
+def ask(extra):
+    s = socket.socket(socket.AF_UNIX); s.connect(sock)
+    req = {"op": "signal", "signal": "KILL", "client": {"protocol_version": 3, "seat_token": tok}}
+    req.update(extra)
+    s.sendall((json.dumps(req) + "\n").encode())
+    r = json.loads(s.makefile().readline()); s.close()
+    return r
+a = ask({"exec_id": eid}); b = ask({"pid": int(pid)})
+print(a.get("error"), "exec-signal" in a.get("message", ""), b.get("error"), "exec-signal" in b.get("message", ""))
+PY
+)
+  sleep 0.5
+  if [ "$DX7B" = "E_BAD_REQUEST True E_BAD_REQUEST True" ] && dx_wait_state "$A" "$DX7B_ID" running; then
+    pass "DX7b legacy signal by id and by pid refuses a detached exec (member), exec still running"
+  else
+    fail "DX7b legacy signal by id and by pid refuses a detached exec (member), exec still running" "[$DX7B]"
+  fi
+  timeout 20 "$HISN" exec-signal --session "$A" --exec "$DX7B_ID" --signal KILL </dev/null >/dev/null 2>&1
+else
+  fail "DX7 seat starts a detached exec" "[$DX7_OUT]"
+fi
+
+# DX8: an observer reads status, is refused output and signal.
+DX8_OUT=$(dx_start "$A" sh -c "echo dx8-out; sleep 300")
+DX8_ID=$(dx_id "$DX8_OUT")
+dx_wait_total "$A" "$DX8_ID" stdout
+HISN_SEAT_TOKEN="$DX_CAROL" timeout 20 "$HISN" exec-status --session "$A" --exec "$DX8_ID" --json </dev/null >"$T/dx8.st" 2>&1
+DX8_RC=$?
+if [ "$DX8_RC" = 0 ] && [ "$(jget state <"$T/dx8.st")" = running ]; then pass "DX8 an observer reads exec status"; else fail "DX8 an observer reads exec status" "rc=$DX8_RC [$(cat "$T/dx8.st")]"; fi
+HISN_SEAT_TOKEN="$DX_CAROL" timeout 20 "$HISN" exec-output --session "$A" --exec "$DX8_ID" </dev/null >"$T/dx8.out" 2>"$T/dx8.err"
+DX8_RC=$?
+if [ "$DX8_RC" = 125 ] && grep -q E_UNAUTHORIZED "$T/dx8.err" && ! grep -q dx8-out "$T/dx8.out" "$T/dx8.err"; then pass "DX8 an observer is refused exec output (exit 125, no data)"; else fail "DX8 an observer is refused exec output (exit 125, no data)" "rc=$DX8_RC [$(cat "$T/dx8.out" "$T/dx8.err")]"; fi
+HISN_SEAT_TOKEN="$DX_CAROL" timeout 20 "$HISN" exec-signal --session "$A" --exec "$DX8_ID" --signal KILL </dev/null >/dev/null 2>&1
+if [ "$?" = 125 ] && dx_wait_state "$A" "$DX8_ID" running; then pass "DX8 an observer cannot signal"; else fail "DX8 an observer cannot signal" "not refused or exec gone"; fi
+journal_is "DX8 journal: execoutput/refused for the observer" "$AWS" 1 kind=execoutput/refused
+timeout 20 "$HISN" exec-signal --session "$A" --exec "$DX8_ID" --signal KILL </dev/null >/dev/null 2>&1
+
 # DX5: a detached exec ends when its session stops: the process is gone, the
 # exec's journal record says session-stop, and session/stop lists it.
 DX5="$TOKEN-dx5"
@@ -722,6 +877,29 @@ print("exit=%s stop=%s" % (exit_ok, stop_ok))
   if [ "$DX5_J" = "exit=True stop=True" ]; then pass "DX5 journal: exec/exit cause session-stop and session/stop lists the exec"; else fail "DX5 journal: exec/exit cause session-stop and session/stop lists the exec" "[$DX5_J] id [$DX5_ID]"; fi
 else
   fail "DX5 session starts" "[$(cat "$T/$DX5.log" 2>/dev/null)]"
+fi
+
+# DX10: a running detached exec keeps its session alive past the idle timeout;
+# once it ends, the session idles out.
+DX10="$TOKEN-dx10"
+DX10CWD="$T/dx10-cwd"
+printf 'version = "hisn-policy/v1"\n[session]\ncwd = "%s"\nnetwork = "none"\nidle_timeout = "3s"\n' "$DX10CWD" >"$T/dx10.toml"
+if start_session "$DX10" "$DX10CWD" --policy "$T/dx10.toml" sleep 3600; then
+  # the main command is a client-less sleep; stop it so only the exec counts
+  DX10_OUT=$(dx_start "$DX10" sleep 600)
+  DX10_ID=$(dx_id "$DX10_OUT")
+  sleep 8
+  if [ "$(session_field "$DX10" state)" = running ] && dx_wait_state "$DX10" "$DX10_ID" running; then
+    pass "DX10 a session with a 3 s idle timeout and a running detached exec is alive after 8 s"
+  else
+    fail "DX10 a session with a 3 s idle timeout and a running detached exec is alive after 8 s" "state [$(session_field "$DX10" state)]"
+  fi
+  timeout 20 "$HISN" exec-signal --session "$DX10" --exec "$DX10_ID" --signal KILL </dev/null >/dev/null 2>&1
+  DX10_GONE=1
+  for _ in $(seq 150); do [ "$(session_field "$DX10" state)" != running ] && { DX10_GONE=0; break; }; sleep 0.2; done
+  if [ "$DX10_GONE" = 0 ]; then pass "DX10 after the exec ended the session idled out ($(session_field "$DX10" state))"; else fail "DX10 after the exec ended the session idled out" "still running after 30 s"; fi
+else
+  fail "DX10 session starts" "[$(cat "$T/$DX10.log" 2>/dev/null)]"
 fi
 
 check "net harness: open session stops cleanly" "" timeout 30 "$HISN" stop --session "$A" </dev/null

@@ -117,9 +117,20 @@ pub fn allows(role: Role, op: Op) -> bool {
         Role::Owner => true,
         Role::Member => matches!(
             op,
-            Op::Exec | Op::Signal | Op::Note | Op::List | Op::Inspect | Op::SessionInfo
+            Op::Exec
+                | Op::Signal
+                | Op::Note
+                | Op::List
+                | Op::Inspect
+                | Op::SessionInfo
+                | Op::ExecStatus
+                | Op::ExecOutput
+                | Op::ExecSignal
         ),
-        Role::Observer => matches!(op, Op::List | Op::Inspect | Op::SessionInfo),
+        Role::Observer => matches!(
+            op,
+            Op::List | Op::Inspect | Op::SessionInfo | Op::ExecStatus
+        ),
     }
 }
 
@@ -136,6 +147,9 @@ pub enum Op {
     Signal,
     SessionInfo,
     Note,
+    ExecStatus,
+    ExecOutput,
+    ExecSignal,
     SeatAdd,
     SeatLs,
     SeatSetRole,
@@ -154,6 +168,9 @@ impl Op {
             Request::Signal { .. } => Op::Signal,
             Request::SessionInfo { .. } => Op::SessionInfo,
             Request::Note { .. } => Op::Note,
+            Request::ExecStatus { .. } => Op::ExecStatus,
+            Request::ExecOutput { .. } => Op::ExecOutput,
+            Request::ExecSignal { .. } => Op::ExecSignal,
             Request::SeatAdd { .. } => Op::SeatAdd,
             Request::SeatLs { .. } => Op::SeatLs,
             Request::SeatSetRole { .. } => Op::SeatSetRole,
@@ -172,6 +189,9 @@ impl Op {
             Op::Signal => "signal",
             Op::SessionInfo => "sessioninfo",
             Op::Note => "note",
+            Op::ExecStatus => "execstatus",
+            Op::ExecOutput => "execoutput",
+            Op::ExecSignal => "execsignal",
             Op::SeatAdd => "seat-add",
             Op::SeatLs => "seat-ls",
             Op::SeatSetRole => "seat-set-role",
@@ -235,6 +255,28 @@ pub fn authorize(
     credential: &Credential,
     req: &Request,
 ) -> Result<Authorized, Refusal> {
+    authorize_target(client, session, credential, req, None)
+}
+
+/// The target of an exec operation, looked up by the supervisor from the
+/// live detached-exec registry before the decision (plan 7 B11). `None` at
+/// the call = unknown (or another incarnation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecTarget {
+    /// The seat that started the exec (`None` = the owner, no credential).
+    pub seat: Option<String>,
+}
+
+/// [`authorize`] with the exec target. Role first, ownership second: a seat
+/// that may not perform the op at all is refused before the target matters,
+/// so an observer learns nothing about whether an id exists (B11).
+pub fn authorize_target(
+    client: &ClientRecord,
+    session: &SessionAuth,
+    credential: &Credential,
+    req: &Request,
+    target: Option<&ExecTarget>,
+) -> Result<Authorized, Refusal> {
     let op = Op::of(req);
     // Decision B: no credential + owner uid = owner, on every op.
     // This is also the 0.5.0 behaviour, byte for byte.
@@ -262,6 +304,22 @@ pub fn authorize(
         }),
         Credential::Authenticated { name, role } => {
             let role = *role;
+            // Ownership: a member signals only an exec its own seat started.
+            // An unknown target or an owner-started one is refused alike (no
+            // existence oracle). Owner-role seats are not restricted.
+            if allows(role, op)
+                && op == Op::ExecSignal
+                && role == Role::Member
+                && target.and_then(|t| t.seat.as_deref()) != Some(name.as_str())
+            {
+                return Err(Refusal {
+                    op,
+                    reason: format!(
+                        "seat {name} (role {}) may signal only execs started by its own seat",
+                        role.as_str()
+                    ),
+                });
+            }
             if allows(role, op) {
                 Ok(Authorized {
                     op,
@@ -557,6 +615,34 @@ mod tests {
             ),
             (Op::SessionInfo, Request::SessionInfo { client: None }),
             (
+                Op::ExecStatus,
+                Request::ExecStatus {
+                    exec_id: "e-1".into(),
+                    incarnation: None,
+                    client: None,
+                },
+            ),
+            (
+                Op::ExecOutput,
+                Request::ExecOutput {
+                    exec_id: "e-1".into(),
+                    incarnation: None,
+                    stream: None,
+                    offset: 0,
+                    max: None,
+                    client: None,
+                },
+            ),
+            (
+                Op::ExecSignal,
+                Request::ExecSignal {
+                    exec_id: "e-1".into(),
+                    incarnation: None,
+                    signal: "TERM".into(),
+                    client: None,
+                },
+            ),
+            (
                 Op::Note,
                 Request::Note {
                     kind: "note".into(),
@@ -580,13 +666,24 @@ mod tests {
                 allows(Role::Member, op),
                 matches!(
                     op,
-                    Op::Exec | Op::Signal | Op::Note | Op::List | Op::Inspect | Op::SessionInfo
+                    Op::Exec
+                        | Op::Signal
+                        | Op::Note
+                        | Op::List
+                        | Op::Inspect
+                        | Op::SessionInfo
+                        | Op::ExecStatus
+                        | Op::ExecOutput
+                        | Op::ExecSignal
                 ),
                 "{op:?}"
             );
             assert_eq!(
                 allows(Role::Observer, op),
-                matches!(op, Op::List | Op::Inspect | Op::SessionInfo),
+                matches!(
+                    op,
+                    Op::List | Op::Inspect | Op::SessionInfo | Op::ExecStatus
+                ),
                 "{op:?}"
             );
         }
@@ -672,5 +769,118 @@ mod tests {
             assert!(!allows(Role::Observer, op));
             assert!(allows(Role::Owner, op));
         }
+    }
+
+    fn exec_req(op: Op) -> Request {
+        every_op().into_iter().find(|(o, _)| *o == op).unwrap().1
+    }
+
+    fn tgt(seat: Option<&str>) -> ExecTarget {
+        ExecTarget {
+            seat: seat.map(str::to_owned),
+        }
+    }
+
+    fn ask(c: &Credential, op: Op, t: Option<&ExecTarget>) -> Result<Authorized, Refusal> {
+        authorize_target(&client(1000), &sess(), c, &exec_req(op), t)
+    }
+
+    #[test]
+    fn authz_exec_ops_role_matrix() {
+        let ops = [Op::ExecStatus, Op::ExecOutput, Op::ExecSignal];
+        for op in ops {
+            assert!(allows(Role::Owner, op), "{op:?}");
+            assert!(allows(Role::Member, op), "{op:?}");
+        }
+        assert!(allows(Role::Observer, Op::ExecStatus));
+        assert!(!allows(Role::Observer, Op::ExecOutput));
+        assert!(!allows(Role::Observer, Op::ExecSignal));
+        assert_eq!(Op::of(&exec_req(Op::ExecOutput)), Op::ExecOutput);
+        assert_eq!(Op::ExecStatus.name(), "execstatus");
+        assert_eq!(Op::ExecOutput.name(), "execoutput");
+        assert_eq!(Op::ExecSignal.name(), "execsignal");
+        assert_eq!(Op::ExecOutput.required_role(), Role::Member);
+        // `required_role` names the lowest of member/observer/owner it checks
+        // first, as for `List`: member.
+        assert_eq!(Op::ExecStatus.required_role(), Role::Member);
+    }
+
+    #[test]
+    fn authz_member_signals_only_own_seat() {
+        let bob = cred("bob", Role::Member);
+        assert!(ask(&bob, Op::ExecSignal, Some(&tgt(Some("bob")))).is_ok());
+        let r = ask(&bob, Op::ExecSignal, Some(&tgt(Some("dave")))).unwrap_err();
+        assert_eq!(r.op, Op::ExecSignal);
+        assert!(
+            r.reason.contains("bob") && r.reason.contains("own seat"),
+            "{}",
+            r.reason
+        );
+    }
+
+    #[test]
+    fn authz_owner_signals_any() {
+        // Owner by uid (no credential), whatever the target.
+        for t in [None, Some(tgt(None)), Some(tgt(Some("dave")))] {
+            let a = authorize_target(
+                &client(1000),
+                &sess(),
+                &absent(),
+                &exec_req(Op::ExecSignal),
+                t.as_ref(),
+            )
+            .unwrap();
+            assert_eq!(a.role(), "owner");
+        }
+        // An owner-role seat is not restricted either.
+        let o = cred("olga", Role::Owner);
+        assert!(ask(&o, Op::ExecSignal, Some(&tgt(Some("dave")))).is_ok());
+        assert!(ask(&o, Op::ExecSignal, None).is_ok());
+    }
+
+    #[test]
+    fn authz_observer_reads_status_only() {
+        let c = cred("carol", Role::Observer);
+        assert!(ask(&c, Op::ExecStatus, None).is_ok());
+        for op in [Op::ExecOutput, Op::ExecSignal] {
+            let r = ask(&c, op, Some(&tgt(Some("carol")))).unwrap_err();
+            assert!(
+                r.reason.contains("carol") && r.reason.contains("member"),
+                "{}",
+                r.reason
+            );
+        }
+    }
+
+    #[test]
+    fn authz_member_reads_any_seat_output() {
+        let bob = cred("bob", Role::Member);
+        for op in [Op::ExecStatus, Op::ExecOutput] {
+            for t in [None, Some(tgt(None)), Some(tgt(Some("dave")))] {
+                assert!(ask(&bob, op, t.as_ref()).is_ok(), "{op:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn authz_unknown_exec_after_role_check() {
+        // Role first: an observer asking about an unknown id is refused for
+        // its role, never told "not found" (the op does not run at all).
+        let c = cred("carol", Role::Observer);
+        let r = ask(&c, Op::ExecOutput, None).unwrap_err();
+        assert!(r.reason.contains("may not execoutput"), "{}", r.reason);
+        // A member passes the role check for output with no target: the op
+        // then runs and answers E_NOT_FOUND itself.
+        assert!(ask(&cred("bob", Role::Member), Op::ExecOutput, None).is_ok());
+    }
+
+    #[test]
+    fn authz_member_signal_unknown_or_owner_started_refused() {
+        let bob = cred("bob", Role::Member);
+        // Unknown target and an owner-started exec (seat None) are refused
+        // with the same reason: no existence oracle (B11).
+        let a = ask(&bob, Op::ExecSignal, None).unwrap_err();
+        let b = ask(&bob, Op::ExecSignal, Some(&tgt(None))).unwrap_err();
+        assert_eq!(a.reason, b.reason);
     }
 }

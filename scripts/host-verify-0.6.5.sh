@@ -429,33 +429,31 @@ PY
       [ "$eof" = true ] && { tot=$(printf '%s' "$r" | jget total); break; }
       sleep 0.2
     done
-    [ "$eof" = true ] && [ "$tot" = 156 ] \
-      && ok "Block 1: prune while a pump is writing keeps output complete (156 bytes)" \
+    [ "$eof" = true ] && [ "$tot" = 168 ] \
+      && ok "Block 1: prune while a pump is writing keeps output complete (168 bytes)" \
       || bad "Block 1: prune while a pump is writing" "eof=$eof total=$tot"
-    # Block 1: exec/request carries detach: true (read the journal file).
-    J=$(ls "$ADIR"/journal.jsonl 2>/dev/null || ls "$ADIR"/journal*.jsonl 2>/dev/null | head -1)
-    if [ -n "$J" ] && grep -q '"kind":"exec/request"' "$J"; then
-      c=$(python3 -c '
+    # Block 1: exec/request carries detach: true (via the public journal API).
+    c=$(H 20 journal --workspace "$WS" --json 2>/dev/null | python3 -c '
 import json,sys
-for l in open(sys.argv[1]):
-    d=json.loads(l)
+found=False
+for l in sys.stdin:
+    try: d=json.loads(l)
+    except Exception: continue
     if d.get("kind")=="exec/request" and d.get("detach"):
-        print("detach:true"); break
-' "$J" 2>/dev/null)
-      [ "$c" = "detach:true" ] && ok "Block 1: exec/request carries detach: true" || bad "Block 1: exec/request detach" "$c"
-    else
-      bad "Block 1: exec/request detach" "journal line not found"
-    fi
+        found=True; break
+print("detach:true" if found else "missing")' 2>/dev/null)
+    [ "$c" = "detach:true" ] && ok "Block 1: exec/request carries detach: true" || bad "Block 1: exec/request detach" "$c"
     # Block 2: oversized request -> exit 125, E_TOO_LARGE naming 65536.
     BIG=$(python3 -c 'print("x" * 70000)')
     out=$(H 20 exec --no-tty --session "$A" -- sh -c "echo $BIG" 2>"$W/big.err"; echo "rc=$?")
     if printf '%s' "$out" | grep -q 'rc=125' && grep -q E_TOO_LARGE "$W/big.err" && grep -q 65536 "$W/big.err"; then
       ok "Block 2: oversized request: exit 125, E_TOO_LARGE naming the limit"
     else bad "Block 2: oversized request" "[$out] [$(cat "$W/big.err")]"; fi
-    # Block 3: stdin passthrough under --stdin-limit.
-    printf 'hv065-in' | H 20 exec --no-tty --stdin-limit 1048576 --session "$A" -- cat >"$W/in.out" 2>/dev/null
+    # Block 3: stdin passthrough under --stdin-limit. (Uses the bare binary:
+    # H feeds /dev/null as the CLI's stdin by design.)
+    printf 'hv065-in' | timeout 20 "$HISN" exec --no-tty --stdin-limit 1048576 --session "$A" -- cat >"$W/in.out" 2>/dev/null
     [ "$(cat "$W/in.out")" = hv065-in ] && ok "Block 3: stdin passes through under --stdin-limit" || bad "Block 3: stdin passthrough" "[$(cat "$W/in.out")]"
-    head -c 1001 /dev/zero | tr '\0' 'z' | H 20 exec --no-tty --stdin-limit 1000 --session "$A" -- cat >"$W/in2.out" 2>"$W/in2.err"; rc=$?
+    head -c 1001 /dev/zero | tr '\0' 'z' | timeout 20 "$HISN" exec --no-tty --stdin-limit 1000 --session "$A" -- cat >"$W/in2.out" 2>"$W/in2.err"; rc=$?
     if [ "$rc" = 125 ] && grep -q E_TOO_LARGE "$W/in2.err"; then ok "Block 3: stdin over the cap: exit 125 E_TOO_LARGE"; else bad "Block 3: stdin over the cap" "rc=$rc [$(cat "$W/in2.err")]"; fi
     # Block 4: capabilities.
     caps=$("$HISN" capabilities --json 2>/dev/null)

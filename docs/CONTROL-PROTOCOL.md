@@ -94,6 +94,7 @@ Error response: `{"ok":false,"error":"<CODE>","message":"…"}`.
 | `E_EXEC` | the program could not be started (confinement failed, not found, not executable). |
 | `E_UNSUPPORTED` | **0.6.4**: `detach` or one of `execstatus`/`execoutput`/`execsignal` from a client that declares no `protocol_version` or one below 4. Answered after authorization, before any effect. |
 | `E_BUSY` | **0.6.4**: 32 detached execs are already running in the session. |
+| `E_TOO_LARGE` | **0.6.5**: the request line exceeds 65536 bytes (the limit excluding the newline). Answered instead of silently closing the connection; the message names the limit and a lower bound on the buffered size. Delivery is best-effort for a peer still blocked in `write`. The `hisn` CLI also refuses an oversized request before sending it (exit 125, `hisn-error/v1`). |
 | `E_VERSION` | **0.5.0**: the request declares a protocol revision newer than the supervisor supports. The message names the supported revision. See "Version rule". An unknown op string is never `E_VERSION`: it fails parsing first and is answered `E_BAD_REQUEST` + close, exactly as in 0.4.3. |
 
 There are no CLI exit codes for these wire errors: a client maps a failed

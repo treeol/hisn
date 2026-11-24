@@ -275,6 +275,9 @@ fn run_detached(args: ExecArgs) -> Result<i32> {
     }
     let (token, revision) = seat_material_v4(args.seat_token_file.as_deref())?;
     let req = build_request_with(&args, token.as_deref(), revision)?;
+    if refuse_oversized_request(&req) {
+        return Ok(EXIT_INTERNAL);
+    }
     let sock = supervisor::socket_for(&args.session)?;
     let reply = control::request(&sock, &req)
         .with_context(|| format!("talking to session {}", args.session))?;
@@ -644,6 +647,24 @@ pub fn refuse_real_terminal(
     )
 }
 
+/// 0.6.5: refuse a request whose line would exceed the supervisor's
+/// [`control::MAX_LINE`] (bytes, excluding the newline), before anything is
+/// sent. Prints the `hisn-error/v1` object on stderr and returns `true` when
+/// the request must not be sent (caller exits 125). The newline formatted
+/// into `line` is not counted: `MAX_LINE` excludes it.
+pub(crate) fn refuse_oversized_request(req: &Value) -> bool {
+    let line_len = req.to_string().len();
+    if line_len > control::MAX_LINE {
+        let msg = format!(
+            "request is {line_len} bytes, over the {} byte limit",
+            control::MAX_LINE
+        );
+        eprintln!("{}", error_object(control::E_TOO_LARGE, &msg));
+        return true;
+    }
+    false
+}
+
 /// Run `hisn exec`; returns the process exit code.
 pub fn run(args: ExecArgs) -> Result<i32> {
     if args.detach {
@@ -654,6 +675,9 @@ pub fn run(args: ExecArgs) -> Result<i32> {
     refuse_stdin_token_unless_no_tty(args.seat_token_file.as_deref(), args.no_tty)?;
     let (token, revision) = seat_material(&args.session, args.seat_token_file.as_deref())?;
     let req = build_request_with(&args, token.as_deref(), revision)?;
+    if refuse_oversized_request(&req) {
+        return Ok(EXIT_INTERNAL);
+    }
     refuse_real_terminal(args.tty, args.no_tty, sys::isatty)?;
     let sock = supervisor::socket_for(&args.session)?;
     let conn = UnixStream::connect(&sock)
@@ -965,6 +989,39 @@ mod tests {
             req.to_string(),
             r#"{"argv":["ls"],"client":null,"cwd":null,"env":{},"op":"exec","tty":false}"#
         );
+    }
+
+    #[test]
+    fn oversized_request_is_refused_before_sending() {
+        // 0.6.5: the client refuses a request line over MAX_LINE (excluding
+        // the newline) without sending; exactly at the limit passes.
+        let a = exec_args(&["hisn", "exec", "--session", "s", "--", "ls"]);
+        let small = build_request(&a).unwrap();
+        assert!(!refuse_oversized_request(&small));
+        // pad the serialized request to exactly MAX_LINE: add a long argv
+        // element. The base request for ["ls"] is short; grow argv[0].
+        let mut req = small.clone();
+        let base_len = req.to_string().len();
+        let need = control::MAX_LINE - base_len;
+        // base_len includes "ls" (2 chars); replace argv with one long string
+        req["argv"] = json!(["x".repeat(need)]);
+        // len now = base_len - 2 + need + quotes adjust: compute directly
+        let len = req.to_string().len();
+        assert!(len <= control::MAX_LINE, "len {len}");
+        // adjust to exactly the limit by trimming/padding one char at a time
+        while req.to_string().len() < control::MAX_LINE {
+            let cur = req["argv"][0].as_str().unwrap().to_owned();
+            req["argv"] = json!([format!("{cur}x")]);
+        }
+        assert_eq!(req.to_string().len(), control::MAX_LINE);
+        assert!(
+            !refuse_oversized_request(&req),
+            "exactly at the limit passes"
+        );
+        let cur = req["argv"][0].as_str().unwrap().to_owned();
+        req["argv"] = json!([format!("{cur}x")]);
+        assert_eq!(req.to_string().len(), control::MAX_LINE + 1);
+        assert!(refuse_oversized_request(&req), "one byte over is refused");
     }
 
     #[test]

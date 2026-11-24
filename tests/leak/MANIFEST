@@ -190,5 +190,7 @@ DX11: exited state is final while a grandchild holds the pipe
 DX11: late output after the exec ended
 DX13: prune while a pump is writing: output stays complete (156 bytes)
 DX14: journal: detached exec/request carries detach:true, plain keeps the v0.6.3 shape
+DX15: oversized exec request: exit 125, hisn-error/v1 E_TOO_LARGE naming the limit
+DX15: a request within the limit runs normally
 DX12: session stop delivers TERM to a detached exec before the sandbox ends
 DX12: journal: exec/exit cause session-stop

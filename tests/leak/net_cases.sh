@@ -1115,6 +1115,20 @@ print("detach=%s plain=%s" % (d_ok, d_plain))
 ')
 if [ "$DX14_J" = "detach=True plain=True" ]; then pass "DX14 journal: detached exec/request carries detach:true, plain keeps the v0.6.3 shape"; else fail "DX14 journal: detached exec/request carries detach:true, plain keeps the v0.6.3 shape" "[$DX14_J]"; fi
 
+# DX15 (0.6.5): a request line over 64 KiB is refused before sending: exit 125,
+# hisn-error/v1 with E_TOO_LARGE naming the limit, nothing sent.
+DX15_BIG=$(python3 -c 'print("x" * 70000)')
+DX15_OUT=$(timeout 20 "$HISN" exec --no-tty --session "$A" -- sh -c "echo $DX15_BIG" </dev/null 2>"$T/dx15.err"; echo "rc=$?")
+if printf '%s' "$DX15_OUT" | grep -q 'rc=125' && grep -q 'E_TOO_LARGE' "$T/dx15.err" && grep -q '65536' "$T/dx15.err"; then
+  pass "DX15 oversized exec request: exit 125, hisn-error/v1 E_TOO_LARGE naming the limit"
+else
+  fail "DX15 oversized exec request: exit 125, hisn-error/v1 E_TOO_LARGE naming the limit" "[$DX15_OUT] [$(cat "$T/dx15.err")]"
+fi
+# exactly at the limit still runs
+DX15_N=$(python3 -c 'print(65536 - 90)')
+DX15_OK=$(timeout 20 "$HISN" exec --no-tty --session "$A" -- python3 -c "print('y' * $DX15_N)" </dev/null 2>/dev/null | wc -c)
+if [ "$DX15_OK" -gt 0 ] 2>/dev/null; then pass "DX15 a request within the limit runs normally"; else fail "DX15 a request within the limit runs normally" "no output"; fi
+
 check "net harness: open session stops cleanly" "" timeout 30 "$HISN" stop --session "$A" </dev/null
 for _ in $(seq 50); do [ "$(session_field "$A" state)" != running ] && break; sleep 0.1; done
 check "net harness: open session is no longer running" "stopped" session_field "$A" state

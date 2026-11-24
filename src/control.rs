@@ -48,6 +48,10 @@ pub const E_VERSION: &str = "E_VERSION";
 pub const E_UNSUPPORTED: &str = "E_UNSUPPORTED";
 /// 0.6.4: a limit is reached (at most 32 live detached execs).
 pub const E_BUSY: &str = "E_BUSY";
+/// 0.6.5: the request line exceeds [`MAX_LINE`] bytes. Emitted by the
+/// supervisor instead of silently closing the connection, and by the CLI
+/// before sending an oversized request.
+pub const E_TOO_LARGE: &str = "E_TOO_LARGE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -581,13 +585,23 @@ impl FdLineReader {
         self.buf.len()
     }
 
-    /// `Ok(None)` = clean EOF; `Err(InvalidData)` = oversized, non-UTF-8 or
-    /// truncated input.
+    /// 0.6.5: the typed oversize error, so `serve_conn` can distinguish it
+    /// from non-UTF-8 and truncated-ancillary errors without matching on the
+    /// message string.
+    pub(crate) fn too_large(buf_len: usize) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("line too long: at least {buf_len} bytes before the newline"),
+        )
+    }
+
+    /// `Ok(None)` = clean EOF; `Err(FileTooLarge)` = oversized line;
+    /// `Err(InvalidData)` = non-UTF-8 or truncated input.
     pub fn next_line(&mut self) -> io::Result<Option<ReadLine>> {
         loop {
             if let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
                 if pos > MAX_LINE {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+                    return Err(Self::too_large(pos));
                 }
                 let rest = self.buf.split_off(pos + 1);
                 let mut line = std::mem::replace(&mut self.buf, rest);
@@ -600,7 +614,7 @@ impl FdLineReader {
                 }));
             }
             if self.buf.len() > MAX_LINE {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+                return Err(Self::too_large(self.buf.len()));
             }
             let mut chunk = [0u8; 8192];
             let r = match crate::sys::recv_with_fds(self.fd, &mut chunk) {
@@ -712,7 +726,24 @@ fn serve_conn(h: &dyn Handler, stream: UnixStream) {
     loop {
         let ReadLine { line, fds } = match reader.next_line() {
             Ok(Some(l)) => l,
-            _ => return, // EOF, oversized, truncated or malformed framing: close
+            // 0.6.5: an oversized request gets a machine-readable refusal
+            // (best-effort: a peer still blocked in write may take EPIPE
+            // instead of reading it) instead of a silent close. The buffered
+            // size is a lower bound; the true line length is unknowable
+            // without draining. Descriptors received so far are dropped by
+            // the reader, never dispatched.
+            Err(e) if e.kind() == io::ErrorKind::FileTooLarge => {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    err(
+                        E_TOO_LARGE,
+                        format!("request line exceeds {MAX_LINE} bytes ({e})")
+                    )
+                );
+                return;
+            }
+            _ => return, // EOF, truncated or malformed framing: close
         };
         lines += 1;
         if h.authorize(&stream).is_err() {
@@ -985,6 +1016,56 @@ mod tests {
         assert_eq!(*h.seen.lock().unwrap(), ["list", "inspect"]);
         // helper client
         assert_eq!(request(&sock, &json!({"op":"list"})).unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn oversized_request_line_gets_too_large_reply() {
+        // 0.6.5: a request line over MAX_LINE gets err(E_TOO_LARGE) on the
+        // wire (not a silent close); exactly at the limit it parses normally.
+        let (_d, sock, h) = start(true);
+        // exactly at the limit: a line of MAX_LINE bytes + newline. Build a
+        // valid JSON request padded to exactly MAX_LINE.
+        let base = r#"{"op":"list","pad":""#;
+        let suffix = r#""}"#;
+        let pad_len = MAX_LINE - base.len() - suffix.len();
+        let at_limit = format!("{base}{}{suffix}", "a".repeat(pad_len));
+        // `pad` is not a field of List: add an unknown field check via op list
+        // with a big but legal field instead: use "client" is an object; use a
+        // long `exec` argv in an exec request? Simpler: unknown field must be
+        // rejected with E_BAD_REQUEST, which still proves the line parsed.
+        let mut s = UnixStream::connect(&sock).unwrap();
+        writeln!(s, "{at_limit}").unwrap();
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        let line = read_line_limited(&mut r).unwrap().unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["error"], E_BAD_REQUEST, "at-limit line must parse: {v}");
+        // one byte over: E_TOO_LARGE, connection then closed
+        let mut s2 = UnixStream::connect(&sock).unwrap();
+        let over = format!("{at_limit}a"); // MAX_LINE + 1 bytes
+        writeln!(s2, "{over}").unwrap();
+        let mut r2 = BufReader::new(s2.try_clone().unwrap());
+        let line2 = read_line_limited(&mut r2).unwrap().unwrap();
+        let v2: Value = serde_json::from_str(&line2).unwrap();
+        assert_eq!(v2["error"], E_TOO_LARGE, "over-limit line: {v2}");
+        assert!(
+            v2["message"].as_str().unwrap().contains("65536"),
+            "limit named: {v2}"
+        );
+        assert!(h.seen.lock().unwrap().is_empty(), "nothing dispatched");
+        drop((r, r2));
+    }
+
+    #[test]
+    fn oversized_stream_without_newline_is_too_large() {
+        // 0.6.5: over the limit before any newline appears: same refusal.
+        let (_d, sock, _h) = start(true);
+        let mut s = UnixStream::connect(&sock).unwrap();
+        // a single write larger than MAX_LINE + one 8192 chunk, no newline yet
+        s.write_all(&vec![b'x'; MAX_LINE + 1]).unwrap();
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        let line = read_line_limited(&mut r).unwrap().unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["error"], E_TOO_LARGE, "no-newline overflow: {v}");
     }
 
     #[test]
@@ -2012,6 +2093,7 @@ mod tests {
             E_VERSION,
             E_UNSUPPORTED,
             E_BUSY,
+            E_TOO_LARGE,
         ];
         for code in real {
             assert!(

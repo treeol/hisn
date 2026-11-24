@@ -1062,6 +1062,59 @@ else
   fail "DX11 the exec ends" "[$DX11_OUT]"
 fi
 
+# DX13 (0.6.5): prune must never delete files of an exec whose output pump is
+# still running. A gradchild holds the pipe (like DX11); while it writes,
+# other execs finish and trigger prune. The output must stay complete and
+# readable, and the state file must survive until the pumps finish.
+cat >"$ACWD/dx13.py" <<'PY'
+import sys, time
+for i in range(12):
+    sys.stdout.buffer.write(b"dx13-line-%02d\n" % i)
+    sys.stdout.buffer.flush()
+    time.sleep(0.5)
+PY
+DX13_OUT=$(dx_start "$A" sh -c "python3 '$ACWD/dx13.py' & exit 0")
+DX13_ID=$(dx_id "$DX13_OUT")
+if dx_wait_state "$A" "$DX13_ID" exited; then
+  # Force several prunes by finishing short-lived execs while DX13 writes.
+  for i in 1 2 3; do dx_start "$A" true >/dev/null; done
+  DX13_OK=0
+  for _ in $(seq 100); do
+    DX13_R=$(timeout 20 "$HISN" exec-output --session "$A" --exec "$DX13_ID" --offset 0 --json </dev/null 2>/dev/null)
+    DX13_TOT=$(printf '%s' "$DX13_R" | jget total)
+    DX13_EOF=$(printf '%s' "$DX13_R" | jget eof)
+    [ "$DX13_EOF" = true ] && { DX13_OK=1; break; }
+    sleep 0.2
+  done
+  DX13_ST=$(timeout 20 "$HISN" exec-status --session "$A" --exec "$DX13_ID" --json </dev/null 2>&1)
+  if [ "$DX13_OK" = 1 ] && [ "$(printf '%s' "$DX13_ST" | jget stdout.total)" = 156 ] \
+    && [ "$(printf '%s' "$DX13_ST" | jget output_open)" = false ]; then
+    pass "DX13 prune while a pump is writing: output stays complete (156 bytes), output_open false at the end"
+  else
+    fail "DX13 prune while a pump is writing: output stays complete (156 bytes), output_open false at the end" "ok=$DX13_OK [$DX13_ST]"
+  fi
+else
+  fail "DX13 the exec ends" "[$DX13_OUT]"
+fi
+
+# DX14 (0.6.5): a detached exec's exec/request journal record carries
+# detach: true; a plain exec's record keeps the v0.6.3 shape (no detach key).
+DX14_WS=$(session_field "$A" workspace.id)
+timeout 20 "$HISN" exec --no-tty --session "$A" -- true </dev/null >/dev/null 2>&1
+DX14_J=$(journal "$DX14_WS" | python3 -c '
+import json,sys
+d_ok=d_plain=False
+for l in sys.stdin:
+    l=l.strip()
+    if not l: continue
+    r=json.loads(l)
+    if r["kind"]=="exec/request":
+        if r["data"].get("detach") is True: d_ok=True
+        elif "detach" not in r["data"]: d_plain=True
+print("detach=%s plain=%s" % (d_ok, d_plain))
+')
+if [ "$DX14_J" = "detach=True plain=True" ]; then pass "DX14 journal: detached exec/request carries detach:true, plain keeps the v0.6.3 shape"; else fail "DX14 journal: detached exec/request carries detach:true, plain keeps the v0.6.3 shape" "[$DX14_J]"; fi
+
 check "net harness: open session stops cleanly" "" timeout 30 "$HISN" stop --session "$A" </dev/null
 for _ in $(seq 50); do [ "$(session_field "$A" state)" != running ] && break; sleep 0.1; done
 check "net harness: open session is no longer running" "stopped" session_field "$A" state

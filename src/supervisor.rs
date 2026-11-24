@@ -157,6 +157,7 @@ fn journal_exec_request_record(
     op: &str,
     argv_json: &Value,
     cwd: Option<&str>,
+    detach: bool,
 ) {
     let mut data = json!({
         "op": op,
@@ -168,6 +169,11 @@ fn journal_exec_request_record(
     });
     if let Some(cwd) = cwd {
         data["cwd"] = json!(cwd);
+    }
+    // 0.6.5 (plan 2.9 leftover): a detached exec journals `detach: true`.
+    // A plain exec's record keeps the v0.6.3 shape exactly (compat).
+    if detach {
+        data["detach"] = json!(true);
     }
     data["seq"] = json!(client.seq);
     data["authz"] = json!({ "allow": true });
@@ -956,8 +962,9 @@ impl Shared {
         op: &str,
         argv_json: &Value,
         cwd: Option<&str>,
+        detach: bool,
     ) {
-        journal_exec_request_record(&self.journal, client, op, argv_json, cwd);
+        journal_exec_request_record(&self.journal, client, op, argv_json, cwd, detach);
     }
 
     fn log(
@@ -1489,7 +1496,7 @@ impl Shared {
         // whatever a command line contains, and docs say so.
         let argv_json = cap_argv(&req.argv);
         let req_cwd = req.cwd.clone();
-        self.journal_exec_request(client, op, &argv_json, req_cwd.as_deref());
+        self.journal_exec_request(client, op, &argv_json, req_cwd.as_deref(), detached);
         let fail = |code: &str, msg: String| {
             self.log_client(op, "result", Some(&argv0), None, Some(code), client, true);
             err(code, msg)
@@ -1896,7 +1903,8 @@ impl Shared {
         self.exec_table.lock().expect("exec_table").remove(exec_id);
         self.exec_seats.lock().expect("exec_seats").remove(&pid);
         self.detached.remove(exec_id);
-        self.prune_exec_logs();
+        // 0.6.5 (round 2 finding): prune AFTER the drain and the final state
+        // write below, so prune never unlinks files under a live pump.
         // B10 (round 2): a grandchild may hold the pipes past `DRAIN_WAIT`.
         // Keep this entry alive (its rotation hook is a `Weak` to it, and it
         // owns the state-file writer) until both pumps have seen EOF, then
@@ -1907,6 +1915,7 @@ impl Shared {
             std::time::Duration::from_secs(1),
         ) {}
         w.entry.update(|_| {});
+        self.prune_exec_logs();
     }
 
     /// Retention of finished execs' files (plan 2.5): at supervisor start
@@ -5715,6 +5724,7 @@ mod tests {
             "exec",
             &cap_argv(&["sh".into(), "-c".into(), "echo \u{1b}[31mRED".into()]),
             None,
+            false,
         );
         log_client_record(
             &audit,
@@ -5753,6 +5763,47 @@ mod tests {
         assert!(!audit_lines.contains("argv"));
         assert!(!audit_lines.contains("exec/exit"));
         assert!(!audit_lines.contains("RED"));
+    }
+
+    #[test]
+    fn detached_exec_request_journals_detach_true() {
+        // 0.6.5 (plan 2.9 leftover): a detached exec's `exec/request` journal
+        // record carries `detach: true`; a plain exec's does not (compat).
+        use super::{cap_argv, journal_exec_request_record};
+        let d = tempfile::tempdir_in("target").unwrap();
+        let journal = Journal::new(d.path().join("workspace"), "abcdef0123456789".into());
+        let client = authz::ClientRecord {
+            principal: None,
+            uid: 1000,
+            pid: Some(7),
+            label: "local".into(),
+            label_source: "flag".into(),
+            req_id: Some("r1".into()),
+            seq: 7,
+            seat: None,
+            seat_role: None,
+        };
+        journal_exec_request_record(
+            &journal,
+            &client,
+            "exec",
+            &cap_argv(&["sleep".into()]),
+            None,
+            true,
+        );
+        journal_exec_request_record(
+            &journal,
+            &client,
+            "exec",
+            &cap_argv(&["sleep".into()]),
+            None,
+            false,
+        );
+        let (records, skipped) = crate::journal::read_records(&d.path().join("workspace"));
+        assert_eq!(skipped, 0);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].data["detach"], serde_json::json!(true));
+        assert!(records[1].data.get("detach").is_none());
     }
 
     fn info() -> ClientInfo {

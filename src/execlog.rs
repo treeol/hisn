@@ -645,7 +645,11 @@ fn exec_files_of(dir: &Path, stem: &str) -> Vec<PathBuf> {
 /// age rule), then the oldest beyond `max_finished`. A `running` file of the
 /// live incarnation is never touched; one of another incarnation counts as
 /// lost only when its writer is gone, and a file with no writer identity is
-/// left alone. Best effort; returns the number of execs removed.
+/// left alone. A file whose output is still open (pumps may be writing) is
+/// skipped **while its writer may still be alive** (live incarnation, or a
+/// foreign one whose writer is not known gone) and does not count against
+/// `max_finished`; once the writer is gone the pumps are dead, so the files
+/// are prunable. Best effort; returns the number of execs removed.
 pub fn prune(
     dir: &Path,
     live_incarnation: &str,
@@ -669,6 +673,21 @@ pub fn prune(
             }
             finished.push((st.started.clone(), stem.to_owned()));
         } else {
+            // 0.6.5 (round 2 finding): a finished exec whose pumps are still
+            // writing (grandchild holding the pipes) must not be unlinked under
+            // a live pump. `output_open` is false only after both pumps saw EOF
+            // and the final state was written. Skip only while the writer is
+            // positively alive (live incarnation, or a foreign one whose
+            // supervisor pid/starttime still match): then the pumps may run.
+            // A gone writer means dead pumps; no identity at all means an old
+            // build that never maintained the flag — both stay collectible,
+            // as before. Skipped entries leave `finished` entirely, so they do
+            // not count against `max_finished`.
+            if st.output_open
+                && (st.incarnation == live_incarnation || writer_gone(&st) == Some(false))
+            {
+                continue;
+            }
             finished.push((
                 st.ended.clone().unwrap_or(st.started.clone()),
                 stem.to_owned(),
@@ -1542,6 +1561,79 @@ mod tests {
         assert!(!exec_file(&d, "I0", 2, "state.json").exists());
         assert!(!exec_file(&d, "I0", 3, "state.json").exists());
         assert!(exec_file(&d, "I0", 4, "state.json").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn prune_skips_finished_with_output_open_and_live_writer() {
+        // 0.6.5: a finished state with output_open=true and a positively live
+        // writer (live incarnation) is skipped and does NOT count against the
+        // cap: with max_finished=0 it must still survive.
+        let d = tmp("prune-open-live");
+        write_finished(&d, "I1", 1, "2026-11-01T00:00:00Z"); // output_open=true by default
+        assert_eq!(prune(&d, "I1", Some("2026-11-10T00:00:00Z"), 0), 0);
+        assert!(exec_file(&d, "I1", 1, "state.json").exists());
+        assert!(exec_file(&d, "I1", 1, "stdout").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn prune_skips_finished_with_output_open_and_live_foreign_pid() {
+        // 0.6.5: foreign incarnation, writer positively alive (this process)
+        // with output_open=true: skipped.
+        let d = tmp("prune-open-foreign-live");
+        let me = std::process::id() as i32;
+        write_finished(&d, "I0", 1, "2026-11-01T00:00:00Z");
+        let p = exec_file(&d, "I0", 1, "state.json");
+        let mut st = read_state(&p).unwrap();
+        st.supervisor_pid = Some(me);
+        st.supervisor_start = Some(crate::sys::stat_starttime(me).unwrap());
+        write_state(&p, &st).unwrap();
+        assert_eq!(prune(&d, "I1", Some("2026-11-10T00:00:00Z"), 256), 0);
+        assert!(exec_file(&d, "I0", 1, "state.json").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn prune_collects_finished_with_output_open_and_no_identity() {
+        // 0.6.5: output_open=true but NO writer identity (old build that
+        // never maintained the flag): stays collectible, as before.
+        let d = tmp("prune-open-noid");
+        write_finished(&d, "I0", 1, "2026-11-01T00:00:00Z");
+        // write_finished leaves supervisor_pid None
+        assert_eq!(prune(&d, "I1", Some("2026-11-10T00:00:00Z"), 256), 1);
+        assert!(!exec_file(&d, "I0", 1, "state.json").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn prune_collects_finished_with_output_open_and_gone_writer() {
+        // 0.6.5: a finished state with output_open=true but a gone writer
+        // (foreign incarnation, dead supervisor) is prunable: dead pumps.
+        let d = tmp("prune-open-gone");
+        write_finished(&d, "I0", 1, "2026-11-01T00:00:00Z");
+        // give it a writer identity that is gone
+        let p = exec_file(&d, "I0", 1, "state.json");
+        let mut st = read_state(&p).unwrap();
+        st.supervisor_pid = Some(i32::MAX);
+        st.supervisor_start = Some(5);
+        write_state(&p, &st).unwrap();
+        assert_eq!(prune(&d, "I1", Some("2026-11-10T00:00:00Z"), 256), 1);
+        assert!(!exec_file(&d, "I0", 1, "state.json").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn prune_collects_finished_with_output_closed() {
+        // 0.6.5: output_open=false (pumps done) is prunable even live.
+        let d = tmp("prune-closed");
+        write_finished(&d, "I1", 1, "2026-11-01T00:00:00Z");
+        let p = exec_file(&d, "I1", 1, "state.json");
+        let mut st = read_state(&p).unwrap();
+        st.output_open = false;
+        write_state(&p, &st).unwrap();
+        assert_eq!(prune(&d, "I1", Some("2026-11-10T00:00:00Z"), 256), 1);
+        assert!(!exec_file(&d, "I1", 1, "state.json").exists());
         fs::remove_dir_all(&d).unwrap();
     }
 

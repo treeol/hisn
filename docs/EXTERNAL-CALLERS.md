@@ -96,8 +96,13 @@ hisn exec-signal --session seat-a --exec e-3 --signal TERM       # TERM, INT, KI
 - `exec --detach` returns at once and the command survives the client. It runs
   in the same sandbox, with the same network policy and seat, as any exec. Its
   stdin is `/dev/null`; stdout and stderr are captured by the supervisor. It
-  cannot be combined with `--tty` or `attach`. At most 32 per session
+  cannot be combined with `--tty` or `--no-tty` (the CLI refuses both with a
+  usage error, and the supervisor refuses a detached request that carries
+  descriptors or asks for a tty): a detached exec has no client stdio by design,
+  so there is nothing for `--no-tty`'s pipe relay to copy. At most 32 per session
   (`E_BUSY`).
+- The `exec/request` journal record of a detached exec carries `detach: true`
+  (plain execs keep the v0.6.3 record shape).
 - **Identity** is `(incarnation, exec_id)`. `--incarnation` selects an older
   one for status and output; signalling works on the live one only.
 - **Output by offset.** Offsets are absolute byte offsets in the stream.

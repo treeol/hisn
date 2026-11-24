@@ -188,5 +188,7 @@ DX9: 20 MiB output: offset 0 is rotated_away
 DX10: a running detached exec is alive after 8 s
 DX11: exited state is final while a grandchild holds the pipe
 DX11: late output after the exec ended
+DX13: prune while a pump is writing: output stays complete (156 bytes)
+DX14: journal: detached exec/request carries detach:true, plain keeps the v0.6.3 shape
 DX12: session stop delivers TERM to a detached exec before the sandbox ends
 DX12: journal: exec/exit cause session-stop

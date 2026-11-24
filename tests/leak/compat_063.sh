@@ -17,8 +17,8 @@
 #
 # Sessions run in a private runtime and state dir under a temp dir; nothing is
 # installed and no existing session is touched. Needs unprivileged user
-# namespaces: without them parts 2 and 3 print SKIP and the script exits 0 after
-# part 1 (the host run is the acceptance evidence for them).
+# namespaces: without them parts 2 and 3 FAIL (0.6.5: a skipped live-session
+# part must not go green with only the part-1 wire checks counted).
 # Output: PASS / FAIL / SKIP lines like the leak suite; exit 1 on any FAIL.
 set -u
 
@@ -81,10 +81,11 @@ fi
 
 # ------------------------------------------------------- sessions (parts 2, 3)
 if ! unshare -Ur true >/dev/null 2>&1 || ! "$NEW" check >/dev/null 2>&1; then
-  skip "B3 live sessions" "this host cannot run hisn sessions"
-  printf '\nRESULT: %d passed, %d failed, %d skipped\n' $PASSES $FAILS $SKIPS
-  [ "$FAILS" -eq 0 ]
-  exit
+  # 0.6.5 (Block 1): the live-session parts must fail, not skip, when the host
+  # cannot run them; the release gate must show the live-session count.
+  fail "B3 live sessions" "this host cannot run hisn sessions (live-session part skipped: 0 checks ran)"
+  printf '\nRESULT: %d passed, %d failed, %d skipped (part-1 wire: passed above; live sessions: 0 ran)\n' $PASSES $FAILS $SKIPS
+  exit 1
 fi
 
 # h BIN ARGS...: run one command with the private dirs, bounded, no stdin.

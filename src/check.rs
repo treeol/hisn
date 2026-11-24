@@ -639,6 +639,80 @@ pub fn run_checks() -> Report {
     Report { arch, items }
 }
 
+/// One capability feature for `hisn capabilities` (schema
+/// `hisn-capabilities/v1`). Names are stable public API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Capability {
+    pub name: &'static str,
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Capability {
+    fn yes(name: &'static str) -> Self {
+        Capability {
+            name,
+            available: true,
+            reason: None,
+        }
+    }
+    fn from_check(name: &'static str, it: Option<&Item>) -> Self {
+        match it {
+            None => Capability {
+                name,
+                available: false,
+                reason: Some("no check item".into()),
+            },
+            Some(it) if it.status == Status::Ok => Self::yes(name),
+            Some(it) => Capability {
+                name,
+                available: false,
+                reason: Some(it.detail.clone()),
+            },
+        }
+    }
+}
+
+/// The `hisn-capabilities/v1` object body (without the schema key, which the
+/// caller adds). Runs the same probes as `hisn check`.
+pub fn capabilities() -> serde_json::Value {
+    let report = run_checks();
+    let by_name = |n: &str| report.items.iter().find(|i| i.name == n);
+    let userns = by_name("user namespaces");
+    let userns_ok = userns.is_some_and(|i| i.status == Status::Ok);
+    let net_open = by_name("landlock net rules (open mode)");
+    let net_open_ok = userns_ok && net_open.is_some_and(|i| i.status == Status::Ok);
+    // Binary facts: the code paths exist in this binary. An older running
+    // supervisor may still refuse them (documented in EXTERNAL-CALLERS.md).
+    let features = vec![
+        Capability::yes("detached-exec"),
+        Capability::yes("journal-cursor"),
+        Capability::yes("journal-unreadable"),
+        Capability::yes("exec-stdin"),
+        Capability::yes("seat-credential-stdin"),
+        Capability::from_check("network-none", userns),
+        Capability::from_check("network-host", userns),
+        if net_open_ok {
+            Capability::yes("network-open")
+        } else {
+            // name the blocking check
+            let blocking = if !userns_ok { userns } else { net_open };
+            Capability::from_check("network-open", blocking)
+        },
+        Capability::from_check("rootfs", by_name("rootfs store")),
+        Capability::yes("ssh-agent"),
+        Capability::yes("services"),
+    ];
+    serde_json::json!({
+        "schema": "hisn-capabilities/v1",
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol_revision": crate::sessionmeta::PROTOCOL_REVISION,
+        "declared_protocol_version": crate::sessionmeta::PROTOCOL_VERSION,
+        "features": features,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +782,51 @@ mod tests {
         assert_eq!(subid_ranges(body, "bob", 6, 65536), 0);
         assert_eq!(subid_ranges(body, "carol", 1000, 65536), 1);
         assert_eq!(subid_ranges("", "alice", 1, 1), 0);
+    }
+
+    #[test]
+    fn capabilities_pin_feature_names_and_shape() {
+        // The 11 feature names are public API: renaming one fails this test.
+        let v = capabilities();
+        assert_eq!(v["schema"], "hisn-capabilities/v1");
+        assert_eq!(
+            v["protocol_revision"],
+            crate::sessionmeta::PROTOCOL_REVISION
+        );
+        assert_eq!(
+            v["declared_protocol_version"],
+            crate::sessionmeta::PROTOCOL_VERSION
+        );
+        assert!(v["version"].as_str().unwrap().starts_with("0."));
+        let names: Vec<&str> = v["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "detached-exec",
+                "journal-cursor",
+                "journal-unreadable",
+                "exec-stdin",
+                "seat-credential-stdin",
+                "network-none",
+                "network-host",
+                "network-open",
+                "rootfs",
+                "ssh-agent",
+                "services",
+            ]
+        );
+        // every feature has available: bool; when false a reason is present
+        for f in v["features"].as_array().unwrap() {
+            assert!(f["available"].is_boolean(), "{f}");
+            if f["available"] == false {
+                assert!(f["reason"].as_str().is_some(), "{f}");
+            }
+        }
     }
 
     #[test]

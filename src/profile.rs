@@ -31,6 +31,65 @@ pub const E_RISK_ACK_REQUIRED: &str = "E_RISK_ACK_REQUIRED";
 pub const E_RISK_ACK_MISMATCH: &str = "E_RISK_ACK_MISMATCH";
 pub const E_NOT_SUPPORTED: &str = "E_NOT_SUPPORTED";
 
+/// 0.6.5 (`profile validate --json`, schema `hisn-profile-validation/v1`):
+/// structured validation errors. `path` is the dotted TOML key path when the
+/// validation layer knows it (`session.network`, `services[1].ready.socket`);
+/// omitted (never `""`) when unknown. `line`/`column` are 1-based, from the
+/// toml byte span when available. Codes: `E_PROFILE_PARSE` (syntax, type or
+/// unknown-key errors from the TOML deserializer, which exposes no structured
+/// enum to distinguish them), `E_PROFILE_VALUE` (validation failures with a
+/// known path, and resolve/plan failures).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileError {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl ProfileError {
+    fn parse(message: String) -> Self {
+        ProfileError {
+            path: None,
+            line: None,
+            column: None,
+            code: "E_PROFILE_PARSE",
+            message,
+        }
+    }
+    fn value(path: Option<String>, message: String) -> Self {
+        ProfileError {
+            path,
+            line: None,
+            column: None,
+            code: "E_PROFILE_VALUE",
+            message,
+        }
+    }
+}
+
+/// Byte offset → 1-based (line, column) against the TOML source.
+fn line_col(text: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for (i, b) in text.bytes().enumerate() {
+        if i >= offset {
+            break;
+        }
+        if b == b'\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
 /// A profile as written in a `.toml` file: the envelope around a `Policy`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,21 +126,60 @@ pub struct Profile {
 
 impl Profile {
     /// Parse and syntax-validate a profile TOML (no filesystem access).
+    /// The anyhow message is byte-identical to the pre-0.6.5 wording.
     pub fn parse(text: &str) -> Result<Self> {
-        let p: Profile = toml::from_str(text).map_err(|e| anyhow!("profile parse: {e}"))?;
+        Self::parse_inner(text).map_err(|e| {
+            // Rebuild the historical message: `profile parse: {e}` for toml
+            // errors, `{e}` for the rest.
+            if e.code == "E_PROFILE_PARSE" {
+                anyhow!("profile parse: {}", e.message)
+            } else {
+                anyhow!("{}", e.message)
+            }
+        })
+    }
+
+    /// Structured parse: the error carries line/column and, where the
+    /// validation layer knows it, the TOML key path.
+    pub fn parse_structured(text: &str) -> std::result::Result<Self, ProfileError> {
+        Self::parse_inner(text)
+    }
+
+    fn parse_inner(text: &str) -> std::result::Result<Self, ProfileError> {
+        let p: Profile = toml::from_str(text).map_err(|e| {
+            let mut pe = ProfileError::parse(format!("{e}"));
+            if let Some(span) = e.span() {
+                let (line, column) = line_col(text, span.start);
+                pe.line = Some(line);
+                pe.column = Some(column);
+            }
+            pe
+        })?;
         if p.version != PROFILE_VERSION {
-            bail!(
-                "version: must be \"{PROFILE_VERSION}\", got {:?}",
-                p.version
-            );
+            return Err(ProfileError::value(
+                Some("version".into()),
+                format!(
+                    "version: must be \"{PROFILE_VERSION}\", got {:?}",
+                    p.version
+                ),
+            ));
         }
         // The inner Policy::validate runs from Policy::parse inside the
         // toml::from_str above (deny_unknown_fields + the Parse path). But
         // the inner Policy is deserialized by serde, not parsed — so we
         // re-validate it here to get the same syntax checks.
-        p.policy.validate().map_err(|e| anyhow!("{e}"))?;
+        p.policy.validate().map_err(|e| match e {
+            crate::policy::PolicyError::Invalid { key, reason } => {
+                ProfileError::value(Some(key.clone()), format!("{key}: {reason}"))
+            }
+            crate::policy::PolicyError::Parse(m) => ProfileError::parse(m),
+            crate::policy::PolicyError::Read { path, source } => {
+                ProfileError::parse(format!("cannot read {}: {source}", path.display()))
+            }
+        })?;
         // Validate the 0.3 surface (forwards and host_services).
-        p.validate_surface()?;
+        p.validate_surface()
+            .map_err(|e| ProfileError::value(None, format!("{e}")))?;
         Ok(p)
     }
 
@@ -1089,6 +1187,11 @@ pub fn validate(path: Option<&Path>) -> Result<ResolvedPolicy> {
         }
     };
     let profile = Profile::load(&path)?;
+    finish_validate(&path, profile)
+}
+
+/// The tail of [`validate`] shared by the text and JSON entries.
+fn finish_validate(path: &Path, profile: Profile) -> Result<ResolvedPolicy> {
     let base = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1109,10 +1212,152 @@ pub fn validate(path: Option<&Path>) -> Result<ResolvedPolicy> {
     Ok(resolved)
 }
 
+/// `hisn profile validate --json` (0.6.5, schema
+/// `hisn-profile-validation/v1`). Fail-fast: at most one error (the first),
+/// matching the anyhow behaviour of the text path. `warnings` is reserved
+/// (no producer today; emitted as `[]`).
+pub fn validate_json(path: Option<&Path>) -> (bool, Value) {
+    let fail = |e: ProfileError| {
+        (
+            false,
+            json!({
+                "schema": "hisn-profile-validation/v1",
+                "ok": false,
+                "errors": [e],
+                "warnings": [],
+            }),
+        )
+    };
+    let path = match path {
+        Some(p) => p.to_path_buf(),
+        None => match resolve_profile_path("base") {
+            Ok((p, _)) => p,
+            Err(e) => return fail(ProfileError::value(None, format!("{e}"))),
+        },
+    };
+    // Read the text once so parse errors carry line/column.
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            return fail(ProfileError::parse(format!(
+                "reading profile {}: {e}",
+                path.display()
+            )));
+        }
+    };
+    let profile = match Profile::parse_structured(&text) {
+        Ok(p) => p,
+        Err(e) => return fail(e),
+    };
+    match finish_validate(&path, profile) {
+        Ok(_) => (
+            true,
+            json!({
+                "schema": "hisn-profile-validation/v1",
+                "ok": true,
+                "errors": [],
+                "warnings": [],
+            }),
+        ),
+        Err(e) => fail(ProfileError::value(None, format!("{e}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn golden_profile_error_text_is_preserved() {
+        // 0.6.5: the text path stays byte-identical. Pin the messages the
+        // structured refactor must not change.
+        let bad_syntax = "version = \"hisn-profile/v1\"\n[policy]\nbad = [\n";
+        let e = Profile::parse(bad_syntax).unwrap_err().to_string();
+        assert!(e.contains("profile parse:"), "{e}");
+        // `session.hostname` is validated after deserialization, so it
+        // carries a dotted path; `session.network = "bogus"` fails at serde
+        // (no path). The profile envelope carries the policy inline.
+        let bad_value = "version = \"hisn-profile/v1\"\n[policy]\nversion = \"hisn-policy/v1\"\nsession = { hostname = \"-bad\" }\n";
+        let e = Profile::parse(bad_value).unwrap_err().to_string();
+        assert!(e.contains("session.hostname"), "{e}");
+        // structured form carries the same message, plus the path
+        let pe = Profile::parse_structured(bad_value).unwrap_err();
+        assert_eq!(pe.path.as_deref(), Some("session.hostname"));
+        assert_eq!(pe.code, "E_PROFILE_VALUE");
+        assert!(pe.message.contains("session.hostname"), "{}", pe.message);
+    }
+
+    #[test]
+    fn validate_json_unknown_key_and_wrong_type() {
+        // unknown key (deny_unknown_fields) and wrong type both land in
+        // E_PROFILE_PARSE with line/column, no invented path.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("p.toml");
+        fs::write(
+            &p,
+            "version = \"hisn-profile/v1\"\n[policy]\nversion = \"hisn-policy/v1\"\nunknown = 1\n",
+        )
+        .unwrap();
+        let (ok, v) = validate_json(Some(&p));
+        assert!(!ok);
+        assert_eq!(v["schema"], "hisn-profile-validation/v1");
+        assert_eq!(v["errors"].as_array().unwrap().len(), 1);
+        let e = &v["errors"][0];
+        assert_eq!(e["code"], "E_PROFILE_PARSE");
+        assert!(e.get("path").is_none(), "{e}");
+        assert!(e["line"].is_number() && e["column"].is_number(), "{e}");
+
+        fs::write(
+            &p,
+            "version = \"hisn-profile/v1\"\n[policy]\nversion = 42\n",
+        )
+        .unwrap();
+        let (ok, v) = validate_json(Some(&p));
+        assert!(!ok);
+        assert_eq!(v["errors"][0]["code"], "E_PROFILE_PARSE");
+    }
+
+    #[test]
+    fn validate_json_invalid_value_carries_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("p.toml");
+        fs::write(
+            &p,
+            "version = \"hisn-profile/v1\"\n[policy]\nversion = \"hisn-policy/v1\"\nsession = { hostname = \"-bad\" }\n",
+        )
+        .unwrap();
+        let (ok, v) = validate_json(Some(&p));
+        assert!(!ok);
+        let e = &v["errors"][0];
+        assert_eq!(e["code"], "E_PROFILE_VALUE");
+        assert_eq!(e["path"], "session.hostname");
+    }
+
+    #[test]
+    fn validate_json_valid_profile_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("p.toml");
+        fs::write(
+            &p,
+            "version = \"hisn-profile/v1\"\n[policy]\nversion = \"hisn-policy/v1\"\n",
+        )
+        .unwrap();
+        let (ok, v) = validate_json(Some(&p));
+        assert!(ok);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["errors"].as_array().unwrap().len(), 0);
+        assert_eq!(v["warnings"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn line_col_math() {
+        assert_eq!(line_col("ab\ncd", 0), (1, 1));
+        assert_eq!(line_col("ab\ncd", 3), (2, 1));
+        assert_eq!(line_col("ab\ncd", 4), (2, 2));
+        // past the end: saturates at the last byte
+        assert_eq!(line_col("ab\ncd", 99), (2, 3));
+    }
 
     #[test]
     fn net_nameservers_loopback_only_is_rejected_at_validate() {

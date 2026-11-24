@@ -58,6 +58,25 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 ExitCode::from(2)
             })
         }
+        Command::Capabilities(args) => {
+            let caps = hisn::check::capabilities();
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&caps)?);
+            } else {
+                // name: available  /  name: unavailable (reason)
+                for f in caps["features"].as_array().unwrap() {
+                    let name = f["name"].as_str().unwrap();
+                    if f["available"] == true {
+                        println!("{name}: available");
+                    } else if let Some(r) = f["reason"].as_str() {
+                        println!("{name}: unavailable ({r})");
+                    } else {
+                        println!("{name}: unavailable");
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Policy { command } => match command {
             PolicyCommand::Schema => {
                 println!("{}", policy::schema_json());
@@ -102,10 +121,20 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&info)?);
                 Ok(ExitCode::SUCCESS)
             }
-            ProfileCommand::Validate { file } => {
-                let resolved = profile::validate(file.as_deref())?;
-                print!("{}", resolved.to_toml());
-                Ok(ExitCode::SUCCESS)
+            ProfileCommand::Validate { file, json } => {
+                if json {
+                    let (ok, obj) = profile::validate_json(file.as_deref());
+                    println!("{}", serde_json::to_string_pretty(&obj)?);
+                    Ok(if ok {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(EXIT_INTERNAL)
+                    })
+                } else {
+                    let resolved = profile::validate(file.as_deref())?;
+                    print!("{}", resolved.to_toml());
+                    Ok(ExitCode::SUCCESS)
+                }
             }
         },
         Command::Run(args) => {

@@ -58,6 +58,9 @@ pub enum Command {
     Stop(StopArgs),
     /// Report host capabilities required by hisn.
     Check(CheckArgs),
+    /// Print the `hisn-capabilities/v1` object: version, protocol revision
+    /// and the stable feature list with availability and reasons.
+    Capabilities(CapabilitiesArgs),
     /// Policy utilities.
     Policy {
         #[command(subcommand)]
@@ -620,6 +623,13 @@ pub struct CheckArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct CapabilitiesArgs {
+    /// Emit machine-readable JSON instead of the text table.
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum PolicyCommand {
     /// Validate a policy file (default ./hisn.toml).
@@ -652,7 +662,13 @@ pub enum ProfileCommand {
     /// Explain a profile's capabilities and risk labels (default: base).
     Explain { name: Option<String> },
     /// Validate a profile file (default: the built-in base).
-    Validate { file: Option<PathBuf> },
+    Validate {
+        file: Option<PathBuf>,
+        /// Emit the `hisn-profile-validation/v1` object instead of the
+        /// resolved policy; text output is unchanged without this flag.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[cfg(test)]

@@ -7,6 +7,54 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-11-24
+
+hisn 0.6.5 is small additions for external callers: an oversized request and
+an over-cap stdin are reported, not silently dropped; `exec --no-tty` gains an
+opt-in capped stdin passthrough; `hisn capabilities --json` and
+`hisn profile validate --json` give machine-readable answers to two questions
+callers ask often ("does this host have X?", "is my profile valid and where
+is the mistake?"). No wire change: the protocol revision stays 4 and the
+version existing commands declare stays 3, so every command that uses no new
+option sends byte-identical requests to 0.6.4 and a 0.6.4 or 0.6.3 client
+keeps working against a 0.6.5 supervisor.
+
+### Added
+- `hisn exec --no-tty --stdin-limit BYTES` (opt-in): the caller's stdin is
+  passed to the command through the existing exec path with a byte cap
+  (1..=1 GiB). Without the flag, `--no-tty` keeps `/dev/null` exactly as in
+  0.6.4, and a terminal on fd 0 is never read. A cap overflow ends the exec
+  with exit 125 and `E_TOO_LARGE` naming the stdin limit; the journal records
+  it; input is never silently truncated as if it had ended. With
+  `--seat-token-file -` the credential line feeds the seat and the cap counts
+  only the rest. Detached execs keep stdin at `/dev/null`.
+- `hisn capabilities --json` (`hisn-capabilities/v1`): version, protocol
+  revision, declared protocol version and the 11 stable feature names with
+  `available` and — when false — a `reason` from the same checks `hisn check`
+  runs. Works without a running session.
+- `hisn profile validate --json` (`hisn-profile-validation/v1`): `ok`, a
+  fail-fast list of errors (with the TOML key path, line and column when
+  known) and a reserved `warnings` list. Codes `E_PROFILE_PARSE` and
+  `E_PROFILE_VALUE`. Text output is unchanged.
+
+### Changed
+- An `exec` request over 65536 bytes is refused before it is sent: exit 125
+  with a `hisn-error/v1` object (`E_TOO_LARGE`, naming the limit). A
+  supervisor refusal now reaches the client as an error reply, not a closed
+  connection.
+- Log pruning never deletes files of an exec whose output pump is still
+  running; a detached exec being written keeps its complete output.
+- `exec/request` of a detached exec carries `detach: true`.
+- Documented: `exec --detach` refuses `--no-tty` (a detached exec has no
+  client stdio by design).
+
+### Fixed
+- The net-harness/compat scripts name-registry check now compares only
+  entries of the script's own session prefix; other live sessions do not
+  fail it.
+- `tests/leak/compat_063.sh` fails (does not pass) when its live-session
+  part is skipped; the release gate shows that part's count.
+
 ## [0.6.4] - 2026-11-22
 
 hisn 0.6.4 lets an exec outlive its client and makes the journal cursor cheap.

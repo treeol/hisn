@@ -202,5 +202,7 @@ DX17: the credential line feeds the seat, the cap counts only the rest
 DX17: stdin after the credential line over the cap: exit 125 E_TOO_LARGE
 DX18: --stdin-limit passes data to a normal exec
 DX18: a detached exec's stdin is /dev/null (piped data is not delivered)
+DX19: 300 KiB to a slow consumer round-trips byte-for-byte
+DX20: over-cap input to a program that closes early: the cap still trips (125, 10 bytes read)
 DX12: session stop delivers TERM to a detached exec before the sandbox ends
 DX12: journal: exec/exit cause session-stop

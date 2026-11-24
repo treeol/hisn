@@ -1124,7 +1124,7 @@ if printf '%s' "$DX15_OUT" | grep -q 'rc=125' && grep -q 'E_TOO_LARGE' "$T/dx15.
 else
   fail "DX15 oversized exec request: exit 125, hisn-error/v1 E_TOO_LARGE naming the limit" "[$DX15_OUT] [$(cat "$T/dx15.err")]"
 fi
-# exactly at the limit still runs
+# exactly at the limit still runs: a request just under 65536 bytes
 DX15_N=$(python3 -c 'print(65536 - 90)')
 DX15_OK=$(timeout 20 "$HISN" exec --no-tty --session "$A" -- python3 -c "print('y' * $DX15_N)" </dev/null 2>/dev/null | wc -c)
 if [ "$DX15_OK" -gt 0 ] 2>/dev/null; then pass "DX15 a request within the limit runs normally"; else fail "DX15 a request within the limit runs normally" "no output"; fi
@@ -1184,6 +1184,23 @@ if [ "$DX18_N" = "dx18-should-not-arrivedone" ]; then pass "DX18 --stdin-limit p
 # writes only "done" (never the piped text).
 for i in $(seq 100); do [ -s "$ACWD/dx18.out" ] && break; sleep 0.1; done
 if [ "$(cat "$ACWD/dx18.out" 2>/dev/null)" = done ]; then pass "DX18 a detached exec's stdin is /dev/null (piped data is not delivered)"; else fail "DX18 a detached exec's stdin is /dev/null (piped data is not delivered)" "[$(cat "$ACWD/dx18.out" 2>/dev/null)]"; fi
+
+# DX19 (0.6.5, Mashura round 2): stdin larger than the pipe buffer to a
+# consumer that starts late round-trips byte-for-byte (no silent loss on
+# backpressure). ~300 KiB through a slow reader.
+head -c 300000 /dev/urandom > "$T/dx19.bin"
+timeout 60 "$HISN" exec --no-tty --stdin-limit 1048576 --session "$A" -- sh -c 'sleep 1; cat' < "$T/dx19.bin" > "$T/dx19.out" 2>/dev/null
+if cmp -s "$T/dx19.bin" "$T/dx19.out"; then pass "DX19 300 KiB to a slow consumer round-trips byte-for-byte"; else fail "DX19 300 KiB to a slow consumer round-trips byte-for-byte" "cmp differs"; fi
+
+# DX20: over-cap input to a program that closes after 10 bytes is still a
+# cap hit: the relay's write of the cap chunk lands in the pipe buffer before
+# the program can close, so the cap trips with a live reader. (EPIPE as the
+# normal end is pinned deterministically at unit level:
+# relay_epipe_over_cap_is_not_a_cap_hit.)
+head -c 1001 /dev/zero | tr '\0' 'q' | timeout 20 "$HISN" exec --no-tty --stdin-limit 1000 --session "$A" -- sh -c 'head -c 10; sleep 1' >"$T/dx20.out" 2>"$T/dx20.err"
+DX20_RC=$?
+DX20_N=$(wc -c < "$T/dx20.out")
+if [ "$DX20_RC" = 125 ] && [ "$DX20_N" = 10 ] && grep -q E_TOO_LARGE "$T/dx20.err"; then pass "DX20 over-cap input to a program that closes early: the cap still trips (125, 10 bytes read)"; else fail "DX20 over-cap input to a program that closes early: the cap still trips (125, 10 bytes read)" "rc=$DX20_RC n=$DX20_N [$(cat "$T/dx20.err")]"; fi
 
 check "net harness: open session stops cleanly" "" timeout 30 "$HISN" stop --session "$A" </dev/null
 for _ in $(seq 50); do [ "$(session_field "$A" state)" != running ] && break; sleep 0.1; done

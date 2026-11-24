@@ -674,8 +674,8 @@ impl Capability {
     }
 }
 
-/// The `hisn-capabilities/v1` object body (without the schema key, which the
-/// caller adds). Runs the same probes as `hisn check`.
+/// The `hisn-capabilities/v1` object body (including the schema key).
+/// Runs the same probes as `hisn check`.
 pub fn capabilities() -> serde_json::Value {
     let report = run_checks();
     let by_name = |n: &str| report.items.iter().find(|i| i.name == n);

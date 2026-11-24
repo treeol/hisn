@@ -682,6 +682,9 @@ pub fn run(args: ExecArgs) -> Result<i32> {
         return Ok(EXIT_INTERNAL);
     }
     refuse_real_terminal(args.tty, args.no_tty, sys::isatty)?;
+    // Validated before connecting: a bad --stdin-limit must not touch the
+    // supervisor socket (it is a usage error, not a connection error).
+    let stdin_cap_validated = effective_stdin_limit(args.stdin_limit)?;
     let sock = supervisor::socket_for(&args.session)?;
     let conn = UnixStream::connect(&sock)
         .with_context(|| format!("connecting to session {}", args.session))?;
@@ -714,7 +717,7 @@ pub fn run(args: ExecArgs) -> Result<i32> {
     //   caller's stdin (0.6.5 opt-in); stdout and stderr are client-owned
     //   pipes whose read ends the client copies to its own fd 1 and 2.
     let line = format!("{req}\n");
-    let stdin_cap = effective_stdin_limit(args.stdin_limit)?;
+    let stdin_cap = stdin_cap_validated;
     // tty on fd 0: never read from the caller's terminal (0.6.3 property).
     let stdin_tty = !args.tty && stdin_cap.is_some() && sys::isatty(0);
     let use_stdin_relay = stdin_cap.is_some() && !stdin_tty;
@@ -835,6 +838,11 @@ pub(crate) struct StdinRelayOutcome {
 /// set. `wakeup` is the read end of a pipe the main thread writes to when
 /// `stop` is set, so the poll always ends. EPIPE (the program closed stdin
 /// early) is a normal end.
+///
+/// Backpressure: when `dst` is full (EAGAIN), the unwritten remainder is
+/// held in `pending` and the relay polls `dst` for POLLOUT (alongside the
+/// wakeup fd) instead of reading more from `src_fd`, so no byte is ever
+/// dropped or overwritten. `pending` holds at most one read chunk.
 fn relay_stdin(
     src_fd: RawFd,
     dst: OwnedFd,
@@ -856,9 +864,23 @@ fn relay_stdin(
     let wake_fd = wakeup.as_raw_fd();
     let mut read_total: u64 = 0;
     let mut exceeded = false;
+    // Bytes read but not yet written to `dst` (backpressure buffer).
+    let mut pending: Vec<u8> = Vec::new();
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
+        }
+        if !pending.is_empty() {
+            // Drain the pending chunk: poll dst for POLLOUT until it accepts.
+            let mut slice: &[u8] = &pending;
+            match write_pending(dst_fd, &mut slice, wake_fd) {
+                WriteOutcome::Drained => {}
+                WriteOutcome::Closed => break, // EPIPE: normal end
+                WriteOutcome::Stopped => break,
+            }
+            // write_pending consumed a prefix; keep the remainder.
+            pending.drain(..(pending.len() - slice.len().min(pending.len())));
+            continue;
         }
         let mut pfds = [
             libc::pollfd {
@@ -868,7 +890,7 @@ fn relay_stdin(
             },
             libc::pollfd {
                 fd: wake_fd,
-                events: libc::POLLIN,
+                events: libc::POLLIN | libc::POLLHUP,
                 revents: 0,
             },
         ];
@@ -877,8 +899,12 @@ fn relay_stdin(
             Ok(_) => {}
             Err(_) => break,
         }
-        if pfds[1].revents & libc::POLLIN != 0 {
+        if pfds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             break; // stop requested via wakeup pipe
+        }
+        // POLLERR/POLLNVAL on a bad fd 0: end, never spin.
+        if pfds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            break;
         }
         if pfds[0].revents & (libc::POLLIN | libc::POLLHUP) == 0 {
             continue;
@@ -905,15 +931,36 @@ fn relay_stdin(
         let n = n as usize;
         read_total += n as u64;
         if read_total > cap {
-            // One byte over the cap: deliver up to the cap, then stop.
+            // One byte over the cap: deliver up to the cap, then stop. EPIPE
+            // while delivering (the program closed stdin early) is still a
+            // normal end, not a cap hit: the cap never had a live reader.
             let deliver = (cap - (read_total - n as u64)) as usize;
             if deliver > 0 {
-                drain_write(dst_fd, &buf[..deliver]);
+                let mut chunk: &[u8] = &buf[..deliver];
+                if write_pending(dst_fd, &mut chunk, wake_fd).is_closed() {
+                    // Reader already gone: normal end.
+                    break;
+                }
             }
             exceeded = true;
             break;
         }
-        drain_write(dst_fd, &buf[..n]);
+        pending = buf[..n].to_vec();
+        let outcome = {
+            let mut slice: &[u8] = &pending;
+            let o = write_pending(dst_fd, &mut slice, wake_fd);
+            (o, slice.len())
+        };
+        match outcome.0 {
+            WriteOutcome::Drained => pending.clear(),
+            WriteOutcome::Closed => break, // EPIPE: normal end
+            WriteOutcome::Stopped => break,
+        }
+        // Any remainder stays in `pending` for the next loop iteration.
+        if outcome.1 > 0 {
+            let rest = pending[pending.len() - outcome.1..].to_vec();
+            pending = rest;
+        }
     }
     StdinRelayOutcome {
         exceeded,
@@ -921,24 +968,69 @@ fn relay_stdin(
     }
 }
 
-/// Write all of `data` to a non-blocking pipe end; stop on EPIPE (the reader
-/// closed) or when the pipe is full (the program is not reading — the exit
-/// path ends the relay via `stop`, so this never blocks).
-fn drain_write(fd: RawFd, mut data: &[u8]) {
-    while !data.is_empty() {
-        // SAFETY: write into a buffer we own.
-        let n = unsafe { libc::write(fd, data.as_ptr() as *const _, data.len()) };
+/// The result of writing a pending chunk to the destination pipe.
+enum WriteOutcome {
+    /// All pending bytes written.
+    Drained,
+    /// The reader closed (EPIPE): a normal end; stop the relay.
+    Closed,
+    /// `stop` was set via the wakeup pipe while waiting for POLLOUT.
+    Stopped,
+}
+
+impl WriteOutcome {
+    fn is_closed(&self) -> bool {
+        matches!(self, WriteOutcome::Closed)
+    }
+}
+
+/// Write `pending` to a non-blocking pipe end, blocking on POLLOUT (with the
+/// wakeup fd as an escape) while the pipe is full. EPIPE (the reader closed)
+/// ends the write immediately. Never drops a byte.
+fn write_pending(fd: RawFd, pending: &mut &[u8], wake_fd: RawFd) -> WriteOutcome {
+    while !pending.is_empty() {
+        // SAFETY: write from a buffer we own.
+        let n = unsafe { libc::write(fd, pending.as_ptr() as *const _, pending.len()) };
         if n < 0 {
             let e = io::Error::last_os_error();
             match e.raw_os_error() {
                 Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => return, // pipe full: stop writing (normal)
-                Some(libc::EPIPE) => return,  // reader closed: normal end
-                _ => return,
+                Some(libc::EPIPE) => return WriteOutcome::Closed,
+                Some(libc::EAGAIN) => {}
+                _ => return WriteOutcome::Closed,
             }
+            // Pipe full: wait for POLLOUT or the wakeup pipe.
+            let mut pfds = [
+                libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: wake_fd,
+                    events: libc::POLLIN | libc::POLLHUP,
+                    revents: 0,
+                },
+            ];
+            match sys::poll(&mut pfds, 200) {
+                Ok(0) => continue,
+                Ok(_) => {}
+                Err(_) => return WriteOutcome::Stopped,
+            }
+            if pfds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                return WriteOutcome::Stopped;
+            }
+            if pfds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                return WriteOutcome::Closed;
+            }
+            if pfds[0].revents & libc::POLLOUT == 0 {
+                continue;
+            }
+            continue; // retry the write
         }
-        data = &data[n as usize..];
+        *pending = &pending[n as usize..];
     }
+    WriteOutcome::Drained
 }
 
 /// A fresh anonymous pipe as `(read, write)`, both close-on-exec.
@@ -1313,9 +1405,11 @@ mod tests {
             data = &data[n as usize..];
         }
         drop(w); // EOF after the input
-        drop(wake_w); // no stop: run to EOF/cap
+        // wake_w stays alive until after the relay joins (as in production:
+        // the main thread holds it and writes the stop byte at the end).
         let stop = std::sync::atomic::AtomicBool::new(false);
         let out = relay_stdin(src_r.as_raw_fd(), dst_w, cap, &stop, &wake_r);
+        drop(wake_w);
         drop(src_r);
         // collect dst
         let mut got = Vec::new();
@@ -1383,6 +1477,76 @@ mod tests {
     }
 
     #[test]
+    fn relay_slow_consumer_round_trips_every_byte() {
+        // >4 pipe buffers (64 KiB each) to a consumer that starts reading
+        // late: backpressure must hold every byte, none dropped on EAGAIN.
+        let input: Vec<u8> = (0u32..300_000).map(|i| (i % 251) as u8).collect();
+        let (src_r, src_w) = open_pipe().unwrap();
+        let (dst_r, dst_w) = open_pipe().unwrap();
+        let (wake_r, wake_w) = open_pipe().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let relay = std::thread::spawn(move || {
+            relay_stdin(src_r.as_raw_fd(), dst_w, 1 << 20, &stop2, &wake_r)
+        });
+        // the consumer: a separate thread, reading slowly so dst fills and
+        // EAGAIN/backpressure fires.
+        let consumer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let mut got = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                // SAFETY: blocking read of our own pipe.
+                let n =
+                    unsafe { libc::read(dst_r.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n as usize]);
+            }
+            got
+        });
+        // prefill src in chunks (300 KiB > pipe buffers); the relay drains it.
+        let mut data: &[u8] = &input;
+        let w = src_w;
+        while !data.is_empty() {
+            // SAFETY: blocking write into our own pipe; the relay drains it.
+            let n = unsafe { libc::write(w.as_raw_fd(), data.as_ptr() as *mut _, data.len()) };
+            assert!(n > 0);
+            data = &data[n as usize..];
+        }
+        drop(w);
+        let got = consumer.join().unwrap();
+        let out = relay.join().unwrap();
+        drop(wake_w); // no stop needed: the relay ended on EOF
+        assert!(!out.exceeded);
+        assert_eq!(got, input, "every byte must survive backpressure");
+    }
+
+    #[test]
+    fn relay_epipe_over_cap_is_not_a_cap_hit() {
+        // The program closes stdin early (dst read end dropped) while the
+        // input exceeds the cap: EPIPE is the normal end, NOT a cap hit, so
+        // the exec must not be replaced by 125/E_TOO_LARGE.
+        let (src_r, src_w) = open_pipe().unwrap();
+        let (dst_r, dst_w) = open_pipe().unwrap();
+        let (wake_r, wake_w) = open_pipe().unwrap();
+        // prefill src with 200 bytes, cap 100
+        let w = src_w;
+        let blob = [7u8; 200];
+        // SAFETY: blocking write into our own pipe.
+        let n = unsafe { libc::write(w.as_raw_fd(), blob.as_ptr() as *const _, blob.len()) };
+        assert!(n > 0);
+        drop(w);
+        drop(dst_r); // the program has closed stdin
+        // wake_w stays alive until the relay ends (as in production).
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let out = relay_stdin(src_r.as_raw_fd(), dst_w, 100, &stop, &wake_r);
+        drop(wake_w);
+        assert!(!out.exceeded, "EPIPE is a normal end, not a cap hit");
+    }
+
+    #[test]
     fn relay_epipe_is_normal_end() {
         // dst read end closed: the relay must end, no exceeded flag.
         let (src_r, src_w) = open_pipe().unwrap();
@@ -1398,6 +1562,7 @@ mod tests {
         drop(_dst_r); // close dst read end so the relay's writes hit EPIPE
         let stop = std::sync::atomic::AtomicBool::new(false);
         let out = relay_stdin(src_r.as_raw_fd(), dst_w, 1 << 20, &stop, &wake_r);
+        drop(_wake_w);
         assert!(!out.exceeded, "EPIPE is a normal end");
     }
 

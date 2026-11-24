@@ -1,10 +1,10 @@
-# Driving hisn from an external service (0.6.4)
+# Driving hisn from an external service (0.6.5)
 
 This guide is for a service that hosts hisn sessions for several people and
 talks to hisn only through the CLI, for example over non-interactive SSH. It
 complements [Driving hisn from a program](sessions.md#driving-hisn-from-a-program)
 and [CONTROL-PROTOCOL](CONTROL-PROTOCOL.md). Everything here exists in 0.6.3;
-what 0.6.4 will replace is marked.
+what 0.6.4 or 0.6.5 will replace is marked.
 
 ## Node setup
 
@@ -72,6 +72,14 @@ carries `exit_code` or `signal`, `exec_id`, `pid`, `attach` and `duration_ms`.
 Only `exec/exit` has `exec_id`, `pid` and `attach`; `exec/request` is written
 before the exec is numbered and does not.
 
+Request and stdin size limits (0.6.5): a request line over 65536 bytes is
+refused before it is sent — exit 125 with a `hisn-error/v1` object (`E_TOO_LARGE`,
+naming the limit) on stderr, and the supervisor never sees it. A supervisor
+that refuses a request answers with an error reply, not a closed connection.
+With `--stdin-limit` feeding a `--no-tty` exec, a stdin over the cap ends the
+exec with exit 125 and `E_TOO_LARGE` naming the stdin limit; the journal
+records it. It is never silently truncated as if the input had ended.
+
 `journal` exits 3 when `--after-wseq` is ahead of the journal and 4 when the
 records are not contiguous (see "Journal cursor").
 
@@ -80,6 +88,26 @@ records are not contiguous (see "Journal cursor").
 Each tool call is `hisn exec --no-tty --session <id> -- <argv>`. The call lasts
 as long as the program; killing the `hisn exec` client ends the program (TERM,
 then KILL after about 5 s).
+
+**Passing stdin (0.6.5).** By default an `--no-tty` exec's stdin is `/dev/null`
+(the 0.6.4 behaviour, unchanged). Add `--stdin-limit BYTES` (1..=1073741824)
+and the caller's stdin is passed through a capped relay: the command sees the
+bytes, and exactly the cap is delivered when the input exceeds it. Without
+`--stdin-limit`, a terminal on fd 0 is never read. With
+`--seat-token-file -`, the first line is the credential and the cap counts
+only the rest. Detached execs always keep stdin at `/dev/null`. Side effect:
+when the cap is hit, the program sees EOF after the cap bytes and may commit
+before the client replaces its exit with 125.
+
+```sh
+printf 'dx16-hello' | hisn exec --no-tty --stdin-limit 1048576 --session seat-a -- cat
+```
+
+When the cap is hit, the program sees EOF after the cap bytes and may commit
+before the client replaces its exit with 125. If the program closes stdin
+early, that is a normal end when the reader is already gone at write time
+(the relay stops feeding stdin); if the cap trips while the pipe still
+accepts the bytes, the cap hit stands.
 
 **A long-running command: detached exec (0.6.4).** Start it under the
 supervisor and come back to it later:
@@ -186,11 +214,47 @@ printf '%s\n' "$TOKEN" | hisn exec --no-tty --seat-token-file - --session seat-a
   is consumed. A terminal on stdin, an empty line and a non-UTF-8 line are
   refused.
 - On `exec`, `-` requires `--no-tty`: the program's stdin is then `/dev/null`,
-  so it cannot read anything that followed the credential. `attach` does not
-  accept `-`.
+  so it cannot read anything that followed the credential (without
+  `--stdin-limit`; with it, the rest is passed through a capped relay).
+  `attach` does not accept `-`.
 - Setting `HISN_SEAT_TOKEN` together with `-` is the existing "both set" error.
 - With a credential the journal records carry the seat; without one the
   record's seat is empty.
+
+## Capabilities and profile validation (0.6.5)
+
+```sh
+hisn capabilities --json
+# {"schema":"hisn-capabilities/v1","version":"0.6.5","protocol_revision":4,
+#  "declared_protocol_version":3,
+#  "features":[{"name":"detached-exec","available":true}, ...]}
+hisn profile validate --json ./hisn.toml
+# {"schema":"hisn-profile-validation/v1","ok":false,"errors":[{"path":"session.hostname",
+#   "code":"E_PROFILE_VALUE","message":"session.hostname: ..."}],"warnings":[]}
+```
+
+- `capabilities` works without a running session and always exits 0 when the
+  report is produced. The 11 feature names are public API and pinned by a
+  test: `detached-exec`, `journal-cursor`, `journal-unreadable`, `exec-stdin`,
+  `seat-credential-stdin`, `network-none`, `network-host`, `network-open`,
+  `rootfs`, `ssh-agent`, `services`. When `available` is false, `reason`
+  carries the detail from the same check `hisn check` runs (for example open
+  mode on a kernel without the needed Landlock ABI). Features derived from
+  the binary itself (`detached-exec`, `journal-*`, `exec-stdin`,
+  `seat-credential-stdin`, `ssh-agent`, `services`) report `available: true`:
+  the code paths exist in this binary, but an older running supervisor may
+  still refuse them (for example `detached-exec` needs protocol revision 4).
+  `protocol_revision` is what the supervisor speaks; `declared_protocol_version`
+  is what existing commands declare (3, unchanged since 0.6.3).
+- `profile validate --json` is fail-fast (at most one error, the first —
+  the same one the text path prints). `path` is the dotted TOML key path
+  when the validation layer knows it (`session.network`,
+  `services[1].ready.socket`); omitted when unknown, never empty. `line` and
+  `column` are 1-based and present when the TOML deserializer knows them.
+  `code` is `E_PROFILE_PARSE` (syntax, type or unknown-key errors) or
+  `E_PROFILE_VALUE` (validation failures and resolve/plan failures).
+  `warnings` is reserved (`[]` today). Text output without `--json` is
+  byte-identical to earlier releases.
 
 ## Why a session ended
 

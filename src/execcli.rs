@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -73,14 +73,17 @@ pub fn seat_token(token_file: Option<&std::path::Path>) -> Result<Option<String>
 /// caller's own fds 0-2 are passed on, so the program would inherit whatever
 /// follows the credential line; with `--no-tty` its stdin is `/dev/null`.
 /// Checked before anything is read from stdin.
+/// 0.6.5: the message names the opt-in: `--no-tty` alone keeps stdin at
+/// /dev/null; `--stdin-limit N` passes the caller's stdin through a capped
+/// relay (the credential line is read first, the cap counts the rest).
 pub fn refuse_stdin_token_unless_no_tty(
     token_file: Option<&std::path::Path>,
     no_tty: bool,
 ) -> Result<()> {
     if token_file == Some(std::path::Path::new("-")) && !no_tty {
         bail!(
-            "--seat-token-file - on exec requires --no-tty (the program's stdin is then /dev/null, \
-             so it cannot read what follows the credential)"
+            "--seat-token-file - on exec requires --no-tty (without --stdin-limit the program's stdin is /dev/null, \
+             so it cannot read what follows the credential; with --stdin-limit the rest is passed through)"
         );
     }
     Ok(())
@@ -706,45 +709,236 @@ pub fn run(args: ExecArgs) -> Result<i32> {
     // never receives a descriptor that refers to the caller's terminal:
     // - default (no pty flag): fds 0-2 are the caller's, as before (a terminal
     //   on any of them was already refused above);
-    // - --no-tty: stdin is /dev/null, stdout and stderr are client-owned pipes
-    //   whose read ends the client copies to its own fd 1 and 2.
+    // - --no-tty: stdin is /dev/null, or — with --stdin-limit — the read end
+    //   of a client-owned pipe whose write end a relay thread feeds from the
+    //   caller's stdin (0.6.5 opt-in); stdout and stderr are client-owned
+    //   pipes whose read ends the client copies to its own fd 1 and 2.
     let line = format!("{req}\n");
+    let stdin_cap = effective_stdin_limit(args.stdin_limit)?;
+    // tty on fd 0: never read from the caller's terminal (0.6.3 property).
+    let stdin_tty = !args.tty && stdin_cap.is_some() && sys::isatty(0);
+    let use_stdin_relay = stdin_cap.is_some() && !stdin_tty;
+    // (relay pipe write end, cap, wakeup read end) for the relay thread.
+    let mut stdin_relay: Option<(OwnedFd, u64, OwnedFd)> = None;
+    let mut stdin_wakeup_w: Option<OwnedFd> = None;
     let mut relay_pipes: Option<[(OwnedFd, RawFd); 2]> = None;
     if let Some(s) = &slave {
         sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), &[s.as_raw_fd()])
             .context("sending request")?;
     } else if args.no_tty {
-        let stdin = fs::File::open("/dev/null").context("opening /dev/null for --no-tty stdin")?;
+        // The sandbox's stdin fd for this call (one of ours):
+        // - no --stdin-limit (or fd 0 is a tty): /dev/null, as in 0.6.4;
+        // - --stdin-limit with a non-tty fd 0: the read end of a pipe the
+        //   relay thread below feeds from fd 0.
+        let (stdin_fd, relay_pair) = if use_stdin_relay {
+            let (r, w) = open_pipe().context("creating stdin pipe")?;
+            (r, Some(w))
+        } else {
+            if stdin_tty {
+                eprintln!("hisn: stdin was not passed: fd 0 is a terminal (use a pipe or file)");
+            }
+            let null =
+                fs::File::open("/dev/null").context("opening /dev/null for --no-tty stdin")?;
+            // SAFETY: `null` is a file we opened and own.
+            (unsafe { OwnedFd::from_raw_fd(null.into_raw_fd()) }, None)
+        };
         let (out_r, out_w) = open_pipe().context("creating stdout pipe")?;
         let (err_r, err_w) = open_pipe().context("creating stderr pipe")?;
-        let fds = [stdin.as_raw_fd(), out_w.as_raw_fd(), err_w.as_raw_fd()];
+        let fds = [stdin_fd.as_raw_fd(), out_w.as_raw_fd(), err_w.as_raw_fd()];
         sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), &fds).context("sending request")?;
         // The client's write ends close now: the read ends see EOF exactly
-        // when the sandbox's side has closed.
-        drop((stdin, out_w, err_w));
+        // when the sandbox's side has closed. The sandbox holds its own copy
+        // of stdin_fd (SCM_RIGHTS); ours is dropped.
+        drop((out_w, err_w, stdin_fd));
         relay_pipes = Some([(out_r, 1), (err_r, 2)]);
+        if let Some(w) = relay_pair {
+            let (wake_r, wake_w) = open_pipe().context("creating wakeup pipe")?;
+            stdin_relay = Some((w, stdin_cap.unwrap(), wake_r));
+            stdin_wakeup_w = Some(wake_w);
+        }
     } else {
         sys::send_with_fds(conn.as_raw_fd(), line.as_bytes(), &[0, 1, 2])
             .context("sending request")?;
     }
     drop(slave); // the master sees EOF/EIO once the program's side closes
 
-    // The pipes are pumped on their own thread, concurrently with the exit
-    // wait: a program writing more than a pipe buffer would otherwise block on
-    // write and never send its exit line.
+    // The stdin relay thread (opt-in): copies fd 0 to the sandbox pipe until
+    // EOF, the cap, or `stop`. The wakeup pipe ends its poll when `stop` is
+    // set, so it is always joinable.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stdin_thread = stdin_relay.map(|(w, cap, wake_r)| {
+        let stop = stop.clone();
+        std::thread::spawn(move || relay_stdin(0, w, cap, &stop, &wake_r))
+    });
     let pump = relay_pipes.map(|p| {
         let stop = stop.clone();
         std::thread::spawn(move || pump_pipes(p, &stop))
     });
     let finish = relay(&conn, &args.session, master);
-    // The exit line is in (or the relay failed). The pump drains what is
-    // already buffered, then stops at EOF or after its grace period.
+    // The exit line is in (or the relay failed). The pumps drain what is
+    // already buffered, then stop at EOF or after their grace period. The
+    // stdin relay stops via the wakeup pipe.
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(w) = &stdin_wakeup_w {
+        let byte = [0u8; 1];
+        // SAFETY: one byte into our own wakeup pipe.
+        let _ = unsafe { libc::write(w.as_raw_fd(), byte.as_ptr() as *const _, 1) };
+    }
     if let Some(h) = pump {
         let _ = h.join();
     }
+    let stdin_outcome = stdin_thread.map(|h| {
+        h.join().unwrap_or(StdinRelayOutcome {
+            exceeded: false,
+            bytes: 0,
+        })
+    });
+    if let Some(out) = &stdin_outcome
+        && out.exceeded
+    {
+        let cap = stdin_cap.unwrap();
+        let msg = format!(
+            "the command's stdin exceeded the {cap} byte limit (read {} bytes)",
+            out.bytes
+        );
+        eprintln!("{}", error_object(control::E_TOO_LARGE, &msg));
+        return Ok(EXIT_INTERNAL);
+    }
     Ok(exit_code(&finish?))
+}
+
+/// 0.6.5 opt-in stdin relay for `exec --no-tty --stdin-limit`.
+pub(crate) const MAX_STDIN_LIMIT: u64 = 1024 * 1024 * 1024;
+
+/// Resolve the effective stdin cap for `exec`. `None` = no passthrough
+/// (--no-tty without --stdin-limit keeps /dev/null, byte-identical to 0.6.4).
+/// A value outside 1..=MAX_STDIN_LIMIT is a usage error (bail).
+pub(crate) fn effective_stdin_limit(requested: Option<u64>) -> Result<Option<u64>> {
+    match requested {
+        None => Ok(None),
+        Some(n) if (1..=MAX_STDIN_LIMIT).contains(&n) => Ok(Some(n)),
+        Some(n) => bail!("--stdin-limit must be between 1 and {MAX_STDIN_LIMIT} bytes, got {n}"),
+    }
+}
+
+/// The result of one stdin relay: whether the cap was exceeded.
+pub(crate) struct StdinRelayOutcome {
+    pub exceeded: bool,
+    /// Total bytes read from the source.
+    pub bytes: u64,
+}
+
+/// Copy the caller's stdin (`src_fd`, normally fd 0, blocking — never
+/// O_NONBLOCK on a shared description) to `dst` (a pipe write end we own, set
+/// non-blocking) until EOF, until the cap is exceeded (then stop after cap+1
+/// bytes have been seen, so exactly-at-cap ends cleanly), or until `stop` is
+/// set. `wakeup` is the read end of a pipe the main thread writes to when
+/// `stop` is set, so the poll always ends. EPIPE (the program closed stdin
+/// early) is a normal end.
+fn relay_stdin(
+    src_fd: RawFd,
+    dst: OwnedFd,
+    cap: u64,
+    stop: &std::sync::atomic::AtomicBool,
+    wakeup: &OwnedFd,
+) -> StdinRelayOutcome {
+    use std::sync::atomic::Ordering;
+    // O_NONBLOCK on our own pipe end (never on fd 0).
+    // SAFETY: fcntl on a descriptor we own.
+    unsafe {
+        let flags = libc::fcntl(dst.as_raw_fd(), libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(dst.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let mut buf = vec![0u8; 16384];
+    let dst_fd = dst.as_raw_fd();
+    let wake_fd = wakeup.as_raw_fd();
+    let mut read_total: u64 = 0;
+    let mut exceeded = false;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let mut pfds = [
+            libc::pollfd {
+                fd: src_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        match sys::poll(&mut pfds, 200) {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if pfds[1].revents & libc::POLLIN != 0 {
+            break; // stop requested via wakeup pipe
+        }
+        if pfds[0].revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            continue;
+        }
+        // Read at most cap+1-sent bytes: one byte past the cap decides.
+        let sent = read_total.min(cap);
+        let want = ((cap + 1).saturating_sub(sent)).min(buf.len() as u64) as usize;
+        if want == 0 {
+            exceeded = true;
+            break;
+        }
+        // SAFETY: read into a buffer we own; `src_fd` is borrowed, never closed.
+        let n = unsafe { libc::read(src_fd, buf.as_mut_ptr() as *mut _, want) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+        if n == 0 {
+            break; // EOF: normal end
+        }
+        let n = n as usize;
+        read_total += n as u64;
+        if read_total > cap {
+            // One byte over the cap: deliver up to the cap, then stop.
+            let deliver = (cap - (read_total - n as u64)) as usize;
+            if deliver > 0 {
+                drain_write(dst_fd, &buf[..deliver]);
+            }
+            exceeded = true;
+            break;
+        }
+        drain_write(dst_fd, &buf[..n]);
+    }
+    StdinRelayOutcome {
+        exceeded,
+        bytes: read_total,
+    }
+}
+
+/// Write all of `data` to a non-blocking pipe end; stop on EPIPE (the reader
+/// closed) or when the pipe is full (the program is not reading — the exit
+/// path ends the relay via `stop`, so this never blocks).
+fn drain_write(fd: RawFd, mut data: &[u8]) {
+    while !data.is_empty() {
+        // SAFETY: write into a buffer we own.
+        let n = unsafe { libc::write(fd, data.as_ptr() as *const _, data.len()) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => return, // pipe full: stop writing (normal)
+                Some(libc::EPIPE) => return,  // reader closed: normal end
+                _ => return,
+            }
+        }
+        data = &data[n as usize..];
+    }
 }
 
 /// A fresh anonymous pipe as `(read, write)`, both close-on-exec.
@@ -1022,6 +1216,189 @@ mod tests {
         req["argv"] = json!([format!("{cur}x")]);
         assert_eq!(req.to_string().len(), control::MAX_LINE + 1);
         assert!(refuse_oversized_request(&req), "one byte over is refused");
+    }
+
+    #[test]
+    fn stdin_limit_resolution() {
+        // None = no passthrough (byte-identical to 0.6.4); 1..=1GiB ok; 0 and
+        // 1GiB+ are usage errors.
+        assert_eq!(effective_stdin_limit(None).unwrap(), None);
+        assert_eq!(effective_stdin_limit(Some(1)).unwrap(), Some(1));
+        assert_eq!(
+            effective_stdin_limit(Some(64 * 1024 * 1024)).unwrap(),
+            Some(64 * 1024 * 1024)
+        );
+        assert_eq!(
+            effective_stdin_limit(Some(MAX_STDIN_LIMIT)).unwrap(),
+            Some(MAX_STDIN_LIMIT)
+        );
+        assert!(effective_stdin_limit(Some(0)).is_err());
+        assert!(effective_stdin_limit(Some(MAX_STDIN_LIMIT + 1)).is_err());
+    }
+
+    #[test]
+    fn stdin_limit_requires_no_tty_and_conflicts() {
+        // clap: --stdin-limit requires --no-tty; conflicts with --tty/--detach.
+        assert!(
+            Cli::try_parse_from([
+                "hisn",
+                "exec",
+                "--session",
+                "s",
+                "--stdin-limit",
+                "10",
+                "--",
+                "ls"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "hisn",
+                "exec",
+                "--session",
+                "s",
+                "--no-tty",
+                "--tty",
+                "--stdin-limit",
+                "10",
+                "--",
+                "ls"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "hisn",
+                "exec",
+                "--session",
+                "s",
+                "--detach",
+                "--stdin-limit",
+                "10",
+                "--",
+                "ls"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "hisn",
+                "exec",
+                "--session",
+                "s",
+                "--no-tty",
+                "--stdin-limit",
+                "10",
+                "--",
+                "ls"
+            ])
+            .is_ok()
+        );
+    }
+
+    /// Run one relay: `input` on a pipe as src, collect what lands on the dst
+    /// pipe. Returns (outcome, bytes received).
+    fn run_relay(input: &[u8], cap: u64) -> (StdinRelayOutcome, Vec<u8>) {
+        let (src_r, src_w) = open_pipe().unwrap();
+        let (dst_r, dst_w) = open_pipe().unwrap();
+        let (wake_r, wake_w) = open_pipe().unwrap();
+        // prefill the source pipe (input is small in tests)
+        let w = src_w;
+        let mut data = input;
+        while !data.is_empty() {
+            // SAFETY: blocking write into our own pipe.
+            let n = unsafe { libc::write(w.as_raw_fd(), data.as_ptr() as *const _, data.len()) };
+            assert!(n > 0);
+            data = &data[n as usize..];
+        }
+        drop(w); // EOF after the input
+        drop(wake_w); // no stop: run to EOF/cap
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let out = relay_stdin(src_r.as_raw_fd(), dst_w, cap, &stop, &wake_r);
+        drop(src_r);
+        // collect dst
+        let mut got = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            // SAFETY: blocking read of our own pipe.
+            let n = unsafe { libc::read(dst_r.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n as usize]);
+        }
+        (out, got)
+    }
+
+    #[test]
+    fn relay_small_input_passes_through() {
+        let (out, got) = run_relay(b"hello world", 1024);
+        assert!(!out.exceeded);
+        assert_eq!(got, b"hello world");
+        assert_eq!(out.bytes, 11);
+    }
+
+    #[test]
+    fn relay_exactly_at_cap_is_normal() {
+        let (out, got) = run_relay(&[7u8; 100], 100);
+        assert!(!out.exceeded, "exactly at the cap must not flag");
+        assert_eq!(got.len(), 100);
+    }
+
+    #[test]
+    fn relay_one_byte_over_flags_and_delivers_cap() {
+        let (out, got) = run_relay(&[9u8; 101], 100);
+        assert!(out.exceeded, "cap+1 must flag");
+        assert_eq!(got.len(), 100, "exactly the cap is delivered");
+    }
+
+    #[test]
+    fn relay_binary_with_nul_round_trips() {
+        let input: Vec<u8> = (0u8..=255).cycle().take(300).collect();
+        let (out, got) = run_relay(&input, 1024);
+        assert!(!out.exceeded);
+        assert_eq!(got, input);
+    }
+
+    #[test]
+    fn relay_stop_ends_without_hanging() {
+        // src pipe never gets EOF (write end kept): stop must end the relay.
+        let (src_r, src_w) = open_pipe().unwrap();
+        let (dst_r, dst_w) = open_pipe().unwrap();
+        let (wake_r, wake_w) = open_pipe().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let t = std::thread::spawn(move || {
+            relay_stdin(src_r.as_raw_fd(), dst_w, 1 << 20, &stop2, &wake_r)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let byte = [0u8; 1];
+        // SAFETY: one byte into our own wakeup pipe.
+        unsafe { libc::write(wake_w.as_raw_fd(), byte.as_ptr() as *const _, 1) };
+        let out = t.join().unwrap();
+        assert!(!out.exceeded);
+        drop((src_w, dst_r));
+    }
+
+    #[test]
+    fn relay_epipe_is_normal_end() {
+        // dst read end closed: the relay must end, no exceeded flag.
+        let (src_r, src_w) = open_pipe().unwrap();
+        let (_dst_r, dst_w) = open_pipe().unwrap();
+        let (wake_r, _wake_w) = open_pipe().unwrap();
+        // write a lot to src so the relay tries to write to a dead dst
+        let w = src_w;
+        let blob = [4u8; 8192];
+        // SAFETY: blocking write into our own pipe (fills until relay drains).
+        let n = unsafe { libc::write(w.as_raw_fd(), blob.as_ptr() as *const _, blob.len()) };
+        assert!(n > 0);
+        drop(w);
+        drop(_dst_r); // close dst read end so the relay's writes hit EPIPE
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let out = relay_stdin(src_r.as_raw_fd(), dst_w, 1 << 20, &stop, &wake_r);
+        assert!(!out.exceeded, "EPIPE is a normal end");
     }
 
     #[test]

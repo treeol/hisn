@@ -230,11 +230,19 @@ pub struct ExecArgs {
     /// Run on a pty (allocated here, never the caller's own terminal).
     #[arg(long, conflicts_with = "no_tty")]
     pub tty: bool,
-    /// Non-interactive: no pty, stdin from /dev/null, stdout and stderr passed
-    /// through pipes that the client copies to its own stdout and stderr, so the
-    /// sandbox never receives a descriptor for the caller's terminal.
+    /// Non-interactive: no pty. Combined with `--stdin-limit`, the caller's
+    /// stdin is passed through a capped relay; otherwise stdin is /dev/null.
+    /// Stdout and stderr are passed through pipes that the client copies to
+    /// its own stdout and stderr, so the sandbox never receives a descriptor
+    /// for the caller's terminal.
     #[arg(long = "no-tty", conflicts_with = "tty")]
     pub no_tty: bool,
+    /// Pass the caller's stdin to the command (opt-in, 0.6.5). Requires
+    /// `--no-tty`; conflicts with `--tty` and `--detach`. The relay stops
+    /// after this many bytes; exceeding it ends the exec with exit 125 and
+    /// E_TOO_LARGE instead of silently truncating.
+    #[arg(long = "stdin-limit", value_name = "BYTES", requires = "no_tty", conflicts_with_all = ["tty", "detach"])]
+    pub stdin_limit: Option<u64>,
     /// Run detached (0.6.4, protocol revision 4): the command starts with no
     /// client stdio, keeps running after this command exits, and is read
     /// with `hisn exec-status|exec-output|exec-signal`. Prints the exec id

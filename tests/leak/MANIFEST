@@ -192,5 +192,15 @@ DX13: prune while a pump is writing: output stays complete (156 bytes)
 DX14: journal: detached exec/request carries detach:true, plain keeps the v0.6.3 shape
 DX15: oversized exec request: exit 125, hisn-error/v1 E_TOO_LARGE naming the limit
 DX15: a request within the limit runs normally
+DX16: small stdin passes through to the command
+DX16: without --stdin-limit, --no-tty stdin is still /dev/null
+DX16: input exactly at the cap passes
+DX16: one byte over the cap: exit 125 E_TOO_LARGE naming the stdin limit
+DX16: binary stdin with NUL bytes round-trips
+DX16: stdin-ignoring command with 1 MiB stdin does not hang
+DX17: the credential line feeds the seat, the cap counts only the rest
+DX17: stdin after the credential line over the cap: exit 125 E_TOO_LARGE
+DX18: --stdin-limit passes data to a normal exec
+DX18: a detached exec's stdin is /dev/null (piped data is not delivered)
 DX12: session stop delivers TERM to a detached exec before the sandbox ends
 DX12: journal: exec/exit cause session-stop

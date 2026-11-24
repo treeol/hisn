@@ -1129,6 +1129,62 @@ DX15_N=$(python3 -c 'print(65536 - 90)')
 DX15_OK=$(timeout 20 "$HISN" exec --no-tty --session "$A" -- python3 -c "print('y' * $DX15_N)" </dev/null 2>/dev/null | wc -c)
 if [ "$DX15_OK" -gt 0 ] 2>/dev/null; then pass "DX15 a request within the limit runs normally"; else fail "DX15 a request within the limit runs normally" "no output"; fi
 
+# DX16 (0.6.5): --stdin-limit passes the caller's stdin through a capped
+# relay. Small input, exactly-at-cap, one over, binary with NULs, a
+# credential line followed by data, an stdin-ignoring command (no hang).
+DX16_OUT=$(printf 'dx16-hello' | timeout 20 "$HISN" exec --no-tty --stdin-limit 1048576 --session "$A" -- cat 2>/dev/null)
+DX16_RC=$?
+if [ "$DX16_RC" = 0 ] && [ "$DX16_OUT" = dx16-hello ]; then pass "DX16 small stdin passes through to the command"; else fail "DX16 small stdin passes through to the command" "rc=$DX16_RC [$DX16_OUT]"; fi
+
+# without --stdin-limit, --no-tty keeps stdin at /dev/null (0.6.4 property)
+DX16_NULL=$(timeout 20 "$HISN" exec --no-tty --session "$A" -- cat </dev/null 2>/dev/null; echo "rc=$?")
+if [ "$DX16_NULL" = "rc=0" ]; then pass "DX16 without --stdin-limit, --no-tty stdin is still /dev/null"; else fail "DX16 without --stdin-limit, --no-tty stdin is still /dev/null" "[$DX16_NULL]"; fi
+
+# exactly at the cap: a byte-for-byte echo
+head -c 1000 /dev/zero | tr '\0' 'z' | timeout 20 "$HISN" exec --no-tty --stdin-limit 1000 --session "$A" -- cat 2>/dev/null | wc -c > "$T/dx16.at"
+if [ "$(cat "$T/dx16.at")" = 1000 ]; then pass "DX16 input exactly at the cap passes"; else fail "DX16 input exactly at the cap passes" "[$(cat "$T/dx16.at")]"; fi
+
+# one byte over the cap: exit 125 E_TOO_LARGE naming the stdin limit
+head -c 1001 /dev/zero | tr '\0' 'z' | timeout 20 "$HISN" exec --no-tty --stdin-limit 1000 --session "$A" -- cat >"$T/dx16.over" 2>"$T/dx16.over.err"
+DX16_RC=$?
+if [ "$DX16_RC" = 125 ] && grep -q 'E_TOO_LARGE' "$T/dx16.over.err" && grep -q '1000' "$T/dx16.over.err"; then pass "DX16 one byte over the cap: exit 125 E_TOO_LARGE naming the stdin limit"; else fail "DX16 one byte over the cap: exit 125 E_TOO_LARGE naming the stdin limit" "rc=$DX16_RC [$(cat "$T/dx16.over.err")]"; fi
+
+# binary data with NUL bytes round-trips
+head -c 300 /dev/urandom > "$T/dx16.bin"
+timeout 20 "$HISN" exec --no-tty --stdin-limit 1048576 --session "$A" -- cat < "$T/dx16.bin" > "$T/dx16.bin.out" 2>/dev/null
+if cmp -s "$T/dx16.bin" "$T/dx16.bin.out"; then pass "DX16 binary stdin with NUL bytes round-trips"; else fail "DX16 binary stdin with NUL bytes round-trips" "cmp differs"; fi
+
+# an exec that does not read stdin at all: 1 MiB of stdin must not hang
+DX16_T0=$(date +%s%N)
+head -c 1048576 /dev/zero | timeout 20 "$HISN" exec --no-tty --stdin-limit 1048576 --session "$A" -- true >/dev/null 2>&1
+DX16_RC=$?
+DX16_MS=$(( ($(date +%s%N) - DX16_T0) / 1000000 ))
+if [ "$DX16_RC" = 0 ] && [ "$DX16_MS" -lt 15000 ]; then pass "DX16 stdin-ignoring command with 1 MiB stdin does not hang ($DX16_MS ms)"; else fail "DX16 stdin-ignoring command with 1 MiB stdin does not hang" "rc=$DX16_RC ${DX16_MS} ms"; fi
+
+# DX17: --seat-token-file - with --stdin-limit: the first line is the
+# credential, the cap counts only the rest.
+DX17_TOK=$("$HISN" seat --workspace "$AWS" add dx17 --role member 2>/dev/null)
+printf '%s\ndx17-data' "$DX17_TOK" | timeout 20 "$HISN" exec --no-tty --stdin-limit 100 --seat-token-file - --session "$A" -- cat 2>/dev/null > "$T/dx17.out"
+DX17_RC=$?
+if [ "$DX17_RC" = 0 ] && [ "$(cat "$T/dx17.out")" = dx17-data ]; then pass "DX17 the credential line feeds the seat, the cap counts only the rest"; else fail "DX17 the credential line feeds the seat, the cap counts only the rest" "rc=$DX17_RC [$(cat "$T/dx17.out")]"; fi
+# 101 bytes after the credential line over a 100 cap -> 125
+printf '%s\n' "$DX17_TOK" > "$T/dx17.in"
+head -c 101 /dev/zero | tr '\0' 'y' >> "$T/dx17.in"
+timeout 20 "$HISN" exec --no-tty --stdin-limit 100 --seat-token-file - --session "$A" -- cat < "$T/dx17.in" >"$T/dx17.over" 2>"$T/dx17.over.err"
+DX17_RC=$?
+if [ "$DX17_RC" = 125 ] && grep -q 'E_TOO_LARGE' "$T/dx17.over.err"; then pass "DX17 stdin after the credential line over the cap: exit 125 E_TOO_LARGE"; else fail "DX17 stdin after the credential line over the cap: exit 125 E_TOO_LARGE" "rc=$DX17_RC [$(cat "$T/dx17.over.err")]"; fi
+
+# DX18: detached execs keep stdin at /dev/null; piped data is not delivered.
+# A normal (non-detached) --stdin-limit exec DOES receive the data.
+dx_start "$A" sh -c "cat >'$ACWD/dx18.out'; echo done >>'$ACWD/dx18.out'" >/dev/null
+printf 'dx18-should-not-arrive' | timeout 20 "$HISN" exec --no-tty --stdin-limit 1048576 --session "$A" -- sh -c "cat; echo done" >"$T/dx18.out" 2>/dev/null
+DX18_N=$(cat "$T/dx18.out" 2>/dev/null)
+if [ "$DX18_N" = "dx18-should-not-arrivedone" ]; then pass "DX18 --stdin-limit passes data to a normal exec"; else fail "DX18 --stdin-limit passes data to a normal exec" "[$DX18_N]"; fi
+# the detached one above: stdin is /dev/null, so cat sees EOF at once and
+# writes only "done" (never the piped text).
+for i in $(seq 100); do [ -s "$ACWD/dx18.out" ] && break; sleep 0.1; done
+if [ "$(cat "$ACWD/dx18.out" 2>/dev/null)" = done ]; then pass "DX18 a detached exec's stdin is /dev/null (piped data is not delivered)"; else fail "DX18 a detached exec's stdin is /dev/null (piped data is not delivered)" "[$(cat "$ACWD/dx18.out" 2>/dev/null)]"; fi
+
 check "net harness: open session stops cleanly" "" timeout 30 "$HISN" stop --session "$A" </dev/null
 for _ in $(seq 50); do [ "$(session_field "$A" state)" != running ] && break; sleep 0.1; done
 check "net harness: open session is no longer running" "stopped" session_field "$A" state

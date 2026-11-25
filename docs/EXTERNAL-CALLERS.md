@@ -83,6 +83,20 @@ records it. It is never silently truncated as if the input had ended.
 `journal` exits 3 when `--after-wseq` is ahead of the journal and 4 when the
 records are not contiguous (see "Journal cursor").
 
+**Blocking read (0.6.7).** `hisn journal --after-wseq N --wait [SECS]`
+blocks until at least one record with `wseq > N` exists, then prints it
+like the non-wait path and exits 0. With `SECS` it gives up after that
+many seconds and exits 6 (`E_WAIT_TIMEOUT`); without, it waits
+indefinitely. If the session ends while waiting and no matching record
+arrived, it exits 7 (`E_WAIT_SESSION_ENDED`); a matching record arriving
+in the same batch as the stop still exits 0. Exit 4 keeps meaning a real
+gap (reported immediately, never waited on); exit 5 is unused and reserved.
+Works with `--json` and `--session`. Wake is inotify on the journal file
+and directory with a bounded 1 s poll fallback; the wait holds no session
+lock and survives journal rotation. A stop record with `wseq <= N`, a
+supervisor killed outright, or a failed stop append cannot be detected
+from the journal alone — in those cases the wait ends by its timeout.
+
 ## Running commands
 
 Each tool call is `hisn exec --no-tty --session <id> -- <argv>`. The call lasts
@@ -234,20 +248,25 @@ hisn profile validate --json ./hisn.toml
 ```
 
 - `capabilities` works without a running session and always exits 0 when the
-  report is produced. The 11 feature names are public API and pinned by a
-  test: `detached-exec`, `journal-cursor`, `journal-unreadable`, `exec-stdin`,
-  `seat-credential-stdin`, `network-none`, `network-host`, `network-open`,
-  `rootfs`, `ssh-agent`, `services`. When `available` is false, `reason`
+  report is produced. The feature names are public API and pinned by a
+  test: the 11 originals `detached-exec`, `journal-cursor`, `journal-unreadable`,
+  `exec-stdin`, `seat-credential-stdin`, `network-none`, `network-host`,
+  `network-open`, `rootfs`, `ssh-agent`, `services`, plus 0.6.7's
+  `journal-wait` and `caller-agent-socket` (appended after, order of the
+  original 11 unchanged). When `available` is false, `reason`
   carries the detail from the same check `hisn check` runs (for example open
   mode on a kernel without the needed Landlock ABI). Features derived from
   the binary itself (`detached-exec`, `journal-*`, `exec-stdin`,
-  `seat-credential-stdin`, `ssh-agent`, `services`) report `available: true`:
+  `seat-credential-stdin`, `ssh-agent`, `services`,
+  `caller-agent-socket`) report `available: true`:
   the code paths exist in this binary, but an older running supervisor may
   still refuse them (for example `detached-exec` needs protocol revision 4).
   `protocol_revision` is what the supervisor speaks; `declared_protocol_version`
   is what existing commands declare (3, unchanged since 0.6.3).
-- `profile validate --json` is fail-fast (at most one error, the first —
-  the same one the text path prints). `path` is the dotted TOML key path
+- `profile validate --json` (0.6.7) reports **all** post-parse errors in
+  deterministic, dedup'd order (version, policy, every surface table,
+  resolve/plan); a TOML parse failure stops with exactly one error. The
+  text path stays fail-fast. `path` is the dotted TOML key path
   when the validation layer knows it (`session.network`,
   `services[1].ready.socket`); omitted when unknown, never empty. `line` and
   `column` are 1-based and present when the TOML deserializer knows them.
@@ -255,6 +274,38 @@ hisn profile validate --json ./hisn.toml
   `E_PROFILE_VALUE` (validation failures and resolve/plan failures).
   `warnings` is reserved (`[]` today). Text output without `--json` is
   byte-identical to earlier releases.
+
+## Caller-provided ssh-agent socket (0.6.7)
+
+`hisn run --ssh-agent-socket PATH` (profile: `[ssh] socket = PATH`, the CLI
+flag winning when both are set) hands the session's ssh-agent proxy a
+caller-chosen upstream instead of the host's `SSH_AUTH_SOCK`. Default off:
+with neither set the upstream is `SSH_AUTH_SOCK` exactly as before. The
+flag without `[ssh] agent = true` is an error, and the path must be
+absolute. The resolved upstream is read once at session start and checked
+with the existing socket-is-a-socket check (whose error text now names the
+path actually checked).
+
+Every sign request journals one `ssh/sign` record through the bounded
+network queue: `fingerprint` (the `SHA256:…` key fingerprint, or null for
+an unparseable envelope), `seat`, `attributed` (the explicit marker — null
+seat alone does not distinguish the main command from an unattributed
+client), `exec_id` (`e-<n>` or null), and `result` (`ok`, `refused`, or
+`error`). The record never carries the data being signed, the signature,
+or the key blob. Over-rate signs fold into one `ssh/sign-summary` per
+affected second, like `network/summary`.
+
+Attribution reuses the network records' `/proc` ancestry walk from the
+accepted connection's peer pid, resolved at accept: an attributed exec
+signs as its seat (owner/member allowed, observer refused with
+`SSH_AGENT_FAILURE` and a `refused` record), the main command signs as
+owner, and an orphan, reparented-to-init, over-deep, or unreadable client
+is refused with `attributed: false`. The walk is racy against pid reuse —
+a client that exits and whose pid is recycled between accept and walk
+could be misattributed; the role is re-checked per sign, and a pidfd
+(`SO_PEERPIDFD`) hardening is deferred. Identity listing (type 11) stays
+ungated; add/remove/lock keep today's tracing-only logging, and refused
+non-sign message types are not journaled.
 
 ## Why a session ended
 

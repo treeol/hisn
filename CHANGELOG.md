@@ -7,6 +7,60 @@ All notable changes to hisn are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-11-26
+
+0.6.6 was not released; 0.6.7 follows 0.6.5.
+
+hisn 0.6.7 adds a blocking journal read for external callers and a
+caller-provided ssh-agent socket. `hisn journal --after-wseq N --wait [SECS]`
+blocks until a record after the cursor exists, then prints it exactly like
+the non-wait path and exits 0; giving up after SECS exits 6
+(`E_WAIT_TIMEOUT`), and a session ending while waiting (with no matching
+records) exits 7 (`E_WAIT_SESSION_ENDED`). Exit 4 keeps meaning a real gap;
+exit 5 is left unused and documented as such. Wake is via inotify on the
+journal directory with a bounded 1 s poll fallback; the wait holds no
+session lock and survives rotation.
+
+`hisn run --ssh-agent-socket PATH` (mirrored as the profile `[ssh] socket`
+key, CLI winning) hands the session's ssh-agent proxy a caller-chosen
+upstream instead of the host's `SSH_AUTH_SOCK`; default off, and the
+existing add/remove refusal is unchanged. Every sign request journals one
+`ssh/sign` record (key fingerprint, seat, exec id, result — never the data
+being signed, never the signature), and owner/member may sign while an
+observer is refused. `hisn capabilities --json` gains `journal-wait` and
+`caller-agent-socket` after the existing 11 names.
+
+No wire change: no new control request, `PROTOCOL_REVISION` stays 4, and
+`tests/leak/compat_063.sh` passes unchanged, so 0.6.3/0.6.5 clients keep
+working against a 0.6.7 supervisor.
+
+### Added
+- `hisn journal --after-wseq N --wait [SECS]`, with `--json` and `--session`
+  supported. Exit codes 6 (`E_WAIT_TIMEOUT`) and 7 (`E_WAIT_SESSION_ENDED`)
+  are new; the stop surface is documented beside 3/4.
+- `hisn run --ssh-agent-socket PATH` and the `[ssh] socket` profile key.
+- Journal records `ssh/sign` and `ssh/sign-summary`.
+- Capability feature names `journal-wait` and `caller-agent-socket`.
+
+### Changed
+- `hisn profile validate --json` now reports **all** post-parse errors
+  (deterministic, dedup'd order) instead of only the first. This is a
+  deliberate behaviour change to the JSON entry only; the text path stays
+  fail-fast, and `ok`/exit codes are unchanged. A TOML parse failure still
+  stops with exactly one error.
+- The ssh-agent proxy now gates signs by seat role (owner/member sign,
+  observer is refused with `SSH_AGENT_FAILURE`), on both the env path and
+  the caller-socket path. This reverses the old allowlist-only behaviour
+  for observers.
+- `check_host_agent` error text now names the path actually checked
+  (a caller socket is no longer reported as `SSH_AUTH_SOCK`).
+
+### Fixed
+- A late `exec-signal` arriving while a detached exec drains could be
+  missed by the journal cause (computed before the signal landed). The
+  cause is now finalised under the same `exec_table` lock the signal
+  delivers through, so it cannot slip into the gap.
+
 ## [0.6.5] - 2026-11-24
 
 hisn 0.6.5 is small additions for external callers: an oversized request and

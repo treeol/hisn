@@ -703,6 +703,9 @@ pub fn capabilities() -> serde_json::Value {
         Capability::from_check("rootfs", by_name("rootfs store")),
         Capability::yes("ssh-agent"),
         Capability::yes("services"),
+        // 0.6.7: journal --wait and the caller-provided agent socket.
+        Capability::yes("journal-wait"),
+        Capability::yes("caller-agent-socket"),
     ];
     serde_json::json!({
         "schema": "hisn-capabilities/v1",
@@ -786,7 +789,9 @@ mod tests {
 
     #[test]
     fn capabilities_pin_feature_names_and_shape() {
-        // The 11 feature names are public API: renaming one fails this test.
+        // The 11 original feature names plus the two 0.6.7 names are
+        // public API: renaming one fails this test. The original 11 stay
+        // first, in order.
         let v = capabilities();
         assert_eq!(v["schema"], "hisn-capabilities/v1");
         assert_eq!(
@@ -818,6 +823,8 @@ mod tests {
                 "rootfs",
                 "ssh-agent",
                 "services",
+                "journal-wait",
+                "caller-agent-socket",
             ]
         );
         // every feature has available: bool; when false a reason is present

@@ -4142,11 +4142,12 @@ if needs_host; then
     python3 -c "
 import json, sys, time
 # The next wseq follows the file's last record: a huge jump would be a
-# cursor gap (exit 4), not a wake.
+# cursor gap (exit 4), not a wake. The session is the real one so the
+# --session filter matches it.
 wseq = int(sys.argv[3])
-rec = {'v': 1, 'ts': '2026-11-25T00:00:00Z', 'wseq': wseq, 'session': 'l90wait', 'kind': 'note', 'data': {'text': sys.argv[2]}}
+rec = {'v': 1, 'ts': '2026-11-25T00:00:00Z', 'wseq': wseq, 'session': sys.argv[4], 'kind': 'note', 'data': {'text': sys.argv[2]}}
 open(sys.argv[1], 'a').write(json.dumps(rec) + chr(10))
-" "$1" "$2" "$3"
+" "$1" "$2" "$3" "$4"
   }
   last_wseq() { # FILE -> last wseq, or 0
     python3 -c "
@@ -4164,7 +4165,7 @@ print(last)" "$1"
     WDIR="${XDG_STATE_HOME:-$HOME/.local/state}/hisn/workspaces/$L90_WS"
     # -- case 1: wait-then-append
     W_NOW=$(last_wseq "$(journal_file)")
-    ( sleep 0.5; append_note "$(journal_file)" "L90-wait-wake" "$((W_NOW + 1))" ) &
+    ( sleep 0.5; append_note "$(journal_file)" "L90-wait-wake" "$((W_NOW + 1))" "l90wait-$$" ) &
     L90_AP=$!
     W_OUT=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 8 --session "l90wait-$$" --json 2>"$WORK/l90w.err"); W_RC=$?
     wait $L90_AP 2>/dev/null
@@ -4193,7 +4194,7 @@ print(last)" "$1"
     fi
     # -- case 3: rotation while waiting. The new file's first record
     # follows the old tail, so the cursor stays contiguous.
-    ( sleep 0.4; mv "$(journal_file)" "$WDIR/journal.3.jsonl"; : >"$(journal_file)"; append_note "$(journal_file)" "L90-rotated" "$((W_NOW + 1))" ) &
+    ( sleep 0.4; mv "$(journal_file)" "$WDIR/journal.3.jsonl"; : >"$(journal_file)"; append_note "$(journal_file)" "L90-rotated" "$((W_NOW + 1))" "l90wait-$$" ) &
     L90_RP=$!
     W_OUT=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 8 --json 2>"$WORK/l90r.err"); W_RC=$?
     wait $L90_RP 2>/dev/null

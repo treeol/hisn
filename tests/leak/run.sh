@@ -4138,19 +4138,33 @@ if needs_host; then
   write_policy "$L90_POL" "$L90_CWD"
   WDIR=""
   journal_file() { printf '%s\n' "$WDIR/journal.jsonl"; }
-  append_note() { # append_note PATH TEXT
+  append_note() { # append_note PATH TEXT [WSEQ]
     python3 -c "
 import json, sys, time
-rec = {'v': 1, 'ts': '2026-11-25T00:00:00Z', 'wseq': 989999, 'session': 'l90wait', 'kind': 'note', 'data': {'text': sys.argv[2]}}
+# The next wseq follows the file's last record: a huge jump would be a
+# cursor gap (exit 4), not a wake.
+wseq = int(sys.argv[3])
+rec = {'v': 1, 'ts': '2026-11-25T00:00:00Z', 'wseq': wseq, 'session': 'l90wait', 'kind': 'note', 'data': {'text': sys.argv[2]}}
 open(sys.argv[1], 'a').write(json.dumps(rec) + chr(10))
-" "$1" "$2"
+" "$1" "$2" "$3"
+  }
+  last_wseq() { # FILE -> last wseq, or 0
+    python3 -c "
+import json, sys
+last = 0
+try:
+    for l in open(sys.argv[1]):
+        try: last = json.loads(l).get('wseq', last)
+        except Exception: pass
+except FileNotFoundError: pass
+print(last)" "$1"
   }
   if start_session l90wait-$$ "$L90_CWD" "$L90_POL" --detach; then
     L90_WS=$(ls_workspace_id "l90wait-$$")
     WDIR="${XDG_STATE_HOME:-$HOME/.local/state}/hisn/workspaces/$L90_WS"
     # -- case 1: wait-then-append
-    W_NOW=$("$HISN" journal --workspace "$L90_WS" --info 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['last_wseq'] or 0)")
-    ( sleep 0.5; append_note "$(journal_file)" "L90-wait-wake" ) &
+    W_NOW=$(last_wseq "$(journal_file)")
+    ( sleep 0.5; append_note "$(journal_file)" "L90-wait-wake" "$((W_NOW + 1))" ) &
     L90_AP=$!
     W_OUT=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 8 --session "l90wait-$$" --json 2>"$WORK/l90w.err"); W_RC=$?
     wait $L90_AP 2>/dev/null
@@ -4159,23 +4173,27 @@ open(sys.argv[1], 'a').write(json.dumps(rec) + chr(10))
     else
       fail "L90 journal --wait wakes on a later append and exits 0" "rc=$W_RC out=[$(printf '%s' "$W_OUT" | head -c 200)] err=[$(head -c 200 "$WORK/l90w.err")]"
     fi
-    # -- case 2: timeout (also covers --wait 0)
+    # -- case 2: timeout (also covers --wait 0). The cursor is the real
+    # tail; nothing arrives, so the wait gives up. --json carries the
+    # machine-readable code.
+    W_NOW=$(last_wseq "$(journal_file)")
     W_S=$(date +%s)
-    W_ERR=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq 989999 --wait 1 2>&1); W_RC=$?
+    W_ERR=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 1 --json 2>&1); W_RC=$?
     W_E=$(date +%s)
-    if [ $W_RC -eq 6 ] && printf '%s' "$W_ERR" | grep -q "E_WAIT_TIMEOUT" && [ $((W_E - W_S)) -le 4 ]; then
+    if [ $W_RC -eq 6 ] && printf '%s' "$W_ERR" | grep -q E_WAIT_TIMEOUT && [ $((W_E - W_S)) -le 4 ]; then
       pass "L90 journal --wait timeout exits 6 with E_WAIT_TIMEOUT"
     else
       fail "L90 journal --wait timeout exits 6 with E_WAIT_TIMEOUT" "rc=$W_RC elapsed=$((W_E - W_S))s out=[$(printf '%s' "$W_ERR" | head -c 200)]"
     fi
-    W_ERR=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq 989999 --wait 0 2>&1); W_RC=$?
-    if [ $W_RC -eq 6 ] && printf '%s' "$W_ERR" | grep -q "E_WAIT_TIMEOUT"; then
+    W_ERR=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 0 --json 2>&1); W_RC=$?
+    if [ $W_RC -eq 6 ] && printf '%s' "$W_ERR" | grep -q E_WAIT_TIMEOUT; then
       pass "L90 journal --wait 0 is an immediate poll (exit 6)"
     else
       fail "L90 journal --wait 0 is an immediate poll" "rc=$W_RC out=[$(printf '%s' "$W_ERR" | head -c 200)]"
     fi
-    # -- case 3: rotation while waiting
-    ( sleep 0.4; mv "$(journal_file)" "$WDIR/journal.3.jsonl"; : >"$(journal_file)"; append_note "$(journal_file)" "L90-rotated" ) &
+    # -- case 3: rotation while waiting. The new file's first record
+    # follows the old tail, so the cursor stays contiguous.
+    ( sleep 0.4; mv "$(journal_file)" "$WDIR/journal.3.jsonl"; : >"$(journal_file)"; append_note "$(journal_file)" "L90-rotated" "$((W_NOW + 1))" ) &
     L90_RP=$!
     W_OUT=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 8 --json 2>"$WORK/l90r.err"); W_RC=$?
     wait $L90_RP 2>/dev/null
@@ -4184,12 +4202,15 @@ open(sys.argv[1], 'a').write(json.dumps(rec) + chr(10))
     else
       fail "L90 journal --wait survives rotation while waiting" "rc=$W_RC out=[$(printf '%s' "$W_OUT" | head -c 200)] err=[$(head -c 200 "$WORK/l90r.err")]"
     fi
-    # -- case 4: session stops while waiting
+    # -- case 4: session stops while waiting. Filtered to the session and
+    # to notes with the cursor at the tail, so no matching record
+    # arrives; the stop surface ends the wait with exit 7.
+    W_NOW=$(last_wseq "$(journal_file)")
     ( sleep 0.4; "$HISN" stop --session "l90wait-$$" >/dev/null 2>&1 ) &
     L90_SP=$!
-    W_ERR=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq 989999 --wait 8 --session "l90wait-$$" --kind note 2>&1); W_RC=$?
+    W_ERR=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 8 --session "l90wait-$$" --kind note --json 2>&1); W_RC=$?
     wait $L90_SP 2>/dev/null
-    if [ $W_RC -eq 7 ] && printf '%s' "$W_ERR" | grep -q "E_WAIT_SESSION_ENDED"; then
+    if [ $W_RC -eq 7 ] && printf '%s' "$W_ERR" | grep -q E_WAIT_SESSION_ENDED; then
       pass "L90 journal --wait returns 7 when the session ends"
     else
       fail "L90 journal --wait returns 7 when the session ends" "rc=$W_RC out=[$(printf '%s' "$W_ERR" | head -c 200)]"

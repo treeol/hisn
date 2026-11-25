@@ -31,12 +31,41 @@ use std::thread;
 use anyhow::{Context, Result, bail};
 use sha2::Digest;
 
+use crate::authz;
+use crate::journal::Journal;
+use crate::seats::Role;
+
+/// 0.6.7: attribution of one proxy client. `seat`/`exec_id` are the
+/// resolved identity; `attributed` is the explicit marker (seat is null
+/// for the main command and for unattributed clients alike).
+#[derive(Debug, Clone)]
+pub struct Attribution {
+    pub seat: Option<String>,
+    pub exec_id: Option<String>,
+    pub attributed: bool,
+}
+
+impl Attribution {
+    pub fn unattributed() -> Self {
+        Self {
+            seat: None,
+            exec_id: None,
+            attributed: false,
+        }
+    }
+}
+
+/// Role for the sign check, resolved at accept: `Some(role)` allows the
+/// check to be made, `None` means unattributed (refused).
+pub type RoleResolver = Arc<dyn Fn() -> Option<Role> + Send + Sync>;
+
 /// SSH agent protocol message types (draft-miller-ssh-agent / OpenSSH).
 /// These are stable byte values, not an API that changes.
 pub const SSH_AGENT_FAILURE: u8 = 5;
 pub const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 pub const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
 pub const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
+pub const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
 
 /// The maximum message size the proxy will accept (256 KiB — large enough
 /// for key blobs and signatures, small enough to prevent memory exhaustion).
@@ -247,26 +276,35 @@ fn is_forwarded(msg_type: u8) -> bool {
 
 /// Handle one client connection: read messages, forward the allowed ones
 /// to the host agent, filter responses. Disallowed messages get FAILURE.
-fn handle_client(mut client: UnixStream, host_agent: &str, allowed: Vec<String>, session_id: &str) {
-    let mut host = match UnixStream::connect(host_agent) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("ssh-agent proxy: connect to {host_agent}: {e}");
-            let _ = write_msg(&mut client, &failure_msg());
-            return;
+/// 0.6.7: the host connection is lazy (made on the first forwarded
+/// message) so a down host still produces an `ssh/sign` record with
+/// `result: "error"` per sign attempt. Attribution runs once at accept
+/// (smallest pid-reuse window); the role is re-checked per sign.
+#[allow(clippy::too_many_arguments)]
+fn handle_client(
+    mut client: UnixStream,
+    host_agent: &str,
+    allowed: Vec<String>,
+    session_id: &str,
+    journal: Option<Journal>,
+    attribution: Attribution,
+    role: Option<Role>,
+    role_resolver: Option<RoleResolver>,
+) {
+    // Lazy host connection: re-check the role per SIGN_REQUEST from the
+    // resolver (the accept-time `role` is the first snapshot).
+    let mut host: Option<UnixStream> = None;
+    let journal_sign = |fp: Option<&str>, result: &str, a: &Attribution| {
+        if let Some(j) = &journal {
+            j.sign_record(
+                fp,
+                a.seat.as_deref(),
+                a.exec_id.as_deref(),
+                a.attributed,
+                result,
+            );
         }
     };
-    // Bound every write to the host agent: without it a host agent that
-    // stops reading pins this worker (and the client's counter slot).
-    // The read side gets the symmetric bound from `HOST_READ_TIMEOUT`
-    // (Part 2.5): a host agent that accepts but never replies would
-    // otherwise block `read_msg` forever.
-    if let Err(e) = host.set_write_timeout(Some(HOST_WRITE_TIMEOUT)) {
-        tracing::warn!("ssh-agent proxy [{session_id}]: host write timeout: {e}");
-    }
-    if let Err(e) = host.set_read_timeout(Some(HOST_READ_TIMEOUT)) {
-        tracing::warn!("ssh-agent proxy [{session_id}]: host read timeout: {e}");
-    }
     loop {
         let payload = match read_msg(&mut client) {
             Ok(p) => p,
@@ -296,40 +334,97 @@ fn handle_client(mut client: UnixStream, host_agent: &str, allowed: Vec<String>,
             continue;
         }
         // SIGN_REQUEST: extract the key fingerprint for logging and
-        // allowlist checking. Every forwarded SIGN_REQUEST is logged once
-        // (fingerprint, session id) — allowlist or not.
+        // allowlist checking. Role gate first (the pure predicate, never an
+        // Authorized): observer and unattributed are refused. Every sign is
+        // journaled exactly once, whatever the outcome.
+        let sign_fp: Option<String> = if msg_type == SSH_AGENTC_SIGN_REQUEST {
+            match extract_sign_key_blob(&payload) {
+                Some(blob) => Some(ssh_fingerprint(&blob)),
+                None => {
+                    tracing::info!(
+                        "ssh-agent proxy [{session_id}]: sign denied: malformed SIGN_REQUEST"
+                    );
+                    journal_sign(None, "refused", &attribution);
+                    let _ = write_msg(&mut client, &failure_msg());
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         if msg_type == SSH_AGENTC_SIGN_REQUEST {
-            let Some(blob) = extract_sign_key_blob(&payload) else {
-                tracing::info!(
-                    "ssh-agent proxy [{session_id}]: sign denied: malformed SIGN_REQUEST"
-                );
+            let fp = sign_fp.as_deref().unwrap_or("");
+            let current_role = role_resolver.as_ref().map(|r| r()).unwrap_or(role);
+            let allowed_sign = current_role
+                .map(|r| authz::allows(r, authz::Op::Sign))
+                .unwrap_or(false);
+            if !allowed_sign {
+                tracing::info!("ssh-agent proxy [{session_id}]: sign denied: role for key {fp}");
+                journal_sign(Some(fp), "refused", &attribution);
                 let _ = write_msg(&mut client, &failure_msg());
                 continue;
-            };
-            let fp = ssh_fingerprint(&blob);
-            if !allowed.is_empty() && !allowed.iter().any(|a| a == &fp) {
+            }
+            if !allowed.is_empty() && !allowed.iter().any(|a| a == fp) {
                 tracing::info!(
                     "ssh-agent proxy [{session_id}]: sign denied: key {fp} not in allowlist"
                 );
+                journal_sign(Some(fp), "refused", &attribution);
                 let _ = write_msg(&mut client, &failure_msg());
                 continue;
             }
             tracing::info!("ssh-agent proxy [{session_id}]: sign forwarded: key {fp}");
         }
+        // Lazy host connect on first forwarded message.
+        if host.is_none() {
+            match UnixStream::connect(host_agent) {
+                Ok(s) => {
+                    if let Err(e) = s.set_write_timeout(Some(HOST_WRITE_TIMEOUT)) {
+                        tracing::warn!("ssh-agent proxy [{session_id}]: host write timeout: {e}");
+                    }
+                    if let Err(e) = s.set_read_timeout(Some(HOST_READ_TIMEOUT)) {
+                        tracing::warn!("ssh-agent proxy [{session_id}]: host read timeout: {e}");
+                    }
+                    host = Some(s);
+                }
+                Err(e) => {
+                    tracing::warn!("ssh-agent proxy [{session_id}]: connect to {host_agent}: {e}");
+                    if msg_type == SSH_AGENTC_SIGN_REQUEST {
+                        journal_sign(sign_fp.as_deref(), "error", &attribution);
+                    }
+                    let _ = write_msg(&mut client, &failure_msg());
+                    break;
+                }
+            }
+        }
+        let host_sock = host.as_mut().expect("host connected");
         // Forward to the host agent.
-        if let Err(e) = write_msg(&mut host, &payload) {
+        if let Err(e) = write_msg(host_sock, &payload) {
             tracing::warn!("ssh-agent proxy [{session_id}]: write to host: {e}");
+            if msg_type == SSH_AGENTC_SIGN_REQUEST {
+                journal_sign(sign_fp.as_deref(), "error", &attribution);
+            }
             let _ = write_msg(&mut client, &failure_msg());
             break;
         }
-        let response = match read_msg(&mut host) {
+        let response = match read_msg(host_sock) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("ssh-agent proxy [{session_id}]: read from host: {e}");
+                if msg_type == SSH_AGENTC_SIGN_REQUEST {
+                    journal_sign(sign_fp.as_deref(), "error", &attribution);
+                }
                 let _ = write_msg(&mut client, &failure_msg());
                 break;
             }
         };
+        if msg_type == SSH_AGENTC_SIGN_REQUEST {
+            let result = match response.first().copied() {
+                Some(SSH_AGENT_SIGN_RESPONSE) => "ok",
+                Some(SSH_AGENT_FAILURE) => "refused",
+                _ => "error",
+            };
+            journal_sign(sign_fp.as_deref(), result, &attribution);
+        }
         // REQUEST_IDENTITIES: filter the response.
         let response = if msg_type == SSH_AGENTC_REQUEST_IDENTITIES {
             filter_identities_response(&response, &allowed).unwrap_or_else(|_| failure_msg())
@@ -374,6 +469,10 @@ pub fn bind_proxy_socket(socket_path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
+/// Attribution of one accepted client (0.6.7): the `SO_PEERCRED` pid walked
+/// at accept. Production impl is in the supervisor; tests fake it.
+pub type AttributionFn = Arc<dyn Fn(i32) -> (Attribution, Option<Role>) + Send + Sync>;
+
 /// Start the accept loop on a bound listener. Spawns a thread that accepts
 /// connections and handles them with filtering. Called **after**
 /// `unshare(NEWUSER)`: `unshare` fails with `EINVAL` in a multithreaded
@@ -386,6 +485,8 @@ pub fn spawn_accept_loop(
     host_auth_sock: String,
     allowed: Vec<String>,
     session_id: String,
+    journal: Option<Journal>,
+    attribute: Option<AttributionFn>,
 ) -> thread::JoinHandle<()> {
     let active = Arc::new(AtomicUsize::new(0));
     thread::spawn(move || {
@@ -405,6 +506,25 @@ pub fn spawn_accept_loop(
                     let h = host_auth_sock.clone();
                     let a = allowed.clone();
                     let id = session_id.clone();
+                    let j = journal.as_ref().map(|x| x.clone_for_engine());
+                    // Attribution at accept (smallest pid-reuse window):
+                    // SO_PEERCRED is fixed at connect time. The proxy socket
+                    // is a bind mount (do_forward), so the peer is the real
+                    // in-sandbox client.
+                    let (attr, role, resolver) = match &attribute {
+                        Some(f) => {
+                            let peer_pid =
+                                crate::sys::peer_cred(std::os::unix::io::AsRawFd::as_raw_fd(&s))
+                                    .map(|(p, _)| p)
+                                    .unwrap_or(-1);
+                            let (at, ro) = f(peer_pid);
+                            // Re-check the role per sign from the same walk.
+                            let ff = Arc::clone(f);
+                            let resolver: RoleResolver = Arc::new(move || ff(peer_pid).1);
+                            (at, ro, Some(resolver))
+                        }
+                        None => (Attribution::unattributed(), None, None),
+                    };
                     let counter = Arc::clone(&active);
                     // The guard lives in the worker thread: it decrements
                     // the counter when the worker exits, including on a
@@ -416,7 +536,7 @@ pub fn spawn_accept_loop(
                         let _guard = ClientGuard {
                             counter: guard_counter,
                         };
-                        handle_client(s, &h, a, &id);
+                        handle_client(s, &h, a, &id, j, attr, role, resolver);
                     });
                     if let Err(e) = spawned {
                         active.fetch_sub(1, Ordering::SeqCst);
@@ -452,12 +572,13 @@ pub fn spawn_accept_loop(
 }
 
 /// Verify that the host SSH agent socket exists and is a socket. Called
-/// before `unshare` (no threads).
+/// before `unshare` (no threads). Names the path actually checked (0.6.7:
+/// a caller-provided socket is checked, not always `SSH_AUTH_SOCK`).
 pub fn check_host_agent(host_auth_sock: &str) -> Result<()> {
     let meta = std::fs::symlink_metadata(host_auth_sock)
-        .with_context(|| format!("ssh-agent: host SSH_AUTH_SOCK {host_auth_sock} not found"))?;
+        .with_context(|| format!("ssh-agent: host agent socket {host_auth_sock} not found"))?;
     if !meta.file_type().is_socket() {
-        bail!("ssh-agent: host SSH_AUTH_SOCK {host_auth_sock} is not a socket");
+        bail!("ssh-agent: host agent socket {host_auth_sock} is not a socket");
     }
     Ok(())
 }
@@ -687,5 +808,256 @@ mod tests {
         empty.extend(s(b"data"));
         empty.extend(0u32.to_be_bytes());
         assert_eq!(extract_sign_key_blob(&empty), None);
+    }
+
+    // ---- 0.6.7: sign journaling + role gate (real socketpairs) ----
+
+    fn sign_request(blob: &[u8], data: &[u8]) -> Vec<u8> {
+        let s = |b: &[u8]| {
+            let mut v = (b.len() as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(b);
+            v
+        };
+        let mut v = vec![SSH_AGENTC_SIGN_REQUEST];
+        v.extend(s(blob));
+        v.extend(s(data));
+        v.extend(0u32.to_be_bytes());
+        v
+    }
+
+    /// A fake host agent: answers one message with `reply`, then closes.
+    fn fake_agent(reply: &[u8]) -> (String, thread::JoinHandle<()>) {
+        let reply = reply.to_vec();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        let l = UnixListener::bind(&path).unwrap();
+        let h = thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let _ = read_msg(&mut c);
+            write_msg(&mut c, &reply).unwrap();
+        });
+        std::mem::forget(dir);
+        (path.to_str().unwrap().to_owned(), h)
+    }
+
+    fn run_client(
+        host_sock: &str,
+        journal: Option<Journal>,
+        attr: Attribution,
+        role: Option<Role>,
+        messages: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let (c1, mut c2) = UnixStream::pair().unwrap();
+        let h = host_sock.to_owned();
+        let worker = thread::spawn(move || {
+            handle_client(c1, &h, vec![], "test", journal, attr, role, None);
+        });
+        write_msg(&mut c2, &messages[0]).unwrap();
+        let resp = read_msg(&mut c2).unwrap();
+        // Half-close: the worker's next read sees EOF and exits. A full
+        // drop can race the worker's write-back (UnixStream::pair is not
+        // ordered across drop under load).
+        let _ = c2.shutdown(std::net::Shutdown::Write);
+        let _ = worker.join();
+        resp
+    }
+
+    #[test]
+    fn sign_ok_journals_fingerprint_seat_and_exec() {
+        // The fake agent answers one message then closes; the client side
+        // half-closes so the worker exits after the first exchange.
+        let (sock, agent) = fake_agent(&[SSH_AGENT_SIGN_RESPONSE, 0, 0, 0, 1, 7]);
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path().join("ws");
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&ws)
+                .unwrap();
+        }
+        let j = Journal::new(ws.clone(), "sess".into()).clone_for_engine();
+        let attr = Attribution {
+            seat: Some("alice".into()),
+            exec_id: Some("e-7".into()),
+            attributed: true,
+        };
+        let resp = run_client(
+            &sock,
+            Some(j.plain_clone_for_test()),
+            attr,
+            Some(Role::Member),
+            &[sign_request(b"blob", b"secret-data-marker")],
+        );
+        assert_eq!(resp, vec![SSH_AGENT_SIGN_RESPONSE, 0, 0, 0, 1, 7]);
+        assert!(j.net_flush(std::time::Duration::from_secs(5)));
+        let (recs, _) = crate::journal::read_records(&ws);
+        let sign = recs.iter().find(|r| r.kind == "ssh/sign").unwrap();
+        assert_eq!(sign.data["result"], "ok");
+        assert_eq!(sign.data["seat"], "alice");
+        assert_eq!(sign.data["exec_id"], "e-7");
+        assert_eq!(sign.data["attributed"], true);
+        assert!(
+            sign.data["fingerprint"]
+                .as_str()
+                .unwrap()
+                .starts_with("SHA256:")
+        );
+        // No payload bytes on the raw line.
+        let raw = std::fs::read_to_string(ws.join("journal.jsonl")).unwrap();
+        let line = raw.lines().find(|l| l.contains("ssh/sign")).unwrap();
+        assert!(!line.contains("secret-data-marker"), "{line}");
+        let _ = agent.join();
+    }
+
+    #[test]
+    fn observer_sign_is_refused_and_journaled() {
+        // The role gate refuses before any host connect, so no fake agent
+        // is needed (its accept() would block the join).
+        let sock = String::new();
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path().join("ws");
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&ws)
+                .unwrap();
+        }
+        let j = Journal::new(ws.clone(), "sess".into()).clone_for_engine();
+        let attr = Attribution {
+            seat: Some("bob".into()),
+            exec_id: Some("e-3".into()),
+            attributed: true,
+        };
+        let resp = run_client(
+            &sock,
+            Some(j.plain_clone_for_test()),
+            attr,
+            Some(Role::Observer),
+            &[sign_request(b"blob", b"x")],
+        );
+        assert_eq!(resp, vec![SSH_AGENT_FAILURE]);
+        assert!(j.net_flush(std::time::Duration::from_secs(5)));
+        let (recs, _) = crate::journal::read_records(&ws);
+        let sign = recs.iter().find(|r| r.kind == "ssh/sign").unwrap();
+        assert_eq!(sign.data["result"], "refused");
+        assert_eq!(sign.data["seat"], "bob");
+    }
+
+    #[test]
+    fn unattributed_sign_is_refused_and_marked() {
+        let sock = String::new();
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path().join("ws");
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&ws)
+                .unwrap();
+        }
+        let j = Journal::new(ws.clone(), "sess".into()).clone_for_engine();
+        let resp = run_client(
+            &sock,
+            Some(j.clone_for_engine()),
+            Attribution::unattributed(),
+            None,
+            &[sign_request(b"blob", b"x")],
+        );
+        assert_eq!(resp, vec![SSH_AGENT_FAILURE]);
+        assert!(j.net_flush(std::time::Duration::from_secs(5)));
+        let (recs, _) = crate::journal::read_records(&ws);
+        let sign = recs.iter().find(|r| r.kind == "ssh/sign").unwrap();
+        assert_eq!(sign.data["result"], "refused");
+        assert_eq!(sign.data["attributed"], false);
+        assert!(sign.data["seat"].is_null());
+    }
+
+    #[test]
+    fn host_failure_reply_maps_to_refused() {
+        let (sock, agent) = fake_agent(&[SSH_AGENT_FAILURE]);
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path().join("ws");
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&ws)
+                .unwrap();
+        }
+        let j = Journal::new(ws.clone(), "sess".into()).clone_for_engine();
+        let attr = Attribution {
+            seat: None,
+            exec_id: None,
+            attributed: true,
+        };
+        let resp = run_client(
+            &sock,
+            Some(j.plain_clone_for_test()),
+            attr,
+            Some(Role::Owner),
+            &[sign_request(b"blob", b"x")],
+        );
+        assert_eq!(resp, vec![SSH_AGENT_FAILURE]);
+        assert!(j.net_flush(std::time::Duration::from_secs(5)));
+        let (recs, _) = crate::journal::read_records(&ws);
+        let sign = recs.iter().find(|r| r.kind == "ssh/sign").unwrap();
+        assert_eq!(sign.data["result"], "refused");
+        let _ = agent.join();
+    }
+
+    #[test]
+    fn host_down_maps_to_error() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path().join("ws");
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&ws)
+                .unwrap();
+        }
+        let j = Journal::new(ws.clone(), "sess".into()).clone_for_engine();
+        let attr = Attribution {
+            seat: None,
+            exec_id: None,
+            attributed: true,
+        };
+        let resp = run_client(
+            "/nonexistent/agent.sock",
+            Some(j.plain_clone_for_test()),
+            attr,
+            Some(Role::Owner),
+            &[sign_request(b"blob", b"x")],
+        );
+        assert_eq!(resp, vec![SSH_AGENT_FAILURE]);
+        assert!(j.net_flush(std::time::Duration::from_secs(5)));
+        let (recs, _) = crate::journal::read_records(&ws);
+        let sign = recs.iter().find(|r| r.kind == "ssh/sign").unwrap();
+        assert_eq!(sign.data["result"], "error");
+    }
+
+    #[test]
+    fn add_remove_still_refused() {
+        assert!(!is_forwarded(17)); // ADD_IDENTITY
+        assert!(!is_forwarded(22)); // REMOVE_ALL
+        assert!(is_forwarded(SSH_AGENTC_REQUEST_IDENTITIES));
+        assert!(is_forwarded(SSH_AGENTC_SIGN_REQUEST));
+    }
+
+    #[test]
+    fn no_wire_request_maps_to_sign_op() {
+        // Pin the authorize boundary: Op::of is exhaustive over Request and
+        // has no Sign arm, so no control request can produce Op::Sign.
+        assert_eq!(authz::Op::Sign.name(), "sign");
+        assert!(authz::allows(Role::Owner, authz::Op::Sign));
+        assert!(authz::allows(Role::Member, authz::Op::Sign));
+        assert!(!authz::allows(Role::Observer, authz::Op::Sign));
     }
 }

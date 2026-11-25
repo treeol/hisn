@@ -111,11 +111,7 @@ impl InotifyBackend {
         use std::os::fd::AsRawFd;
         let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
         let wd = unsafe { libc::inotify_add_watch(f.as_raw_fd(), cpath.as_ptr(), mask) };
-        if wd < 0 {
-            None
-        } else {
-            Some(wd)
-        }
+        if wd < 0 { None } else { Some(wd) }
     }
 
     fn unwatch(&self, wd: i32) {
@@ -143,10 +139,7 @@ impl InotifyBackend {
             self.unwatch(wd);
         }
         let Some(dir) = self.dir.clone() else { return };
-        self.dir_wd = self.watch(
-            &dir,
-            libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_MODIFY,
-        );
+        self.dir_wd = self.watch(&dir, libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_MODIFY);
     }
 
     fn relevant(&self, name: &[u8]) -> bool {
@@ -154,8 +147,7 @@ impl InotifyBackend {
         // `journal.idx.*` (written by the reader's own cursor_read through
         // the index) are excluded: waking on them would self-trigger a spin.
         let name = std::str::from_utf8(name).unwrap_or("");
-        name == JOURNAL_FILE
-            || (name.starts_with("journal.") && name.ends_with(".jsonl"))
+        name == JOURNAL_FILE || (name.starts_with("journal.") && name.ends_with(".jsonl"))
     }
 
     /// Parse the buffered inotify events; returns `(relevant, rotated)`.
@@ -187,13 +179,11 @@ impl InotifyBackend {
                     relevant = true;
                 }
             }
-            if Some(wd) == self.dir_wd {
-                if !name.is_empty() && self.relevant(&name) {
-                    if mask & libc::IN_MOVED_TO != 0 {
-                        rotated = true;
-                    }
-                    relevant = true;
+            if Some(wd) == self.dir_wd && !name.is_empty() && self.relevant(&name) {
+                if mask & libc::IN_MOVED_TO != 0 {
+                    rotated = true;
                 }
+                relevant = true;
             }
             off += 16 + len;
         }
@@ -287,6 +277,7 @@ impl WaitBackend for InotifyBackend {
 
 /// Poll-only backend (inotify unavailable, or tests): the step loop sleeps
 /// `WAIT_POLL` between reads. Still correct — just bounded latency.
+#[cfg(test)]
 struct PollBackend;
 
 #[cfg(test)]
@@ -507,7 +498,7 @@ mod tests {
     #[test]
     fn step_empty_then_records_and_cursor_advances() {
         let (_d, dir) = ws_dir();
-        let mut j = journal(&dir);
+        let j = journal(&dir);
         j.append("note", None, json!({"i": 1})).unwrap();
         j.append("note", None, json!({"i": 2})).unwrap();
         let mut w = Waiter::new(dir.clone(), 2, None, Box::new(PollBackend));
@@ -521,7 +512,7 @@ mod tests {
     #[test]
     fn step_reset_and_gap_are_immediate() {
         let (_d, dir) = ws_dir();
-        let mut j = journal(&dir);
+        let j = journal(&dir);
         j.append("note", None, json!({})).unwrap();
         let mut w = Waiter::new(dir.clone(), 5, None, Box::new(PollBackend));
         assert_eq!(w.step(), WaitOutcome::Reset(Some(1)));
@@ -533,13 +524,19 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         fs::write(&path, lines[0].to_owned() + "\n" + lines[2] + "\n").unwrap();
         let mut w2 = Waiter::new(dir.clone(), 0, None, Box::new(PollBackend));
-        assert_eq!(w2.step(), WaitOutcome::Gap { expected: 2, got: 3 });
+        assert_eq!(
+            w2.step(),
+            WaitOutcome::Gap {
+                expected: 2,
+                got: 3
+            }
+        );
     }
 
     #[test]
     fn run_timeout_returns_empty_and_records_win_at_deadline() {
         let (_d, dir) = ws_dir();
-        let mut j = journal(&dir);
+        let _j = journal(&dir);
         // Nothing ever arrives: the deadline fires.
         let mut w = Waiter::new(dir.clone(), 0, None, Box::new(PollBackend));
         let start = Instant::now();
@@ -551,7 +548,7 @@ mod tests {
         let dir2 = dir.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
-            let mut j = journal(&dir2);
+            let j = journal(&dir2);
             j.append("note", None, json!({"i": 1})).unwrap();
         });
         let out = w.run(Some(Instant::now() + Duration::from_secs(5)));
@@ -561,13 +558,13 @@ mod tests {
     #[test]
     fn run_unbounded_returns_on_append() {
         let (_d, dir) = ws_dir();
-        let mut j = journal(&dir);
+        let j = journal(&dir);
         j.append("note", None, json!({"i": 1})).unwrap();
         let mut w = Waiter::new(dir.clone(), 1, None, Box::new(PollBackend));
         let dir2 = dir.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
-            let mut j = journal(&dir2);
+            let j = journal(&dir2);
             j.append("note", None, json!({"i": 2})).unwrap();
         });
         let out = w.run(None);
@@ -577,36 +574,22 @@ mod tests {
     #[test]
     fn session_stop_ends_the_wait_before_filters() {
         let (_d, dir) = ws_dir();
-        let mut j = journal(&dir);
-        j.append("session/start", None, json!({"session": "s1"})).unwrap();
-        let mut w = Waiter::new(
-            dir.clone(),
-            1,
-            Some("s1".into()),
-            Box::new(PollBackend),
-        );
+        let j = journal(&dir);
+        j.append("session/start", None, json!({"session": "s1"}))
+            .unwrap();
+        let mut w = Waiter::new(dir.clone(), 1, Some("s1".into()), Box::new(PollBackend));
         assert_eq!(w.step(), WaitOutcome::Empty);
         // Another session's records do not end the wait.
         j.append("note", None, json!({})).unwrap();
-        let mut w2 = Waiter::new(
-            dir.clone(),
-            1,
-            Some("s1".into()),
-            Box::new(PollBackend),
-        );
+        let mut w2 = Waiter::new(dir.clone(), 1, Some("s1".into()), Box::new(PollBackend));
         assert_eq!(wait_wseqs(&w2.step()), vec![2]);
         // The stop ends it even though a --kind filter might hide it.
         // The writer's session id is what the record carries (the Journal
         // was constructed with session "s"); append under the watched id.
-        let mut j2 = Journal::with_rotate_after(dir.clone(), "s1".into(), ROTATE_AFTER);
+        let j2 = Journal::with_rotate_after(dir.clone(), "s1".into(), ROTATE_AFTER);
         j2.append("session/stop", None, json!({"cause": "stop-request"}))
             .unwrap();
-        let mut w3 = Waiter::new(
-            dir.clone(),
-            2,
-            Some("s1".into()),
-            Box::new(PollBackend),
-        );
+        let mut w3 = Waiter::new(dir.clone(), 2, Some("s1".into()), Box::new(PollBackend));
         match w3.step() {
             WaitOutcome::SessionEnded(records, _) => {
                 assert_eq!(
@@ -617,20 +600,16 @@ mod tests {
             other => panic!("not session ended: {other:?}"),
         }
         // A stop at or below the cursor does not end a new wait.
-        let mut w4 = Waiter::new(
-            dir.clone(),
-            3,
-            Some("s1".into()),
-            Box::new(PollBackend),
-        );
+        let mut w4 = Waiter::new(dir.clone(), 3, Some("s1".into()), Box::new(PollBackend));
         assert_eq!(w4.step(), WaitOutcome::Empty);
     }
 
     #[test]
     fn session_stop_without_a_session_filter_does_not_end_the_wait() {
         let (_d, dir) = ws_dir();
-        let mut j = journal(&dir);
-        j.append("session/start", None, json!({"session": "s1"})).unwrap();
+        let j = journal(&dir);
+        j.append("session/start", None, json!({"session": "s1"}))
+            .unwrap();
         j.append("session/stop", None, json!({})).unwrap();
         let mut w = Waiter::new(dir.clone(), 0, None, Box::new(PollBackend));
         assert_eq!(wait_wseqs(&w.step()), vec![1, 2]);
@@ -669,13 +648,13 @@ mod tests {
     #[test]
     fn inotify_backend_wakes_on_append_well_below_the_poll_interval() {
         let (_d, dir) = ws_dir();
-        let mut j = journal(&dir);
+        let j = journal(&dir);
         j.append("note", None, json!({"i": 1})).unwrap();
         let mut w = Waiter::production(dir.clone(), 1, None);
         let dir2 = dir.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
-            let mut j = journal(&dir2);
+            let j = journal(&dir2);
             j.append("note", None, json!({"i": 2})).unwrap();
         });
         let start = Instant::now();
@@ -698,14 +677,14 @@ mod tests {
         let mut w = Waiter::production(dir.clone(), 0, None);
         assert_eq!(w.step(), WaitOutcome::Empty);
         create_test_ws_dir(&dir);
-        let mut j = journal(&dir);
+        let j = journal(&dir);
         j.append("note", None, json!({"i": 1})).unwrap();
         // The first record is already there when the wait starts; a
         // second one appended after the wait begins must still wake it.
         let dir2 = dir.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
-            let mut j = journal(&dir2);
+            let j = journal(&dir2);
             j.append("note", None, json!({"i": 2})).unwrap();
         });
         let out = w.run(Some(Instant::now() + Duration::from_secs(5)));
@@ -723,7 +702,7 @@ mod tests {
         // Guard the latency test's premise: the writer appends to
         // journal.jsonl itself (the file the wait watches).
         let (_d, dir) = ws_dir();
-        let mut j = journal(&dir);
+        let j = journal(&dir);
         j.append("note", None, json!({"i": 1})).unwrap();
         let meta = fs::metadata(dir.join(JOURNAL_FILE)).unwrap();
         assert!(meta.len() > 0 && meta.ino() > 0);

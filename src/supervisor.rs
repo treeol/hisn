@@ -287,6 +287,14 @@ struct Held {
     mount_root: OwnedFd,
 }
 
+/// One `exec_seats` entry (0.6.7): the exec's seat (itself `None` for a
+/// client without a seat) and its exec id.
+#[derive(Debug, Clone)]
+pub struct ExecSeat {
+    pub seat: Option<String>,
+    pub exec_id: String,
+}
+
 pub struct Shared {
     uid: u32,
     init_pid: i32,
@@ -360,7 +368,9 @@ pub struct Shared {
     /// engine when a notification arrives. Lookups are exact and bounded
     /// (one entry per live exec plus one per service); a miss means the
     /// program is not a known exec of this session, so seat stays null.
-    exec_seats: Mutex<std::collections::BTreeMap<i32, Option<String>>>,
+    /// 0.6.7: the value also carries the exec id (`e-<n>`) so the ssh
+    /// proxy's sign path can stamp it; the engine reads only the seat.
+    exec_seats: Mutex<std::collections::BTreeMap<i32, Option<ExecSeat>>>,
     /// 0.6.4: this supervisor's incarnation id; a detached exec is
     /// `(incarnation, exec_id)`.
     incarnation: String,
@@ -726,6 +736,101 @@ impl Shared {
             owner_uid: self.uid,
             seats: self.seat_set(),
         }
+    }
+
+    /// 0.6.7: attribute one ssh-proxy client (the `SO_PEERCRED` pid) to
+    /// `(Attribution, role)`. Same ancestry walk as the connect engine
+    /// (`notif::resolve_seat`'s `/proc` rules): the sandbox pid namespace
+    /// is at `NSpid` depth = supervisor depth + 1. Deny by default:
+    /// orphan/reparented/over-deep/unreadable → unattributed (the proxy
+    /// refuses the sign); main command (init tree, pid 1 at the sandbox
+    /// depth) → allowed as owner. The exec lookup yields `(seat, exec_id)`;
+    /// the seat's role comes from the seat cache (an unknown seat rolls to
+    /// unattributed rather than owner).
+    pub(crate) fn attribute_sign_client(
+        &self,
+        peer_pid: i32,
+    ) -> (crate::ssh_agent::Attribution, Option<crate::seats::Role>) {
+        use crate::notif::{ProcReader, RealProc};
+        let level = RealProc
+            .status(unsafe { libc::getpid() })
+            .map(|s| s.nspid.len() + 1)
+            .unwrap_or(2);
+        // Walk to the exec top pid, remembering whether we passed sandbox
+        // init (pid 1 at `level`) — the main-command case.
+        let exec_lookup = |pid: i32| {
+            self.exec_seats
+                .lock()
+                .expect("exec_seats")
+                .get(&pid)
+                .cloned()
+        };
+        let mut pid = match RealProc.status(peer_pid) {
+            Some(s) => s.tgid,
+            None => {
+                return (crate::ssh_agent::Attribution::unattributed(), None);
+            }
+        };
+        let mut seen: Vec<i32> = Vec::new();
+        for _ in 0..64 {
+            if pid <= 0 || seen.contains(&pid) {
+                return (crate::ssh_agent::Attribution::unattributed(), None);
+            }
+            seen.push(pid);
+            let st = match RealProc.status(pid) {
+                Some(s) => s,
+                None => {
+                    return (crate::ssh_agent::Attribution::unattributed(), None);
+                }
+            };
+            let inner = *st.nspid.last().expect("nspid non-empty");
+            if st.nspid.len() < level {
+                return (crate::ssh_agent::Attribution::unattributed(), None);
+            }
+            if st.nspid.len() == level {
+                if inner == 1 {
+                    // Main command: the session's init tree.
+                    return (
+                        crate::ssh_agent::Attribution {
+                            seat: None,
+                            exec_id: None,
+                            attributed: true,
+                        },
+                        Some(crate::seats::Role::Owner),
+                    );
+                }
+                if let Some(Some(es)) = exec_lookup(inner) {
+                    let role = es.seat.as_deref().and_then(|name| {
+                        let mut cache = self.seat_cache.lock().expect("seat cache");
+                        cache.refresh(&self.workspace_dir);
+                        cache.get(name).filter(|s| !s.revoked).map(|s| s.role)
+                    });
+                    let (seat, role) = match (es.seat.clone(), role) {
+                        (Some(name), Some(r)) => (Some(name), Some(r)),
+                        // A seat the cache does not know: refuse, do not
+                        // silently treat as owner.
+                        _ => {
+                            return (crate::ssh_agent::Attribution::unattributed(), None);
+                        }
+                    };
+                    return (
+                        crate::ssh_agent::Attribution {
+                            seat,
+                            exec_id: Some(es.exec_id),
+                            attributed: true,
+                        },
+                        role,
+                    );
+                }
+                if let Some(None) = exec_lookup(inner) {
+                    // An exec whose client had no seat: the exec is known
+                    // but carries no identity — deny, never guess.
+                    return (crate::ssh_agent::Attribution::unattributed(), None);
+                }
+            }
+            pid = st.ppid;
+        }
+        (crate::ssh_agent::Attribution::unattributed(), None)
     }
 
     /// Next request sequence number (supervisor-assigned, never reused).
@@ -1609,10 +1714,13 @@ impl Shared {
             }
         });
         // 0.6.1: record the exec's seat for its network records.
-        self.exec_seats
-            .lock()
-            .expect("exec_seats")
-            .insert(sp.pid, client.seat.clone());
+        self.exec_seats.lock().expect("exec_seats").insert(
+            sp.pid,
+            Some(ExecSeat {
+                seat: client.seat.clone(),
+                exec_id: format!("e-{exec_id}"),
+            }),
+        );
         let ident = ExecIdent {
             exec_id,
             pid: sp.pid,
@@ -3948,6 +4056,7 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
             username,
             declared_env,
             ssh,
+            ssh_agent_socket: args.ssh_agent_socket.as_deref(),
             sdir,
         },
         &mut rules,
@@ -4056,6 +4165,7 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
         forwards,
         ssh_proxy_listener: prepared.ssh_proxy_listener,
         ssh,
+        ssh_upstream: prepared.ssh_upstream,
         session_id,
     })?;
     let shared = control.shared;
@@ -4084,6 +4194,7 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
                 .expect("exec_seats")
                 .get(&pid)
                 .cloned()
+                .and_then(|e| e.map(|es| es.seat))
         })
     };
     let _exec_engine = exec_net_listener.map(|l| {
@@ -4258,6 +4369,10 @@ struct PreparedEnv {
     session_env: std::collections::BTreeMap<String, String>,
     exec_rules: ExecRules,
     ssh_proxy_listener: Option<UnixListener>,
+    /// 0.6.7: the resolved upstream agent socket, read once here (host
+    /// side). `start_control` reads this, never re-reads `SSH_AUTH_SOCK`,
+    /// so a caller socket can never silently fall back to the default.
+    ssh_upstream: Option<String>,
 }
 
 struct PrepareEnvArgs<'a> {
@@ -4267,6 +4382,8 @@ struct PrepareEnvArgs<'a> {
     username: &'a str,
     declared_env: &'a std::collections::BTreeMap<String, String>,
     ssh: Option<&'a profile::SshConfig>,
+    /// 0.6.7: `--ssh-agent-socket` (CLI wins over the profile key).
+    ssh_agent_socket: Option<&'a str>,
     sdir: &'a SessionDir,
 }
 
@@ -4323,12 +4440,19 @@ fn prepare_session_env(a: &mut PrepareEnvArgs<'_>, rules: &mut Rules) -> Result<
     let mut ssh_proxy_listener: Option<UnixListener> = None;
     let ssh_agent_expose = "/run/ssh-agent.sock";
     let mut ssh_sock_expose: Option<&str> = None;
+    let mut ssh_upstream: Option<String> = None;
     if let Some(ssh_cfg) = ssh
         && ssh_cfg.agent
     {
-        let host_auth_sock = std::env::var("SSH_AUTH_SOCK")
-            .context("ssh-agent: SSH_AUTH_SOCK is not set (agent = true requires a host agent)")?;
+        // 0.6.7: CLI wins over the profile key, which wins over SSH_AUTH_SOCK.
+        let host_auth_sock = match a.ssh_agent_socket.or(ssh_cfg.socket.as_deref()) {
+            Some(p) => p.to_owned(),
+            None => std::env::var("SSH_AUTH_SOCK").context(
+                "ssh-agent: SSH_AUTH_SOCK is not set (agent = true requires a host agent)",
+            )?,
+        };
         crate::ssh_agent::check_host_agent(&host_auth_sock)?;
+        ssh_upstream = Some(host_auth_sock);
         let proxy_socket_path = sdir.path.join("ssh-agent.sock");
         ssh_proxy_listener = Some(
             crate::ssh_agent::bind_proxy_socket(&proxy_socket_path).context("ssh-agent proxy")?,
@@ -4360,6 +4484,7 @@ fn prepare_session_env(a: &mut PrepareEnvArgs<'_>, rules: &mut Rules) -> Result<
         session_env,
         exec_rules,
         ssh_proxy_listener,
+        ssh_upstream,
     })
 }
 
@@ -4629,6 +4754,8 @@ struct SessionControlArgs<'a> {
     forwards: &'a [profile::Forward],
     ssh_proxy_listener: Option<UnixListener>,
     ssh: Option<&'a profile::SshConfig>,
+    /// 0.6.7: resolved upstream from prepare (never re-read from the env).
+    ssh_upstream: Option<String>,
     session_id: &'a str,
 }
 
@@ -4744,16 +4871,26 @@ fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
     // into the sandbox. The listener was bound before unshare (single-
     // threaded); the accept loop is spawned now (post-clone, multithreaded).
     if let Some(listener) = ssh_proxy_listener.take() {
-        let host_auth_sock = std::env::var("SSH_AUTH_SOCK").unwrap_or_default();
+        // Resolved once in prepare; never re-read SSH_AUTH_SOCK here (an
+        // env change after prepare must not change the upstream).
+        let host_auth_sock = a.ssh_upstream.clone().unwrap_or_default();
         let ssh_keys = a
             .ssh
             .and_then(|c| if c.agent { Some(c.keys.clone()) } else { None })
             .unwrap_or_default();
+        // 0.6.7: sign records go through the same bounded queue as network
+        // records; attribution walks the peer pid's ancestry.
+        let sign_journal = Some(shared.journal.clone_for_engine());
+        let attr_shared = Arc::clone(&shared);
+        let attribute: crate::ssh_agent::AttributionFn =
+            Arc::new(move |peer_pid| attr_shared.attribute_sign_client(peer_pid));
         let _ssh_handle = crate::ssh_agent::spawn_accept_loop(
             listener,
             host_auth_sock,
             ssh_keys,
             a.session_id.to_owned(),
+            sign_journal,
+            Some(attribute),
         );
         let proxy_socket_path = a.sdir.path.join("ssh-agent.sock");
         if let Err(e) = shared.do_forward_inner(
@@ -6264,6 +6401,7 @@ mod tests {
             name: None,
             network: Some(crate::cli::NetworkArg::Host),
             allow_host_abstract_sockets: false,
+            ssh_agent_socket: None,
             quiet_risk: false,
             home_persist: None,
             rootfs_path: None,

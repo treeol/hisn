@@ -56,7 +56,7 @@ mod wait;
 /// The `--wait` wait loop (0.6.7). Re-exported for `journal_cmd`.
 #[cfg(unix)]
 pub use wait::{
-    EXIT_WAIT_SESSION_ENDED, EXIT_WAIT_TIMEOUT, E_WAIT_SESSION_ENDED, E_WAIT_TIMEOUT, WaitBackend,
+    E_WAIT_SESSION_ENDED, E_WAIT_TIMEOUT, EXIT_WAIT_SESSION_ENDED, EXIT_WAIT_TIMEOUT, WaitBackend,
     WaitOutcome, Waiter, cursor_after,
 };
 
@@ -247,12 +247,23 @@ struct NetCounts {
     dns: u64,
     result_connected: u64,
     result_other: u64,
+    sign_ok: u64,
+    sign_refused: u64,
+    sign_error: u64,
 }
 
 impl NetCounts {
     fn add(&mut self, kind: &str, data: &Value) {
         if kind == "network/dns" {
             self.dns += 1;
+            return;
+        }
+        if kind == "ssh/sign" {
+            match data.get("result").and_then(Value::as_str) {
+                Some("ok") => self.sign_ok += 1,
+                Some("refused") => self.sign_refused += 1,
+                _ => self.sign_error += 1,
+            }
             return;
         }
         if kind == "network/connect-result" {
@@ -272,7 +283,15 @@ impl NetCounts {
         }
     }
     fn total(&self) -> u64 {
-        self.allow + self.refuse + self.cont + self.dns + self.result_connected + self.result_other
+        self.allow
+            + self.refuse
+            + self.cont
+            + self.dns
+            + self.result_connected
+            + self.result_other
+            + self.sign_ok
+            + self.sign_refused
+            + self.sign_error
     }
 }
 
@@ -352,11 +371,28 @@ fn net_writer(
             "dns": over.dns,
             "result_connected": over.result_connected,
             "result_other": over.result_other,
+            "sign_ok": over.sign_ok,
+            "sign_refused": over.sign_refused,
+            "sign_error": over.sign_error,
             "dropped": lost,
             "tracked_overflow": over_tracked,
         });
+        let sign_summary = (over.sign_ok + over.sign_refused + over.sign_error) > 0;
+        let sign_data = json!({
+            "ok": over.sign_ok,
+            "refused": over.sign_refused,
+            "error": over.sign_error,
+            "dropped": lost,
+        });
         *over = NetCounts::default();
         if journal.append_inner("network/summary", None, data).is_err() {
+            journal.failures.fetch_add(1, Ordering::Relaxed);
+        }
+        if sign_summary
+            && journal
+                .append_inner("ssh/sign-summary", None, sign_data)
+                .is_err()
+        {
             journal.failures.fetch_add(1, Ordering::Relaxed);
         }
     };
@@ -447,6 +483,12 @@ impl Journal {
             retention_bytes: self.retention_bytes,
             net_queue: None,
         }
+    }
+
+    /// Test-only: a handle sharing this handle's queue (no new writer).
+    #[cfg(test)]
+    pub(crate) fn plain_clone_for_test(&self) -> Self {
+        self.clone_for_engine()
     }
 
     fn clone_for_engine_with_cap(&self, cap: usize) -> Self {
@@ -603,6 +645,31 @@ impl Journal {
     /// [`Journal::net_record`].
     pub fn dns_record(&self, data: Value) {
         self.net_enqueue("network/dns", data);
+    }
+
+    /// One ssh-agent SIGN_REQUEST the proxy handled (`ssh/sign`, 0.6.7).
+    /// `fingerprint` is the `SHA256:…` key fingerprint or null when the
+    /// envelope was unparseable; `seat`/`exec_id` are the attribution (null
+    /// when unattributed) with `attributed: false` as the explicit marker;
+    /// `result` is `ok`/`refused`/`error`. Never the data being signed,
+    /// never the signature, never the key blob. Same queue discipline as
+    /// [`Journal::net_record`]: a sign never waits on a journal write.
+    pub fn sign_record(
+        &self,
+        fingerprint: Option<&str>,
+        seat: Option<&str>,
+        exec_id: Option<&str>,
+        attributed: bool,
+        result: &str,
+    ) {
+        let data = json!({
+            "fingerprint": fingerprint.map(Value::from).unwrap_or(Value::Null),
+            "seat": seat.map(Value::from).unwrap_or(Value::Null),
+            "attributed": attributed,
+            "exec_id": exec_id.map(Value::from).unwrap_or(Value::Null),
+            "result": result,
+        });
+        self.net_enqueue("ssh/sign", data);
     }
 
     fn net_enqueue(&self, kind: &'static str, data: Value) {
@@ -1807,15 +1874,41 @@ fn summary_for(rec: &JournalRecord) -> String {
         "network/summary" => {
             let n = |k: &str| d.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
             format!(
-                "not recorded one by one: allow={} refuse={} continue={} dns={} result_connected={} result_other={} dropped={} tracked_overflow={}",
+                "not recorded one by one: allow={} refuse={} continue={} dns={} result_connected={} result_other={} sign_ok={} sign_refused={} sign_error={} dropped={} tracked_overflow={}",
                 n("allow"),
                 n("refuse"),
                 n("continue"),
                 n("dns"),
                 n("result_connected"),
                 n("result_other"),
+                n("sign_ok"),
+                n("sign_refused"),
+                n("sign_error"),
                 n("dropped"),
                 n("tracked_overflow"),
+            )
+        }
+        "ssh/sign" => {
+            let field = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+            let seat = d
+                .get("seat")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unattributed");
+            format!(
+                "sign {} {}]",
+                escape_terminal(field("result")),
+                escape_terminal(field("fingerprint")),
+            )
+            .replace("]", &format!("] seat={}", escape_terminal(seat)))
+        }
+        "ssh/sign-summary" => {
+            let n = |k: &str| d.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            format!(
+                "signs not recorded one by one: ok={} refused={} error={} dropped={}",
+                n("ok"),
+                n("refused"),
+                n("error"),
+                n("dropped"),
             )
         }
         "journal/pruned" => {

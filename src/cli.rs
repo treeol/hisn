@@ -141,6 +141,12 @@ pub struct RunArgs {
     /// Accept `network = "host"` even without Landlock abstract-socket scoping.
     #[arg(long)]
     pub allow_host_abstract_sockets: bool,
+    /// Caller-provided ssh-agent socket (0.6.7): proxy this agent instead
+    /// of the host's `SSH_AUTH_SOCK`. Requires `[ssh] agent = true` in the
+    /// profile; wins over the profile `[ssh] socket` key when both are set.
+    /// Absolute path only.
+    #[arg(long = "ssh-agent-socket", value_name = "PATH")]
+    pub ssh_agent_socket: Option<String>,
     /// Suppress risk label output on start.
     #[arg(long)]
     pub quiet_risk: bool,
@@ -214,6 +220,13 @@ impl RunArgs {
             return Err(format!(
                 "invalid --workspace name {w:?} (allowed: [A-Za-z0-9._-]{{1,64}}, no leading '.')"
             ));
+        }
+        // 0.6.7: a caller-provided agent socket must be absolute; it is
+        // checked against the profile by the supervisor.
+        if let Some(p) = &self.ssh_agent_socket
+            && !p.starts_with('/')
+        {
+            return Err("--ssh-agent-socket must be an absolute path".to_string());
         }
         Ok(())
     }

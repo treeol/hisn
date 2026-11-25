@@ -1060,9 +1060,8 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
     let mut cursor_behind = false;
     let (recs, skipped) = if let Some(after) = a.after_wseq {
         if let Some(wait_arg) = a.wait {
-            let deadline = wait_arg.map(|secs| {
-                std::time::Instant::now() + std::time::Duration::from_secs(secs)
-            });
+            let deadline = wait_arg
+                .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs));
             let mut waiter =
                 journal::Waiter::production(dir.clone(), after, session_filter.clone());
             let q = journal::Query {
@@ -1159,9 +1158,7 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
                         a.json,
                         journal::EXIT_WAIT_TIMEOUT,
                         journal::E_WAIT_TIMEOUT,
-                        &format!(
-                            "no matching record after wseq {after} within the --wait timeout"
-                        ),
+                        &format!("no matching record after wseq {after} within the --wait timeout"),
                     ));
                 }
             }

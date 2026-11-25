@@ -163,6 +163,10 @@ L121
 L122
 L123
 L124
+L91
+L91: --ssh-agent-socket wins over SSH_AUTH_SOCK (lists key4)
+L91: sign via the caller socket succeeds
+L91: ssh/sign record carries fingerprint, seat, exec id; no payload bytes
 L90: timeout socket: O_NONBLOCK set
 L117: non-blocking connect to the blackhole returns EINPROGRESS in under 100 ms
 L117: the program's own SO_ERROR after POLLOUT is ECONNREFUSED

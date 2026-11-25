@@ -232,6 +232,19 @@ impl Profile {
     /// `[[host_services]]`, and `[docker]`. Enforces risk_ack matching
     /// (§16–§18) and path sanity.
     fn validate_surface(&self) -> Result<()> {
+        if let Some(ssh) = &self.ssh {
+            // 0.6.7: a caller-provided agent socket only makes sense for
+            // the proxy it feeds; a `socket` with `agent = false` is the
+            // same mistake as `--ssh-agent-socket` without `[ssh] agent`.
+            if let Some(socket) = &ssh.socket {
+                if !ssh.agent {
+                    bail!("[ssh]: socket = {:?} requires agent = true", socket);
+                }
+                if !socket.starts_with('/') {
+                    bail!("[ssh]: socket must be an absolute path");
+                }
+            }
+        }
         if let Some(n) = &self.net
             && let Some(ns) = &n.nameservers
         {
@@ -550,6 +563,12 @@ pub struct SshConfig {
     /// Optional fingerprint allowlist (`SHA256:…`). Empty/absent = all keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
+    /// 0.6.7: caller-provided agent socket to proxy through. When `Some`,
+    /// it is the upstream instead of the host's `SSH_AUTH_SOCK` (the CLI
+    /// `--ssh-agent-socket` flag wins over this key when both are given).
+    /// Requires `agent = true`; validated to be an absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
 }
 
 /// A `[[services]]` table: start a long-lived process inside the sandbox

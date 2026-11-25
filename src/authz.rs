@@ -126,6 +126,7 @@ pub fn allows(role: Role, op: Op) -> bool {
                 | Op::ExecStatus
                 | Op::ExecOutput
                 | Op::ExecSignal
+                | Op::Sign
         ),
         Role::Observer => matches!(
             op,
@@ -154,6 +155,12 @@ pub enum Op {
     SeatLs,
     SeatSetRole,
     SeatRevoke,
+    /// 0.6.7: an ssh-agent SIGN_REQUEST through the session's agent proxy.
+    /// `Op::of` has no arm producing this (no control `Request` maps to
+    /// it): the proxy checks the pure predicate `allows(role, Sign)`
+    /// directly and never holds an `Authorized`, so no wire request can
+    /// produce `Op::Sign`.
+    Sign,
 }
 
 impl Op {
@@ -196,6 +203,7 @@ impl Op {
             Op::SeatLs => "seat-ls",
             Op::SeatSetRole => "seat-set-role",
             Op::SeatRevoke => "seat-revoke",
+            Op::Sign => "sign",
         }
     }
 
@@ -836,6 +844,21 @@ mod tests {
         let o = cred("olga", Role::Owner);
         assert!(ask(&o, Op::ExecSignal, Some(&tgt(Some("dave")))).is_ok());
         assert!(ask(&o, Op::ExecSignal, None).is_ok());
+    }
+
+    #[test]
+    fn authz_sign_op_role_matrix_and_no_wire_producer() {
+        // 0.6.7: owner and member may sign, observer may not.
+        assert!(allows(Role::Owner, Op::Sign));
+        assert!(allows(Role::Member, Op::Sign));
+        assert!(!allows(Role::Observer, Op::Sign));
+        assert_eq!(Op::Sign.name(), "sign");
+        assert_eq!(Op::Sign.required_role(), Role::Member);
+        // No control Request maps to Op::Sign: `Op::of` over every variant
+        // in `every_op` never yields it.
+        for (op, req) in every_op() {
+            assert_ne!(Op::of(&req), Op::Sign, "wire request produced Sign: {op:?}");
+        }
     }
 
     #[test]

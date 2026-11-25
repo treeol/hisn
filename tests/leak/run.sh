@@ -2210,6 +2210,80 @@ else
   skip "L45 ssh-agent" "ssh-agent, ssh-add or ssh-keygen binary not found"
 fi
 
+# ================================================ L91: caller agent socket (0.6.7, HOST)
+# A second throwaway ssh-agent (key4 alone) is handed to the session via
+# --ssh-agent-socket. The env path already points SSH_AUTH_SOCK at the
+# L45 host agent (now holding key1+key2); the flag's agent must win:
+# `ssh-add -l` inside lists exactly key4, and a sign produces an
+# ssh/sign journal record carrying the fingerprint, seat and exec id and
+# no payload bytes. Skip: the L45 host-agent fixture (or the flag) is
+# unavailable.
+if [ -z "${L45_HOST_SOCK:-}" ]; then
+  skip "L91 caller agent socket sign journaled" "L45 host agent fixture unavailable"
+else
+  L91_CWD=$(new_cwd l91)
+  mkdir -p "$WORK/l91-keys"
+  L91_KEY4="$WORK/l91-keys/key4"
+  ssh-keygen -t ed25519 -f "$L91_KEY4" -N "" -q 2>/dev/null
+  mkdir -p "$L91_CWD/pub"
+  cp "$L91_KEY4.pub" "$L91_CWD/pub/key4.pub"
+  printf 'L91-sign-me-marker' >"$L91_CWD/msg"
+  L91_SAVED_SOCK="${SSH_AUTH_SOCK:-}"
+  L91_SAVED_PID="${SSH_AGENT_PID:-}"
+  unset SSH_AUTH_SOCK SSH_AGENT_PID
+  eval "$(ssh-agent -s 2>/dev/null)" >/dev/null 2>&1
+  L91_AGENT_SOCK="${SSH_AUTH_SOCK:-}"
+  L91_AGENT_PID="${SSH_AGENT_PID:-}"
+  if [ -n "$L91_AGENT_SOCK" ] && [ "$L91_AGENT_SOCK" != "$L91_SAVED_SOCK" ] && [ -n "$L91_AGENT_PID" ]; then
+    ssh-add "$L91_KEY4" >/dev/null 2>&1
+  fi
+  if [ -n "$L91_AGENT_SOCK" ] && [ "$L91_AGENT_SOCK" != "$L91_SAVED_SOCK" ] && [ -n "$L91_AGENT_PID" ] \
+     && [ "$(ssh-add -l 2>/dev/null | grep -c SHA256:)" = 1 ]; then
+    L91_FP4=$(ssh-keygen -lf "$L91_KEY4.pub" | awk '{print $2}')
+    L91_PROFILE="$WORK/L91-profile.toml"
+    write_profile "$L91_PROFILE" "$L91_CWD" '[ssh]' 'agent = true'
+    if start_profile_session l91-$$ "$L91_CWD" "$L91_PROFILE" --ssh-agent-socket "$L91_AGENT_SOCK"; then
+      # The flag's agent wins over SSH_AUTH_SOCK: exactly key4 is listed.
+      r=$(q "$L91_CWD" "exec-out ssh-add -l")
+      if [ "$(printf '%s\n' "$r" | grep -c SHA256:)" = 1 ] && printf '%s' "$r" | grep -q "$L91_FP4"; then
+        pass "L91 --ssh-agent-socket wins over SSH_AUTH_SOCK (lists key4)"
+      else
+        fail "L91 caller socket" "ssh-add -l: $r"
+      fi
+      r=$(q "$L91_CWD" "exec-out ssh-keygen -Y sign -n hisnleak -f $L91_CWD/pub/key4.pub $L91_CWD/msg")
+      if [ "$(exit_of "$r")" = 0 ] && [ -s "$L91_CWD/msg.sig" ]; then
+        pass "L91 sign via the caller socket succeeds"
+      else
+        fail "L91 sign" "ssh-keygen -Y sign: $r"
+      fi
+      L91_WS=$(ls_workspace_id "l91-$$")
+      # The journal record carries fingerprint/seat/exec id, no payload.
+      L91_REC=""
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        L91_REC=$(timeout 5 "$HISN" journal --workspace "$L91_WS" --kind ssh/sign --json 2>/dev/null | head -c 4000)
+        printf '%s' "$L91_REC" | grep -q '"kind": "ssh/sign"' && break
+        sleep 0.3
+      done
+      if printf '%s' "$L91_REC" | grep -q "$L91_FP4" && printf '%s' "$L91_REC" | grep -q '"exec_id": "e-' \
+         && printf '%s' "$L91_REC" | grep -q '"attributed": true' \
+         && ! printf '%s' "$L91_REC" | grep -q "L91-sign-me-marker"; then
+        pass "L91 ssh/sign record carries fingerprint, seat, exec id; no payload bytes"
+      else
+        fail "L91 ssh/sign record" "rec=[$(printf '%s' "$L91_REC" | head -c 300)]"
+      fi
+      end_session "$L91_CWD" "$S_PID"
+    else
+      fail "L91 caller agent socket" "session did not start"
+    fi
+    kill "$L91_AGENT_PID" 2>/dev/null
+  else
+    skip "L91 caller agent socket sign journaled" "second ssh-agent did not start or key not loaded"
+    [ -n "${L91_AGENT_PID:-}" ] && kill "$L91_AGENT_PID" 2>/dev/null
+  fi
+  if [ -n "$L91_SAVED_SOCK" ]; then export SSH_AUTH_SOCK="$L91_SAVED_SOCK"; else unset SSH_AUTH_SOCK; fi
+  if [ -n "$L91_SAVED_PID" ]; then export SSH_AGENT_PID="$L91_SAVED_PID"; else unset SSH_AGENT_PID; fi
+fi
+
 # ================================================ L46: rootfs symlink traps (0.3.2, needs HISN_TEST_ROOTFS)
 # On a test copy of the rootfs: symlinks in /usr/local/bin pointing (relative
 # and absolute) at a real host marker file must not reach it from the session;

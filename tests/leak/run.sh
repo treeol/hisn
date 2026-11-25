@@ -4147,8 +4147,7 @@ open(sys.argv[1], 'a').write(json.dumps(rec) + chr(10))
   }
   if start_session l90wait-$$ "$L90_CWD" "$L90_POL" --detach; then
     L90_WS=$(ls_workspace_id "l90wait-$$")
-    WDIR="$XDG_STATE_HOME/hisn/workspaces/$L90_WS"
-    [ -z "$WDIR" ] && WDIR="$HOME/.local/state/hisn/workspaces/$L90_WS"
+    WDIR="${XDG_STATE_HOME:-$HOME/.local/state}/hisn/workspaces/$L90_WS"
     # -- case 1: wait-then-append
     W_NOW=$("$HISN" journal --workspace "$L90_WS" --info 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['last_wseq'] or 0)")
     ( sleep 0.5; append_note "$(journal_file)" "L90-wait-wake" ) &

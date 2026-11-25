@@ -39,7 +39,7 @@ pub const E_NOT_SUPPORTED: &str = "E_NOT_SUPPORTED";
 /// unknown-key errors from the TOML deserializer, which exposes no structured
 /// enum to distinguish them), `E_PROFILE_VALUE` (validation failures with a
 /// known path, and resolve/plan failures).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProfileError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -145,6 +145,22 @@ impl Profile {
         Self::parse_inner(text)
     }
 
+    /// 0.6.7 (C4): parse without the surface validation, so `validate_json`
+    /// can collect every post-parse error. The TOML/serde stage is the
+    /// phase boundary: a parse failure yields one error by nature.
+    pub fn parse_structured_no_surface(text: &str) -> std::result::Result<Self, ProfileError> {
+        let p: Profile = toml::from_str(text).map_err(|e| {
+            let mut pe = ProfileError::parse(format!("{e}"));
+            if let Some(span) = e.span() {
+                let (line, column) = line_col(text, span.start);
+                pe.line = Some(line);
+                pe.column = Some(column);
+            }
+            pe
+        })?;
+        Ok(p)
+    }
+
     fn parse_inner(text: &str) -> std::result::Result<Self, ProfileError> {
         let p: Profile = toml::from_str(text).map_err(|e| {
             let mut pe = ProfileError::parse(format!("{e}"));
@@ -230,50 +246,78 @@ impl Profile {
 
     /// Validate the 0.3 surface tables: `[[services]]`, `[[forward]]`,
     /// `[[host_services]]`, and `[docker]`. Enforces risk_ack matching
-    /// (§16–§18) and path sanity.
+    /// (§16–§18) and path sanity. Fail-fast (first error), as the text
+    /// path and `Profile::parse` have always been.
     fn validate_surface(&self) -> Result<()> {
+        let errors = self.surface_errors();
+        if let Some(e) = errors.into_iter().next() {
+            bail!("{e}");
+        }
+        Ok(())
+    }
+
+    /// 0.6.7 (C4): every surface error, in deterministic order. The
+    /// fail-fast `validate_surface` above is its first element; nothing
+    /// else. Each check below appends instead of bailing, so one bad
+    /// table cannot hide another.
+    fn surface_errors(&self) -> Vec<String> {
+        let mut errors: Vec<String> = Vec::new();
+        let mut push = |e: String| errors.push(e);
+        self.surface_errors_into(&mut push);
+        errors
+    }
+
+    fn surface_errors_into(&self, push: &mut impl FnMut(String)) {
         if let Some(ssh) = &self.ssh {
             // 0.6.7: a caller-provided agent socket only makes sense for
             // the proxy it feeds; a `socket` with `agent = false` is the
             // same mistake as `--ssh-agent-socket` without `[ssh] agent`.
             if let Some(socket) = &ssh.socket {
                 if !ssh.agent {
-                    bail!("[ssh]: socket = {:?} requires agent = true", socket);
+                    push(format!(
+                        "[ssh]: socket = {:?} requires agent = true",
+                        socket
+                    ));
                 }
                 if !socket.starts_with('/') {
-                    bail!("[ssh]: socket must be an absolute path");
+                    push(format!("[ssh]: socket must be an absolute path"));
                 }
             }
         }
         if let Some(n) = &self.net
             && let Some(ns) = &n.nameservers
         {
-            validate_nameservers(ns)?;
+            if let Err(e) = validate_nameservers(ns) {
+                push(format!("{e}"));
+            }
         }
         // Validate [[services]] (§19).
         let mut service_names = std::collections::HashSet::new();
         for s in &self.services {
             if s.name.is_empty() {
-                bail!("[[services]]: name must not be empty");
+                push(format!("[[services]]: name must not be empty"));
             }
             if !service_names.insert(s.name.as_str()) {
-                bail!("[[services]]: duplicate name {:?}", s.name);
+                push(format!("[[services]]: duplicate name {:?}", s.name));
             }
             if s.exec.is_empty() {
-                bail!("[[services]] {}: exec must not be empty", s.name);
+                push(format!("[[services]] {}: exec must not be empty", s.name));
             }
             for arg in &s.exec {
-                Self::check_no_nul(arg, &format!("[[services]] {}: exec arg", s.name))?;
+                if let Err(e) =
+                    Self::check_no_nul(arg, &format!("[[services]] {}: exec arg", s.name))
+                {
+                    push(format!("{e}"));
+                }
             }
             // restart = "none" only in 0.3.
             match s.restart.as_deref() {
                 None | Some("none") => {}
                 Some(other) => {
-                    bail!(
+                    push(format!(
                         "E_NOT_SUPPORTED: [[services]] {}: restart = {:?} is not available in 0.3 (only \"none\")",
-                        s.name,
-                        other
-                    );
+                        s.name, other
+                    ));
                 }
             }
             // ready for [[services]] only supports `socket` (stat from
@@ -285,72 +329,87 @@ impl Profile {
                 && let Some(t) = r.timeout
                 && t > MAX_TIMEOUT_SECS
             {
-                bail!(
+                push(format!(
                     "[[services]] {}: ready.timeout {t} exceeds maximum {MAX_TIMEOUT_SECS} seconds",
                     s.name
-                );
+                ));
             }
             if let Some(stop) = &s.stop {
                 if stop.grace > MAX_TIMEOUT_SECS {
-                    bail!(
+                    push(format!(
                         "[[services]] {}: stop.grace {} exceeds maximum {} seconds",
-                        s.name,
-                        stop.grace,
-                        MAX_TIMEOUT_SECS
-                    );
+                        s.name, stop.grace, MAX_TIMEOUT_SECS
+                    ));
                 }
-                Self::check_no_nul(
+                if let Err(e) = Self::check_no_nul(
                     &stop.signal,
                     &format!("[[services]] {}: stop.signal", s.name),
-                )?;
+                ) {
+                    push(format!("{e}"));
+                }
             }
         }
         for f in &self.forwards {
             if f.name.is_empty() {
-                bail!("[[forward]]: name must not be empty");
+                push(format!("[[forward]]: name must not be empty"));
             }
             if !f.socket.starts_with('/') {
-                bail!("[[forward]] {}: socket must be an absolute path", f.name);
+                push(format!(
+                    "[[forward]] {}: socket must be an absolute path",
+                    f.name
+                ));
             }
             if !f.expose.starts_with('/') {
-                bail!("[[forward]] {}: expose must be an absolute path", f.name);
+                push(format!(
+                    "[[forward]] {}: expose must be an absolute path",
+                    f.name
+                ));
             }
             // Compute the label and check risk_ack (§16).
             let label = forward_label(&f.socket, f.risk.as_deref());
             if label == RiskLabel::None && f.risk.is_none() {
                 // Unknown socket with no explicit risk → load error
-                bail!(
+                push(format!(
                     "E_RISK_ACK_REQUIRED: [[forward]] {}: unknown socket {} — set `risk` explicitly (minimum host-exec)",
-                    f.name,
-                    f.socket
-                );
+                    f.name, f.socket
+                ));
             }
             if label.requires_ack() {
                 let subject = format!("[[forward]] {}:", f.name);
-                Self::check_risk_ack(&subject, Some(&f.socket), label, &f.risk_ack)?;
+                if let Err(e) = Self::check_risk_ack(&subject, Some(&f.socket), label, &f.risk_ack)
+                {
+                    push(format!("{e}"));
+                }
             }
         }
         for h in &self.host_services {
             if h.name.is_empty() {
-                bail!("[[host_services]]: name must not be empty");
+                push(format!("[[host_services]]: name must not be empty"));
             }
             if h.exec.is_empty() {
-                bail!("[[host_services]] {}: exec must not be empty", h.name);
+                push(format!(
+                    "[[host_services]] {}: exec must not be empty",
+                    h.name
+                ));
             }
             for arg in &h.exec {
-                Self::check_no_nul(arg, &format!("[[host_services]] {}: exec arg", h.name))?;
+                if let Err(e) =
+                    Self::check_no_nul(arg, &format!("[[host_services]] {}: exec arg", h.name))
+                {
+                    push(format!("{e}"));
+                }
             }
             if !h.socket.starts_with('/') {
-                bail!(
+                push(format!(
                     "[[host_services]] {}: socket must be an absolute path",
                     h.name
-                );
+                ));
             }
             if !h.expose.starts_with('/') {
-                bail!(
+                push(format!(
                     "[[host_services]] {}: expose must be an absolute path",
                     h.name
-                );
+                ));
             }
             // host_services always requires host-exec for the execution
             // itself, plus the socket's label. For an unknown socket
@@ -375,73 +434,84 @@ impl Profile {
             // `[[host_services]]` always requires an ack: its effective
             // label is at least `host-exec` (the execution itself), so the
             // ack must match it (None is an error, not "no ack needed").
-            Self::check_risk_ack(
+            if let Err(e) = Self::check_risk_ack(
                 &format!("[[host_services]] {}:", h.name),
                 None,
                 effective,
                 &h.risk_ack,
-            )?;
+            ) {
+                push(format!("{e}"));
+            }
             // Readiness and stop validation.
             if let Some(r) = &h.ready {
                 if r.tcp.is_some() {
-                    bail!(
+                    push(format!(
                         "E_NOT_SUPPORTED: [[host_services]] {}: ready.tcp is not implemented",
                         h.name
-                    );
+                    ));
                 }
                 if let Some(cmd) = &r.command {
                     for arg in cmd {
-                        Self::check_no_nul(
+                        if let Err(e) = Self::check_no_nul(
                             arg,
                             &format!("[[host_services]] {}: ready.command arg", h.name),
-                        )?;
+                        ) {
+                            push(format!("{e}"));
+                        }
                     }
                 }
                 if let Some(t) = r.timeout
                     && t > MAX_TIMEOUT_SECS
                 {
-                    bail!(
+                    push(format!(
                         "[[host_services]] {}: ready.timeout {t} exceeds maximum {MAX_TIMEOUT_SECS} seconds",
                         h.name
-                    );
+                    ));
                 }
             }
             if let Some(stop) = &h.stop {
                 if stop.grace > MAX_TIMEOUT_SECS {
-                    bail!(
+                    push(format!(
                         "[[host_services]] {}: stop.grace {} exceeds maximum {} seconds",
-                        h.name,
-                        stop.grace,
-                        MAX_TIMEOUT_SECS
-                    );
+                        h.name, stop.grace, MAX_TIMEOUT_SECS
+                    ));
                 }
-                Self::check_no_nul(
+                if let Err(e) = Self::check_no_nul(
                     &stop.signal,
                     &format!("[[host_services]] {}: stop.signal", h.name),
-                )?;
+                ) {
+                    push(format!("{e}"));
+                }
             }
         }
         // [docker] tier validation (§18).
         if let Some(d) = &self.docker {
-            let tier = docker_tier(d)?;
+            let tier = match docker_tier(d) {
+                Ok(t) => t,
+                Err(e) => {
+                    push(format!("{e}"));
+                    return;
+                }
+            };
             if tier == "socket" {
                 let label = RiskLabel::RootEquivalent;
                 if d.risk_ack.is_none() {
                     // The `[docker]` subject names only the tier in the
                     // required message (byte-identical to the former copy).
-                    bail!(
+                    push(format!(
                         "E_RISK_ACK_REQUIRED: [docker] tier = \"socket\" requires risk_ack = \"{}\"",
                         label.kebab()
-                    );
+                    ));
                 }
                 // The required message keeps its colon-less form via the
                 // helper's None path is NOT what we want: see helper docs —
                 // the colon-less `[docker]` text is produced by the explicit
                 // None bail above; the helper handles the mismatch here.
-                Self::check_risk_ack("[docker]", None, label, &d.risk_ack)?;
+                if let Err(e) = Self::check_risk_ack("[docker]", None, label, &d.risk_ack) {
+                    push(format!("{e}"));
+                }
             }
         }
-        Ok(())
     }
 
     /// Load and parse a profile from a file.
@@ -1232,17 +1302,20 @@ fn finish_validate(path: &Path, profile: Profile) -> Result<ResolvedPolicy> {
 }
 
 /// `hisn profile validate --json` (0.6.5, schema
-/// `hisn-profile-validation/v1`). Fail-fast: at most one error (the first),
-/// matching the anyhow behaviour of the text path. `warnings` is reserved
-/// (no producer today; emitted as `[]`).
+/// `hisn-profile-validation/v1`). 0.6.7 (C4): collects **all** post-parse
+/// errors, in deterministic order, dedup'd — version, policy, surface
+/// (every table), then the finish_validate stages. A TOML/serde parse
+/// failure stops immediately (one error by nature). `ok` and the exit
+/// codes are unchanged (the text path stays fail-fast). `warnings` is
+/// reserved (no producer today; emitted as `[]`).
 pub fn validate_json(path: Option<&Path>) -> (bool, Value) {
-    let fail = |e: ProfileError| {
+    let fail = |errors: Vec<ProfileError>| {
         (
             false,
             json!({
                 "schema": "hisn-profile-validation/v1",
                 "ok": false,
-                "errors": [e],
+                "errors": errors,
                 "warnings": [],
             }),
         )
@@ -1251,25 +1324,79 @@ pub fn validate_json(path: Option<&Path>) -> (bool, Value) {
         Some(p) => p.to_path_buf(),
         None => match resolve_profile_path("base") {
             Ok((p, _)) => p,
-            Err(e) => return fail(ProfileError::value(None, format!("{e}"))),
+            Err(e) => {
+                return fail(vec![ProfileError::value(None, format!("{e}"))]);
+            }
         },
     };
     // Read the text once so parse errors carry line/column.
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) => {
-            return fail(ProfileError::parse(format!(
+            return fail(vec![ProfileError::parse(format!(
                 "reading profile {}: {e}",
                 path.display()
-            )));
+            ))]);
         }
     };
-    let profile = match Profile::parse_structured(&text) {
+    let profile = match Profile::parse_structured_no_surface(&text) {
         Ok(p) => p,
-        Err(e) => return fail(e),
+        Err(e) => return fail(vec![e]),
     };
-    match finish_validate(&path, profile) {
-        Ok(_) => (
+    let mut errors: Vec<ProfileError> = Vec::new();
+    let mut push = |e: ProfileError| {
+        if !errors.contains(&e) {
+            errors.push(e);
+        }
+    };
+    // Version.
+    if profile.version != PROFILE_VERSION {
+        push(ProfileError::value(
+            Some("version".into()),
+            format!(
+                "version: must be \"{PROFILE_VERSION}\", got {:?}",
+                profile.version
+            ),
+        ));
+    }
+    // Inner policy.
+    if let Err(e) = profile.policy.validate() {
+        push(match e {
+            crate::policy::PolicyError::Invalid { key, reason } => {
+                ProfileError::value(Some(key.clone()), format!("{key}: {reason}"))
+            }
+            crate::policy::PolicyError::Parse(m) => ProfileError::parse(m),
+            crate::policy::PolicyError::Read { path, source } => {
+                ProfileError::parse(format!("cannot read {}: {source}", path.display()))
+            }
+        });
+    }
+    // Surface (every table).
+    for e in profile.surface_errors() {
+        push(ProfileError::value(None, e));
+    }
+    // Finish-validate stages (overrides / resolve / mount plan).
+    let finish = (|| {
+        let base = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let uid = rustix::process::getuid().as_raw();
+        let roots =
+            crate::session::runtime_roots(std::env::var("XDG_RUNTIME_DIR").ok().as_deref(), uid);
+        let overrides = profile.overrides()?;
+        let resolved = profile.resolve(base, &overrides, &roots)?;
+        let uid = rustix::process::getuid().as_raw();
+        let gid = rustix::process::getgid().as_raw();
+        let facts = crate::mounts::HostFacts::probe(&resolved, uid, gid, "user");
+        crate::mounts::plan(&resolved, &facts, &[]).map_err(|e| anyhow!("mount plan: {e}"))?;
+        Ok::<(), anyhow::Error>(())
+    })();
+    if let Err(e) = finish {
+        push(ProfileError::value(None, format!("{e}")));
+    }
+    if errors.is_empty() {
+        (
             true,
             json!({
                 "schema": "hisn-profile-validation/v1",
@@ -1277,8 +1404,9 @@ pub fn validate_json(path: Option<&Path>) -> (bool, Value) {
                 "errors": [],
                 "warnings": [],
             }),
-        ),
-        Err(e) => fail(ProfileError::value(None, format!("{e}"))),
+        )
+    } else {
+        fail(errors)
     }
 }
 
@@ -1351,6 +1479,35 @@ mod tests {
         let e = &v["errors"][0];
         assert_eq!(e["code"], "E_PROFILE_VALUE");
         assert_eq!(e["path"], "session.hostname");
+    }
+
+    #[test]
+    fn validate_json_reports_all_errors_not_only_the_first() {
+        // 0.6.7 (C4): two independent surface errors and a version error
+        // are all reported; a single-error caller sees a superset array.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("p.toml");
+        fs::write(
+            &p,
+            "version = \"wrong\"\n[policy]\nversion = \"hisn-policy/v1\"\n\
+             [[services]]\nname = \"\"\nexec = [\"true\"]\n\
+             [[forward]]\nname = \"f\"\nsocket = \"relative\"\nexpose = \"/x\"\n",
+        )
+        .unwrap();
+        let (ok, v) = validate_json(Some(&p));
+        assert!(!ok);
+        let errs = v["errors"].as_array().unwrap();
+        assert!(errs.len() >= 3, "errors: {errs:?}");
+        let msgs: Vec<&str> = errs
+            .iter()
+            .map(|e| e["message"].as_str().unwrap())
+            .collect();
+        assert!(msgs.iter().any(|m| m.contains("version")), "{msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("name must not be empty")),
+            "{msgs:?}"
+        );
+        assert!(msgs.iter().any(|m| m.contains("absolute path")), "{msgs:?}");
     }
 
     #[test]

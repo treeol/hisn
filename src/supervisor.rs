@@ -1957,7 +1957,11 @@ impl Shared {
         } else {
             self.detached.is_stopping()
         };
-        let cause = execlog::detached_cause(
+        // 0.6.7 (C3): the cause is provisional here and finalised under the
+        // `exec_table` lock below (the same lock `signal_exec` delivers
+        // through), so a late `exec-signal` arriving during the drain
+        // cannot slip into the gap between the check and the removal.
+        let mut cause = execlog::detached_cause(
             exit,
             stopping,
             w.entry.signalled.load(std::sync::atomic::Ordering::SeqCst),
@@ -1994,6 +1998,23 @@ impl Shared {
             true,
         );
         let (exec_id, pid) = (w.ident.exec_id, w.ident.pid);
+        // 0.6.7 (C3): finalise the cause inside the `exec_table` critical
+        // section that removes the entry. A signal delivered before this
+        // point set `signalled` under the same lock, so the check sees it;
+        // after removal `signal_exec` finds no entry and refuses. The
+        // `Exit::Code` arm is unaffected (`detached_cause` returns "exit"
+        // regardless), so a signal after a clean exit cannot misclassify.
+        {
+            let _g = self.exec_table.lock().expect("exec_table");
+            cause = execlog::detached_cause(
+                exit,
+                stopping,
+                w.entry.signalled.load(std::sync::atomic::Ordering::SeqCst),
+            );
+            if w.entry.snapshot().cause.as_deref() != Some(cause) {
+                w.entry.update(|st| st.cause = Some(cause.into()));
+            }
+        }
         let mut ident = w.ident;
         ident.detached = Some(DetachedIdent {
             incarnation: self.incarnation.clone(),

@@ -4038,6 +4038,97 @@ else
   skip "L89 seats with credentials and roles" "hisn check failed (no userns)"
 fi
 
+# ================================================ L90 wait cases (0.6.7, HOST)
+# `hisn journal --after-wseq N --wait [SECS]`:
+#   1. wait-then-append: with N at the journal's last wseq, a record
+#      appended after the wait starts wakes it; it prints that record and
+#      exits 0 (also with --json and --session, filtered to the new record).
+#   2. timeout: without an append the wait gives up after the given secs
+#      and exits 6 with E_WAIT_TIMEOUT (verified with the clock, and with
+#      --wait 0, which is a poll that never sleeps).
+#   3. rotation: while the wait is blocked the journal rotates (the file
+#      is renamed to journal.<gen>.jsonl and a fresh journal.jsonl
+#      appears); a record written to the new file still wakes the wait.
+#   4. session-end: a wait filtered to a session that ends while waiting
+#      exits 7 with E_WAIT_SESSION_ENDED and does not hang.
+# The wait never takes a session lock or holds one open, so it cannot
+# block session teardown (a hang would block the suite past the wrapper
+# timeout, unlike a quick wrong exit).
+if needs_host; then
+  L90_CWD=$(new_cwd l90wait)
+  L90_POL="$WORK/l90wait.toml"
+  write_policy "$L90_POL" "$L90_CWD"
+  WDIR=""
+  journal_file() { printf '%s\n' "$WDIR/journal.jsonl"; }
+  append_note() { # append_note PATH TEXT
+    python3 -c "
+import json, sys, time
+rec = {'v': 1, 'ts': '2026-11-25T00:00:00Z', 'wseq': 989999, 'session': 'l90wait', 'kind': 'note', 'data': {'text': sys.argv[2]}}
+open(sys.argv[1], 'a').write(json.dumps(rec) + chr(10))
+" "$1" "$2"
+  }
+  if start_session l90wait-$$ "$L90_CWD" "$L90_POL" --detach; then
+    L90_WS=$(ls_workspace_id "l90wait-$$")
+    WDIR="$XDG_STATE_HOME/hisn/workspaces/$L90_WS"
+    [ -z "$WDIR" ] && WDIR="$HOME/.local/state/hisn/workspaces/$L90_WS"
+    # -- case 1: wait-then-append
+    W_NOW=$("$HISN" journal --workspace "$L90_WS" --info 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['last_wseq'] or 0)")
+    ( sleep 0.5; append_note "$(journal_file)" "L90-wait-wake" ) &
+    L90_AP=$!
+    W_OUT=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 8 --session "l90wait-$$" --json 2>"$WORK/l90w.err"); W_RC=$?
+    wait $L90_AP 2>/dev/null
+    if [ $W_RC -eq 0 ] && printf '%s' "$W_OUT" | grep -q "L90-wait-wake"; then
+      pass "L90 journal --wait wakes on a later append and exits 0"
+    else
+      fail "L90 journal --wait wakes on a later append and exits 0" "rc=$W_RC out=[$(printf '%s' "$W_OUT" | head -c 200)] err=[$(head -c 200 "$WORK/l90w.err")]"
+    fi
+    # -- case 2: timeout (also covers --wait 0)
+    W_S=$(date +%s)
+    W_ERR=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq 989999 --wait 1 2>&1); W_RC=$?
+    W_E=$(date +%s)
+    if [ $W_RC -eq 6 ] && printf '%s' "$W_ERR" | grep -q "E_WAIT_TIMEOUT" && [ $((W_E - W_S)) -le 4 ]; then
+      pass "L90 journal --wait timeout exits 6 with E_WAIT_TIMEOUT"
+    else
+      fail "L90 journal --wait timeout exits 6 with E_WAIT_TIMEOUT" "rc=$W_RC elapsed=$((W_E - W_S))s out=[$(printf '%s' "$W_ERR" | head -c 200)]"
+    fi
+    W_ERR=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq 989999 --wait 0 2>&1); W_RC=$?
+    if [ $W_RC -eq 6 ] && printf '%s' "$W_ERR" | grep -q "E_WAIT_TIMEOUT"; then
+      pass "L90 journal --wait 0 is an immediate poll (exit 6)"
+    else
+      fail "L90 journal --wait 0 is an immediate poll" "rc=$W_RC out=[$(printf '%s' "$W_ERR" | head -c 200)]"
+    fi
+    # -- case 3: rotation while waiting
+    ( sleep 0.4; mv "$(journal_file)" "$WDIR/journal.3.jsonl"; : >"$(journal_file)"; append_note "$(journal_file)" "L90-rotated" ) &
+    L90_RP=$!
+    W_OUT=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 8 --json 2>"$WORK/l90r.err"); W_RC=$?
+    wait $L90_RP 2>/dev/null
+    if [ $W_RC -eq 0 ] && printf '%s' "$W_OUT" | grep -q "L90-rotated"; then
+      pass "L90 journal --wait survives rotation while waiting"
+    else
+      fail "L90 journal --wait survives rotation while waiting" "rc=$W_RC out=[$(printf '%s' "$W_OUT" | head -c 200)] err=[$(head -c 200 "$WORK/l90r.err")]"
+    fi
+    # -- case 4: session stops while waiting
+    ( sleep 0.4; "$HISN" stop --session "l90wait-$$" >/dev/null 2>&1 ) &
+    L90_SP=$!
+    W_ERR=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq 989999 --wait 8 --session "l90wait-$$" --kind note 2>&1); W_RC=$?
+    wait $L90_SP 2>/dev/null
+    if [ $W_RC -eq 7 ] && printf '%s' "$W_ERR" | grep -q "E_WAIT_SESSION_ENDED"; then
+      pass "L90 journal --wait returns 7 when the session ends"
+    else
+      fail "L90 journal --wait returns 7 when the session ends" "rc=$W_RC out=[$(printf '%s' "$W_ERR" | head -c 200)]"
+    fi
+  else
+    skip "L90 journal --wait" "session did not start"
+  fi
+  rm -rf "$L90_CWD"
+else
+  skip "L90 journal --wait wakes on a later append and exits 0" "hisn check failed (no userns)"
+  skip "L90 journal --wait timeout exits 6 with E_WAIT_TIMEOUT" "hisn check failed (no userns)"
+  skip "L90 journal --wait 0 is an immediate poll" "hisn check failed (no userns)"
+  skip "L90 journal --wait survives rotation while waiting" "hisn check failed (no userns)"
+  skip "L90 journal --wait returns 7 when the session ends" "hisn check failed (no userns)"
+fi
+
 # === 0.6.0 network cases (ADR 0022, open mode): L90, L94, L96-L100,
 # L102-L107, L109-L117, L119-L124. They live in net_cases.sh, which
 # scripts/host-verify-network.sh runs too. It runs inside a throwaway

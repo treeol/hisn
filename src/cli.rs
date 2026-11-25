@@ -600,10 +600,24 @@ pub struct JournalArgs {
     pub last: Option<usize>,
     /// Only records with a sequence number (`wseq`) greater than N, checked
     /// to be contiguous (0.6.3). Exit 3 when N is ahead of the newest record
-    /// (the journal was reset), exit 4 when the records have a hole. A
-    /// cursor for callers that poll; there is no follow mode.
+    /// (the journal was reset), exit 4 when the records have a hole. Exit 5
+    /// is unused and reserved. With `--wait` (0.6.7) the command blocks
+    /// until a matching record arrives instead of printing nothing.
     #[arg(long, value_name = "N", conflicts_with = "info")]
     pub after_wseq: Option<u64>,
+    /// Block until at least one record with `wseq` greater than
+    /// `--after-wseq` matches the other filters, then print it like the
+    /// non-wait path and exit 0. Give SECS to give up after that many
+    /// seconds (exit 6, `E_WAIT_TIMEOUT`); without SECS wait
+    /// indefinitely. With `--session`, a `session/stop` for that session
+    /// ends the wait too: exit 0 when records arrived, otherwise exit 7
+    /// (`E_WAIT_SESSION_ENDED`). A stop record written before the wait
+    /// began, or a session that died without writing one, is not
+    /// detected — the wait then ends only by timeout. Requires
+    /// `--after-wseq`. Works with `--json` and `--session`.
+    #[arg(long, value_name = "SECS", requires = "after_wseq", num_args = 0..=1,
+          conflicts_with = "info")]
+    pub wait: Option<Option<u64>>,
     /// Print `{"schema":"hisn-journal-info/v1","first_wseq","last_wseq",
     /// "files","bytes"}` for the workspace and exit (0.6.3). Always JSON.
     #[arg(

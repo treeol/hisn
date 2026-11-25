@@ -50,6 +50,15 @@ use serde_json::{Value, json};
 use crate::session::rfc3339_now;
 
 mod index;
+#[cfg(unix)]
+mod wait;
+
+/// The `--wait` wait loop (0.6.7). Re-exported for `journal_cmd`.
+#[cfg(unix)]
+pub use wait::{
+    EXIT_WAIT_SESSION_ENDED, EXIT_WAIT_TIMEOUT, E_WAIT_SESSION_ENDED, E_WAIT_TIMEOUT, WaitBackend,
+    WaitOutcome, Waiter, cursor_after,
+};
 
 /// Record schema version.
 pub const JOURNAL_VERSION: u32 = 1;

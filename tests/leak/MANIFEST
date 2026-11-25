@@ -121,6 +121,11 @@ L86
 L87
 L88
 L89
+L90: journal --wait wakes on a later append and exits 0
+L90: journal --wait timeout exits 6 with E_WAIT_TIMEOUT
+L90: journal --wait 0 is an immediate poll
+L90: journal --wait survives rotation while waiting
+L90: journal --wait returns 7 when the session ends
 L90
 L94
 L96

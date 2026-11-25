@@ -1036,56 +1036,11 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
         println!("{}", journal_info_json(&info));
         return Ok(ExitCode::SUCCESS);
     }
-    // 0.6.3 cursor: select after N and check contiguity BEFORE any other
-    // filter, so a hole is never hidden by `--session`/`--kind`.
-    let mut cursor_behind = false;
-    let (recs, skipped) = if let Some(after) = a.after_wseq {
-        let (sel, skipped) = journal::cursor_read(&dir, after);
-        match sel {
-            journal::CursorSelect::Records {
-                records,
-                behind_retention,
-            } => {
-                cursor_behind = behind_retention;
-                (records, skipped)
-            }
-            journal::CursorSelect::Reset { last_wseq } => {
-                return Ok(cursor_failure(
-                    a.json,
-                    3,
-                    "E_CURSOR_RESET",
-                    &format!(
-                        "--after-wseq {after} is ahead of the journal (last wseq {}); \
-                         the journal was reset, restart from `hisn journal --info`",
-                        last_wseq.map_or("none".to_owned(), |w| w.to_string())
-                    ),
-                ));
-            }
-            journal::CursorSelect::Gap { expected, got } => {
-                return Ok(cursor_failure(
-                    a.json,
-                    4,
-                    "E_CURSOR_GAP",
-                    &format!(
-                        "journal records are not contiguous after wseq {after}: \
-                         expected {expected}, found {got}; read again or restart from \
-                         `hisn journal --info`"
-                    ),
-                ));
-            }
-        }
-    } else {
-        journal::read_records(&dir)
-    };
-    if cursor_behind {
-        eprintln!(
-            "hisn: cursor behind retention: records before the oldest one on disk were deleted"
-        );
-    }
     // `--since` is enforced: an unparseable timestamp is an error, not a
     // silent "show everything" (item 5). Only Zulu (Z) timestamps are
     // accepted: an offset like +02:00 would otherwise be silently parsed
-    // as UTC (R2).
+    // as UTC (R2). Parsed once here, before the wait loop: a bad timestamp
+    // fails fast instead of waiting forever for records that never match.
     let since_secs = match a.since.as_deref() {
         Some(s) => Some(
             if s.ends_with('Z') {
@@ -1097,8 +1052,172 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
         ),
         None => None,
     };
+    // 0.6.7 `--wait`: block until a matching record arrives. The loop runs
+    // on the unfiltered cursor result (the Waiter), the filtered query is
+    // applied per pass, and only an empty filtered result keeps waiting.
+    // Everything below this point (printing, skipped counts, the
+    // fell-back and no-journal notes) is shared with the non-wait path.
+    let mut cursor_behind = false;
+    let (recs, skipped) = if let Some(after) = a.after_wseq {
+        if let Some(wait_arg) = a.wait {
+            let deadline = wait_arg.map(|secs| {
+                std::time::Instant::now() + std::time::Duration::from_secs(secs)
+            });
+            let mut waiter =
+                journal::Waiter::production(dir.clone(), after, session_filter.clone());
+            let q = journal::Query {
+                session: session_filter.clone(),
+                seat: a.seat.clone(),
+                kind: a.kind.clone(),
+                since_secs,
+                last: a.last,
+            };
+            // The wait loop, on the unfiltered run. `matches` is the
+            // filtered gate: only a non-empty filtered run ends the wait
+            // with records. A `session/stop` for the watched session is
+            // checked by the Waiter on the unfiltered run before filters;
+            // records win over session end (a filtered match in the same
+            // batch still prints and exits 0).
+            // `session_filter` is the resolved session id (or the raw
+            // --session argument); the Waiter treats it as the watched
+            // session only when it came from --session, which is exactly
+            // the case where session_filter is Some.
+            loop {
+                let (run, run_skipped) = match waiter.step() {
+                    journal::WaitOutcome::Records(records, skipped) => (records, skipped),
+                    journal::WaitOutcome::SessionEnded(records, skipped) => {
+                        // Records win: a filtered match in the same batch
+                        // still prints and exits 0. Only an empty filtered
+                        // run becomes exit 7.
+                        if !journal::query(&records, &q).is_empty() {
+                            (records, skipped)
+                        } else {
+                            return Ok(cursor_failure(
+                                a.json,
+                                journal::EXIT_WAIT_SESSION_ENDED,
+                                journal::E_WAIT_SESSION_ENDED,
+                                &format!(
+                                    "session {} ended before any matching record arrived",
+                                    session_filter.as_deref().unwrap_or("?")
+                                ),
+                            ));
+                        }
+                    }
+                    journal::WaitOutcome::Reset(last_wseq) => {
+                        return Ok(cursor_failure(
+                            a.json,
+                            3,
+                            "E_CURSOR_RESET",
+                            &format!(
+                                "--after-wseq {after} is ahead of the journal (last wseq {}); \
+                                 the journal was reset, restart from `hisn journal --info`",
+                                last_wseq.map_or("none".to_owned(), |w| w.to_string())
+                            ),
+                        ));
+                    }
+                    journal::WaitOutcome::Gap { expected, got } => {
+                        return Ok(cursor_failure(
+                            a.json,
+                            4,
+                            "E_CURSOR_GAP",
+                            &format!(
+                                "journal records are not contiguous after wseq {after}: \
+                                 expected {expected}, found {got}; read again or restart from \
+                                 `hisn journal --info`"
+                            ),
+                        ));
+                    }
+                    journal::WaitOutcome::Empty => (Vec::new(), 0),
+                };
+                if !run.is_empty() && !journal::query(&run, &q).is_empty() {
+                    break (run, run_skipped);
+                }
+                // Nothing to act on: sleep until the next wake or the
+                // deadline. The Waiter's run loop is not used directly
+                // because the filtered-empty check needs the run each
+                // pass; the backend's wait is reached through step+sleep
+                // here via the deadline check below. This loop re-reads
+                // at least once per WAIT_POLL (the poll fallback), and on
+                // deadline returns the timeout outcome.
+                match deadline {
+                    Some(d) if std::time::Instant::now() >= d => {
+                        return Ok(cursor_failure(
+                            a.json,
+                            journal::EXIT_WAIT_TIMEOUT,
+                            journal::E_WAIT_TIMEOUT,
+                            &format!(
+                                "no matching record after wseq {after} within the --wait timeout"
+                            ),
+                        ));
+                    }
+                    _ => {}
+                }
+                // Sleep one backend tick. Waiter exposes its backend
+                // through `wait_tick` below (see journal::Waiter).
+                if !waiter.wait_tick(deadline) {
+                    return Ok(cursor_failure(
+                        a.json,
+                        journal::EXIT_WAIT_TIMEOUT,
+                        journal::E_WAIT_TIMEOUT,
+                        &format!(
+                            "no matching record after wseq {after} within the --wait timeout"
+                        ),
+                    ));
+                }
+            }
+        } else {
+            let (sel, skipped) = journal::cursor_read(&dir, after);
+            match sel {
+                journal::CursorSelect::Records {
+                    records,
+                    behind_retention,
+                } => {
+                    cursor_behind = behind_retention;
+                    (records, skipped)
+                }
+                journal::CursorSelect::Reset { last_wseq } => {
+                    return Ok(cursor_failure(
+                        a.json,
+                        3,
+                        "E_CURSOR_RESET",
+                        &format!(
+                            "--after-wseq {after} is ahead of the journal (last wseq {}); \
+                             the journal was reset, restart from `hisn journal --info`",
+                            last_wseq.map_or("none".to_owned(), |w| w.to_string())
+                        ),
+                    ));
+                }
+                journal::CursorSelect::Gap { expected, got } => {
+                    return Ok(cursor_failure(
+                        a.json,
+                        4,
+                        "E_CURSOR_GAP",
+                        &format!(
+                            "journal records are not contiguous after wseq {after}: \
+                             expected {expected}, found {got}; read again or restart from \
+                             `hisn journal --info`"
+                        ),
+                    ));
+                }
+            }
+        }
+    } else {
+        journal::read_records(&dir)
+    };
+    if cursor_behind {
+        eprintln!(
+            "hisn: cursor behind retention: records before the oldest one on disk were deleted"
+        );
+    }
+    // The wait branch moved `session_filter` into its own Query; rebuild
+    // the shared Query from the same resolution (resolved id, else the
+    // raw --session argument — exactly what `session_filter` held).
     let q = journal::Query {
-        session: session_filter,
+        session: if let Some(m) = &resolved {
+            Some(m.session.clone())
+        } else {
+            session_arg.clone()
+        },
         seat: a.seat,
         kind: a.kind,
         since_secs,

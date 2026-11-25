@@ -2268,8 +2268,8 @@ else
       # leakprobe, the session's main command), so it is attributed as the
       # main command: attributed:true, seat/exec_id null. The fingerprint
       # is the caller agent's key, and no payload bytes appear.
-      if printf '%s' "$L91_REC" | grep -q "$L91_FP4" && printf '%s' "$L91_REC" | grep -q '"attributed": true' \
-         && printf '%s' "$L91_REC" | grep -q '"result": "ok"' \
+      if printf '%s' "$L91_REC" | grep -q "$L91_FP4" && printf '%s' "$L91_REC" | grep -q '"attributed":true' \
+         && printf '%s' "$L91_REC" | grep -q '"result":"ok"' \
          && ! printf '%s' "$L91_REC" | grep -q "L91-sign-me-marker"; then
         pass "L91 ssh/sign record carries fingerprint, result ok, no payload bytes"
       else

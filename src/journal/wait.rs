@@ -458,10 +458,7 @@ impl Waiter {
             return false;
         }
         let _ = self.backend.wait(remaining.min(WAIT_POLL));
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            return false;
-        }
-        true
+        !deadline.is_some_and(|d| Instant::now() >= d)
     }
 }
 

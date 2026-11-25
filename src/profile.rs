@@ -280,22 +280,21 @@ impl Profile {
                     ));
                 }
                 if !socket.starts_with('/') {
-                    push(format!("[ssh]: socket must be an absolute path"));
+                    push("[ssh]: socket must be an absolute path".to_string());
                 }
             }
         }
         if let Some(n) = &self.net
             && let Some(ns) = &n.nameservers
+            && let Err(e) = validate_nameservers(ns)
         {
-            if let Err(e) = validate_nameservers(ns) {
-                push(format!("{e}"));
-            }
+            push(format!("{e}"));
         }
         // Validate [[services]] (§19).
         let mut service_names = std::collections::HashSet::new();
         for s in &self.services {
             if s.name.is_empty() {
-                push(format!("[[services]]: name must not be empty"));
+                push("[[services]]: name must not be empty".to_string());
             }
             if !service_names.insert(s.name.as_str()) {
                 push(format!("[[services]]: duplicate name {:?}", s.name));
@@ -351,7 +350,7 @@ impl Profile {
         }
         for f in &self.forwards {
             if f.name.is_empty() {
-                push(format!("[[forward]]: name must not be empty"));
+                push("[[forward]]: name must not be empty".to_string());
             }
             if !f.socket.starts_with('/') {
                 push(format!(
@@ -384,7 +383,7 @@ impl Profile {
         }
         for h in &self.host_services {
             if h.name.is_empty() {
-                push(format!("[[host_services]]: name must not be empty"));
+                push("[[host_services]]: name must not be empty".to_string());
             }
             if h.exec.is_empty() {
                 push(format!(

@@ -2264,10 +2264,14 @@ else
         printf '%s' "$L91_REC" | grep -q '"kind": "ssh/sign"' && break
         sleep 0.3
       done
-      if printf '%s' "$L91_REC" | grep -q "$L91_FP4" && printf '%s' "$L91_REC" | grep -q '"exec_id": "e-' \
-         && printf '%s' "$L91_REC" | grep -q '"attributed": true' \
+      # The sign comes from the main loop process (exec-out runs inside
+      # leakprobe, the session's main command), so it is attributed as the
+      # main command: attributed:true, seat/exec_id null. The fingerprint
+      # is the caller agent's key, and no payload bytes appear.
+      if printf '%s' "$L91_REC" | grep -q "$L91_FP4" && printf '%s' "$L91_REC" | grep -q '"attributed": true' \
+         && printf '%s' "$L91_REC" | grep -q '"result": "ok"' \
          && ! printf '%s' "$L91_REC" | grep -q "L91-sign-me-marker"; then
-        pass "L91 ssh/sign record carries fingerprint, seat, exec id; no payload bytes"
+        pass "L91 ssh/sign record carries fingerprint, result ok, no payload bytes"
       else
         fail "L91 ssh/sign record" "rec=[$(printf '%s' "$L91_REC" | head -c 300)]"
       fi

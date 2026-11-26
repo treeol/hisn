@@ -2296,7 +2296,7 @@ else
       NA_OBS_PROFILE="$WORK/NA-obs.toml"
       write_profile "$NA_OBS_PROFILE" "$NA_OBS_CWD" '[ssh]' 'agent = true'
       if start_profile_session na-obs-$$ "$NA_OBS_CWD" "$NA_OBS_PROFILE" --ssh-agent-socket "$NA_AGENT_SOCK"; then
-        NA_TOK=$("$HISN" seat add --json --workspace "na-obs-$$" --role member mem1 2>/dev/null | grep -o '"credential": *"[^"]*"' | head -1 | sed 's/.*"credential": *"//; s/"//')
+        NA_TOK=$("$HISN" seat --session "na-obs-$$" add mem1 --role member 2>/dev/null)
         if [ -n "$NA_TOK" ]; then
           # Start a slow sign as member; demote to observer mid-flight.
           # The exec keeps running (sign needs to be in-flight). Use a

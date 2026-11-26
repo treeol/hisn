@@ -2313,7 +2313,7 @@ else
             bash -c 'sleep 1.5; ssh-keygen -Y sign -n hisnleak -f "$0/pub/key4.pub" "$0/msg" || true; echo DONE >>"$0/sign.log"' "$NA_OBS_CWD" >"$WORK/na-exec.out" 2>&1 &
           NA_EXECPID=$!
           sleep 0.5
-          NA_SETROLE_OUT=$("$HISN" seat --session "na-obs-$$" set-role mem1 observer 2>&1)
+          "$HISN" seat --session "na-obs-$$" set-role mem1 observer 2>&1
           touch "$NA_OBS_CWD/go/go"
           wait $NA_EXECPID 2>/dev/null
           NA_WS2=$(ls_workspace_id "na-obs-$$" 2>/dev/null)

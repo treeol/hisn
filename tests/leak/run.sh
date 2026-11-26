@@ -2307,9 +2307,10 @@ else
             bash -c 'while [ ! -e "$0/go/go" ]; do sleep 0.1; done; ssh-keygen -Y sign -n hisnleak -f "$0/pub/key4.pub" "$0/msg" || true' "$NA_OBS_CWD" >/dev/null 2>&1 &
           NA_EXECPID=$!
           sleep 0.5
-          "$HISN" seat set-role --workspace "na-obs-$$" --role observer mem1 >/dev/null 2>&1
+          "$HISN" seat --session "na-obs-$$" set-role mem1 --role observer >"$WORK/na-setrole.out" 2>&1
           touch "$NA_OBS_CWD/go/go"
           wait $NA_EXECPID 2>/dev/null
+          "$HISN" exec --no-tty --session "na-obs-$$" -- echo after-demote >"$WORK/na-after.out" 2>&1
           NA_WS2=$(ls_workspace_id "na-obs-$$" 2>/dev/null)
           NA_REC2=""
           for _ in 1 2 3 4 5 6 7 8 9 10; do

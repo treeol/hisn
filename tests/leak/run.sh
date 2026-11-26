@@ -2291,33 +2291,23 @@ else
       # Observer: an exec started by a member and then demoted to
       # observer cannot sign — the role gate (Op::Sign) refuses it. The
       # sign comes from a live exec whose seat's role is now observer,
-      # so the walk attributes it and allows() refuses it.
+      # so the walk attributes it and allows() refuses it. The exec
+      # first runs a no-op command (so the exec exists), waits, then
+      # signs — the demote happens during the wait.
       NA_OBS_CWD=$(new_cwd na-obs)
       NA_OBS_PROFILE="$WORK/NA-obs.toml"
       write_profile "$NA_OBS_PROFILE" "$NA_OBS_CWD" '[ssh]' 'agent = true'
       if start_profile_session na-obs-$$ "$NA_OBS_CWD" "$NA_OBS_PROFILE" --ssh-agent-socket "$NA_AGENT_SOCK"; then
         NA_TOK=$("$HISN" seat --session "na-obs-$$" add mem1 --role member 2>/dev/null)
         if [ -n "$NA_TOK" ]; then
-          # Start a slow sign as member; demote to observer mid-flight.
-          # The exec keeps running (sign needs to be in-flight). Use a
-          # FIFO marker: the sign only proceeds once we demote.
-          printf '%s' >"$WORK/na-tok"
           mkdir -p "$NA_OBS_CWD/go"
           HISN_SEAT_TOKEN="$NA_TOK" timeout 30 "$HISN" exec --no-tty --session "na-obs-$$" -- \
-            bash -c 'while [ ! -e "$0/go/go" ]; do sleep 0.1; done; ssh-keygen -Y sign -n hisnleak -f "$0/pub/key4.pub" "$0/msg" || true' "$NA_OBS_CWD" >/dev/null 2>&1 &
+            bash -c 'sleep 1.5; ssh-keygen -Y sign -n hisnleak -f "$0/pub/key4.pub" "$0/msg" || true' "$NA_OBS_CWD" >/dev/null 2>&1 &
           NA_EXECPID=$!
           sleep 0.5
-          NR_OUT=$(timeout 10 "$HISN" seat --session "na-obs-$$" ls 2>&1)
-          NR_ROLE=$(printf '%s' "$NR_OUT" | grep mem1)
-          "$HISN" seat --session "na-obs-$$" set-role mem1 --role observer >"$WORK/na-setrole.out" 2>&1
-          NR_SR_RC=$?
-          NR_OBS=$(timeout 10 "$HISN" seat --session "na-obs-$$" ls 2>&1 | grep mem1)
+          "$HISN" seat --session "na-obs-$$" set-role mem1 --role observer 2>&1
           touch "$NA_OBS_CWD/go/go"
           wait $NA_EXECPID 2>/dev/null
-          NA_REC2=$(timeout 5 "$HISN" journal --workspace "$(ls_workspace_id "na-obs-$$")" --kind ssh/sign --json 2>/dev/null)
-          printf '%s' "$NA_REC2" >"$WORK/na-rec.json"
-          printf 'setrole_rc=%s ls_before=[%s] ls_after=[%s] rec=[%s]\n' \
-            "$NR_SR_RC" "$NR_ROLE" "$NR_OBS" "$(head -c 300 "$WORK/na-rec.json")" >"$WORK/na-debug.txt"
           NA_WS2=$(ls_workspace_id "na-obs-$$" 2>/dev/null)
           NA_REC2=""
           for _ in 1 2 3 4 5 6 7 8 9 10; do

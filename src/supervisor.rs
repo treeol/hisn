@@ -800,32 +800,43 @@ impl Shared {
                     );
                 }
                 if let Some(Some(es)) = exec_lookup(inner) {
-                    let role = es.seat.as_deref().and_then(|name| {
-                        let mut cache = self.seat_cache.lock().expect("seat cache");
-                        cache.refresh(&self.workspace_dir);
-                        cache.get(name).filter(|s| !s.revoked).map(|s| s.role)
-                    });
-                    let (seat, role) = match (es.seat.clone(), role) {
-                        (Some(name), Some(r)) => (Some(name), Some(r)),
-                        // A seat the cache does not know: refuse, do not
-                        // silently treat as owner.
-                        _ => {
-                            return (crate::ssh_agent::Attribution::unattributed(), None);
+                    // The exec is known. A seat names a role (unknown or
+                    // revoked seat → refuse, never guess); a seat-less
+                    // exec is the owner's (the client was authorized by
+                    // uid, and authorize() is the only producer of an
+                    // authorized exec), so it signs as owner.
+                    match &es.seat {
+                        Some(name) => {
+                            let mut cache = self.seat_cache.lock().expect("seat cache");
+                            cache.refresh(&self.workspace_dir);
+                            let role = cache.get(name).filter(|s| !s.revoked).map(|s| s.role);
+                            match role {
+                                Some(r) => {
+                                    return (
+                                        crate::ssh_agent::Attribution {
+                                            seat: Some(name.clone()),
+                                            exec_id: Some(es.exec_id),
+                                            attributed: true,
+                                        },
+                                        Some(r),
+                                    );
+                                }
+                                None => {
+                                    return (crate::ssh_agent::Attribution::unattributed(), None);
+                                }
+                            }
                         }
-                    };
-                    return (
-                        crate::ssh_agent::Attribution {
-                            seat,
-                            exec_id: Some(es.exec_id),
-                            attributed: true,
-                        },
-                        role,
-                    );
-                }
-                if let Some(None) = exec_lookup(inner) {
-                    // An exec whose client had no seat: the exec is known
-                    // but carries no identity — deny, never guess.
-                    return (crate::ssh_agent::Attribution::unattributed(), None);
+                        None => {
+                            return (
+                                crate::ssh_agent::Attribution {
+                                    seat: None,
+                                    exec_id: Some(es.exec_id),
+                                    attributed: true,
+                                },
+                                Some(crate::seats::Role::Owner),
+                            );
+                        }
+                    }
                 }
             }
             pid = st.ppid;

@@ -2281,27 +2281,35 @@ else
       NA_BAD_PROFILE="$WORK/NA-bad.toml"
       write_profile "$NA_BAD_PROFILE" "$NA_CWD" '[ssh]' 'agent = false'
       NA_OUT=$("$HISN" run --detach --json --profile "$NA_BAD_PROFILE" --session-id "na-bad-$$" \
-           --workspace "na-bad-$$" --ssh-agent-socket "$NA_AGENT_SOCK" -- true 2>&1)
+           --workspace "na-bad-$$" --ssh-agent-socket "$NA_AGENT_SOCK" 2>&1)
       NA_RC=$?
       if [ $NA_RC -ne 0 ] && printf '%s' "$NA_OUT" | grep -q "requires.*agent = true"; then
         pass "NA --ssh-agent-socket without agent = true is an error"
       else
         fail "NA flag without agent" "rc=$NA_RC out=[$(printf '%s' "$NA_OUT" | head -c 200)]"
       fi
-      # Observer: a sign from an observer-seat exec is refused by the
-      # role gate (Op::Sign), not signed. The observer's double-forked
-      # grandchild also cannot reach owner: the walk must pass through
-      # init's direct child or a known exec, so an orphan that reparents
-      # to pid 1 is unattributed.
+      # Observer: an exec started by a member and then demoted to
+      # observer cannot sign — the role gate (Op::Sign) refuses it. The
+      # sign comes from a live exec whose seat's role is now observer,
+      # so the walk attributes it and allows() refuses it.
       NA_OBS_CWD=$(new_cwd na-obs)
       NA_OBS_PROFILE="$WORK/NA-obs.toml"
       write_profile "$NA_OBS_PROFILE" "$NA_OBS_CWD" '[ssh]' 'agent = true'
       if start_profile_session na-obs-$$ "$NA_OBS_CWD" "$NA_OBS_PROFILE" --ssh-agent-socket "$NA_AGENT_SOCK"; then
-        NA_TOK=$("$HISN" seat add --workspace "na-obs-$$" --role observer obs1 2>/dev/null | grep -o '"credential": *"[^"]*"' | head -1 | sed 's/.*"credential": *"//; s/"//')
+        NA_TOK=$("$HISN" seat add --json --workspace "na-obs-$$" --role member mem1 2>/dev/null | grep -o '"credential": *"[^"]*"' | head -1 | sed 's/.*"credential": *"//; s/"//')
         if [ -n "$NA_TOK" ]; then
-          printf '%s' "$NA_TOK" | timeout 30 "$HISN" exec --session "na-obs-$$" --seat-token-stdin -- \
-            bash -c '(ssh-keygen -Y sign -n hisnleak -f "$0/pub/key4.pub" "$0/msg" &) ; wait' "$NA_OBS_CWD" \
-            >/dev/null 2>&1
+          # Start a slow sign as member; demote to observer mid-flight.
+          # The exec keeps running (sign needs to be in-flight). Use a
+          # FIFO marker: the sign only proceeds once we demote.
+          printf '%s' >"$WORK/na-tok"
+          mkdir -p "$NA_OBS_CWD/go"
+          HISN_SEAT_TOKEN="$NA_TOK" timeout 30 "$HISN" exec --session "na-obs-$$" -- \
+            bash -c 'while [ ! -e "$0/go/go" ]; do sleep 0.1; done; ssh-keygen -Y sign -n hisnleak -f "$0/pub/key4.pub" "$0/msg" || true' "$NA_OBS_CWD" >/dev/null 2>&1 &
+          NA_EXECPID=$!
+          sleep 0.5
+          "$HISN" seat set-role --workspace "na-obs-$$" --role observer mem1 >/dev/null 2>&1
+          touch "$NA_OBS_CWD/go/go"
+          wait $NA_EXECPID 2>/dev/null
           NA_WS2=$(ls_workspace_id "na-obs-$$" 2>/dev/null)
           NA_REC2=""
           for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -2310,7 +2318,7 @@ else
             sleep 0.3
           done
           if printf '%s' "$NA_REC2" | grep -q '"result":"refused"'; then
-            pass "NA observer sign is refused by the role gate"
+            pass "NA demoted-seat sign is refused by the role gate"
           else
             fail "NA observer refused" "rec=[$(printf '%s' "$NA_REC2" | head -c 300)]"
           fi

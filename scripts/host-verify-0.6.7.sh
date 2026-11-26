@@ -491,22 +491,26 @@ d=json.load(sys.stdin)
 msgs=[e["message"] for e in d["errors"]]
 print(d["ok"]==False, len(msgs)>=3, any("version" in m for m in msgs), any("name must not be empty" in m for m in msgs), any("absolute path" in m for m in msgs))' 2>/dev/null)
     [ "$rc" = 125 ] && [ "$c" = "True True True True True" ] && ok "0.6.7: profile validate --json reports all errors (version, service, forward)" || bad "0.6.7: validate --json multi-error" "rc=$rc [$c] [$pv]"
-    # 0.6.7: journal --wait wakes on a later append, exit 0.
+    # 0.6.7: journal --wait wakes on a later append, exit 0. `note`
+    # needs --session; the waiter filters to notes in this workspace.
     info=$(H 20 journal --workspace "$WS" --info 2>/dev/null)
     las=$(printf '%s' "$info" | jget last_wseq)
-    ( sleep 0.5; H 20 note --workspace "$WS" "hv067-wait-wake-$STAMP" >/dev/null 2>&1 ) &
+    ( sleep 0.5; H 20 note --session "$A" "hv067-wait-wake-$STAMP" >/dev/null 2>&1 ) &
     wout=$(timeout 10 "$HISN" journal --workspace "$WS" --after-wseq "${las:-0}" --wait 8 --kind note 2>"$W/w.err"); wrc=$?
     if [ $wrc -eq 0 ] && printf '%s' "$wout" | grep -q "hv067-wait-wake-$STAMP"; then
       ok "0.6.7: journal --wait wakes on a later append and exits 0"
     else bad "0.6.7: journal --wait wakes" "rc=$wrc out=[$(printf '%s' "$wout" | head -c 200)] err=[$(cat "$W/w.err")]"; fi
-    # 0.6.7: journal --wait timeout exits 6 with E_WAIT_TIMEOUT.
-    werr=$(timeout 10 "$HISN" journal --workspace "$WS" --after-wseq 989999 --wait 1 2>&1); wrc=$?
+    # 0.6.7: journal --wait timeout exits 6 with E_WAIT_TIMEOUT. The
+    # cursor is the real tail (a cursor ahead of the journal is exit 3);
+    # --json carries the machine-readable code.
+    las=$(printf '%s' "$(H 20 journal --workspace "$WS" --info 2>/dev/null)" | jget last_wseq)
+    werr=$(timeout 10 "$HISN" journal --workspace "$WS" --after-wseq "${las:-0}" --wait 1 --json 2>&1); wrc=$?
     if [ $wrc -eq 6 ] && printf '%s' "$werr" | grep -q E_WAIT_TIMEOUT; then
       ok "0.6.7: journal --wait timeout exits 6 with E_WAIT_TIMEOUT"
     else bad "0.6.7: journal --wait timeout" "rc=$wrc [$werr]"; fi
     # 0.6.7: --wait 0 is an immediate poll (exit 6, no sleep).
-    werr=$(timeout 10 "$HISN" journal --workspace "$WS" --after-wseq 989999 --wait 0 2>&1); wrc=$?
-    [ $wrc -eq 6 ] && ok "0.6.7: journal --wait 0 is an immediate poll (exit 6)" || bad "0.6.7: wait 0 poll" "rc=$wrc [$werr]"
+    werr=$(timeout 10 "$HISN" journal --workspace "$WS" --after-wseq "${las:-0}" --wait 0 --json 2>&1); wrc=$?
+    [ $wrc -eq 6 ] && printf '%s' "$werr" | grep -q E_WAIT_TIMEOUT && ok "0.6.7: journal --wait 0 is an immediate poll (exit 6)" || bad "0.6.7: wait 0 poll" "rc=$wrc [$werr]"
     echo "E2E: pass=$P fail=$F"
     [ "$F" -eq 0 ]
     ;;
@@ -557,7 +561,7 @@ print(d["ok"]==False, len(msgs)>=3, any("version" in m for m in msgs), any("name
     printf 'hv067-sign-marker' >"$CWD/msg"
     {
       printf 'version = "hisn-profile/v1"\n[policy]\nversion = "hisn-policy/v1"\n'
-      printf '[session]\ncwd = "%s"\n' "$CWD"
+      printf 'session = { cwd = "%s" }\n' "$CWD"
       printf '[ssh]\nagent = true\n'
     } >"$W/b.toml"
     if ! H 60 run --detach --json --profile "$W/b.toml" --session-id "$B" --workspace "$BWS" --ssh-agent-socket "$CALLER_SOCK" >"$W/start.$B" 2>&1; then

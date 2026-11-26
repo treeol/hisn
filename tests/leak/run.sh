@@ -2307,10 +2307,17 @@ else
             bash -c 'while [ ! -e "$0/go/go" ]; do sleep 0.1; done; ssh-keygen -Y sign -n hisnleak -f "$0/pub/key4.pub" "$0/msg" || true' "$NA_OBS_CWD" >/dev/null 2>&1 &
           NA_EXECPID=$!
           sleep 0.5
+          NR_OUT=$(timeout 10 "$HISN" seat --session "na-obs-$$" ls 2>&1)
+          NR_ROLE=$(printf '%s' "$NR_OUT" | grep mem1)
           "$HISN" seat --session "na-obs-$$" set-role mem1 --role observer >"$WORK/na-setrole.out" 2>&1
+          NR_SR_RC=$?
+          NR_OBS=$(timeout 10 "$HISN" seat --session "na-obs-$$" ls 2>&1 | grep mem1)
           touch "$NA_OBS_CWD/go/go"
           wait $NA_EXECPID 2>/dev/null
-          "$HISN" exec --no-tty --session "na-obs-$$" -- echo after-demote >"$WORK/na-after.out" 2>&1
+          NA_REC2=$(timeout 5 "$HISN" journal --workspace "$(ls_workspace_id "na-obs-$$")" --kind ssh/sign --json 2>/dev/null)
+          printf '%s' "$NA_REC2" >"$WORK/na-rec.json"
+          printf 'setrole_rc=%s ls_before=[%s] ls_after=[%s] rec=[%s]\n' \
+            "$NR_SR_RC" "$NR_ROLE" "$NR_OBS" "$(head -c 300 "$WORK/na-rec.json")" >"$WORK/na-debug.txt"
           NA_WS2=$(ls_workspace_id "na-obs-$$" 2>/dev/null)
           NA_REC2=""
           for _ in 1 2 3 4 5 6 7 8 9 10; do

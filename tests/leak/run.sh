@@ -2300,9 +2300,9 @@ else
       if start_profile_session na-obs-$$ "$NA_OBS_CWD" "$NA_OBS_PROFILE" --ssh-agent-socket "$NA_AGENT_SOCK"; then
         NA_TOK=$("$HISN" seat --session "na-obs-$$" add mem1 --role member 2>/dev/null)
         if [ -n "$NA_TOK" ]; then
-          mkdir -p "$NA_OBS_CWD/go"
-          cp "$NA_KEY4.pub" "$NA_OBS_CWD/pub/key4.pub" 2>/dev/null
-          printf 'NA-sign-me-marker' >"$NA_OBS_CWD/msg" 2>/dev/null
+          mkdir -p "$NA_OBS_CWD/go" "$NA_OBS_CWD/pub"
+          cp "$NA_KEY4.pub" "$NA_OBS_CWD/pub/key4.pub"
+          printf 'NA-sign-me-marker' >"$NA_OBS_CWD/msg"
           HISN_SEAT_TOKEN="$NA_TOK" timeout 30 "$HISN" exec --no-tty --session "na-obs-$$" -- \
             bash -c 'sleep 1.5; ssh-keygen -Y sign -n hisnleak -f "$0/pub/key4.pub" "$0/msg" || true; echo DONE >>"$0/sign.log"' "$NA_OBS_CWD" >"$WORK/na-exec.out" 2>&1 &
           NA_EXECPID=$!

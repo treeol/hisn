@@ -2301,13 +2301,19 @@ else
         NA_TOK=$("$HISN" seat --session "na-obs-$$" add mem1 --role member 2>/dev/null)
         if [ -n "$NA_TOK" ]; then
           mkdir -p "$NA_OBS_CWD/go" "$NA_OBS_CWD/pub"
-          cp "$NA_KEY4.pub" "$NA_OBS_CWD/pub/key4.pub"
+          if [ -n "${NA_KEY4:-}" ] && [ -f "$NA_KEY4.pub" ]; then
+            cp "$NA_KEY4.pub" "$NA_OBS_CWD/pub/key4.pub"
+          else
+            # The key4 fixture may have been cleaned up; regenerate.
+            ssh-keygen -t ed25519 -f "$NA_OBS_CWD/keyobs" -N "" -q 2>/dev/null
+            cp "$NA_OBS_CWD/keyobs.pub" "$NA_OBS_CWD/pub/key4.pub"
+          fi
           printf 'NA-sign-me-marker' >"$NA_OBS_CWD/msg"
           HISN_SEAT_TOKEN="$NA_TOK" timeout 30 "$HISN" exec --no-tty --session "na-obs-$$" -- \
             bash -c 'sleep 1.5; ssh-keygen -Y sign -n hisnleak -f "$0/pub/key4.pub" "$0/msg" || true; echo DONE >>"$0/sign.log"' "$NA_OBS_CWD" >"$WORK/na-exec.out" 2>&1 &
           NA_EXECPID=$!
           sleep 0.5
-          "$HISN" seat --session "na-obs-$$" set-role mem1 --role observer 2>&1
+          NA_SETROLE_OUT=$("$HISN" seat --session "na-obs-$$" set-role mem1 --role observer 2>&1)
           touch "$NA_OBS_CWD/go/go"
           wait $NA_EXECPID 2>/dev/null
           NA_WS2=$(ls_workspace_id "na-obs-$$" 2>/dev/null)

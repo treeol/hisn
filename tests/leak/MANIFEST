@@ -163,7 +163,6 @@ L121
 L122
 L123
 L124
-L91
 L90: timeout socket: O_NONBLOCK set
 NA: --ssh-agent-socket wins over SSH_AUTH_SOCK (lists key4)
 NA: sign via the caller socket succeeds

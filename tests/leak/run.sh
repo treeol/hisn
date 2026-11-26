@@ -2303,7 +2303,7 @@ else
           # FIFO marker: the sign only proceeds once we demote.
           printf '%s' >"$WORK/na-tok"
           mkdir -p "$NA_OBS_CWD/go"
-          HISN_SEAT_TOKEN="$NA_TOK" timeout 30 "$HISN" exec --session "na-obs-$$" -- \
+          HISN_SEAT_TOKEN="$NA_TOK" timeout 30 "$HISN" exec --no-tty --session "na-obs-$$" -- \
             bash -c 'while [ ! -e "$0/go/go" ]; do sleep 0.1; done; ssh-keygen -Y sign -n hisnleak -f "$0/pub/key4.pub" "$0/msg" || true' "$NA_OBS_CWD" >/dev/null 2>&1 &
           NA_EXECPID=$!
           sleep 0.5

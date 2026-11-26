@@ -1174,6 +1174,31 @@ mod tests {
     }
 
     #[test]
+    fn cause_is_stable_across_drain_and_late_signal() {
+        // 0.6.7 (C3): the cause is finalised under the lock that removes
+        // the entry, so a late exec-signal during the drain cannot change
+        // it. The two arms that matter for the race:
+        // - a signal that CAUSED a signal exit (signalled=true, Signal)
+        //   stays "exec-signal" — the first load already saw it;
+        // - a signal that arrived after a clean exit (signalled=true,
+        //   Code) stays "exit" — Exit::Code wins regardless, so a late
+        //   signal after a clean exit can never misclassify;
+        // - a signal that arrived after exit-by-other-signal (signalled
+        //   flipped during drain, Signal, signalled=false at finalise if
+        //   the entry was already removed) — the removal under the same
+        //   lock makes the waiter read `signalled` exactly once.
+        assert_eq!(
+            detached_cause(Some(Exit::Signal(15)), false, true),
+            "exec-signal"
+        );
+        assert_eq!(detached_cause(Some(Exit::Code(0)), false, true), "exit");
+        assert_eq!(
+            detached_cause(Some(Exit::Signal(15)), false, false),
+            "signal"
+        );
+    }
+
+    #[test]
     fn registry_wait_stopping_sees_the_flag() {
         let reg = Arc::new(Registry::default());
         assert!(!reg.wait_stopping(Duration::from_millis(30)));

@@ -743,10 +743,15 @@ impl Shared {
     /// (`notif::resolve_seat`'s `/proc` rules): the sandbox pid namespace
     /// is at `NSpid` depth = supervisor depth + 1. Deny by default:
     /// orphan/reparented/over-deep/unreadable → unattributed (the proxy
-    /// refuses the sign); main command (init tree, pid 1 at the sandbox
-    /// depth) → allowed as owner. The exec lookup yields `(seat, exec_id)`;
-    /// the seat's role comes from the seat cache (an unknown seat rolls to
-    /// unattributed rather than owner).
+    /// refuses the sign); main command → allowed as owner. The main
+    /// command is identified positively: the walk must pass through
+    /// init's direct child at the sandbox depth (the process init forked
+    /// for `args.command`) — reaching pid 1 alone does NOT count, because
+    /// every orphan reparents to pid 1 and an observer could double-fork
+    /// into owner. In a `--detach` session there is no main command, so
+    /// anything reaching pid 1 is unattributed. The exec lookup yields
+    /// `(seat, exec_id)`; the seat's role comes from the seat cache (an
+    /// unknown seat rolls to unattributed rather than owner).
     pub(crate) fn attribute_sign_client(
         &self,
         peer_pid: i32,
@@ -788,8 +793,15 @@ impl Shared {
                 return (crate::ssh_agent::Attribution::unattributed(), None);
             }
             if st.nspid.len() == level {
-                if inner == 1 {
-                    // Main command: the session's init tree.
+                // The main command is init's direct child at the sandbox
+                // depth. `ppid` here is the host pid; the supervisor's
+                // init pid is `self.init_pid` (host view), so a task whose
+                // parent is init is exactly the main command. Anything
+                // else reaching pid 1 is an orphan that reparented to
+                // init — refused, never owner. In a `--detach` session
+                // init forks nothing, so no task matches and every
+                // pid-1 walk ends unattributed.
+                if st.ppid == self.init_pid {
                     return (
                         crate::ssh_agent::Attribution {
                             seat: None,
@@ -798,6 +810,11 @@ impl Shared {
                         },
                         Some(crate::seats::Role::Owner),
                     );
+                }
+                if inner == 1 {
+                    // Reached init without passing through the main
+                    // command or a known exec: orphan/reparented.
+                    return (crate::ssh_agent::Attribution::unattributed(), None);
                 }
                 if let Some(Some(es)) = exec_lookup(inner) {
                     // The exec is known. A seat names a role (unknown or
@@ -2009,22 +2026,26 @@ impl Shared {
             true,
         );
         let (exec_id, pid) = (w.ident.exec_id, w.ident.pid);
-        // 0.6.7 (C3): finalise the cause inside the `exec_table` critical
-        // section that removes the entry. A signal delivered before this
+        // 0.6.7 (C3): finalise the cause and remove the entry inside ONE
+        // `exec_table` critical section. A signal delivered before this
         // point set `signalled` under the same lock, so the check sees it;
         // after removal `signal_exec` finds no entry and refuses. The
         // `Exit::Code` arm is unaffected (`detached_cause` returns "exit"
         // regardless), so a signal after a clean exit cannot misclassify.
+        // No journal/state I/O happens under the lock: the state file
+        // update happens after the section; the entry removal is inside
+        // it, so no signal can be delivered into the gap.
         {
-            let _g = self.exec_table.lock().expect("exec_table");
+            let mut g = self.exec_table.lock().expect("exec_table");
             cause = execlog::detached_cause(
                 exit,
                 stopping,
                 w.entry.signalled.load(std::sync::atomic::Ordering::SeqCst),
             );
-            if w.entry.snapshot().cause.as_deref() != Some(cause) {
-                w.entry.update(|st| st.cause = Some(cause.into()));
-            }
+            g.remove(exec_id);
+        }
+        if w.entry.snapshot().cause.as_deref() != Some(cause) {
+            w.entry.update(|st| st.cause = Some(cause.into()));
         }
         let mut ident = w.ident;
         ident.detached = Some(DetachedIdent {
@@ -2040,7 +2061,6 @@ impl Shared {
             duration_ms,
             ident,
         );
-        self.exec_table.lock().expect("exec_table").remove(exec_id);
         self.exec_seats.lock().expect("exec_seats").remove(&pid);
         self.detached.remove(exec_id);
         // 0.6.5 (round 2 finding): prune AFTER the drain and the final state
@@ -2289,10 +2309,23 @@ impl Shared {
                 "a member may signal only execs started by its own seat",
             );
         }
-        let before = e.signalled.swap(true, std::sync::atomic::Ordering::SeqCst);
-        if !self.signal_exec(id, sig) {
-            e.signalled
-                .store(before, std::sync::atomic::Ordering::SeqCst);
+        // 0.6.7 (C3): delivery and `signalled` happen inside ONE
+        // `exec_table` critical section: `signalled` is set only when the
+        // entry exists and the delivery succeeded. `detached_wait`
+        // finalises the cause and removes the entry in the same lock, so
+        // a signal cannot land in the gap between the swap and the
+        // delivery (which would mark an exec that can no longer receive
+        // a signal, or restore a false `signalled` after the waiter
+        // already read it).
+        let delivered = {
+            let g = self.exec_table.lock().expect("exec_table");
+            let ok = table_signal(&g, id, sig);
+            if ok {
+                e.signalled.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            ok
+        };
+        if !delivered {
             return err(
                 control::E_NOT_FOUND,
                 format!("detached exec {exec_id} has ended or cannot be signalled"),
@@ -4292,6 +4325,11 @@ fn run_session(start: SessionStart<'_>) -> Result<SessionEnd> {
     if let Some(j) = &net_journal {
         j.net_flush(std::time::Duration::from_secs(2));
     }
+    // 0.6.7: flush the sign queue the same way (the accept loop's writer is
+    // otherwise detached and queued ssh/sign records could be lost at stop).
+    if let Some(j) = &control.sign_journal {
+        j.net_flush(std::time::Duration::from_secs(2));
+    }
     // The session is live and ending on the normal path: the guard must not
     // kill and reap init again (relay_and_wait already reaped it). The stop
     // paths below own the remaining cleanup.
@@ -4473,6 +4511,12 @@ fn prepare_session_env(a: &mut PrepareEnvArgs<'_>, rules: &mut Rules) -> Result<
     let ssh_agent_expose = "/run/ssh-agent.sock";
     let mut ssh_sock_expose: Option<&str> = None;
     let mut ssh_upstream: Option<String> = None;
+    // 0.6.7: the flag without `[ssh] agent = true` is an error, never a
+    // silent ignore (the caller would believe a chosen agent is in use
+    // while no proxy runs).
+    if a.ssh_agent_socket.is_some() && !(ssh.is_some_and(|c| c.agent)) {
+        anyhow::bail!("--ssh-agent-socket requires [ssh] agent = true in the profile");
+    }
     if let Some(ssh_cfg) = ssh
         && ssh_cfg.agent
     {
@@ -4796,6 +4840,9 @@ struct SessionControl {
     listener: UnixListener,
     handler: Arc<dyn Handler>,
     ssh_agent_expose: &'static str,
+    /// 0.6.7: the sign journal handle (shares the session's one queue);
+    /// flushed at stop alongside `net_journal`.
+    sign_journal: Option<crate::journal::Journal>,
 }
 
 fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
@@ -4902,6 +4949,7 @@ fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
     // 0.3.2: Spawn the SSH agent proxy accept loop and forward its socket
     // into the sandbox. The listener was bound before unshare (single-
     // threaded); the accept loop is spawned now (post-clone, multithreaded).
+    let mut sign_journal_for_control: Option<crate::journal::Journal> = None;
     if let Some(listener) = ssh_proxy_listener.take() {
         // Resolved once in prepare; never re-read SSH_AUTH_SOCK here (an
         // env change after prepare must not change the upstream).
@@ -4910,9 +4958,13 @@ fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
             .ssh
             .and_then(|c| if c.agent { Some(c.keys.clone()) } else { None })
             .unwrap_or_default();
-        // 0.6.7: sign records go through the same bounded queue as network
-        // records; attribution walks the peer pid's ancestry.
-        let sign_journal = Some(shared.journal.clone_for_engine());
+        // 0.6.7: sign records go through one bounded queue (clone_for_engine
+        // shares an existing queue, so the control return handle and the
+        // accept loop share one writer); attribution walks the peer pid's
+        // ancestry. Flushed at stop from run_session.
+        let sj = shared.journal.clone_for_engine();
+        sign_journal_for_control = Some(sj.clone_for_engine());
+        let sign_journal = Some(sj);
         let attr_shared = Arc::clone(&shared);
         let attribute: crate::ssh_agent::AttributionFn =
             Arc::new(move |peer_pid| attr_shared.attribute_sign_client(peer_pid));
@@ -4934,11 +4986,13 @@ fn start_control(a: &mut SessionControlArgs<'_>) -> Result<SessionControl> {
             bail!("ssh-agent forward: {e}");
         }
     }
+    let sign_journal = sign_journal_for_control;
     Ok(SessionControl {
         shared,
         listener,
         handler,
         ssh_agent_expose,
+        sign_journal,
     })
 }
 

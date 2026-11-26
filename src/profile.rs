@@ -497,16 +497,14 @@ impl Profile {
                 if d.risk_ack.is_none() {
                     // The `[docker]` subject names only the tier in the
                     // required message (byte-identical to the former copy).
+                    // `else`: a missing ack is one error, not two — the
+                    // helper's None path would add a differently worded
+                    // duplicate (round-2 finding).
                     push(format!(
                         "E_RISK_ACK_REQUIRED: [docker] tier = \"socket\" requires risk_ack = \"{}\"",
                         label.kebab()
                     ));
-                }
-                // The required message keeps its colon-less form via the
-                // helper's None path is NOT what we want: see helper docs —
-                // the colon-less `[docker]` text is produced by the explicit
-                // None bail above; the helper handles the mismatch here.
-                if let Err(e) = Self::check_risk_ack("[docker]", None, label, &d.risk_ack) {
+                } else if let Err(e) = Self::check_risk_ack("[docker]", None, label, &d.risk_ack) {
                     push(format!("{e}"));
                 }
             }

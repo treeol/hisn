@@ -1052,12 +1052,42 @@ mod tests {
     }
 
     #[test]
-    fn no_wire_request_maps_to_sign_op() {
-        // Pin the authorize boundary: Op::of is exhaustive over Request and
-        // has no Sign arm, so no control request can produce Op::Sign.
-        assert_eq!(authz::Op::Sign.name(), "sign");
+    fn sign_op_role_matrix() {
+        // The role table: owner and member may sign, observer is refused.
         assert!(authz::allows(Role::Owner, authz::Op::Sign));
         assert!(authz::allows(Role::Member, authz::Op::Sign));
         assert!(!authz::allows(Role::Observer, authz::Op::Sign));
+        assert_eq!(authz::Op::Sign.name(), "sign");
+        assert_eq!(authz::Op::Sign.required_role(), Role::Member);
+    }
+
+    #[test]
+    fn sign_flood_produces_summary_not_unbounded_records() {
+        // > NET_RECORDS_PER_SEC signs in one second: the queue writes them
+        // one by one up to the rate, the rest fold into ssh/sign-summary.
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path().join("ws");
+        let j = Journal::new(ws.clone(), "sess".into()).clone_for_engine();
+        let n = crate::journal::NET_RECORDS_PER_SEC + 10;
+        for _ in 0..n {
+            j.sign_record(Some("SHA256:x"), None, None, true, "ok");
+        }
+        assert!(j.net_flush(std::time::Duration::from_secs(10)));
+        // Force the window to close so the summary is written.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(j.net_flush(std::time::Duration::from_secs(10)));
+        let (recs, _) = crate::journal::read_records(&ws);
+        let signs: Vec<_> = recs.iter().filter(|r| r.kind == "ssh/sign").collect();
+        let summaries: Vec<_> = recs
+            .iter()
+            .filter(|r| r.kind == "ssh/sign-summary")
+            .collect();
+        assert_eq!(
+            signs.len() as u32,
+            crate::journal::NET_RECORDS_PER_SEC,
+            "individual records are capped at the per-second rate"
+        );
+        assert_eq!(summaries.len(), 1, "the rest fold into one summary");
+        assert_eq!(summaries[0].data["ok"], 10);
     }
 }

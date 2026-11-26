@@ -180,7 +180,7 @@ impl InotifyBackend {
                 }
             }
             if Some(wd) == self.dir_wd && !name.is_empty() && self.relevant(&name) {
-                if mask & libc::IN_MOVED_TO != 0 {
+                if mask & (libc::IN_MOVED_TO | libc::IN_CREATE) != 0 {
                     rotated = true;
                 }
                 relevant = true;
@@ -255,7 +255,12 @@ impl WaitBackend for InotifyBackend {
 
     fn wait(&mut self, timeout: Duration) -> bool {
         let (relevant, rotated) = self.read_events(true, timeout);
-        if rotated {
+        if rotated || self.file_wd.is_none() {
+            // The current file was rotated away (or was never watchable —
+            // it did not exist at arm time): re-watch the current
+            // journal.jsonl. A missing file simply means the watch fails
+            // for now; the dir watch covers its creation and the next
+            // wait re-arms.
             self.arm_file();
             // A rotation also means the dir watch may need re-arming only
             // if it died; arm_dir is a no-op while the watch lives. When
@@ -406,10 +411,13 @@ impl Waiter {
     pub fn run(&mut self, deadline: Option<Instant>) -> WaitOutcome {
         // Arm before the first read so an append between read and block
         // cannot be lost; drain before each re-read for the same reason.
-        if self.armed.is_none() {
-            self.backend.arm(&self.dir);
+        let armed = if self.armed.is_none() {
+            let a = self.backend.arm(&self.dir);
             self.armed = Some(());
-        }
+            a
+        } else {
+            true
+        };
         loop {
             self.backend.drain();
             match self.step() {
@@ -424,7 +432,12 @@ impl Waiter {
             if deadline.is_some_and(|d| now >= d) {
                 return WaitOutcome::Empty;
             }
-            let _ = self.backend.wait(remaining.min(WAIT_POLL));
+            if armed {
+                let _ = self.backend.wait(remaining.min(WAIT_POLL));
+            } else {
+                // Poll fallback: never spin on a dead backend.
+                std::thread::sleep(remaining.min(WAIT_POLL));
+            }
             // The poll fallback guarantees progress even when no wake
             // arrived: the loop re-reads at least once per WAIT_POLL.
             if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -441,14 +454,20 @@ impl Waiter {
 
     /// One backend sleep tick for the `journal_cmd` wait loop, which needs
     /// the run each pass (its filtered-empty check). Arms the watches on
-    /// first call. Returns `false` when the deadline has passed (the
-    /// caller returns the timeout outcome); `true` otherwise (loop and
-    /// re-read).
+    /// first call. Before returning, drains pending events so an append
+    /// between the caller's read and this tick is not lost; when inotify
+    /// is unavailable (`arm` returned false) the tick sleeps the poll
+    /// interval so the loop polls instead of spinning. Returns `false`
+    /// when the deadline has passed (the caller returns the timeout
+    /// outcome); `true` otherwise (loop and re-read).
     pub fn wait_tick(&mut self, deadline: Option<Instant>) -> bool {
-        if self.armed.is_none() {
-            self.backend.arm(&self.dir);
+        let armed = if self.armed.is_none() {
+            let a = self.backend.arm(&self.dir);
             self.armed = Some(());
-        }
+            a
+        } else {
+            true
+        };
         let now = Instant::now();
         let remaining = match deadline {
             Some(d) => d.saturating_duration_since(now),
@@ -457,7 +476,14 @@ impl Waiter {
         if deadline.is_some_and(|d| now >= d) {
             return false;
         }
-        let _ = self.backend.wait(remaining.min(WAIT_POLL));
+        let slept = remaining.min(WAIT_POLL);
+        if armed {
+            let _ = self.backend.wait(slept);
+        } else {
+            // Poll fallback: never spin on a dead backend.
+            std::thread::sleep(slept);
+        }
+        self.backend.drain();
         !deadline.is_some_and(|d| Instant::now() >= d)
     }
 }

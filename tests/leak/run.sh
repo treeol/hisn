@@ -2210,7 +2210,7 @@ else
   skip "L45 ssh-agent" "ssh-agent, ssh-add or ssh-keygen binary not found"
 fi
 
-# ================================================ L91: caller agent socket (0.6.7, HOST)
+# ================================================ NA: caller agent socket (0.6.7, HOST)
 # A second throwaway ssh-agent (key4 alone) is handed to the session via
 # --ssh-agent-socket. The env path already points SSH_AUTH_SOCK at the
 # L45 host agent (now holding key1+key2); the flag's agent must win:
@@ -2219,73 +2219,118 @@ fi
 # no payload bytes. Skip: the L45 host-agent fixture (or the flag) is
 # unavailable.
 if [ -z "${L45_HOST_SOCK:-}" ]; then
-  skip "L91 caller agent socket sign journaled" "L45 host agent fixture unavailable"
+  skip "NA caller agent socket sign journaled" "L45 host agent fixture unavailable"
 else
-  L91_CWD=$(new_cwd l91)
+  NA_CWD=$(new_cwd l91)
   mkdir -p "$WORK/l91-keys"
-  L91_KEY4="$WORK/l91-keys/key4"
-  ssh-keygen -t ed25519 -f "$L91_KEY4" -N "" -q 2>/dev/null
-  mkdir -p "$L91_CWD/pub"
-  cp "$L91_KEY4.pub" "$L91_CWD/pub/key4.pub"
-  printf 'L91-sign-me-marker' >"$L91_CWD/msg"
-  L91_SAVED_SOCK="${SSH_AUTH_SOCK:-}"
-  L91_SAVED_PID="${SSH_AGENT_PID:-}"
+  NA_KEY4="$WORK/l91-keys/key4"
+  ssh-keygen -t ed25519 -f "$NA_KEY4" -N "" -q 2>/dev/null
+  mkdir -p "$NA_CWD/pub"
+  cp "$NA_KEY4.pub" "$NA_CWD/pub/key4.pub"
+  printf 'NA-sign-me-marker' >"$NA_CWD/msg"
+  NA_SAVED_SOCK="${SSH_AUTH_SOCK:-}"
+  NA_SAVED_PID="${SSH_AGENT_PID:-}"
   unset SSH_AUTH_SOCK SSH_AGENT_PID
   eval "$(ssh-agent -s 2>/dev/null)" >/dev/null 2>&1
-  L91_AGENT_SOCK="${SSH_AUTH_SOCK:-}"
-  L91_AGENT_PID="${SSH_AGENT_PID:-}"
-  if [ -n "$L91_AGENT_SOCK" ] && [ "$L91_AGENT_SOCK" != "$L91_SAVED_SOCK" ] && [ -n "$L91_AGENT_PID" ]; then
-    ssh-add "$L91_KEY4" >/dev/null 2>&1
+  NA_AGENT_SOCK="${SSH_AUTH_SOCK:-}"
+  NA_AGENT_PID="${SSH_AGENT_PID:-}"
+  if [ -n "$NA_AGENT_SOCK" ] && [ "$NA_AGENT_SOCK" != "$NA_SAVED_SOCK" ] && [ -n "$NA_AGENT_PID" ]; then
+    ssh-add "$NA_KEY4" >/dev/null 2>&1
   fi
-  if [ -n "$L91_AGENT_SOCK" ] && [ "$L91_AGENT_SOCK" != "$L91_SAVED_SOCK" ] && [ -n "$L91_AGENT_PID" ] \
+  if [ -n "$NA_AGENT_SOCK" ] && [ "$NA_AGENT_SOCK" != "$NA_SAVED_SOCK" ] && [ -n "$NA_AGENT_PID" ] \
      && [ "$(ssh-add -l 2>/dev/null | grep -c SHA256:)" = 1 ]; then
-    L91_FP4=$(ssh-keygen -lf "$L91_KEY4.pub" | awk '{print $2}')
-    L91_PROFILE="$WORK/L91-profile.toml"
-    write_profile "$L91_PROFILE" "$L91_CWD" '[ssh]' 'agent = true'
-    if start_profile_session l91-$$ "$L91_CWD" "$L91_PROFILE" --ssh-agent-socket "$L91_AGENT_SOCK"; then
+    NA_FP4=$(ssh-keygen -lf "$NA_KEY4.pub" | awk '{print $2}')
+    NA_PROFILE="$WORK/NA-profile.toml"
+    write_profile "$NA_PROFILE" "$NA_CWD" '[ssh]' 'agent = true'
+    if start_profile_session l91-$$ "$NA_CWD" "$NA_PROFILE" --ssh-agent-socket "$NA_AGENT_SOCK"; then
       # The flag's agent wins over SSH_AUTH_SOCK: exactly key4 is listed.
-      r=$(q "$L91_CWD" "exec-out ssh-add -l")
-      if [ "$(printf '%s\n' "$r" | grep -c SHA256:)" = 1 ] && printf '%s' "$r" | grep -q "$L91_FP4"; then
-        pass "L91 --ssh-agent-socket wins over SSH_AUTH_SOCK (lists key4)"
+      r=$(q "$NA_CWD" "exec-out ssh-add -l")
+      if [ "$(printf '%s\n' "$r" | grep -c SHA256:)" = 1 ] && printf '%s' "$r" | grep -q "$NA_FP4"; then
+        pass "NA --ssh-agent-socket wins over SSH_AUTH_SOCK (lists key4)"
       else
-        fail "L91 caller socket" "ssh-add -l: $r"
+        fail "NA caller socket" "ssh-add -l: $r"
       fi
-      r=$(q "$L91_CWD" "exec-out ssh-keygen -Y sign -n hisnleak -f $L91_CWD/pub/key4.pub $L91_CWD/msg")
-      if [ "$(exit_of "$r")" = 0 ] && [ -s "$L91_CWD/msg.sig" ]; then
-        pass "L91 sign via the caller socket succeeds"
+      r=$(q "$NA_CWD" "exec-out ssh-keygen -Y sign -n hisnleak -f $NA_CWD/pub/key4.pub $NA_CWD/msg")
+      if [ "$(exit_of "$r")" = 0 ] && [ -s "$NA_CWD/msg.sig" ]; then
+        pass "NA sign via the caller socket succeeds"
       else
-        fail "L91 sign" "ssh-keygen -Y sign: $r"
+        fail "NA sign" "ssh-keygen -Y sign: $r"
       fi
-      L91_WS=$(ls_workspace_id "l91-$$")
+      NA_WS=$(ls_workspace_id "l91-$$")
       # The journal record carries fingerprint/seat/exec id, no payload.
-      L91_REC=""
+      NA_REC=""
       for _ in 1 2 3 4 5 6 7 8 9 10; do
-        L91_REC=$(timeout 5 "$HISN" journal --workspace "$L91_WS" --kind ssh/sign --json 2>/dev/null | head -c 4000)
-        printf '%s' "$L91_REC" | grep -q '"kind": "ssh/sign"' && break
+        NA_REC=$(timeout 5 "$HISN" journal --workspace "$NA_WS" --kind ssh/sign --json 2>/dev/null | head -c 4000)
+        printf '%s' "$NA_REC" | grep -q '"kind": "ssh/sign"' && break
         sleep 0.3
       done
       # The sign comes from the main loop process (exec-out runs inside
       # leakprobe, the session's main command), so it is attributed as the
       # main command: attributed:true, seat/exec_id null. The fingerprint
       # is the caller agent's key, and no payload bytes appear.
-      if printf '%s' "$L91_REC" | grep -q "$L91_FP4" && printf '%s' "$L91_REC" | grep -q '"attributed":true' \
-         && printf '%s' "$L91_REC" | grep -q '"result":"ok"' \
-         && ! printf '%s' "$L91_REC" | grep -q "L91-sign-me-marker"; then
-        pass "L91 ssh/sign record carries fingerprint, result ok, no payload bytes"
+      if printf '%s' "$NA_REC" | grep -q "$NA_FP4" && printf '%s' "$NA_REC" | grep -q '"attributed":true' \
+         && printf '%s' "$NA_REC" | grep -q '"result":"ok"' \
+         && ! printf '%s' "$NA_REC" | grep -q "NA-sign-me-marker"; then
+        pass "NA ssh/sign record carries fingerprint, result ok, no payload bytes"
       else
-        fail "L91 ssh/sign record" "rec=[$(printf '%s' "$L91_REC" | head -c 300)]"
+        fail "NA ssh/sign record" "rec=[$(printf '%s' "$NA_REC" | head -c 300)]"
       fi
-      end_session "$L91_CWD" "$S_PID"
+      end_session "$NA_CWD" "$S_PID"
+      # --ssh-agent-socket without [ssh] agent = true is an error, never a
+      # silent ignore.
+      NA_BAD_PROFILE="$WORK/NA-bad.toml"
+      write_profile "$NA_BAD_PROFILE" "$NA_CWD" '[ssh]' 'agent = false'
+      NA_OUT=$("$HISN" run --detach --json --profile "$NA_BAD_PROFILE" --session-id "na-bad-$$" \
+           --workspace "na-bad-$$" --ssh-agent-socket "$NA_AGENT_SOCK" -- true 2>&1)
+      NA_RC=$?
+      if [ $NA_RC -ne 0 ] && printf '%s' "$NA_OUT" | grep -q "requires.*agent = true"; then
+        pass "NA --ssh-agent-socket without agent = true is an error"
+      else
+        fail "NA flag without agent" "rc=$NA_RC out=[$(printf '%s' "$NA_OUT" | head -c 200)]"
+      fi
+      # Observer: a sign from an observer-seat exec is refused by the
+      # role gate (Op::Sign), not signed. The observer's double-forked
+      # grandchild also cannot reach owner: the walk must pass through
+      # init's direct child or a known exec, so an orphan that reparents
+      # to pid 1 is unattributed.
+      NA_OBS_CWD=$(new_cwd na-obs)
+      NA_OBS_PROFILE="$WORK/NA-obs.toml"
+      write_profile "$NA_OBS_PROFILE" "$NA_OBS_CWD" '[ssh]' 'agent = true'
+      if start_profile_session na-obs-$$ "$NA_OBS_CWD" "$NA_OBS_PROFILE" --ssh-agent-socket "$NA_AGENT_SOCK"; then
+        NA_TOK=$("$HISN" seat add --workspace "na-obs-$$" --role observer obs1 2>/dev/null | grep -o '"credential": *"[^"]*"' | head -1 | sed 's/.*"credential": *"//; s/"//')
+        if [ -n "$NA_TOK" ]; then
+          printf '%s' "$NA_TOK" | timeout 30 "$HISN" exec --session "na-obs-$$" --seat-token-stdin -- \
+            bash -c '(ssh-keygen -Y sign -n hisnleak -f "$0/pub/key4.pub" "$0/msg" &) ; wait' "$NA_OBS_CWD" \
+            >/dev/null 2>&1
+          NA_WS2=$(ls_workspace_id "na-obs-$$" 2>/dev/null)
+          NA_REC2=""
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            NA_REC2=$(timeout 5 "$HISN" journal --workspace "$NA_WS2" --kind ssh/sign --json 2>/dev/null | head -c 4000)
+            printf '%s' "$NA_REC2" | grep -q '"kind": "ssh/sign"' && break
+            sleep 0.3
+          done
+          if printf '%s' "$NA_REC2" | grep -q '"result":"refused"'; then
+            pass "NA observer sign is refused by the role gate"
+          else
+            fail "NA observer refused" "rec=[$(printf '%s' "$NA_REC2" | head -c 300)]"
+          fi
+        else
+          skip "NA observer refused" "seat add did not return a credential"
+        fi
+        end_session "$NA_OBS_CWD" "$S_PID"
+      else
+        skip "NA observer refused" "observer session did not start"
+      fi
     else
-      fail "L91 caller agent socket" "session did not start"
+      fail "NA caller agent socket" "session did not start"
     fi
-    kill "$L91_AGENT_PID" 2>/dev/null
+    kill "$NA_AGENT_PID" 2>/dev/null
   else
-    skip "L91 caller agent socket sign journaled" "second ssh-agent did not start or key not loaded"
-    [ -n "${L91_AGENT_PID:-}" ] && kill "$L91_AGENT_PID" 2>/dev/null
+    skip "NA caller agent socket sign journaled" "second ssh-agent did not start or key not loaded"
+    [ -n "${NA_AGENT_PID:-}" ] && kill "$NA_AGENT_PID" 2>/dev/null
   fi
-  if [ -n "$L91_SAVED_SOCK" ]; then export SSH_AUTH_SOCK="$L91_SAVED_SOCK"; else unset SSH_AUTH_SOCK; fi
-  if [ -n "$L91_SAVED_PID" ]; then export SSH_AGENT_PID="$L91_SAVED_PID"; else unset SSH_AGENT_PID; fi
+  if [ -n "$NA_SAVED_SOCK" ]; then export SSH_AUTH_SOCK="$NA_SAVED_SOCK"; else unset SSH_AUTH_SOCK; fi
+  if [ -n "$NA_SAVED_PID" ]; then export SSH_AGENT_PID="$NA_SAVED_PID"; else unset SSH_AGENT_PID; fi
 fi
 
 # ================================================ L46: rootfs symlink traps (0.3.2, needs HISN_TEST_ROOTFS)
@@ -4116,7 +4161,7 @@ else
   skip "L89 seats with credentials and roles" "hisn check failed (no userns)"
 fi
 
-# ================================================ L90 wait cases (0.6.7, HOST)
+# ================================================ NW wait cases (0.6.7, HOST)
 # `hisn journal --after-wseq N --wait [SECS]`:
 #   1. wait-then-append: with N at the journal's last wseq, a record
 #      appended after the wait starts wakes it; it prints that record and
@@ -4133,9 +4178,9 @@ fi
 # block session teardown (a hang would block the suite past the wrapper
 # timeout, unlike a quick wrong exit).
 if needs_host; then
-  L90_CWD=$(new_cwd l90wait)
-  L90_POL="$WORK/l90wait.toml"
-  write_policy "$L90_POL" "$L90_CWD"
+  NW_CWD=$(new_cwd l90wait)
+  NW_POL="$WORK/l90wait.toml"
+  write_policy "$NW_POL" "$NW_CWD"
   WDIR=""
   journal_file() { printf '%s\n' "$WDIR/journal.jsonl"; }
   append_note() { # append_note PATH TEXT [WSEQ]
@@ -4160,82 +4205,82 @@ try:
 except FileNotFoundError: pass
 print(last)" "$1"
   }
-  if start_session l90wait-$$ "$L90_CWD" "$L90_POL" --detach; then
-    L90_WS=$(ls_workspace_id "l90wait-$$")
-    WDIR="${XDG_STATE_HOME:-$HOME/.local/state}/hisn/workspaces/$L90_WS"
+  if start_session l90wait-$$ "$NW_CWD" "$NW_POL" --detach; then
+    NW_WS=$(ls_workspace_id "l90wait-$$")
+    WDIR="${XDG_STATE_HOME:-$HOME/.local/state}/hisn/workspaces/$NW_WS"
     # -- case 1: wait-then-append
     W_NOW=$(last_wseq "$(journal_file)")
-    ( sleep 0.5; append_note "$(journal_file)" "L90-wait-wake" "$((W_NOW + 1))" "l90wait-$$" ) &
-    L90_AP=$!
-    W_OUT=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 8 --session "l90wait-$$" --json 2>"$WORK/l90w.err"); W_RC=$?
-    wait $L90_AP 2>/dev/null
-    if [ $W_RC -eq 0 ] && printf '%s' "$W_OUT" | grep -q "L90-wait-wake"; then
-      pass "L90 journal --wait wakes on a later append and exits 0"
+    ( sleep 0.5; append_note "$(journal_file)" "NW-wait-wake" "$((W_NOW + 1))" "l90wait-$$" ) &
+    NW_AP=$!
+    W_OUT=$(timeout 10 "$HISN" journal --workspace "$NW_WS" --after-wseq "$W_NOW" --wait 8 --session "l90wait-$$" --json 2>"$WORK/l90w.err"); W_RC=$?
+    wait $NW_AP 2>/dev/null
+    if [ $W_RC -eq 0 ] && printf '%s' "$W_OUT" | grep -q "NW-wait-wake"; then
+      pass "NW journal --wait wakes on a later append and exits 0"
     else
-      fail "L90 journal --wait wakes on a later append and exits 0" "rc=$W_RC out=[$(printf '%s' "$W_OUT" | head -c 200)] err=[$(head -c 200 "$WORK/l90w.err")]"
+      fail "NW journal --wait wakes on a later append and exits 0" "rc=$W_RC out=[$(printf '%s' "$W_OUT" | head -c 200)] err=[$(head -c 200 "$WORK/l90w.err")]"
     fi
     # -- case 2: timeout (also covers --wait 0). The cursor is the real
     # tail; nothing arrives, so the wait gives up. --json carries the
     # machine-readable code.
     W_NOW=$(last_wseq "$(journal_file)")
     W_S=$(date +%s)
-    W_ERR=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 1 --json 2>&1); W_RC=$?
+    W_ERR=$(timeout 10 "$HISN" journal --workspace "$NW_WS" --after-wseq "$W_NOW" --wait 1 --json 2>&1); W_RC=$?
     W_E=$(date +%s)
     if [ $W_RC -eq 6 ] && printf '%s' "$W_ERR" | grep -q E_WAIT_TIMEOUT && [ $((W_E - W_S)) -le 4 ]; then
-      pass "L90 journal --wait timeout exits 6 with E_WAIT_TIMEOUT"
+      pass "NW journal --wait timeout exits 6 with E_WAIT_TIMEOUT"
     else
-      fail "L90 journal --wait timeout exits 6 with E_WAIT_TIMEOUT" "rc=$W_RC elapsed=$((W_E - W_S))s out=[$(printf '%s' "$W_ERR" | head -c 200)]"
+      fail "NW journal --wait timeout exits 6 with E_WAIT_TIMEOUT" "rc=$W_RC elapsed=$((W_E - W_S))s out=[$(printf '%s' "$W_ERR" | head -c 200)]"
     fi
-    W_ERR=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 0 --json 2>&1); W_RC=$?
+    W_ERR=$(timeout 10 "$HISN" journal --workspace "$NW_WS" --after-wseq "$W_NOW" --wait 0 --json 2>&1); W_RC=$?
     if [ $W_RC -eq 6 ] && printf '%s' "$W_ERR" | grep -q E_WAIT_TIMEOUT; then
-      pass "L90 journal --wait 0 is an immediate poll (exit 6)"
+      pass "NW journal --wait 0 is an immediate poll (exit 6)"
     else
-      fail "L90 journal --wait 0 is an immediate poll" "rc=$W_RC out=[$(printf '%s' "$W_ERR" | head -c 200)]"
+      fail "NW journal --wait 0 is an immediate poll" "rc=$W_RC out=[$(printf '%s' "$W_ERR" | head -c 200)]"
     fi
     # -- case 3: rotation while waiting. The new file's first record
     # follows the old tail, so the cursor stays contiguous.
-    ( sleep 0.4; mv "$(journal_file)" "$WDIR/journal.3.jsonl"; : >"$(journal_file)"; append_note "$(journal_file)" "L90-rotated" "$((W_NOW + 1))" "l90wait-$$" ) &
-    L90_RP=$!
-    W_OUT=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 8 --json 2>"$WORK/l90r.err"); W_RC=$?
-    wait $L90_RP 2>/dev/null
-    if [ $W_RC -eq 0 ] && printf '%s' "$W_OUT" | grep -q "L90-rotated"; then
-      pass "L90 journal --wait survives rotation while waiting"
+    ( sleep 0.4; mv "$(journal_file)" "$WDIR/journal.3.jsonl"; : >"$(journal_file)"; append_note "$(journal_file)" "NW-rotated" "$((W_NOW + 1))" "l90wait-$$" ) &
+    NW_RP=$!
+    W_OUT=$(timeout 10 "$HISN" journal --workspace "$NW_WS" --after-wseq "$W_NOW" --wait 8 --json 2>"$WORK/l90r.err"); W_RC=$?
+    wait $NW_RP 2>/dev/null
+    if [ $W_RC -eq 0 ] && printf '%s' "$W_OUT" | grep -q "NW-rotated"; then
+      pass "NW journal --wait survives rotation while waiting"
     else
-      fail "L90 journal --wait survives rotation while waiting" "rc=$W_RC out=[$(printf '%s' "$W_OUT" | head -c 200)] err=[$(head -c 200 "$WORK/l90r.err")]"
+      fail "NW journal --wait survives rotation while waiting" "rc=$W_RC out=[$(printf '%s' "$W_OUT" | head -c 200)] err=[$(head -c 200 "$WORK/l90r.err")]"
     fi
     # -- case 4: session stops while waiting. Filtered to the session and
     # to notes with the cursor at the tail, so no matching record
     # arrives; the stop surface ends the wait with exit 7.
     W_NOW=$(last_wseq "$(journal_file)")
     ( sleep 0.4; "$HISN" stop --session "l90wait-$$" >/dev/null 2>&1 ) &
-    L90_SP=$!
-    W_ERR=$(timeout 10 "$HISN" journal --workspace "$L90_WS" --after-wseq "$W_NOW" --wait 8 --session "l90wait-$$" --kind note --json 2>&1); W_RC=$?
-    wait $L90_SP 2>/dev/null
+    NW_SP=$!
+    W_ERR=$(timeout 10 "$HISN" journal --workspace "$NW_WS" --after-wseq "$W_NOW" --wait 8 --session "l90wait-$$" --kind note --json 2>&1); W_RC=$?
+    wait $NW_SP 2>/dev/null
     if [ $W_RC -eq 7 ] && printf '%s' "$W_ERR" | grep -q E_WAIT_SESSION_ENDED; then
-      pass "L90 journal --wait returns 7 when the session ends"
+      pass "NW journal --wait returns 7 when the session ends"
     else
-      fail "L90 journal --wait returns 7 when the session ends" "rc=$W_RC out=[$(printf '%s' "$W_ERR" | head -c 200)]"
+      fail "NW journal --wait returns 7 when the session ends" "rc=$W_RC out=[$(printf '%s' "$W_ERR" | head -c 200)]"
     fi
   else
-    skip "L90 journal --wait" "session did not start"
+    skip "NW journal --wait" "session did not start"
   fi
-  rm -rf "$L90_CWD"
+  rm -rf "$NW_CWD"
 else
-  skip "L90 journal --wait wakes on a later append and exits 0" "hisn check failed (no userns)"
-  skip "L90 journal --wait timeout exits 6 with E_WAIT_TIMEOUT" "hisn check failed (no userns)"
-  skip "L90 journal --wait 0 is an immediate poll" "hisn check failed (no userns)"
-  skip "L90 journal --wait survives rotation while waiting" "hisn check failed (no userns)"
-  skip "L90 journal --wait returns 7 when the session ends" "hisn check failed (no userns)"
+  skip "NW journal --wait wakes on a later append and exits 0" "hisn check failed (no userns)"
+  skip "NW journal --wait timeout exits 6 with E_WAIT_TIMEOUT" "hisn check failed (no userns)"
+  skip "NW journal --wait 0 is an immediate poll" "hisn check failed (no userns)"
+  skip "NW journal --wait survives rotation while waiting" "hisn check failed (no userns)"
+  skip "NW journal --wait returns 7 when the session ends" "hisn check failed (no userns)"
 fi
 
-# === 0.6.0 network cases (ADR 0022, open mode): L90, L94, L96-L100,
+# === 0.6.0 network cases (ADR 0022, open mode): NW, L94, L96-L100,
 # L102-L107, L109-L117, L119-L124. They live in net_cases.sh, which
 # scripts/host-verify-network.sh runs too. It runs inside a throwaway
 # user + network namespace (`unshare -Urn`) that has only loopback and a
 # dummy interface, so no traffic can leave the machine, and with hisn's
 # runtime and state directories inside its own work dir. The L118
 # real-network cases run only through the host script's --real step.
-NET_IDS="L90 L94 L96 L97 L98 L99 L100 L102 L103 L104 L105 L106 L107 L109 L110 L111 L112 L113 L114 L115 L116 L117 L119 L120 L121 L122 L123 L124 L126"
+NET_IDS="NW L94 L96 L97 L98 L99 L100 L102 L103 L104 L105 L106 L107 L109 L110 L111 L112 L113 L114 L115 L116 L117 L119 L120 L121 L122 L123 L124 L126"
 NET_MISSING=""
 command -v ip >/dev/null 2>&1 || NET_MISSING="the ip command (iproute2) is not installed"
 [ -n "$NET_MISSING" ] || timeout 10 unshare -Urn true 2>/dev/null ||

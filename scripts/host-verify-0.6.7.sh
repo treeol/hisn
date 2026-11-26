@@ -12,7 +12,7 @@
 # seconds; every step has its own timeout, and a step that hit it is named.
 #
 # Nothing is installed and sudo is never called. Binaries are built under
-# target/ only (the v0.6.4 comparison binary comes from a git worktree of the
+# target/ only (the v0.6.5 comparison binary comes from a git worktree of the
 # tag with its own target dir under target/; the worktree is removed at the
 # end). The end-to-end steps start only sessions whose id begins with
 # "host067-", stop only those, and never use --name, --prune or --purge.
@@ -379,10 +379,10 @@ PY
       H 120 journal --workspace $BIG --after-wseq 50000 --json >"$W/new2.out" 2>/dev/null
       if cmp -s "$W/old2.out" "$W/new2.out" && [ "$(wc -l <"$W/new2.out")" = 50000 ]; then ok "journal --after-wseq 50000: identical output (50000 records)"; else bad "identical output (half)" "$(wc -l <"$W/old2.out") vs $(wc -l <"$W/new2.out")"; fi
       mo=$(med "$OLDBIN" 99990); mn=$(med "$HISN" 99990)
-      echo "INFO  journal --after-wseq 99990, 100000 records, median of 5: v0.6.4 ${mo} ms, HEAD ${mn} ms (HEAD first call, builds the index: ${cold} ms)"
+      echo "INFO  journal --after-wseq 99990, 100000 records, median of 5: v0.6.5 ${mo} ms, HEAD ${mn} ms (HEAD first call, builds the index: ${cold} ms)"
       # At ~2 ms, a 1 ms median difference is noise; tolerate it (the point
       # is that the index is not a regression, not microbenchmarking).
-      python3 -c 'import sys; sys.exit(0 if float(sys.argv[2]) <= float(sys.argv[1]) + 1 else 1)' "$mo" "$mn" && ok "HEAD cursor read is within 1 ms of v0.6.5 (${mn} ms vs ${mo} ms)" || bad "HEAD slower" "v0.6.4 ${mo} ms, HEAD ${mn} ms"
+      python3 -c 'import sys; sys.exit(0 if float(sys.argv[2]) <= float(sys.argv[1]) + 1 else 1)' "$mo" "$mn" && ok "HEAD cursor read is within 1 ms of v0.6.5 (${mn} ms vs ${mo} ms)" || bad "HEAD slower" "v0.6.5 ${mo} ms, HEAD ${mn} ms"
     fi
     # --- an unreadable line yields journal/unreadable and the cursor moves on
     U=0000000000000c01
@@ -408,7 +408,7 @@ print(w==list(range(21,51)))' "$W/u2.out" 2>&1)
     H 30 journal --workspace $G --after-wseq 10 --json >/dev/null 2>"$W/g.err"; rc=$?
     [ $rc -eq 4 ] && grep -q E_CURSOR_GAP "$W/g.err" && ok "a real hole (no corrupt line) is still exit 4, E_CURSOR_GAP" || bad "real hole" "rc=$rc $(cat "$W/g.err")"
     if [ -x "$OLDBIN" ]; then
-      "$OLDBIN" journal --workspace $U --after-wseq 10 --json >/dev/null 2>&1 </dev/null; echo "INFO  v0.6.4 on the same corrupt journal: exit $? (the cursor is stuck there)"
+      "$OLDBIN" journal --workspace $U --after-wseq 10 --json >/dev/null 2>&1 </dev/null; echo "INFO  v0.6.5 on the same corrupt journal: exit $? "
     fi
     echo "E2E: pass=$P fail=$F"
     [ "$F" -eq 0 ]
@@ -694,7 +694,7 @@ else
   say "binary under test: $HISN ($("$HISN" --version 2>&1 | head -n 1))"
 fi
 
-# The v0.6.4 comparison binary: a worktree of the tag, its own target dir.
+# The v0.6.5 comparison binary: a worktree of the tag, its own target dir.
 build_old() {
   git rev-parse -q --verify "refs/tags/v0.6.5^{commit}" >/dev/null \
     || { echo "FAIL: tag v0.6.5 is missing (git fetch --tags)"; return 1; }

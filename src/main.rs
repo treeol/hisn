@@ -1060,8 +1060,15 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
     let mut cursor_behind = false;
     let (recs, skipped) = if let Some(after) = a.after_wseq {
         if let Some(wait_arg) = a.wait {
-            let deadline = wait_arg
-                .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs));
+            // A huge --wait value must not panic on Instant overflow.
+            let deadline = match wait_arg {
+                Some(secs) => Some(
+                    std::time::Instant::now()
+                        .checked_add(std::time::Duration::from_secs(secs))
+                        .ok_or_else(|| anyhow!("--wait: deadline overflow for {secs} seconds"))?,
+                ),
+                None => None,
+            };
             let mut waiter =
                 journal::Waiter::production(dir.clone(), after, session_filter.clone());
             let q = journal::Query {
@@ -1154,6 +1161,18 @@ fn journal_cmd(a: hisn::cli::JournalArgs) -> Result<ExitCode> {
                 // Sleep one backend tick. Waiter exposes its backend
                 // through `wait_tick` below (see journal::Waiter).
                 if !waiter.wait_tick(deadline) {
+                    // One last read before declaring the timeout:
+                    // records that arrived in the final window still
+                    // count (records win over timeout).
+                    match waiter.step() {
+                        journal::WaitOutcome::Records(records, skipped)
+                        | journal::WaitOutcome::SessionEnded(records, skipped)
+                            if !journal::query(&records, &q).is_empty() =>
+                        {
+                            break (records, skipped);
+                        }
+                        _ => {}
+                    }
                     return Ok(cursor_failure(
                         a.json,
                         journal::EXIT_WAIT_TIMEOUT,

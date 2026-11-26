@@ -1895,11 +1895,11 @@ fn summary_for(rec: &JournalRecord) -> String {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unattributed");
             format!(
-                "sign {} {}]",
+                "sign {} {} seat={}",
                 escape_terminal(field("result")),
                 escape_terminal(field("fingerprint")),
+                escape_terminal(seat),
             )
-            .replace("]", &format!("] seat={}", escape_terminal(seat)))
         }
         "ssh/sign-summary" => {
             let n = |k: &str| d.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
